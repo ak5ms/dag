@@ -220,13 +220,22 @@ def _xs_rank_builder(children: list[CompiledNode], literals: list[float]) -> Com
             if not self.initialized:
                 self.out = np.empty((n, 1), dtype=np.float64)
                 self.initialized = True
+
+            vals = np.empty(n, dtype=np.float64)
             for i in range(n):
-                c = 0.0
-                v = x[i, 0]
-                for j in range(n):
-                    if x[j, 0] <= v:
-                        c += 1.0
-                self.out[i, 0] = c / n
+                vals[i] = x[i, 0]
+            idx = np.argsort(vals)
+
+            pos = 0
+            while pos < n:
+                start = pos
+                v = vals[idx[pos]]
+                pos += 1
+                while pos < n and vals[idx[pos]] == v:
+                    pos += 1
+                rank = pos / n
+                for k in range(start, pos):
+                    self.out[idx[k], 0] = rank
 
         def emit(self):
             return self.out

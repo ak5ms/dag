@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from numba import int64, types
+from numba.experimental import jitclass
+from numba.typed import List
+
 from .ops import _make_input_node, _make_literal_node, register_builtin_ops
-from .parser import Call, Identifier, Number, Expr, parse_formula
-from .registry import REGISTRY, CompiledNode, TypeInfo
+from .parser import Call, Expr, Identifier, Number, parse_formula
+from .registry import REGISTRY, CompiledNode
 
 
 class FormulaCompileError(ValueError):
@@ -12,14 +16,24 @@ class FormulaCompileError(ValueError):
 
 
 @dataclass(frozen=True)
-class CompiledFormula:
-    formula: str
+class CompiledFormulaArtifact:
+    compiled: object
+    compiled_type: object
     input_names: tuple[str, ...]
-    output_type: TypeInfo
-    make_feature: callable
+    output_kind: str
 
 
-def compile_formula(formula: str) -> CompiledFormula:
+def _kind_to_code(kind: str) -> int:
+    if kind == "scalar":
+        return 0
+    if kind == "vector":
+        return 1
+    if kind == "matrix":
+        return 2
+    raise FormulaCompileError(f"Unknown output kind: {kind}")
+
+
+def compile_formula(formula: str) -> CompiledFormulaArtifact:
     register_builtin_ops()
     ast_expr = parse_formula(formula)
     inputs: dict[str, int] = {}
@@ -46,9 +60,38 @@ def compile_formula(formula: str) -> CompiledFormula:
         raise FormulaCompileError(f"Unhandled expression node: {node}")
 
     root = build(ast_expr)
-    return CompiledFormula(
-        formula=formula,
-        input_names=tuple(inputs.keys()),
-        output_type=root.type_info,
-        make_feature=root.ctor,
+    output_code = _kind_to_code(root.type_info.kind)
+
+    spec = [
+        ("feature", root.instance_type),
+        ("n_inputs", int64),
+        ("output_code", int64),
+        ("input_names", types.ListType(types.unicode_type)),
+    ]
+
+    @jitclass(spec)
+    class CompiledFormula:  # noqa: N801
+        def __init__(self, feature, names, output_code):
+            self.feature = feature
+            self.n_inputs = len(names)
+            self.output_code = output_code
+            self.input_names = names
+
+        def on_data(self, frame2d):
+            self.feature.on_data(frame2d)
+
+        def emit(self):
+            return self.feature.emit()
+
+    ordered_names = tuple(inputs.keys())
+    typed_names = List()
+    for n in ordered_names:
+        typed_names.append(n)
+
+    compiled = CompiledFormula(root.ctor(), typed_names, output_code)
+    return CompiledFormulaArtifact(
+        compiled=compiled,
+        compiled_type=CompiledFormula.class_type.instance_type,
+        input_names=ordered_names,
+        output_kind=root.type_info.kind,
     )

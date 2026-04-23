@@ -11,3 +11,5 @@ dependencies = ["numpy", "numba"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+markers = ["perf: performance tests"]
