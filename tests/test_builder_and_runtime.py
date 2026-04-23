@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from trading_dsl_engine import build_engine, compile_formula, run_batch_from_mapping, update_from_mapping
 
@@ -86,3 +87,15 @@ def test_chunked_batch_matches_full_batch():
     full = run_batch_from_mapping(eng1, {"close": close, "open": open_}, chunk_size=1000)
     chunked = run_batch_from_mapping(eng2, {"close": close, "open": open_}, chunk_size=31)
     np.testing.assert_allclose(full, chunked)
+
+
+def test_batch_path_does_not_require_np_stack(monkeypatch):
+    eng = build_engine("add(close, 1)")
+    close = np.arange(24, dtype=np.float64).reshape(6, 4)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("np.stack should not be used in batch path")
+
+    monkeypatch.setattr(np, "stack", _boom)
+    out = run_batch_from_mapping(eng, {"close": close}, chunk_size=2)
+    np.testing.assert_allclose(out[:, :, 0], close + 1.0)

@@ -13,14 +13,13 @@ from .dsl import (
     sub,
     xs_rank,
 )
-from .engine import build_engine, pack_cube, run_batch_from_mapping, update_from_mapping
+from .engine import build_engine, run_batch_from_mapping, update_from_mapping
 from .parser import FormulaParseError, parse_formula
 
 __all__ = [
     "CompiledFormulaArtifact",
     "compile_formula",
     "build_engine",
-    "pack_cube",
     "run_batch_from_mapping",
     "update_from_mapping",
     "DSLFunctionRegistry",
