@@ -6,7 +6,7 @@ from numba import int64, types
 from numba.experimental import jitclass
 from numba.typed import List
 
-from .dsl import DSL_FUNCTIONS
+from .dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from .ops import _make_input_node, _make_literal_node, register_builtin_ops
 from .parser import Call, Expr, Identifier, Number, parse_formula
 from .registry import REGISTRY, CompiledNode
@@ -34,10 +34,11 @@ def _kind_to_code(kind: str) -> int:
     raise FormulaCompileError(f"Unknown output kind: {kind}")
 
 
-def compile_formula(formula: str) -> CompiledFormulaArtifact:
+def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = None) -> CompiledFormulaArtifact:
     register_builtin_ops()
     ast_expr = parse_formula(formula)
     inputs: dict[str, int] = {}
+    dsl_registry = dsl_registry or DEFAULT_DSL_REGISTRY
 
     def build(node: Expr, depth: int = 0) -> CompiledNode:
         if depth > 256:
@@ -49,7 +50,7 @@ def compile_formula(formula: str) -> CompiledFormulaArtifact:
         if isinstance(node, Number):
             return _make_literal_node(node.value)
         if isinstance(node, Call):
-            py_fn = DSL_FUNCTIONS.get(node.fn)
+            py_fn = dsl_registry.get(node.fn)
             if py_fn is not None:
                 try:
                     expanded = py_fn(*node.args)

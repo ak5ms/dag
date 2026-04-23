@@ -64,3 +64,25 @@ def test_compiled_formula_and_engine_are_jitclasses():
     assert hasattr(compiled.compiled, "_numba_type_")
     eng = build_engine("add(close, 1)")
     assert hasattr(eng, "_numba_type_")
+
+
+def test_nan_handling_div_ewm_and_xs_rank():
+    eng = build_engine("xs_rank(ewm(div(close, open), 3))")
+    close = np.array([[10.0, np.nan, 30.0], [12.0, 24.0, np.nan]], dtype=np.float64)
+    open_ = np.array([[5.0, 10.0, 15.0], [6.0, 12.0, 15.0]], dtype=np.float64)
+
+    out = run_batch_from_mapping(eng, {"close": close, "open": open_})
+    assert np.isnan(out[0, 1, 0])
+    assert not np.isnan(out[1, 2, 0])
+
+
+def test_chunked_batch_matches_full_batch():
+    eng1 = build_engine("ewm(div(close, open), 5)")
+    eng2 = build_engine("ewm(div(close, open), 5)")
+    rng = np.random.default_rng(0)
+    close = rng.uniform(1, 2, size=(200, 8)).astype(np.float64)
+    open_ = rng.uniform(1, 2, size=(200, 8)).astype(np.float64)
+
+    full = run_batch_from_mapping(eng1, {"close": close, "open": open_}, chunk_size=1000)
+    chunked = run_batch_from_mapping(eng2, {"close": close, "open": open_}, chunk_size=31)
+    np.testing.assert_allclose(full, chunked)

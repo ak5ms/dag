@@ -5,7 +5,20 @@ from collections.abc import Callable
 from .parser import Call, Expr, Number
 
 
-DSL_FUNCTIONS: dict[str, Callable[..., Expr]] = {}
+class DSLFunctionRegistry:
+    def __init__(self) -> None:
+        self._fns: dict[str, Callable[..., Expr]] = {}
+
+    def register(self, name: str, fn: Callable[..., Expr]) -> None:
+        if name in self._fns:
+            raise ValueError(f"DSL function already registered: {name}")
+        self._fns[name] = fn
+
+    def get(self, name: str) -> Callable[..., Expr] | None:
+        return self._fns.get(name)
+
+
+DEFAULT_DSL_REGISTRY = DSLFunctionRegistry()
 
 
 def ensure_expr(value) -> Expr:
@@ -28,24 +41,24 @@ def op(name: str) -> Callable[..., Expr]:
     return _op
 
 
-def register_dsl_function(name: str | None = None):
+def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry | None = None):
+    target = registry or DEFAULT_DSL_REGISTRY
+
     def _decorator(fn: Callable[..., Expr]) -> Callable[..., Expr]:
         fn_name = name or fn.__name__
-        if fn_name in DSL_FUNCTIONS:
-            raise ValueError(f"DSL function already registered: {fn_name}")
 
         def _wrapped(*args):
             out = fn(*args)
             return ensure_expr(out)
 
-        DSL_FUNCTIONS[fn_name] = _wrapped
+        target.register(fn_name, _wrapped)
         return fn
 
     return _decorator
 
 
-# Builtin operation constructors to support python-level composition.
 add = op("add")
+sub = op("sub")
 div = op("div")
 ewm = op("ewm")
 xs_rank = op("xs_rank")

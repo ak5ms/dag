@@ -1,6 +1,6 @@
 import numpy as np
 
-from trading_dsl_engine import build_engine, register_dsl_function, run_batch_from_mapping
+from trading_dsl_engine import DSLFunctionRegistry, build_engine, register_dsl_function, run_batch_from_mapping
 from trading_dsl_engine.dsl import add, div, ewm, ratio, xs_rank
 
 
@@ -39,3 +39,16 @@ def test_composite_dsl_function_alpha_ratio_rank_matches_builtin_formula():
     y1 = run_batch_from_mapping(f1, {"close": close, "open": open_})
     y2 = run_batch_from_mapping(f2, {"close": close, "open": open_})
     np.testing.assert_allclose(y1, y2)
+
+
+def test_registry_namespace_isolation():
+    reg = DSLFunctionRegistry()
+
+    @register_dsl_function("twice", registry=reg)
+    def twice(x):
+        return add(x, x)
+
+    eng = build_engine("twice(close)", dsl_registry=reg)
+    close = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+    out = run_batch_from_mapping(eng, {"close": close})
+    np.testing.assert_allclose(out[:, :, 0], close * 2.0)

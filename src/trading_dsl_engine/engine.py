@@ -5,6 +5,7 @@ from numba import boolean, float64
 from numba.experimental import jitclass
 
 from .compiler import compile_formula
+from .dsl import DSLFunctionRegistry
 
 
 def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
@@ -15,9 +16,10 @@ def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
     return frame
 
 
-def pack_cube(engine, data: dict[str, np.ndarray]) -> np.ndarray:
+def pack_cube(engine, data: dict[str, np.ndarray], start: int = 0, stop: int | None = None) -> np.ndarray:
     names = engine.compiled.input_names
-    stacked = [np.asarray(data[names[i]], dtype=np.float64) for i in range(len(names))]
+    end = data[names[0]].shape[0] if stop is None else stop
+    stacked = [np.asarray(data[names[i]][start:end], dtype=np.float64) for i in range(len(names))]
     return np.stack(stacked, axis=1)
 
 
@@ -27,17 +29,34 @@ def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
     return engine.emit().copy()
 
 
-def run_batch_from_mapping(engine, data: dict[str, np.ndarray], out: np.ndarray | None = None) -> np.ndarray:
-    cube = pack_cube(engine, data)
+def run_batch_from_mapping(
+    engine,
+    data: dict[str, np.ndarray],
+    out: np.ndarray | None = None,
+    chunk_size: int = 8192,
+) -> np.ndarray:
+    names = engine.compiled.input_names
+    t = data[names[0]].shape[0]
+
     if out is None:
-        engine.on_data(cube[0])
+        frame0 = _pack_tick(engine, {n: data[n][0] for n in names})
+        engine.on_data(frame0)
         y0 = engine.emit()
-        out = np.empty((cube.shape[0], y0.shape[0], y0.shape[1]), dtype=np.float64)
-    return engine.run_batch(cube, out)
+        out = np.empty((t, y0.shape[0], y0.shape[1]), dtype=np.float64)
+        out[0] = y0
+        start = 1
+    else:
+        start = 0
+
+    for i in range(start, t, chunk_size):
+        j = min(t, i + chunk_size)
+        cube = pack_cube(engine, data, i, j)
+        engine.run_batch(cube, out[i:j])
+    return out
 
 
-def build_engine(formula: str):
-    compiled_artifact = compile_formula(formula)
+def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
+    compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry)
 
     spec = [
         ("compiled", compiled_artifact.compiled_type),

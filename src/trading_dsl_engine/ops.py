@@ -67,6 +67,7 @@ def _make_literal_node(value: float) -> CompiledNode:
 
 def make_binary_op(name: str, kernel: Callable[[float, float], float]) -> None:
     kernel_jit = njit(inline="always")(kernel)
+    is_div = name == "div"
     def validator(types: list[TypeInfo]) -> TypeInfo:
         if len(types) != 2:
             raise ValueError(f"{name} expects exactly 2 args")
@@ -116,7 +117,14 @@ def make_binary_op(name: str, kernel: Callable[[float, float], float]) -> None:
                     for j in range(cols):
                         aj = j if a.shape[1] > 1 else 0
                         bj = j if b.shape[1] > 1 else 0
-                        self.out[i, j] = kernel_jit(a[ai, aj], b[bi, bj])
+                        av = a[ai, aj]
+                        bv = b[bi, bj]
+                        if np.isnan(av) or np.isnan(bv):
+                            self.out[i, j] = np.nan
+                        elif is_div and bv == 0.0:
+                            self.out[i, j] = np.nan
+                        else:
+                            self.out[i, j] = kernel_jit(av, bv)
 
             def emit(self):
                 return self.out
@@ -179,7 +187,14 @@ def _ewm_builder(children: list[CompiledNode], literals: list[float]) -> Compile
                 b = 1.0 - a
                 for i in range(rows):
                     for j in range(cols):
-                        self.state[i, j] = a * x[i, j] + b * self.state[i, j]
+                        xv = x[i, j]
+                        sv = self.state[i, j]
+                        if np.isnan(xv):
+                            self.state[i, j] = sv
+                        elif np.isnan(sv):
+                            self.state[i, j] = xv
+                        else:
+                            self.state[i, j] = a * xv + b * sv
             for i in range(rows):
                 for j in range(cols):
                     self.out[i, j] = self.state[i, j]
@@ -222,20 +237,34 @@ def _xs_rank_builder(children: list[CompiledNode], literals: list[float]) -> Com
                 self.initialized = True
 
             vals = np.empty(n, dtype=np.float64)
+            valid = np.empty(n, dtype=np.float64)
+            m = 0
             for i in range(n):
                 vals[i] = x[i, 0]
-            idx = np.argsort(vals)
+                if np.isnan(vals[i]):
+                    self.out[i, 0] = np.nan
+                else:
+                    valid[m] = vals[i]
+                    m += 1
+            if m == 0:
+                return
+            idx = np.argsort(valid[:m])
 
             pos = 0
-            while pos < n:
+            while pos < m:
                 start = pos
-                v = vals[idx[pos]]
+                v = valid[idx[pos]]
                 pos += 1
-                while pos < n and vals[idx[pos]] == v:
+                while pos < m and valid[idx[pos]] == v:
                     pos += 1
-                rank = pos / n
-                for k in range(start, pos):
-                    self.out[idx[k], 0] = rank
+                rank = pos / m
+                target_count = 0
+                for i in range(n):
+                    if not np.isnan(vals[i]) and vals[i] == v:
+                        self.out[i, 0] = rank
+                        target_count += 1
+                        if target_count == pos - start:
+                            break
 
         def emit(self):
             return self.out
@@ -287,6 +316,7 @@ def register_builtin_ops() -> None:
 
     make_binary_op("div", lambda a, b: a / b)
     make_binary_op("add", lambda a, b: a + b)
+    make_binary_op("sub", lambda a, b: a - b)
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
