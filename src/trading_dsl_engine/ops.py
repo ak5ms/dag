@@ -6,7 +6,7 @@ import numpy as np
 from numba import boolean, float64, int64, njit
 from numba.experimental import jitclass
 
-from .registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
+from trading_dsl_engine.registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
 
 
 VECTOR = TypeInfo("vector")

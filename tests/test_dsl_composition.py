@@ -23,9 +23,9 @@ def test_composite_dsl_function_hlc3():
     out = run_batch_from_mapping(eng, {"high": high, "low": low, "close": close})
     hlc3_np = (high + low + close) / 3.0
     alpha = 2.0 / (3.0 + 1.0)
-    expected = np.empty((2, 2, 1), dtype=np.float64)
-    expected[0, :, 0] = hlc3_np[0]
-    expected[1, :, 0] = alpha * hlc3_np[1] + (1 - alpha) * hlc3_np[0]
+    expected = np.empty((2, 2), dtype=np.float64)
+    expected[0] = hlc3_np[0]
+    expected[1] = alpha * hlc3_np[1] + (1 - alpha) * hlc3_np[0]
     np.testing.assert_allclose(out, expected)
 
 
@@ -51,4 +51,4 @@ def test_registry_namespace_isolation():
     eng = build_engine("twice(close)", dsl_registry=reg)
     close = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
     out = run_batch_from_mapping(eng, {"close": close})
-    np.testing.assert_allclose(out[:, :, 0], close * 2.0)
+    np.testing.assert_allclose(out, close * 2.0)

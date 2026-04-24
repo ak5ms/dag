@@ -31,8 +31,9 @@ class FormulaParseError(ValueError):
 
 class _AstParser:
     def parse(self, text: str) -> Expr:
+        source = text.strip()
         try:
-            tree = ast.parse(text, mode="eval")
+            tree = ast.parse(source, mode="eval")
         except SyntaxError as exc:
             raise FormulaParseError(f"Syntax error at line {exc.lineno}, col {exc.offset}: {exc.msg}") from exc
         return self._expr(tree.body)

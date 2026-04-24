@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .parser import Call, Expr, Number
+from trading_dsl_engine.parser import Call, Expr, Number
 
 
 class DSLFunctionRegistry:

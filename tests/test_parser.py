@@ -22,3 +22,16 @@ def test_parse_number_and_identifier():
 def test_parse_error_keyword_args():
     with pytest.raises(FormulaParseError):
         parse_formula("ewm(close, span=21)")
+
+
+def test_parse_multiline_formula():
+    expr = parse_formula("""
+xs_rank(
+    ewm(
+        div(close, open),
+        21
+    )
+)
+""")
+    assert isinstance(expr, Call)
+    assert expr.fn == "xs_rank"

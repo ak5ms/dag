@@ -5,8 +5,8 @@ from numba import boolean, float64, int64
 from numba.experimental import jitclass
 from numba.typed import List
 
-from .compiler import compile_formula
-from .dsl import DSLFunctionRegistry
+from trading_dsl_engine.compiler import compile_formula
+from trading_dsl_engine.dsl import DSLFunctionRegistry
 
 
 def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
@@ -45,30 +45,50 @@ def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
     return engine.emit().copy()
 
 
+def _alloc_output(engine, t: int, n_instruments: int):
+    output_code = engine.compiled.output_code
+    if output_code == 0:
+        return np.empty(t, dtype=np.float64)
+    if output_code == 1:
+        return np.empty((t, n_instruments), dtype=np.float64)
+    if output_code == 2:
+        return np.empty((t, n_instruments, n_instruments), dtype=np.float64)
+    raise ValueError(f"Unknown output code: {output_code}")
+
+
 def run_batch_from_mapping(
     engine,
     data: dict[str, np.ndarray],
     out: np.ndarray | None = None,
     chunk_size: int = 8192,
-) -> np.ndarray:
+):
     inputs = _as_aligned_inputs(engine, data)
-    t, _ = _validate_aligned_inputs(inputs)
+    t, n_instruments = _validate_aligned_inputs(inputs)
 
+    output_code = engine.compiled.output_code
     if out is None:
-        frame0 = _pack_tick(engine, {name: data[name][0] for name in engine.compiled.input_names})
-        engine.on_data(frame0)
-        y0 = engine.emit()
-        out = np.empty((t, y0.shape[0], y0.shape[1]), dtype=np.float64)
-        out[0] = y0
-        start = 1
-    else:
-        if out.shape[0] != t:
-            raise ValueError("Output leading dimension must match input time dimension")
-        start = 0
+        out = _alloc_output(engine, t, n_instruments)
 
-    for i in range(start, t, chunk_size):
+    if output_code == 0:
+        if out.ndim != 1 or out.shape[0] != t:
+            raise ValueError("Scalar output requires out.shape == (time,)")
+    elif output_code == 1:
+        if out.ndim != 2 or out.shape[0] != t or out.shape[1] != n_instruments:
+            raise ValueError("Vector output requires out.shape == (time, n_instruments)")
+    elif output_code == 2:
+        if out.ndim != 3 or out.shape[0] != t or out.shape[1] != n_instruments or out.shape[2] != n_instruments:
+            raise ValueError("Matrix output requires out.shape == (time, n_instruments, n_instruments)")
+    else:
+        raise ValueError(f"Unknown output code: {output_code}")
+
+    for i in range(0, t, chunk_size):
         j = min(t, i + chunk_size)
-        engine.run_batch_aligned(inputs, out, i, j)
+        if output_code == 0:
+            engine.run_batch_scalar_aligned(inputs, out, i, j)
+        elif output_code == 1:
+            engine.run_batch_vector_aligned(inputs, out, i, j)
+        else:
+            engine.run_batch_matrix_aligned(inputs, out, i, j)
     return out
 
 
@@ -112,16 +132,37 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
         def emit(self):
             return self.last
 
-        def run_batch_aligned(self, inputs, out3d, start: int64, stop: int64):
+        def _load_tick(self, inputs, t: int64):
             n_inputs = len(inputs)
             n_instruments = inputs[0].shape[1]
             self._ensure_frame(n_inputs, n_instruments)
+            for k in range(n_inputs):
+                source = inputs[k]
+                for j in range(n_instruments):
+                    self.frame[k, j] = source[t, j]
 
+        def run_batch_scalar_aligned(self, inputs, out1d, start: int64, stop: int64):
             for t in range(start, stop):
-                for k in range(n_inputs):
-                    row = inputs[k]
-                    for j in range(n_instruments):
-                        self.frame[k, j] = row[t, j]
+                self._load_tick(inputs, t)
+                self.compiled.on_data(self.frame)
+                y = self.compiled.emit()
+                self._copy_last(y)
+                out1d[t] = y[0, 0]
+            return out1d
+
+        def run_batch_vector_aligned(self, inputs, out2d, start: int64, stop: int64):
+            for t in range(start, stop):
+                self._load_tick(inputs, t)
+                self.compiled.on_data(self.frame)
+                y = self.compiled.emit()
+                self._copy_last(y)
+                for i in range(y.shape[0]):
+                    out2d[t, i] = y[i, 0]
+            return out2d
+
+        def run_batch_matrix_aligned(self, inputs, out3d, start: int64, stop: int64):
+            for t in range(start, stop):
+                self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
                 self._copy_last(y)

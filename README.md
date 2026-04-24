@@ -23,7 +23,7 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 - `src/trading_dsl_engine/ops.py`
   - Built-in op implementations and generic op builders.
 - `src/trading_dsl_engine/compiler.py`
-  - Compile path from expression to `CompiledFormula` jitclass artifact.
+  - Compile path from expression to `CompiledFormula` jitclass artifact, with CSE hash/cache stats.
 - `src/trading_dsl_engine/engine.py`
   - Runtime `StreamingFeatureEngine` jitclass and batch/live helpers.
 - `tests/`
@@ -35,13 +35,13 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 from trading_dsl_engine import compile_formula, build_engine, run_batch_from_mapping
 
 artifact = compile_formula("xs_rank(ewm(div(close, open), 21))")
-engine = build_engine(artifact)
+engine = build_engine("xs_rank(ewm(div(close, open), 21))")
 
 # live tick update
 out = engine.update_from_mapping({"open": open_t, "close": close_t})
 
 # batch run
-out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)
+out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)  # shape (time, n_instruments) for vector outputs
 ```
 
 ## DSL composition
@@ -59,6 +59,8 @@ def hlc3(high, low, close):
 ```
 
 Then compile with `compile_formula(..., dsl_registry=my_registry)`.
+
+The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compile-time common-subexpression hashing behavior can be validated.
 
 ## Data contract
 

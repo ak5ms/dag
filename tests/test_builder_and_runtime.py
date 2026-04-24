@@ -27,7 +27,7 @@ def _manual_formula(close, open_, span):
             for k in range(start, pos):
                 row[order[k], 0] = rank
         out.append(row)
-    return np.array(out)
+    return np.array(out)[:, :, 0]
 
 
 def test_compile_collects_inputs_and_runs_formula():
@@ -73,8 +73,8 @@ def test_nan_handling_div_ewm_and_xs_rank():
     open_ = np.array([[5.0, 10.0, 15.0], [6.0, 12.0, 15.0]], dtype=np.float64)
 
     out = run_batch_from_mapping(eng, {"close": close, "open": open_})
-    assert np.isnan(out[0, 1, 0])
-    assert not np.isnan(out[1, 2, 0])
+    assert np.isnan(out[0, 1])
+    assert not np.isnan(out[1, 2])
 
 
 def test_chunked_batch_matches_full_batch():
@@ -98,4 +98,20 @@ def test_batch_path_does_not_require_np_stack(monkeypatch):
 
     monkeypatch.setattr(np, "stack", _boom)
     out = run_batch_from_mapping(eng, {"close": close}, chunk_size=2)
-    np.testing.assert_allclose(out[:, :, 0], close + 1.0)
+    np.testing.assert_allclose(out, close + 1.0)
+
+
+def test_vector_batch_output_is_2d():
+    vec = build_engine("add(close, 1)")
+    close = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    vec_out = run_batch_from_mapping(vec, {"close": close})
+
+    assert vec_out.shape == (3, 4)
+    np.testing.assert_allclose(vec_out, close + 1.0)
+
+
+def test_compile_stats_reports_cse_cache_hits():
+    compiled = compile_formula("add(div(close, open), div(close, open))")
+    assert compiled.stats.cache_hits > 0
+    assert compiled.stats.expanded_nodes > 0

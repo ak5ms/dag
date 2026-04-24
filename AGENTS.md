@@ -55,8 +55,12 @@ RUN_PERF_TESTS=1 pytest tests/test_performance.py -q
 
 If perf tests are too heavy for the environment, clearly note that and at least run core tests.
 
+- Always run non-performance tests (`pytest -q`) before finalizing unless explicitly told not to.
+- Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
+
 ## Coding style
 
+- Always use absolute imports (e.g., `from trading_dsl_engine...`), not relative imports.
 - Keep implementations concise and generic; avoid repetitive boilerplate.
 - Prefer factories/templates/registries over hardcoded branching.
 - Do not wrap imports in try/except blocks.
