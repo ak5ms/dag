@@ -6,7 +6,7 @@ from typing import Callable
 
 @dataclass(frozen=True)
 class TypeInfo:
-    kind: str  # "vector", "matrix", "scalar"
+    kind: str  # "vector", "matrix", "scalar", "object"
 
 
 @dataclass(frozen=True)

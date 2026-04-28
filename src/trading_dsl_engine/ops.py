@@ -29,9 +29,8 @@ def _make_input_node(input_index: int) -> CompiledNode:
             self.out = np.empty((1, 1), dtype=np.float64)
 
         def on_data(self, frame2d):
-            # frame2d shape: [n_inputs, n_instruments]
             row = frame2d[self.input_index]
-            if not self.initialized:
+            if (not self.initialized) or self.out.shape[0] != row.shape[0]:
                 self.out = np.empty((row.shape[0], 1), dtype=np.float64)
                 self.initialized = True
             for i in range(row.shape[0]):
