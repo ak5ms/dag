@@ -111,6 +111,22 @@ def test_vector_batch_output_is_2d():
     np.testing.assert_allclose(vec_out, close + 1.0)
 
 
+def test_batch_output_defaults_to_disk_memmap():
+    vec = build_engine("add(close, 1)")
+    close = np.arange(12, dtype=np.float64).reshape(3, 4)
+    vec_out = run_batch_from_mapping(vec, {"close": close})
+    assert isinstance(vec_out, np.memmap)
+    np.testing.assert_allclose(vec_out, close + 1.0)
+
+
+def test_batch_output_supports_in_memory_when_out_path_none():
+    vec = build_engine("add(close, 1)")
+    close = np.arange(12, dtype=np.float64).reshape(3, 4)
+    vec_out = run_batch_from_mapping(vec, {"close": close}, out_path=None)
+    assert not isinstance(vec_out, np.memmap)
+    np.testing.assert_allclose(vec_out, close + 1.0)
+
+
 def test_compile_stats_reports_cse_cache_hits():
     compiled = compile_formula("add(div(close, open), div(close, open))")
     assert compiled.stats.cache_hits > 0

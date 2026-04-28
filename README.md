@@ -40,9 +40,13 @@ engine = build_engine("xs_rank(ewm(div(close, open), 21))")
 # live tick update
 out = engine.update_from_mapping({"open": open_t, "close": close_t})
 
-# batch run
-out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)  # shape (time, n_instruments) for vector outputs
+# batch run (disk-backed output by default)
+out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)  # memmap shape (time, n_instruments) for vector outputs
+# opt into RAM materialization instead
+out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
 ```
+
+Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
 
 ## DSL composition
 

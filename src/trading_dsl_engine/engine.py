@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+
 import numpy as np
 from numba import boolean, float64, int64
 from numba.experimental import jitclass
@@ -42,7 +44,7 @@ def _validate_aligned_inputs(inputs: List) -> tuple[int, int]:
 def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
     frame = _pack_tick(engine, data)
     engine.on_data(frame)
-    return engine.emit().copy()
+    return engine.emit()
 
 
 def _alloc_output(engine, t: int, n_instruments: int):
@@ -56,10 +58,26 @@ def _alloc_output(engine, t: int, n_instruments: int):
     raise ValueError(f"Unknown output code: {output_code}")
 
 
+def _output_shape(engine, t: int, n_instruments: int) -> tuple[int, ...]:
+    output_code = engine.compiled.output_code
+    if output_code == 0:
+        return (t,)
+    if output_code == 1:
+        return (t, n_instruments)
+    if output_code == 2:
+        return (t, n_instruments, n_instruments)
+    raise ValueError(f"Unknown output code: {output_code}")
+
+
+def _alloc_memmap_output(engine, t: int, n_instruments: int, out_path: str):
+    return np.memmap(out_path, mode="w+", dtype=np.float64, shape=_output_shape(engine, t, n_instruments))
+
+
 def run_batch_from_mapping(
     engine,
     data: dict[str, np.ndarray],
     out: np.ndarray | None = None,
+    out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_out.memmap",
     chunk_size: int = 8192,
 ):
     inputs = _as_aligned_inputs(engine, data)
@@ -67,7 +85,10 @@ def run_batch_from_mapping(
 
     output_code = engine.compiled.output_code
     if out is None:
-        out = _alloc_output(engine, t, n_instruments)
+        if out_path is None:
+            out = _alloc_output(engine, t, n_instruments)
+        else:
+            out = _alloc_memmap_output(engine, t, n_instruments, out_path)
 
     if output_code == 0:
         if out.ndim != 1 or out.shape[0] != t:
@@ -97,9 +118,7 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
 
     spec = [
         ("compiled", compiled_artifact.compiled_type),
-        ("initialized", boolean),
         ("frame_initialized", boolean),
-        ("last", float64[:, :]),
         ("frame", float64[:, :]),
     ]
 
@@ -107,18 +126,8 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
     class EngineArtifact:  # noqa: N801
         def __init__(self, compiled):
             self.compiled = compiled
-            self.initialized = False
             self.frame_initialized = False
-            self.last = np.empty((1, 1), dtype=np.float64)
             self.frame = np.empty((1, 1), dtype=np.float64)
-
-        def _copy_last(self, y):
-            if not self.initialized or self.last.shape[0] != y.shape[0] or self.last.shape[1] != y.shape[1]:
-                self.last = np.empty((y.shape[0], y.shape[1]), dtype=np.float64)
-                self.initialized = True
-            for i in range(y.shape[0]):
-                for j in range(y.shape[1]):
-                    self.last[i, j] = y[i, j]
 
         def _ensure_frame(self, n_inputs: int, n_instruments: int):
             if (not self.frame_initialized) or self.frame.shape[0] != n_inputs or self.frame.shape[1] != n_instruments:
@@ -127,10 +136,9 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
 
         def on_data(self, frame2d):
             self.compiled.on_data(frame2d)
-            self._copy_last(self.compiled.emit())
 
         def emit(self):
-            return self.last
+            return self.compiled.emit()
 
         def _load_tick(self, inputs, t: int64):
             n_inputs = len(inputs)
@@ -146,7 +154,6 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
                 self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
-                self._copy_last(y)
                 out1d[t] = y[0, 0]
             return out1d
 
@@ -155,7 +162,6 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
                 self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
-                self._copy_last(y)
                 for i in range(y.shape[0]):
                     out2d[t, i] = y[i, 0]
             return out2d
@@ -165,7 +171,6 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
                 self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
-                self._copy_last(y)
                 for i in range(y.shape[0]):
                     for j in range(y.shape[1]):
                         out3d[t, i, j] = y[i, j]

@@ -34,6 +34,7 @@ Priorities, in order:
 - Do not add Python-level per-timestep loops in runtime hot paths.
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
+- Keep batch output disk-backed by default (`run_batch_from_mapping(..., out_path=...)`) to avoid large RAM materialization; use `out_path=None` only when in-memory output is explicitly desired.
 - For any algorithmic change, consider complexity across ~1 year minutely x ~150 instruments (or larger).
 
 ## NaN and numerical behavior
