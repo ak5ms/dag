@@ -219,3 +219,55 @@ def test_object_emitter_can_be_consumed_by_downstream_array_op():
 
     expected = np.array([[1.5, 1.5], [4.0, 4.0], [9.0, 9.0]])
     np.testing.assert_allclose(out, expected)
+
+
+def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
+    formula_preds = "get_preds(Ridge(close, open, volume, target, 4, 0.1))"
+    formula_beta = "get_beta(Ridge(close, open, volume, target, 4, 0.1))"
+    eng_preds = build_engine(formula_preds)
+    eng_beta = build_engine(formula_beta)
+
+    t0_preds = update_from_mapping(
+        eng_preds,
+        {
+            "close": np.array([1.0, 2.0]),
+            "open": np.array([2.0, 3.0]),
+            "volume": np.array([10.0, 11.0]),
+            "target": np.array([5.0, 8.0]),
+        },
+    )
+    t0_beta = update_from_mapping(
+        eng_beta,
+        {
+            "close": np.array([1.0, 2.0]),
+            "open": np.array([2.0, 3.0]),
+            "volume": np.array([10.0, 11.0]),
+            "target": np.array([5.0, 8.0]),
+        },
+    )
+    np.testing.assert_allclose(t0_preds[:, 0], np.array([0.0, 0.0]))
+    assert t0_beta.shape == (3, 1)
+
+    t1_close = np.array([1.5, 2.5])
+    t1_open = np.array([1.0, 2.0])
+    t1_volume = np.array([12.0, 13.0])
+    t1_target = np.array([3.0, 5.0])
+    t1_preds = update_from_mapping(
+        eng_preds,
+        {"close": t1_close, "open": t1_open, "volume": t1_volume, "target": t1_target},
+    )
+    expected = t0_beta[0, 0] * t1_close + t0_beta[1, 0] * t1_open + t0_beta[2, 0] * t1_volume
+    np.testing.assert_allclose(t1_preds[:, 0], expected)
+
+    close = np.array([[1.0, 2.0], [1.1, 2.1], [1.2, 2.2]], dtype=np.float64)
+    open_ = np.array([[2.0, 3.0], [2.1, 3.1], [2.2, 3.2]], dtype=np.float64)
+    volume = np.array([[10.0, 11.0], [12.0, 13.0], [14.0, 15.0]], dtype=np.float64)
+    target = np.array([[5.0, 8.0], [5.5, 8.5], [6.0, 9.0]], dtype=np.float64)
+    eng_beta_batch = build_engine(formula_beta)
+    out_beta = np.empty((close.shape[0], 3), dtype=np.float64)
+    out = run_batch_from_mapping(
+        eng_beta_batch,
+        {"close": close, "open": open_, "volume": volume, "target": target},
+        out=out_beta,
+    )
+    assert out.shape == (3, 3)

@@ -58,6 +58,22 @@ def _alloc_output(engine, t: int, n_instruments: int):
     raise ValueError(f"Unknown output code: {output_code}")
 
 
+def _probe_vector_output(engine, inputs: List) -> np.ndarray:
+    n_inputs = len(inputs)
+    n_instruments = inputs[0].shape[1]
+    frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
+    for k in range(n_inputs):
+        source = inputs[k]
+        for j in range(n_instruments):
+            frame[k, j] = source[0, j]
+    engine.compiled.on_data(frame)
+    y = engine.compiled.emit()
+    out0 = np.empty(y.shape[0], dtype=np.float64)
+    for i in range(y.shape[0]):
+        out0[i] = y[i, 0]
+    return out0
+
+
 def _output_shape(engine, t: int, n_instruments: int) -> tuple[int, ...]:
     output_code = engine.compiled.output_code
     if output_code == 0:
@@ -90,25 +106,43 @@ def run_batch_from_mapping(
             "Project object state to scalar/vector/matrix via a downstream op."
         )
 
+    inferred_vector_t0 = None
+    inferred_vector_width = n_instruments
+    if output_code == 1:
+        inferred_vector_t0 = _probe_vector_output(engine, inputs)
+        inferred_vector_width = inferred_vector_t0.shape[0]
+
     if out is None:
         if out_path is None:
-            out = _alloc_output(engine, t, n_instruments)
+            if output_code == 1:
+                out = np.empty((t, inferred_vector_width), dtype=np.float64)
+            else:
+                out = _alloc_output(engine, t, n_instruments)
         else:
-            out = _alloc_memmap_output(engine, t, n_instruments, out_path)
+            if output_code == 1:
+                out = np.memmap(out_path, mode="w+", dtype=np.float64, shape=(t, inferred_vector_width))
+            else:
+                out = _alloc_memmap_output(engine, t, n_instruments, out_path)
 
     if output_code == 0:
         if out.ndim != 1 or out.shape[0] != t:
             raise ValueError("Scalar output requires out.shape == (time,)")
     elif output_code == 1:
-        if out.ndim != 2 or out.shape[0] != t or out.shape[1] != n_instruments:
-            raise ValueError("Vector output requires out.shape == (time, n_instruments)")
+        if out.ndim != 2 or out.shape[0] != t:
+            raise ValueError("Vector output requires out.shape == (time, width)")
     elif output_code == 2:
         if out.ndim != 3 or out.shape[0] != t or out.shape[1] != n_instruments or out.shape[2] != n_instruments:
             raise ValueError("Matrix output requires out.shape == (time, n_instruments, n_instruments)")
     else:
         raise ValueError(f"Unknown output code: {output_code}")
 
-    for i in range(0, t, chunk_size):
+    start_idx = 0
+    if output_code == 1 and inferred_vector_t0 is not None:
+        for j in range(inferred_vector_width):
+            out[0, j] = inferred_vector_t0[j]
+        start_idx = 1
+
+    for i in range(start_idx, t, chunk_size):
         j = min(t, i + chunk_size)
         if output_code == 0:
             engine.run_batch_scalar_aligned(inputs, out, i, j)
