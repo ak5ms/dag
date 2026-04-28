@@ -84,6 +84,12 @@ def run_batch_from_mapping(
     t, n_instruments = _validate_aligned_inputs(inputs)
 
     output_code = engine.compiled.output_code
+    if output_code == 3:
+        raise ValueError(
+            "Root object outputs are not supported in batch mode. "
+            "Project object state to scalar/vector/matrix via a downstream op."
+        )
+
     if out is None:
         if out_path is None:
             out = _alloc_output(engine, t, n_instruments)

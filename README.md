@@ -48,6 +48,8 @@ out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d},
 
 Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
 
+Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
+
 ## DSL composition
 
 You can define reusable macro-like composed functions with an explicit registry namespace:

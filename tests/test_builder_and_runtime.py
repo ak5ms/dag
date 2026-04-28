@@ -1,7 +1,10 @@
 import numpy as np
 import pytest
+from numba import boolean, float64
+from numba.experimental import jitclass
 
 from trading_dsl_engine import build_engine, compile_formula, run_batch_from_mapping, update_from_mapping
+from trading_dsl_engine.registry import CompiledNode, OpSpec, REGISTRY, TypeInfo
 
 
 def _manual_formula(close, open_, span):
@@ -131,3 +134,88 @@ def test_compile_stats_reports_cse_cache_hits():
     compiled = compile_formula("add(div(close, open), div(close, open))")
     assert compiled.stats.cache_hits > 0
     assert compiled.stats.expanded_nodes > 0
+
+
+def test_object_emitter_can_be_consumed_by_downstream_array_op():
+    object_type = TypeInfo("object")
+
+    state_spec = [("mean", float64)]
+
+    @jitclass(state_spec)
+    class MeanState:
+        def __init__(self):
+            self.mean = np.nan
+
+    def mean_state_validator(types):
+        if len(types) != 1 or types[0].kind != "vector":
+            raise ValueError("mean_state_obj expects one vector arg")
+        return object_type
+
+    def mean_state_builder(children, literals):
+        src = children[0]
+        spec = [("src", src.instance_type), ("state", MeanState.class_type.instance_type)]
+
+        @jitclass(spec)
+        class MeanStateObjOp:
+            def __init__(self, src):
+                self.src = src
+                self.state = MeanState()
+
+            def on_data(self, frame2d):
+                self.src.on_data(frame2d)
+                x = self.src.emit()
+                total = 0.0
+                n = x.shape[0]
+                for i in range(n):
+                    total += x[i, 0]
+                self.state.mean = total / n
+
+            def emit(self):
+                return self.state
+
+        return CompiledNode(object_type, MeanStateObjOp.class_type.instance_type, lambda: MeanStateObjOp(src.ctor()))
+
+    def get_mean_state_validator(types):
+        if len(types) != 1 or types[0].kind != "object":
+            raise ValueError("get_mean_state expects one object arg")
+        return TypeInfo("vector")
+
+    def get_mean_state_builder(children, literals):
+        src = children[0]
+        spec = [
+            ("src", src.instance_type),
+            ("initialized", boolean),
+            ("out", float64[:, :]),
+        ]
+
+        @jitclass(spec)
+        class GetMeanStateOp:
+            def __init__(self, src):
+                self.src = src
+                self.initialized = False
+                self.out = np.empty((1, 1), dtype=np.float64)
+
+            def on_data(self, frame2d):
+                self.src.on_data(frame2d)
+                state = self.src.emit()
+                row = frame2d[0]
+                if (not self.initialized) or self.out.shape[0] != row.shape[0]:
+                    self.out = np.empty((row.shape[0], 1), dtype=np.float64)
+                    self.initialized = True
+                for i in range(row.shape[0]):
+                    self.out[i, 0] = state.mean
+
+            def emit(self):
+                return self.out
+
+        return CompiledNode(TypeInfo("vector"), GetMeanStateOp.class_type.instance_type, lambda: GetMeanStateOp(src.ctor()))
+
+    REGISTRY.register(OpSpec(name="mean_state_obj", validator=mean_state_validator, builder=mean_state_builder))
+    REGISTRY.register(OpSpec(name="get_mean_state", validator=get_mean_state_validator, builder=get_mean_state_builder))
+
+    eng = build_engine("get_mean_state(mean_state_obj(close))")
+    close = np.array([[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]], dtype=np.float64)
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+
+    expected = np.array([[1.5, 1.5], [4.0, 4.0], [9.0, 9.0]])
+    np.testing.assert_allclose(out, expected)

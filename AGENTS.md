@@ -35,6 +35,7 @@ Priorities, in order:
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
 - Keep batch output disk-backed by default (`run_batch_from_mapping(..., out_path=...)`) to avoid large RAM materialization; use `out_path=None` only when in-memory output is explicitly desired.
+- If adding ops that emit non-ndarray state objects (`TypeInfo("object")`), keep the batch timestep loop in compiled/JIT code; project object state back to scalar/vector/matrix before root output.
 - For any algorithmic change, consider complexity across ~1 year minutely x ~150 instruments (or larger).
 
 ## NaN and numerical behavior

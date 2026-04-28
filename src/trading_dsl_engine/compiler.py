@@ -38,6 +38,8 @@ def _kind_to_code(kind: str) -> int:
         return 1
     if kind == "matrix":
         return 2
+    if kind == "object":
+        return 3
     raise FormulaCompileError(f"Unknown output kind: {kind}")
 
 
