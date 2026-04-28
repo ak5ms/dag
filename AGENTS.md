@@ -45,6 +45,8 @@ When modifying ops, keep NaN handling explicit and tested:
 - Divide-by-zero behavior.
 - Stateful-op behavior when inputs include NaNs.
 - Ranking/tie semantics and NaN masking.
+- Ridge/object-op behavior when feature/target/parameter inputs include NaNs.
+- Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, hl, lambda)`) and downstream shape expectations.
 
 ## Test expectations
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
-from numba import boolean, float64, int64, njit
+from numba import boolean, float64, int64, literal_unroll, njit, types
 from numba.experimental import jitclass
 
 from trading_dsl_engine.registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
@@ -12,6 +12,7 @@ from trading_dsl_engine.registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
 VECTOR = TypeInfo("vector")
 MATRIX = TypeInfo("matrix")
 SCALAR = TypeInfo("scalar")
+OBJECT = TypeInfo("object")
 
 
 def _make_input_node(input_index: int) -> CompiledNode:
@@ -309,6 +310,255 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
     return CompiledNode(MATRIX, OuterOp.class_type.instance_type, lambda: OuterOp(src.ctor()))
 
 
+_ridge_state_spec = [
+    ("initialized", boolean),
+    ("n_instruments", int64),
+    ("n_features", int64),
+    ("b", float64[:]),
+    ("p", float64[:, :]),
+    ("beta", float64[:]),
+    ("preds", float64[:, :]),
+    ("beta_out", float64[:, :]),
+]
+
+
+@jitclass(_ridge_state_spec)
+class _RidgeState:
+    def __init__(self):
+        self.initialized = False
+        self.n_instruments = 0
+        self.n_features = 0
+        self.b = np.empty(1, dtype=np.float64)
+        self.p = np.empty((1, 1), dtype=np.float64)
+        self.beta = np.empty(1, dtype=np.float64)
+        self.preds = np.empty((1, 1), dtype=np.float64)
+        self.beta_out = np.empty((1, 1), dtype=np.float64)
+
+
+@njit(inline="always")
+def _sm_update_matrix(p, u):
+    k = p.shape[0]
+    v = np.empty(k, dtype=np.float64)
+    for i in range(k):
+        acc = 0.0
+        for j in range(k):
+            acc += p[i, j] * u[j]
+        v[i] = acc
+    den = 1.0
+    for i in range(k):
+        den += u[i] * v[i]
+    if den <= 1e-12 or np.isnan(den):
+        return
+    inv_den = 1.0 / den
+    for i in range(k):
+        for j in range(k):
+            p[i, j] -= v[i] * v[j] * inv_den
+
+
+@njit(inline="always")
+def _dot_vec(a, b):
+    acc = 0.0
+    for i in range(a.shape[0]):
+        acc += a[i] * b[i]
+    return acc
+
+
+def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) < 4:
+        raise ValueError("Ridge expects at least 4 args: x..., y, hl, lambda")
+    for t in types[:-3]:
+        if t.kind != "vector":
+            raise ValueError("Ridge feature args must be vector")
+    if types[-3].kind != "vector":
+        raise ValueError("Ridge y must be vector")
+    if types[-2].kind != "scalar" or types[-1].kind != "scalar":
+        raise ValueError("Ridge hl and lambda must be scalar")
+    return OBJECT
+
+
+def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    feature_nodes = children[:-3]
+    y_node = children[-3]
+    hl_node = children[-2]
+    lam_node = children[-1]
+    k = len(feature_nodes)
+
+    x_nodes_type = types.Tuple(tuple(node.instance_type for node in feature_nodes))
+    spec = [
+        ("x_nodes", x_nodes_type),
+        ("y_node", y_node.instance_type),
+        ("hl_node", hl_node.instance_type),
+        ("lam_node", lam_node.instance_type),
+        ("state", _RidgeState.class_type.instance_type),
+    ]
+
+    @jitclass(spec)
+    class RidgeOp:
+        def __init__(self, x_nodes, y_node, hl_node, lam_node):
+            self.x_nodes = x_nodes
+            self.y_node = y_node
+            self.hl_node = hl_node
+            self.lam_node = lam_node
+            self.state = _RidgeState()
+
+        def on_data(self, frame2d):
+            self.y_node.on_data(frame2d)
+            self.hl_node.on_data(frame2d)
+            self.lam_node.on_data(frame2d)
+            for node in literal_unroll(self.x_nodes):
+                node.on_data(frame2d)
+            y = self.y_node.emit()
+            hl = self.hl_node.emit()[0, 0]
+            lam = self.lam_node.emit()[0, 0]
+            n = y.shape[0]
+            if (not self.state.initialized) or self.state.n_instruments != n or self.state.n_features != k:
+                self.state.initialized = True
+                self.state.n_instruments = n
+                self.state.n_features = k
+                self.state.b = np.zeros(k, dtype=np.float64)
+                self.state.p = np.empty((k, k), dtype=np.float64)
+                self.state.beta = np.zeros(k, dtype=np.float64)
+                for i in range(k):
+                    for j in range(k):
+                        self.state.p[i, j] = 1e6 if i == j else 0.0
+                self.state.preds = np.empty((n, 1), dtype=np.float64)
+                self.state.beta_out = np.empty((k, 1), dtype=np.float64)
+
+            xmat = np.empty((k, n), dtype=np.float64)
+            idx = 0
+            for node in literal_unroll(self.x_nodes):
+                col = node.emit()
+                for i in range(n):
+                    xmat[idx, i] = col[i, 0]
+                idx += 1
+
+            xvec = np.empty(k, dtype=np.float64)
+            if np.isnan(hl) or hl <= 0.0:
+                rho = 0.0
+            else:
+                rho = np.exp(np.log(0.5) / hl)
+            alpha = 1.0 - rho
+            if alpha < 0.0:
+                alpha = 0.0
+            if alpha > 1.0:
+                alpha = 1.0
+            if np.isnan(lam) or lam < 0.0:
+                lam = 0.0
+            eps = 1e-12
+            inv_rho = 1.0 / (rho if rho > eps else eps)
+            for i in range(k):
+                self.state.b[i] = rho * self.state.b[i]
+                for j in range(k):
+                    self.state.p[i, j] *= inv_rho
+
+            for i in range(n):
+                for j in range(k):
+                    xvec[j] = xmat[j, i]
+                target = y[i, 0]
+                has_nan = np.isnan(target)
+                if not has_nan:
+                    for j in range(k):
+                        if np.isnan(xvec[j]):
+                            has_nan = True
+                            break
+                if has_nan:
+                    self.state.preds[i, 0] = np.nan
+                    continue
+                self.state.preds[i, 0] = _dot_vec(self.state.beta, xvec)
+                for j in range(k):
+                    self.state.b[j] += alpha * xvec[j] * target
+                u = np.empty(k, dtype=np.float64)
+                root_alpha = np.sqrt(alpha)
+                for j in range(k):
+                    u[j] = root_alpha * xvec[j]
+                _sm_update_matrix(self.state.p, u)
+                if lam > 0.0:
+                    for j in range(k):
+                        if xvec[j] == 0.0:
+                            continue
+                        for m in range(k):
+                            u[m] = 0.0
+                        u[j] = np.sqrt(alpha * lam) * abs(xvec[j])
+                        _sm_update_matrix(self.state.p, u)
+
+            for i in range(k):
+                acc = 0.0
+                for j in range(k):
+                    acc += self.state.p[i, j] * self.state.b[j]
+                self.state.beta[i] = acc
+                self.state.beta_out[i, 0] = acc
+
+        def emit(self):
+            return self.state
+
+    feature_ctors = [node.ctor for node in feature_nodes]
+    y_ctor = y_node.ctor
+    hl_ctor = hl_node.ctor
+    lam_ctor = lam_node.ctor
+
+    def _ctor():
+        x_nodes = tuple(fn() for fn in feature_ctors)
+        return RidgeOp(x_nodes, y_ctor(), hl_ctor(), lam_ctor())
+
+    return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor)
+
+
+def _get_beta_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 1 or types[0].kind != "object":
+        raise ValueError("get_beta expects one object arg")
+    return VECTOR
+
+
+def _get_beta_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    spec = [("src", src.instance_type), ("out", float64[:, :])]
+
+    @jitclass(spec)
+    class GetBetaOp:
+        def __init__(self, src):
+            self.src = src
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            state = self.src.emit()
+            k = state.beta_out.shape[0]
+            if self.out.shape[0] != k:
+                self.out = np.empty((k, 1), dtype=np.float64)
+            for i in range(k):
+                self.out[i, 0] = state.beta_out[i, 0]
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(VECTOR, GetBetaOp.class_type.instance_type, lambda: GetBetaOp(src.ctor()))
+
+
+def _get_preds_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 1 or types[0].kind != "object":
+        raise ValueError("get_preds expects one object arg")
+    return VECTOR
+
+
+def _get_preds_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    spec = [("src", src.instance_type)]
+
+    @jitclass(spec)
+    class GetPredsOp:
+        def __init__(self, src):
+            self.src = src
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+
+        def emit(self):
+            state = self.src.emit()
+            return state.preds
+
+    return CompiledNode(VECTOR, GetPredsOp.class_type.instance_type, lambda: GetPredsOp(src.ctor()))
+
+
 def register_builtin_ops() -> None:
     if getattr(register_builtin_ops, "_done", False):
         return
@@ -319,6 +569,9 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
+    REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
+    REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))
+    REGISTRY.register(OpSpec(name="get_preds", validator=_get_preds_validator, builder=_get_preds_builder))
     register_builtin_ops._done = True
 
 

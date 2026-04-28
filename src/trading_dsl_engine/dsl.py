@@ -63,6 +63,9 @@ div = op("div")
 ewm = op("ewm")
 xs_rank = op("xs_rank")
 outer = op("outer")
+Ridge = op("Ridge")
+get_beta = op("get_beta")
+get_preds = op("get_preds")
 
 
 @register_dsl_function("ratio")

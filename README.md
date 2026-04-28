@@ -81,6 +81,13 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 - `ewm` skips updates for NaN inputs and can recover from NaN state.
 - `xs_rank` ranks only valid values and emits NaN where input is NaN.
 
+## Ridge regression op (cross-sectional)
+
+- `Ridge(x1, x2, ..., xk, y, hl, lambda)` emits an object state and performs cross-sectional EWMA ridge updates each tick.
+- State uses exponentially-weighted sufficient statistics and a Sherman-Morrison inverse update path for the feature precision matrix.
+- `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
+- `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
+
 ## Development quickstart
 
 ```bash
