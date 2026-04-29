@@ -413,6 +413,54 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
     )
 
 
+def _col_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 2:
+        raise ValueError("col expects 2 args: matrix, index")
+    if types[0].kind != "matrix":
+        raise ValueError("col first arg must be matrix")
+    if types[1].kind != "scalar":
+        raise ValueError("col second arg must be scalar index")
+    return VECTOR
+
+
+def _col_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    idx = int(round(literals[1]))
+    if idx < 0:
+        raise ValueError("col index must be >= 0")
+    spec = [
+        ("src", src.instance_type),
+        ("initialized", boolean),
+        ("idx", int64),
+        ("out", float64[:, :]),
+    ]
+
+    @jitclass(spec)
+    class ColOp:
+        def __init__(self, src, idx):
+            self.src = src
+            self.initialized = False
+            self.idx = idx
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            if self.idx >= x.shape[1]:
+                raise ValueError("col index out of bounds for matrix width")
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.initialized = True
+            for i in range(n):
+                self.out[i, 0] = x[i, self.idx]
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx))
+
+
 _ridge_state_spec = [
     ("initialized", boolean),
     ("n_instruments", int64),
@@ -786,6 +834,7 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
+    REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
     REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))
     REGISTRY.register(OpSpec(name="get_preds", validator=_get_preds_validator, builder=_get_preds_builder))
