@@ -63,6 +63,20 @@ def test_shape_vector_and_matrix_emits():
     assert ym.shape == (3, 3)
 
 
+def test_bspline_emits_matrix_with_expected_width():
+    eng = build_engine("bspline(close, 3, 5)")
+    y = update_from_mapping(eng, {"close": np.array([0.0, 0.5, 1.0])})
+    assert y.shape == (3, 7)
+    assert np.isfinite(y).all()
+
+
+def test_matrix_batch_output_supports_non_square_width():
+    eng = build_engine("bspline(close, 2, 4)")
+    close = np.array([[0.0, 0.2, 0.6], [0.1, 0.4, 0.9]], dtype=np.float64)
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+    assert out.shape == (2, 3, 5)
+
+
 def test_compiled_formula_and_engine_are_jitclasses():
     compiled = compile_formula("add(close, 1)")
     assert hasattr(compiled.compiled, "_numba_type_")
