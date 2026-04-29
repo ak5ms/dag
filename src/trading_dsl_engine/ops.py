@@ -311,12 +311,12 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
 
 def _bspline_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) != 3:
-        raise ValueError("bspline expects 3 args: x, degree, n_knots")
+    if len(types) != 2:
+        raise ValueError("bspline expects 2 args: x, n_basis")
     if types[0].kind != "vector":
         raise ValueError("bspline first arg must be vector")
-    if types[1].kind != "scalar" or types[2].kind != "scalar":
-        raise ValueError("bspline degree and n_knots args must be scalar")
+    if types[1].kind != "scalar":
+        raise ValueError("bspline n_basis arg must be scalar")
     return MATRIX
 
 
@@ -343,15 +343,9 @@ def _periodic_basis_eval(centers: np.ndarray, sigma: float, x: float, out_row: n
 
 def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     src = children[0]
-    degree = int(round(literals[1]))
-    n_knots = int(round(literals[2]))
-    if degree < 0:
-        raise ValueError("bspline degree must be >= 0")
-    if n_knots < 2:
-        raise ValueError("bspline n_knots must be >= 2")
-    n_basis = n_knots + degree - 1
+    n_basis = int(round(literals[1]))
     if n_basis <= 0:
-        raise ValueError("bspline has invalid basis width")
+        raise ValueError("bspline n_basis must be >= 1")
     spec = [
         ("src", src.instance_type),
         ("initialized", boolean),
@@ -363,7 +357,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
 
     @jitclass(spec)
     class BSplineOp:
-        def __init__(self, src, degree, n_knots, n_basis):
+        def __init__(self, src, n_basis):
             self.src = src
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
@@ -399,7 +393,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
     return CompiledNode(
         MATRIX,
         BSplineOp.class_type.instance_type,
-        lambda: BSplineOp(src.ctor(), degree, n_knots, n_basis),
+        lambda: BSplineOp(src.ctor(), n_basis),
     )
 
 
@@ -508,8 +502,8 @@ def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) < 5:
         raise ValueError("Ridge expects at least 5 args: x..., y, weights, hl, lambda")
     for t in types[:-4]:
-        if t.kind != "vector":
-            raise ValueError("Ridge feature args must be vector")
+        if t.kind not in ("vector", "matrix"):
+            raise ValueError("Ridge feature args must be vector or matrix")
     if types[-4].kind != "vector":
         raise ValueError("Ridge y must be vector")
     if types[-3].kind not in ("vector", "matrix"):
@@ -525,8 +519,6 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
     w_node = children[-3]
     hl_node = children[-2]
     lam_node = children[-1]
-    k = len(feature_nodes)
-
     x_nodes_type = types.Tuple(tuple(node.instance_type for node in feature_nodes))
     spec = [
         ("x_nodes", x_nodes_type),
@@ -559,26 +551,34 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             hl = self.hl_node.emit()[0, 0]
             lam = self.lam_node.emit()[0, 0]
             n = y.shape[0]
-            if (not self.state.initialized) or self.state.n_instruments != n or self.state.n_features != k:
+            total_k = 0
+            for node in literal_unroll(self.x_nodes):
+                x = node.emit()
+                total_k += x.shape[1]
+
+            if (not self.state.initialized) or self.state.n_instruments != n or self.state.n_features != total_k:
                 self.state.initialized = True
                 self.state.n_instruments = n
-                self.state.n_features = k
-                self.state.b = np.zeros(k, dtype=np.float64)
-                self.state.p = np.empty((k, k), dtype=np.float64)
-                self.state.beta = np.zeros(k, dtype=np.float64)
-                for i in range(k):
-                    for j in range(k):
+                self.state.n_features = total_k
+                self.state.b = np.zeros(total_k, dtype=np.float64)
+                self.state.p = np.empty((total_k, total_k), dtype=np.float64)
+                self.state.beta = np.zeros(total_k, dtype=np.float64)
+                for i in range(total_k):
+                    for j in range(total_k):
                         self.state.p[i, j] = 1e6 if i == j else 0.0
                 self.state.preds = np.empty((n, 1), dtype=np.float64)
-                self.state.beta_out = np.empty((k, 1), dtype=np.float64)
+                self.state.beta_out = np.empty((total_k, 1), dtype=np.float64)
 
+            k = self.state.n_features
             xmat = np.empty((k, n), dtype=np.float64)
             idx = 0
             for node in literal_unroll(self.x_nodes):
-                col = node.emit()
-                for i in range(n):
-                    xmat[idx, i] = col[i, 0]
-                idx += 1
+                feat = node.emit()
+                feat_width = feat.shape[1]
+                for j in range(feat_width):
+                    for i in range(n):
+                        xmat[idx, i] = feat[i, j]
+                    idx += 1
 
             xvec = np.empty(k, dtype=np.float64)
             if np.isnan(hl) or hl <= 0.0:
