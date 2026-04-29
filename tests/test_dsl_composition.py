@@ -1,6 +1,6 @@
 import numpy as np
 
-from trading_dsl_engine import DSLFunctionRegistry, build_engine, register_dsl_function, run_batch_from_mapping
+from trading_dsl_engine import DSLFunctionRegistry, build_engine, compile_formula, register_dsl_function, run_batch_from_mapping
 from trading_dsl_engine.dsl import add, div, ewm, ratio, xs_rank
 
 
@@ -52,3 +52,17 @@ def test_registry_namespace_isolation():
     close = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
     out = run_batch_from_mapping(eng, {"close": close})
     np.testing.assert_allclose(out, close * 2.0)
+
+
+def test_dsl_expansion_is_cached_for_repeated_calls():
+    reg = DSLFunctionRegistry()
+    call_count = {"n": 0}
+
+    @register_dsl_function("counted", registry=reg)
+    def counted(x):
+        call_count["n"] += 1
+        return add(x, 1.0)
+
+    compiled = compile_formula("add(counted(close), counted(close))", dsl_registry=reg)
+    assert compiled.stats.cache_hits > 0
+    assert call_count["n"] == 1
