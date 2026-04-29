@@ -222,8 +222,8 @@ def test_object_emitter_can_be_consumed_by_downstream_array_op():
 
 
 def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
-    formula_preds = "get_preds(Ridge(close, open, volume, target, 4, 0.1))"
-    formula_beta = "get_beta(Ridge(close, open, volume, target, 4, 0.1))"
+    formula_preds = "get_preds(Ridge(close, open, volume, target, weights, 4, 0.1))"
+    formula_beta = "get_beta(Ridge(close, open, volume, target, weights, 4, 0.1))"
     eng_preds = build_engine(formula_preds)
     eng_beta = build_engine(formula_beta)
 
@@ -234,6 +234,7 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
             "open": np.array([2.0, 3.0]),
             "volume": np.array([10.0, 11.0]),
             "target": np.array([5.0, 8.0]),
+            "weights": np.array([1.0, 2.0]),
         },
     )
     t0_beta = update_from_mapping(
@@ -243,6 +244,7 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
             "open": np.array([2.0, 3.0]),
             "volume": np.array([10.0, 11.0]),
             "target": np.array([5.0, 8.0]),
+            "weights": np.array([1.0, 2.0]),
         },
     )
     np.testing.assert_allclose(t0_preds[:, 0], np.array([0.0, 0.0]))
@@ -254,7 +256,13 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
     t1_target = np.array([3.0, 5.0])
     t1_preds = update_from_mapping(
         eng_preds,
-        {"close": t1_close, "open": t1_open, "volume": t1_volume, "target": t1_target},
+        {
+            "close": t1_close,
+            "open": t1_open,
+            "volume": t1_volume,
+            "target": t1_target,
+            "weights": np.array([1.0, 2.0]),
+        },
     )
     expected = t0_beta[0, 0] * t1_close + t0_beta[1, 0] * t1_open + t0_beta[2, 0] * t1_volume
     np.testing.assert_allclose(t1_preds[:, 0], expected)
@@ -267,7 +275,13 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
     out_beta = np.empty((close.shape[0], 3), dtype=np.float64)
     out = run_batch_from_mapping(
         eng_beta_batch,
-        {"close": close, "open": open_, "volume": volume, "target": target},
+        {
+            "close": close,
+            "open": open_,
+            "volume": volume,
+            "target": target,
+            "weights": np.array([[1.0, 2.0], [2.0, 1.0], [1.0, 1.0]], dtype=np.float64),
+        },
         out=out_beta,
     )
     assert out.shape == (3, 3)
