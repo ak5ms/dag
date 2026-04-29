@@ -89,6 +89,19 @@ def _alloc_memmap_output(engine, t: int, n_instruments: int, out_path: str):
     return np.memmap(out_path, mode="w+", dtype=np.float64, shape=_output_shape(engine, t, n_instruments))
 
 
+def _probe_matrix_output(engine, inputs: List) -> int:
+    n_inputs = len(inputs)
+    n_instruments = inputs[0].shape[1]
+    frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
+    for k in range(n_inputs):
+        source = inputs[k]
+        for j in range(n_instruments):
+            frame[k, j] = source[0, j]
+    engine.compiled.on_data(frame)
+    y = engine.compiled.emit()
+    return y.shape[1]
+
+
 def run_batch_from_mapping(
     engine,
     data: dict[str, np.ndarray],
@@ -108,19 +121,31 @@ def run_batch_from_mapping(
 
     inferred_vector_t0 = None
     inferred_vector_width = n_instruments
+    inferred_matrix_width = n_instruments
     if output_code == 1:
         inferred_vector_t0 = _probe_vector_output(engine, inputs)
         inferred_vector_width = inferred_vector_t0.shape[0]
+    elif output_code == 2:
+        inferred_matrix_width = _probe_matrix_output(engine, inputs)
 
     if out is None:
         if out_path is None:
             if output_code == 1:
                 out = np.empty((t, inferred_vector_width), dtype=np.float64)
+            elif output_code == 2:
+                out = np.empty((t, n_instruments, inferred_matrix_width), dtype=np.float64)
             else:
                 out = _alloc_output(engine, t, n_instruments)
         else:
             if output_code == 1:
                 out = np.memmap(out_path, mode="w+", dtype=np.float64, shape=(t, inferred_vector_width))
+            elif output_code == 2:
+                out = np.memmap(
+                    out_path,
+                    mode="w+",
+                    dtype=np.float64,
+                    shape=(t, n_instruments, inferred_matrix_width),
+                )
             else:
                 out = _alloc_memmap_output(engine, t, n_instruments, out_path)
 
@@ -131,8 +156,8 @@ def run_batch_from_mapping(
         if out.ndim != 2 or out.shape[0] != t:
             raise ValueError("Vector output requires out.shape == (time, width)")
     elif output_code == 2:
-        if out.ndim != 3 or out.shape[0] != t or out.shape[1] != n_instruments or out.shape[2] != n_instruments:
-            raise ValueError("Matrix output requires out.shape == (time, n_instruments, n_instruments)")
+        if out.ndim != 3 or out.shape[0] != t or out.shape[1] != n_instruments:
+            raise ValueError("Matrix output requires out.shape == (time, n_instruments, width)")
     else:
         raise ValueError(f"Unknown output code: {output_code}")
 

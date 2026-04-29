@@ -72,7 +72,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 
 - Inputs are aligned 2D arrays with shape `(time, n_instruments)`.
 - Live `update` expects 1D vectors with shape `(n_instruments,)`.
-- Some ops may emit matrix outputs (e.g., `outer`), and shape is represented in metadata.
+- Some ops may emit matrix outputs (e.g., `outer`, `bspline`), with shape `(n_instruments, width)` where `width` can differ from `n_instruments`.
 
 ## NaN semantics (current)
 
@@ -80,6 +80,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 - `div` returns NaN on divide-by-zero.
 - `ewm` skips updates for NaN inputs and can recover from NaN state.
 - `xs_rank` ranks only valid values and emits NaN where input is NaN.
+- `bspline(x, degree, n_knots)` emits a per-instrument B-spline basis matrix using uniform knots on `[0, 1]` (inputs are clipped to `[0, 1]` and NaNs propagate).
 
 ## Ridge regression op (cross-sectional)
 
