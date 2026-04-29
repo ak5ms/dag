@@ -311,12 +311,12 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
 
 def _bspline_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) != 3:
-        raise ValueError("bspline expects 3 args: x, degree, n_knots")
+    if len(types) != 2:
+        raise ValueError("bspline expects 2 args: x, n_basis")
     if types[0].kind != "vector":
         raise ValueError("bspline first arg must be vector")
-    if types[1].kind != "scalar" or types[2].kind != "scalar":
-        raise ValueError("bspline degree and n_knots args must be scalar")
+    if types[1].kind != "scalar":
+        raise ValueError("bspline n_basis arg must be scalar")
     return MATRIX
 
 
@@ -343,15 +343,9 @@ def _periodic_basis_eval(centers: np.ndarray, sigma: float, x: float, out_row: n
 
 def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     src = children[0]
-    degree = int(round(literals[1]))
-    n_knots = int(round(literals[2]))
-    if degree < 0:
-        raise ValueError("bspline degree must be >= 0")
-    if n_knots < 2:
-        raise ValueError("bspline n_knots must be >= 2")
-    n_basis = n_knots + degree - 1
+    n_basis = int(round(literals[1]))
     if n_basis <= 0:
-        raise ValueError("bspline has invalid basis width")
+        raise ValueError("bspline n_basis must be >= 1")
     spec = [
         ("src", src.instance_type),
         ("initialized", boolean),
@@ -363,7 +357,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
 
     @jitclass(spec)
     class BSplineOp:
-        def __init__(self, src, degree, n_knots, n_basis):
+        def __init__(self, src, n_basis):
             self.src = src
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
@@ -399,7 +393,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
     return CompiledNode(
         MATRIX,
         BSplineOp.class_type.instance_type,
-        lambda: BSplineOp(src.ctor(), degree, n_knots, n_basis),
+        lambda: BSplineOp(src.ctor(), n_basis),
     )
 
 

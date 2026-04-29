@@ -80,7 +80,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 - `div` returns NaN on divide-by-zero.
 - `ewm` skips updates for NaN inputs and can recover from NaN state.
 - `xs_rank` ranks only valid values and emits NaN where input is NaN.
-- `bspline(x, degree, n_knots)` emits a per-instrument B-spline basis matrix using uniform knots on `[0, 1]` (inputs are clipped to `[0, 1]` and NaNs propagate).
+- `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 
 ## Ridge regression op (cross-sectional)

@@ -64,14 +64,14 @@ def test_shape_vector_and_matrix_emits():
 
 
 def test_bspline_emits_matrix_with_expected_width():
-    eng = build_engine("bspline(close, 3, 5)")
+    eng = build_engine("bspline(close, 7)")
     y = update_from_mapping(eng, {"close": np.array([0.0, 0.5, 1.0])})
     assert y.shape == (3, 7)
     assert np.isfinite(y).all()
 
 
 def test_bspline_matches_periodic_reference_values():
-    eng = build_engine("bspline(close, 3, 94)")
+    eng = build_engine("bspline(close, 96)")
     day_us = 24 * 60 * 60 * 1_000_000
     t_us = np.arange(0, day_us, 1_000_000, dtype=np.int64)
     tod = (t_us % day_us) / day_us
@@ -90,14 +90,14 @@ def test_bspline_matches_periodic_reference_values():
 
 
 def test_matrix_batch_output_supports_non_square_width():
-    eng = build_engine("bspline(close, 2, 4)")
+    eng = build_engine("bspline(close, 5)")
     close = np.array([[0.0, 0.2, 0.6], [0.1, 0.4, 0.9]], dtype=np.float64)
     out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
     assert out.shape == (2, 3, 5)
 
 
 def test_col_unstacks_matrix_feature_for_ridge_input():
-    formula = "get_beta(Ridge(col(bspline(close, 2, 4), 0), col(bspline(close, 2, 4), 1), target, weights, 4, 0.1))"
+    formula = "get_beta(Ridge(col(bspline(close, 5), 0), col(bspline(close, 5), 1), target, weights, 4, 0.1))"
     eng = build_engine(formula)
     close = np.array([[0.1, 0.3], [0.2, 0.6], [0.4, 0.7]], dtype=np.float64)
     target = np.array([[1.0, 1.2], [1.1, 1.4], [1.5, 1.8]], dtype=np.float64)
@@ -107,13 +107,12 @@ def test_col_unstacks_matrix_feature_for_ridge_input():
 
 
 def test_ridge_accepts_matrix_feature_without_manual_col_unstack():
-    formula = "get_beta(Ridge(bspline(close, 2, 4), target, weights, 4, 0.1))"
+    formula = "get_beta(Ridge(bspline(close, 5), target, weights, 4, 0.1))"
     eng = build_engine(formula)
     close = np.array([[0.1, 0.3], [0.2, 0.6], [0.4, 0.7]], dtype=np.float64)
     target = np.array([[1.0, 1.2], [1.1, 1.4], [1.5, 1.8]], dtype=np.float64)
     weights = np.ones_like(target)
     out = run_batch_from_mapping(eng, {"close": close, "target": target, "weights": weights}, out_path=None)
-    # bspline width: n_knots + degree - 1 = 4 + 2 - 1 = 5
     assert out.shape == (3, 5)
 
 
