@@ -364,21 +364,24 @@ def _dot_vec(a, b):
 
 
 def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) < 4:
-        raise ValueError("Ridge expects at least 4 args: x..., y, hl, lambda")
-    for t in types[:-3]:
+    if len(types) < 5:
+        raise ValueError("Ridge expects at least 5 args: x..., y, weights, hl, lambda")
+    for t in types[:-4]:
         if t.kind != "vector":
             raise ValueError("Ridge feature args must be vector")
-    if types[-3].kind != "vector":
+    if types[-4].kind != "vector":
         raise ValueError("Ridge y must be vector")
+    if types[-3].kind not in ("vector", "matrix"):
+        raise ValueError("Ridge weights must be vector or matrix")
     if types[-2].kind != "scalar" or types[-1].kind != "scalar":
         raise ValueError("Ridge hl and lambda must be scalar")
     return OBJECT
 
 
 def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
-    feature_nodes = children[:-3]
-    y_node = children[-3]
+    feature_nodes = children[:-4]
+    y_node = children[-4]
+    w_node = children[-3]
     hl_node = children[-2]
     lam_node = children[-1]
     k = len(feature_nodes)
@@ -387,6 +390,7 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
     spec = [
         ("x_nodes", x_nodes_type),
         ("y_node", y_node.instance_type),
+        ("w_node", w_node.instance_type),
         ("hl_node", hl_node.instance_type),
         ("lam_node", lam_node.instance_type),
         ("state", _RidgeState.class_type.instance_type),
@@ -394,20 +398,23 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
     @jitclass(spec)
     class RidgeOp:
-        def __init__(self, x_nodes, y_node, hl_node, lam_node):
+        def __init__(self, x_nodes, y_node, w_node, hl_node, lam_node):
             self.x_nodes = x_nodes
             self.y_node = y_node
+            self.w_node = w_node
             self.hl_node = hl_node
             self.lam_node = lam_node
             self.state = _RidgeState()
 
         def on_data(self, frame2d):
             self.y_node.on_data(frame2d)
+            self.w_node.on_data(frame2d)
             self.hl_node.on_data(frame2d)
             self.lam_node.on_data(frame2d)
             for node in literal_unroll(self.x_nodes):
                 node.on_data(frame2d)
             y = self.y_node.emit()
+            w = self.w_node.emit()
             hl = self.hl_node.emit()[0, 0]
             lam = self.lam_node.emit()[0, 0]
             n = y.shape[0]
@@ -446,10 +453,19 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 lam = 0.0
             eps = 1e-12
             inv_rho = 1.0 / (rho if rho > eps else eps)
+            # EW forgetting:
+            # - b_t = rho * b_{t-1} + alpha * X'Wy
+            # - cov_t = rho * cov_{t-1} + alpha * X'WX
+            # state.p stores an inverse-like precision term, so scaling cov by rho
+            # corresponds to scaling precision by 1/rho.
             for i in range(k):
                 self.state.b[i] = rho * self.state.b[i]
                 for j in range(k):
                     self.state.p[i, j] *= inv_rho
+
+            w_cols = w.shape[1]
+            if w.shape[0] != n or (w_cols != 1 and w_cols != n):
+                raise ValueError("Ridge weights shape must be (n,1) or (n,n)")
 
             for i in range(n):
                 for j in range(k):
@@ -465,21 +481,117 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                     self.state.preds[i, 0] = np.nan
                     continue
                 self.state.preds[i, 0] = _dot_vec(self.state.beta, xvec)
-                for j in range(k):
-                    self.state.b[j] += alpha * xvec[j] * target
-                u = np.empty(k, dtype=np.float64)
-                root_alpha = np.sqrt(alpha)
-                for j in range(k):
-                    u[j] = root_alpha * xvec[j]
-                _sm_update_matrix(self.state.p, u)
-                if lam > 0.0:
+
+            u = np.empty(k, dtype=np.float64)
+            if w_cols == 1:
+                # Vector weights path: W = diag(w). Each instrument contributes one
+                # rank-1 update using sqrt(alpha * w_i) * x_i, then optional
+                # diagonal ridge stabilization via per-feature rank-1 updates.
+                for i in range(n):
+                    wi = w[i, 0]
+                    target = y[i, 0]
+                    # NaN/invalid handling:
+                    # - ignore rows with invalid/non-positive weights
+                    # - ignore rows with NaN target or NaN features
+                    if np.isnan(wi) or wi <= 0.0 or np.isnan(target):
+                        continue
+                    has_nan = False
                     for j in range(k):
-                        if xvec[j] == 0.0:
-                            continue
-                        for m in range(k):
-                            u[m] = 0.0
-                        u[j] = np.sqrt(alpha * lam) * abs(xvec[j])
-                        _sm_update_matrix(self.state.p, u)
+                        xvec[j] = xmat[j, i]
+                        if np.isnan(xvec[j]):
+                            has_nan = True
+                    if has_nan:
+                        continue
+                    for j in range(k):
+                        self.state.b[j] += alpha * wi * xvec[j] * target
+                    scale = np.sqrt(alpha * wi)
+                    for j in range(k):
+                        u[j] = scale * xvec[j]
+                    _sm_update_matrix(self.state.p, u)
+                    if lam > 0.0:
+                        for j in range(k):
+                            if xvec[j] == 0.0:
+                                continue
+                            for m in range(k):
+                                u[m] = 0.0
+                            u[j] = np.sqrt(alpha * lam * wi) * abs(xvec[j])
+                            _sm_update_matrix(self.state.p, u)
+            else:
+                # Matrix weights path:
+                # b contribution uses alpha * X'Wy.
+                for i in range(n):
+                    wi_target = 0.0
+                    valid = True
+                    for j in range(n):
+                        wij = w[i, j]
+                        yj = y[j, 0]
+                        if np.isnan(wij) or np.isnan(yj):
+                            valid = False
+                            break
+                        wi_target += wij * yj
+                    if (not valid) or np.isnan(y[i, 0]):
+                        continue
+                    for j in range(k):
+                        xvec[j] = xmat[j, i]
+                    has_nan = False
+                    for j in range(k):
+                        if np.isnan(xvec[j]):
+                            has_nan = True
+                    if has_nan:
+                        continue
+                    for j in range(k):
+                        self.state.b[j] += alpha * xvec[j] * wi_target
+                # cov contribution uses alpha * X'WX.
+                # For each row r, build u = (W[r, :] @ X)^T and apply a normalized
+                # rank-1 Sherman-Morrison-style update. The normalization keeps the
+                # rank-1 term aligned with x_r' W x_r and avoids unstable negative
+                # / NaN square roots.
+                for r in range(n):
+                    for j in range(k):
+                        u[j] = 0.0
+                    valid = True
+                    for c in range(n):
+                        wrc = w[r, c]
+                        if np.isnan(wrc):
+                            valid = False
+                            break
+                        xc = xmat[:, c]
+                        for j in range(k):
+                            if np.isnan(xc[j]):
+                                valid = False
+                                break
+                            u[j] += wrc * xc[j]
+                        if not valid:
+                            break
+                    if not valid:
+                        continue
+                    for j in range(k):
+                        xvec[j] = xmat[j, r]
+                    has_nan = False
+                    for j in range(k):
+                        if np.isnan(xvec[j]):
+                            has_nan = True
+                    if has_nan:
+                        continue
+                    proj = _dot_vec(xvec, u)
+                    # If projected weight is non-positive/NaN, skip that update to
+                    # preserve numeric stability and keep inverse updates valid.
+                    if proj <= 0.0 or np.isnan(proj):
+                        continue
+                    scale = np.sqrt(alpha / proj)
+                    for j in range(k):
+                        u[j] = scale * u[j]
+                    _sm_update_matrix(self.state.p, u)
+                    if lam > 0.0:
+                        # Apply ridge adjustment as diagonal rank-1 increments.
+                        for j in range(k):
+                            diag_contrib = alpha * lam * xvec[j] * u[j]
+                            if diag_contrib <= 0.0 or np.isnan(diag_contrib):
+                                continue
+                            for m in range(k):
+                                u[m] = 0.0
+                            u[j] = np.sqrt(diag_contrib)
+                            _sm_update_matrix(self.state.p, u)
 
             for i in range(k):
                 acc = 0.0
@@ -493,12 +605,13 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
     feature_ctors = [node.ctor for node in feature_nodes]
     y_ctor = y_node.ctor
+    w_ctor = w_node.ctor
     hl_ctor = hl_node.ctor
     lam_ctor = lam_node.ctor
 
     def _ctor():
         x_nodes = tuple(fn() for fn in feature_ctors)
-        return RidgeOp(x_nodes, y_ctor(), hl_ctor(), lam_ctor())
+        return RidgeOp(x_nodes, y_ctor(), w_ctor(), hl_ctor(), lam_ctor())
 
     return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor)
 

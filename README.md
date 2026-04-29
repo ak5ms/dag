@@ -83,7 +83,8 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 
 ## Ridge regression op (cross-sectional)
 
-- `Ridge(x1, x2, ..., xk, y, hl, lambda)` emits an object state and performs cross-sectional EWMA ridge updates each tick.
+- `Ridge(x1, x2, ..., xk, y, weights, hl, lambda)` emits an object state and performs cross-sectional EWMA ridge updates each tick.
+- `weights` is mandatory per timestep and can be either a vector `(n, 1)`/`(n,)` (treated as diagonal weights) or a matrix `(n, n)`.
 - State uses exponentially-weighted sufficient statistics and a Sherman-Morrison inverse update path for the feature precision matrix.
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
