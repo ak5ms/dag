@@ -47,6 +47,7 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ranking/tie semantics and NaN masking.
 - Ridge/object-op behavior when feature/target/parameter inputs include NaNs.
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
+- Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
 
 ## Test expectations
 
