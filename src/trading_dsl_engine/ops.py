@@ -321,25 +321,24 @@ def _bspline_validator(types: list[TypeInfo]) -> TypeInfo:
 
 
 @njit(inline="always")
-def _bspline_basis_eval(knots: np.ndarray, degree: int, n_basis: int, x: float, out_row: np.ndarray):
-    for i in range(n_basis):
-        left = knots[i]
-        right = knots[i + 1]
-        if (left <= x < right) or (x == knots[-1] and i == n_basis - 1):
-            out_row[i] = 1.0
-        else:
-            out_row[i] = 0.0
-    for p in range(1, degree + 1):
-        for i in range(n_basis - p):
-            left_denom = knots[i + p] - knots[i]
-            right_denom = knots[i + p + 1] - knots[i + 1]
-            left_term = 0.0
-            right_term = 0.0
-            if left_denom > 0.0:
-                left_term = ((x - knots[i]) / left_denom) * out_row[i]
-            if right_denom > 0.0:
-                right_term = ((knots[i + p + 1] - x) / right_denom) * out_row[i + 1]
-            out_row[i] = left_term + right_term
+def _periodic_basis_eval(centers: np.ndarray, sigma: float, x: float, out_row: np.ndarray):
+    total = 0.0
+    inv_sigma2 = 1.0 / (sigma * sigma)
+    for i in range(centers.shape[0]):
+        d = abs(x - centers[i])
+        if 1.0 - d < d:
+            d = 1.0 - d
+        v = np.exp(-0.5 * d * d * inv_sigma2)
+        out_row[i] = v
+        total += v
+    if total <= 1e-18 or np.isnan(total):
+        val = 1.0 / centers.shape[0]
+        for i in range(centers.shape[0]):
+            out_row[i] = val
+        return
+    inv_total = 1.0 / total
+    for i in range(centers.shape[0]):
+        out_row[i] *= inv_total
 
 
 def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
@@ -357,8 +356,8 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
         ("src", src.instance_type),
         ("initialized", boolean),
         ("out", float64[:, :]),
-        ("knots", float64[:]),
-        ("degree", int64),
+        ("centers", float64[:]),
+        ("sigma", float64),
         ("n_basis", int64),
     ]
 
@@ -368,20 +367,11 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
             self.src = src
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
-            self.degree = degree
             self.n_basis = n_basis
-            knot_count = n_knots + 2 * degree
-            self.knots = np.empty(knot_count, dtype=np.float64)
-            if n_knots == 1:
-                self.knots[0] = 0.0
-            else:
-                for i in range(knot_count):
-                    u = i - degree
-                    if u < 0:
-                        u = 0
-                    if u > n_knots - 1:
-                        u = n_knots - 1
-                    self.knots[i] = u / (n_knots - 1)
+            self.sigma = 1.0 / n_basis
+            self.centers = np.empty(n_basis, dtype=np.float64)
+            for i in range(n_basis):
+                self.centers[i] = i / n_basis
 
         def on_data(self, frame2d):
             self.src.on_data(frame2d)
@@ -401,7 +391,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
                 elif xv > 1.0:
                     xv = 1.0
                 row = self.out[i]
-                _bspline_basis_eval(self.knots, self.degree, self.n_basis, xv, row)
+                _periodic_basis_eval(self.centers, self.sigma, xv, row)
 
         def emit(self):
             return self.out

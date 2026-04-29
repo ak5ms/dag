@@ -70,6 +70,25 @@ def test_bspline_emits_matrix_with_expected_width():
     assert np.isfinite(y).all()
 
 
+def test_bspline_matches_periodic_reference_values():
+    eng = build_engine("bspline(close, 3, 94)")
+    day_us = 24 * 60 * 60 * 1_000_000
+    t_us = np.arange(0, day_us, 1_000_000, dtype=np.int64)
+    tod = (t_us % day_us) / day_us
+    close = tod.reshape(-1, 1).astype(np.float64)
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)[:, 0, :]
+
+    k = out.shape[1]
+    centers = np.linspace(0.0, 1.0, k, endpoint=False)
+    sigma = 1.0 / k
+    diff = np.abs(tod[:, None] - centers[None, :])
+    circ_diff = np.minimum(diff, 1.0 - diff)
+    ref = np.exp(-0.5 * (circ_diff / sigma) ** 2)
+    ref /= ref.sum(axis=1, keepdims=True)
+
+    np.testing.assert_allclose(out, ref, rtol=1e-12, atol=1e-12)
+
+
 def test_matrix_batch_output_supports_non_square_width():
     eng = build_engine("bspline(close, 2, 4)")
     close = np.array([[0.0, 0.2, 0.6], [0.1, 0.4, 0.9]], dtype=np.float64)
