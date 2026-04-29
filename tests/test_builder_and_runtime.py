@@ -63,6 +63,59 @@ def test_shape_vector_and_matrix_emits():
     assert ym.shape == (3, 3)
 
 
+def test_bspline_emits_matrix_with_expected_width():
+    eng = build_engine("bspline(close, 7)")
+    y = update_from_mapping(eng, {"close": np.array([0.0, 0.5, 1.0])})
+    assert y.shape == (3, 7)
+    assert np.isfinite(y).all()
+
+
+def test_bspline_matches_periodic_reference_values():
+    eng = build_engine("bspline(close, 96)")
+    day_us = 24 * 60 * 60 * 1_000_000
+    t_us = np.arange(0, day_us, 1_000_000, dtype=np.int64)
+    tod = (t_us % day_us) / day_us
+    close = tod.reshape(-1, 1).astype(np.float64)
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)[:, 0, :]
+
+    k = out.shape[1]
+    centers = np.linspace(0.0, 1.0, k, endpoint=False)
+    sigma = 1.0 / k
+    diff = np.abs(tod[:, None] - centers[None, :])
+    circ_diff = np.minimum(diff, 1.0 - diff)
+    ref = np.exp(-0.5 * (circ_diff / sigma) ** 2)
+    ref /= ref.sum(axis=1, keepdims=True)
+
+    np.testing.assert_allclose(out, ref, rtol=1e-12, atol=1e-12)
+
+
+def test_matrix_batch_output_supports_non_square_width():
+    eng = build_engine("bspline(close, 5)")
+    close = np.array([[0.0, 0.2, 0.6], [0.1, 0.4, 0.9]], dtype=np.float64)
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+    assert out.shape == (2, 3, 5)
+
+
+def test_col_unstacks_matrix_feature_for_ridge_input():
+    formula = "get_beta(Ridge(col(bspline(close, 5), 0), col(bspline(close, 5), 1), target, weights, 4, 0.1))"
+    eng = build_engine(formula)
+    close = np.array([[0.1, 0.3], [0.2, 0.6], [0.4, 0.7]], dtype=np.float64)
+    target = np.array([[1.0, 1.2], [1.1, 1.4], [1.5, 1.8]], dtype=np.float64)
+    weights = np.ones_like(target)
+    out = run_batch_from_mapping(eng, {"close": close, "target": target, "weights": weights}, out_path=None)
+    assert out.shape == (3, 2)
+
+
+def test_ridge_accepts_matrix_feature_without_manual_col_unstack():
+    formula = "get_beta(Ridge(bspline(close, 5), target, weights, 4, 0.1))"
+    eng = build_engine(formula)
+    close = np.array([[0.1, 0.3], [0.2, 0.6], [0.4, 0.7]], dtype=np.float64)
+    target = np.array([[1.0, 1.2], [1.1, 1.4], [1.5, 1.8]], dtype=np.float64)
+    weights = np.ones_like(target)
+    out = run_batch_from_mapping(eng, {"close": close, "target": target, "weights": weights}, out_path=None)
+    assert out.shape == (3, 5)
+
+
 def test_compiled_formula_and_engine_are_jitclasses():
     compiled = compile_formula("add(close, 1)")
     assert hasattr(compiled.compiled, "_numba_type_")

@@ -67,6 +67,12 @@ def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = Non
         if depth > 256:
             raise FormulaCompileError("Exceeded max DSL expansion depth (256)")
 
+        key = _expr_key(node)
+        cached = cache.get(key)
+        if cached is not None:
+            cache_hits += 1
+            return cached
+
         if isinstance(node, Call):
             py_fn = dsl_registry.get(node.fn)
             if py_fn is not None:
@@ -74,13 +80,9 @@ def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = Non
                     expanded = py_fn(*node.args)
                 except Exception as exc:
                     raise FormulaCompileError(f"Failed expanding DSL function '{node.fn}': {exc}") from exc
-                return build(expanded, depth + 1)
-
-        key = _expr_key(node)
-        cached = cache.get(key)
-        if cached is not None:
-            cache_hits += 1
-            return cached
+                compiled_expanded = build(expanded, depth + 1)
+                cache[key] = compiled_expanded
+                return compiled_expanded
 
         expanded_nodes += 1
         if isinstance(node, Identifier):
