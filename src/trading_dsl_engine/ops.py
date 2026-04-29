@@ -310,6 +310,157 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
     return CompiledNode(MATRIX, OuterOp.class_type.instance_type, lambda: OuterOp(src.ctor()))
 
 
+def _bspline_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 3:
+        raise ValueError("bspline expects 3 args: x, degree, n_knots")
+    if types[0].kind != "vector":
+        raise ValueError("bspline first arg must be vector")
+    if types[1].kind != "scalar" or types[2].kind != "scalar":
+        raise ValueError("bspline degree and n_knots args must be scalar")
+    return MATRIX
+
+
+@njit(inline="always")
+def _bspline_basis_eval(knots: np.ndarray, degree: int, n_basis: int, x: float, out_row: np.ndarray):
+    for i in range(n_basis):
+        left = knots[i]
+        right = knots[i + 1]
+        if (left <= x < right) or (x == knots[-1] and i == n_basis - 1):
+            out_row[i] = 1.0
+        else:
+            out_row[i] = 0.0
+    for p in range(1, degree + 1):
+        for i in range(n_basis - p):
+            left_denom = knots[i + p] - knots[i]
+            right_denom = knots[i + p + 1] - knots[i + 1]
+            left_term = 0.0
+            right_term = 0.0
+            if left_denom > 0.0:
+                left_term = ((x - knots[i]) / left_denom) * out_row[i]
+            if right_denom > 0.0:
+                right_term = ((knots[i + p + 1] - x) / right_denom) * out_row[i + 1]
+            out_row[i] = left_term + right_term
+
+
+def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    degree = int(round(literals[1]))
+    n_knots = int(round(literals[2]))
+    if degree < 0:
+        raise ValueError("bspline degree must be >= 0")
+    if n_knots < 2:
+        raise ValueError("bspline n_knots must be >= 2")
+    n_basis = n_knots + degree - 1
+    if n_basis <= 0:
+        raise ValueError("bspline has invalid basis width")
+    spec = [
+        ("src", src.instance_type),
+        ("initialized", boolean),
+        ("out", float64[:, :]),
+        ("knots", float64[:]),
+        ("degree", int64),
+        ("n_basis", int64),
+    ]
+
+    @jitclass(spec)
+    class BSplineOp:
+        def __init__(self, src, degree, n_knots, n_basis):
+            self.src = src
+            self.initialized = False
+            self.out = np.empty((1, 1), dtype=np.float64)
+            self.degree = degree
+            self.n_basis = n_basis
+            knot_count = n_knots + 2 * degree
+            self.knots = np.empty(knot_count, dtype=np.float64)
+            if n_knots == 1:
+                self.knots[0] = 0.0
+            else:
+                for i in range(knot_count):
+                    u = i - degree
+                    if u < 0:
+                        u = 0
+                    if u > n_knots - 1:
+                        u = n_knots - 1
+                    self.knots[i] = u / (n_knots - 1)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.out = np.empty((n, self.n_basis), dtype=np.float64)
+                self.initialized = True
+            for i in range(n):
+                xv = x[i, 0]
+                if np.isnan(xv):
+                    for j in range(self.n_basis):
+                        self.out[i, j] = np.nan
+                    continue
+                if xv < 0.0:
+                    xv = 0.0
+                elif xv > 1.0:
+                    xv = 1.0
+                row = self.out[i]
+                _bspline_basis_eval(self.knots, self.degree, self.n_basis, xv, row)
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(
+        MATRIX,
+        BSplineOp.class_type.instance_type,
+        lambda: BSplineOp(src.ctor(), degree, n_knots, n_basis),
+    )
+
+
+def _col_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 2:
+        raise ValueError("col expects 2 args: matrix, index")
+    if types[0].kind != "matrix":
+        raise ValueError("col first arg must be matrix")
+    if types[1].kind != "scalar":
+        raise ValueError("col second arg must be scalar index")
+    return VECTOR
+
+
+def _col_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    idx = int(round(literals[1]))
+    if idx < 0:
+        raise ValueError("col index must be >= 0")
+    spec = [
+        ("src", src.instance_type),
+        ("initialized", boolean),
+        ("idx", int64),
+        ("out", float64[:, :]),
+    ]
+
+    @jitclass(spec)
+    class ColOp:
+        def __init__(self, src, idx):
+            self.src = src
+            self.initialized = False
+            self.idx = idx
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            if self.idx >= x.shape[1]:
+                raise ValueError("col index out of bounds for matrix width")
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.initialized = True
+            for i in range(n):
+                self.out[i, 0] = x[i, self.idx]
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx))
+
+
 _ridge_state_spec = [
     ("initialized", boolean),
     ("n_instruments", int64),
@@ -682,6 +833,8 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
+    REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
+    REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
     REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))
     REGISTRY.register(OpSpec(name="get_preds", validator=_get_preds_validator, builder=_get_preds_builder))
