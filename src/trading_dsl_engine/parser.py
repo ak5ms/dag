@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ast
+import re
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class FormulaParseError(ValueError):
 class _AstParser:
     def parse(self, text: str) -> Expr:
         source = text.strip()
+        source = re.sub(r"\band\s*\(", "and_(", source)
+        source = re.sub(r"\bor\s*\(", "or_(", source)
         try:
             tree = ast.parse(source, mode="eval")
         except SyntaxError as exc:

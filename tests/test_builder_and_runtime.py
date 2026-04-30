@@ -427,3 +427,56 @@ def test_groupby_rejects_mixed_keys_within_tick():
             eng,
             {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 2.0], dtype=np.float64)},
         )
+
+
+def test_logical_eq_ne_and_mul_ops():
+    eng = build_engine("and(eq(close, open), ne(volume, 0))")
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "close": np.array([[1.0, 2.0], [3.0, 4.0]]),
+            "open": np.array([[1.0, 9.0], [3.0, 4.0]]),
+            "volume": np.array([[10.0, 0.0], [1.0, 2.0]]),
+        },
+        out_path=None,
+    )
+    np.testing.assert_allclose(out, np.array([[1.0, 0.0], [1.0, 1.0]]), equal_nan=True)
+
+
+def test_where_selects_true_false_branches():
+    eng = build_engine("where(and(eq(close, open), ne(volume, 0)), mul(close, 2), 1)")
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "close": np.array([[1.0, 2.0], [3.0, 4.0]]),
+            "open": np.array([[1.0, 9.0], [3.0, 4.0]]),
+            "volume": np.array([[10.0, 0.0], [1.0, 2.0]]),
+        },
+        out_path=None,
+    )
+    np.testing.assert_allclose(out, np.array([[2.0, 1.0], [6.0, 8.0]]), equal_nan=True)
+
+
+def test_logical_or_and_xor_ops():
+    eng = build_engine("xor(or(close, 1), 0)")
+    out = run_batch_from_mapping(eng, {"close": np.array([[0.0, 2.0]])}, out_path=None)
+    np.testing.assert_allclose(out, np.array([[1.0, 1.0]]), equal_nan=True)
+
+
+def test_isnan_and_abs_streaming():
+    eng = build_engine("abs(where(isnan(close), 0, close))")
+    y1 = update_from_mapping(eng, {"close": np.array([1.0, np.nan])}).copy()
+    y2 = update_from_mapping(eng, {"close": np.array([-2.0, 4.0])}).copy()
+    np.testing.assert_allclose(y1[:, 0], np.array([1.0, 0.0]), equal_nan=True)
+    np.testing.assert_allclose(y2[:, 0], np.array([2.0, 4.0]), equal_nan=True)
+
+
+def test_cumsum_shift_streaming():
+    eng = build_engine("shift(cumsum(close), 1)")
+    y1 = update_from_mapping(eng, {"close": np.array([1.0, np.nan])}).copy()
+    y2 = update_from_mapping(eng, {"close": np.array([-2.0, 4.0])}).copy()
+    y3 = update_from_mapping(eng, {"close": np.array([3.0, -1.0])}).copy()
+
+    np.testing.assert_allclose(y1[:, 0], np.array([np.nan, np.nan]), equal_nan=True)
+    np.testing.assert_allclose(y2[:, 0], np.array([1.0, 0.0]), equal_nan=True)
+    np.testing.assert_allclose(y3[:, 0], np.array([-1.0, 4.0]), equal_nan=True)
