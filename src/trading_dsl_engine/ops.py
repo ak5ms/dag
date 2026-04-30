@@ -66,9 +66,86 @@ def _make_literal_node(value: float) -> CompiledNode:
     return CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value))
 
 
-def make_binary_op(name: str, kernel: Callable[[float, float], float]) -> None:
+def make_nary_op(name: str, arity: int, kernel: Callable[[np.ndarray], float]) -> None:
     kernel_jit = njit(inline="always")(kernel)
-    is_div = name == "div"
+
+    def validator(types: list[TypeInfo]) -> TypeInfo:
+        if len(types) != arity:
+            raise ValueError(f"{name} expects exactly {arity} args")
+        kinds = {t.kind for t in types}
+        if kinds <= {"scalar"}:
+            return SCALAR
+        if kinds <= {"scalar", "vector"}:
+            return VECTOR
+        if kinds <= {"scalar", "matrix"}:
+            return MATRIX
+        if kinds == {"vector"}:
+            return VECTOR
+        if kinds == {"matrix"}:
+            return MATRIX
+        raise ValueError(f"{name} received incompatible arg kinds: {sorted(kinds)}")
+
+    def builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+        child_types = tuple(child.instance_type for child in children)
+        spec = [
+            ("children", types.Tuple(child_types)),
+            ("initialized", boolean),
+            ("out", float64[:, :]),
+            ("scratch", float64[:]),
+        ]
+
+        @jitclass(spec)
+        class NaryOp:
+            def __init__(self, children):
+                self.children = children
+                self.initialized = False
+                self.out = np.empty((1, 1), dtype=np.float64)
+                self.scratch = np.empty(arity, dtype=np.float64)
+
+            def on_data(self, frame2d):
+                for child in literal_unroll(self.children):
+                    child.on_data(frame2d)
+                rows = 1
+                cols = 1
+                for child in literal_unroll(self.children):
+                    v = child.emit()
+                    if v.shape[0] != 1:
+                        rows = v.shape[0]
+                    if v.shape[1] != 1:
+                        cols = v.shape[1]
+                if not self.initialized or self.out.shape[0] != rows or self.out.shape[1] != cols:
+                    self.out = np.empty((rows, cols), dtype=np.float64)
+                    self.initialized = True
+                for i in range(rows):
+                    for j in range(cols):
+                        idx = 0
+                        for child in literal_unroll(self.children):
+                            arg = child.emit()
+                            ai = i if arg.shape[0] > 1 else 0
+                            aj = j if arg.shape[1] > 1 else 0
+                            val = arg[ai, aj]
+                            self.scratch[idx] = val
+                            idx += 1
+                        self.out[i, j] = kernel_jit(self.scratch)
+
+            def emit(self):
+                return self.out
+
+        out_type = validator([child.type_info for child in children])
+        child_ctors = tuple(child.ctor for child in children)
+
+        def _ctor():
+            nodes = tuple(fn() for fn in child_ctors)
+            return NaryOp(nodes)
+
+        return CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor)
+
+    REGISTRY.register(OpSpec(name=name, validator=validator, builder=builder))
+
+
+def make_binary_op(name: str, kernel: Callable[[float, float], float], *, nan_on_zero_divisor: bool = False) -> None:
+    kernel_jit = njit(inline="always")(kernel)
+
     def validator(types: list[TypeInfo]) -> TypeInfo:
         if len(types) != 2:
             raise ValueError(f"{name} expects exactly 2 args")
@@ -122,7 +199,7 @@ def make_binary_op(name: str, kernel: Callable[[float, float], float]) -> None:
                         bv = b[bi, bj]
                         if np.isnan(av) or np.isnan(bv):
                             self.out[i, j] = np.nan
-                        elif is_div and bv == 0.0:
+                        elif nan_on_zero_divisor and bv == 0.0:
                             self.out[i, j] = np.nan
                         else:
                             self.out[i, j] = kernel_jit(av, bv)
@@ -134,6 +211,110 @@ def make_binary_op(name: str, kernel: Callable[[float, float], float]) -> None:
         return CompiledNode(out_type, BinaryOp.class_type.instance_type, lambda: BinaryOp(left.ctor(), right.ctor()))
 
     REGISTRY.register(OpSpec(name=name, validator=validator, builder=builder))
+
+
+
+
+def _cumsum_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 1 or types[0].kind != "vector":
+        raise ValueError("cumsum expects one vector arg")
+    return VECTOR
+
+
+def _cumsum_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    spec = [("src", src.instance_type), ("initialized", boolean), ("state", float64[:, :]), ("out", float64[:, :])]
+
+    @jitclass(spec)
+    class CumSumOp:
+        def __init__(self, src):
+            self.src = src
+            self.initialized = False
+            self.state = np.empty((1, 1), dtype=np.float64)
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.state = np.zeros((n, 1), dtype=np.float64)
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.initialized = True
+            for i in range(n):
+                xv = x[i, 0]
+                if not np.isnan(xv):
+                    self.state[i, 0] += xv
+                self.out[i, 0] = self.state[i, 0]
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(VECTOR, CumSumOp.class_type.instance_type, lambda: CumSumOp(src.ctor()))
+
+
+def _shift_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 2 or types[0].kind != "vector" or types[1].kind != "scalar":
+        raise ValueError("shift expects args: vector, periods")
+    return VECTOR
+
+
+def _shift_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    periods = int(round(literals[1]))
+    if periods < 0:
+        raise ValueError("shift periods must be >= 0")
+    spec = [("src", src.instance_type), ("initialized", boolean), ("periods", int64), ("ring", float64[:, :]), ("head", int64), ("size", int64), ("out", float64[:, :])]
+
+    @jitclass(spec)
+    class ShiftOp:
+        def __init__(self, src, periods):
+            self.src = src
+            self.initialized = False
+            self.periods = periods
+            self.ring = np.empty((1, 1), dtype=np.float64)
+            self.head = 0
+            self.size = 0
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            ring_len = self.periods + 1
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.ring = np.empty((n, ring_len), dtype=np.float64)
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.head = 0
+                self.size = 0
+                for i in range(n):
+                    for j in range(ring_len):
+                        self.ring[i, j] = np.nan
+                self.initialized = True
+            for i in range(n):
+                self.ring[i, self.head] = x[i, 0]
+            if self.size >= self.periods:
+                idx = self.head - self.periods
+                if idx < 0:
+                    idx += ring_len
+                for i in range(n):
+                    self.out[i, 0] = self.ring[i, idx]
+            elif self.periods == 0:
+                for i in range(n):
+                    self.out[i, 0] = x[i, 0]
+            else:
+                for i in range(n):
+                    self.out[i, 0] = np.nan
+            self.head += 1
+            if self.head == ring_len:
+                self.head = 0
+            if self.size < ring_len:
+                self.size += 1
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(VECTOR, ShiftOp.class_type.instance_type, lambda: ShiftOp(src.ctor(), periods))
 
 
 def _ewm_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -1008,11 +1189,24 @@ def register_builtin_ops() -> None:
     if getattr(register_builtin_ops, "_done", False):
         return
 
-    make_binary_op("div", lambda a, b: a / b)
+    make_binary_op("div", lambda a, b: a / b, nan_on_zero_divisor=True)
     make_binary_op("add", lambda a, b: a + b)
     make_binary_op("sub", lambda a, b: a - b)
     make_binary_op("mod", lambda a, b: a % b)
+    make_binary_op("mul", lambda a, b: a * b)
+    make_binary_op("eq", lambda a, b: 1.0 if a == b else 0.0)
+    make_binary_op("ne", lambda a, b: 1.0 if a != b else 0.0)
+    make_binary_op("and", lambda a, b: 1.0 if (a != 0.0 and b != 0.0) else 0.0)
+    make_binary_op("or", lambda a, b: 1.0 if (a != 0.0 or b != 0.0) else 0.0)
+    make_binary_op("and_", lambda a, b: 1.0 if (a != 0.0 and b != 0.0) else 0.0)
+    make_binary_op("or_", lambda a, b: 1.0 if (a != 0.0 or b != 0.0) else 0.0)
+    make_binary_op("xor", lambda a, b: 1.0 if ((a != 0.0) != (b != 0.0)) else 0.0)
+    make_nary_op("where", 3, lambda args: args[1] if args[0] != 0.0 else args[2])
+    make_nary_op("abs", 1, lambda args: np.abs(args[0]))
+    make_nary_op("isnan", 1, lambda args: 1.0 if np.isnan(args[0]) else 0.0)
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
+    REGISTRY.register(OpSpec(name="cumsum", validator=_cumsum_validator, builder=_cumsum_builder))
+    REGISTRY.register(OpSpec(name="shift", validator=_shift_validator, builder=_shift_builder))
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
