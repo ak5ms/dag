@@ -11,5 +11,6 @@ dependencies = ["numpy", "numba"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --durations=0"
 
 markers = ["perf: performance tests"]

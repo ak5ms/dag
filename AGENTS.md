@@ -48,6 +48,7 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ridge/object-op behavior when feature/target/parameter inputs include NaNs.
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
 - Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
+- Grouped-state behavior for keyed operators (e.g., `groupby`) including key NaNs, per-key state transitions, and key consistency expectations.
 
 ## Test expectations
 
@@ -61,6 +62,7 @@ RUN_PERF_TESTS=1 pytest tests/test_performance.py -q
 If perf tests are too heavy for the environment, clearly note that and at least run core tests.
 
 - Always run non-performance tests (`pytest -q`) before finalizing unless explicitly told not to.
+- Pytest output is configured to include per-test durations; use this to catch regressions in compile/runtime costs.
 - Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
 
 ## Coding style

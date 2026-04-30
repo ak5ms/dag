@@ -187,6 +187,7 @@ def test_compile_stats_reports_cse_cache_hits():
     compiled = compile_formula("add(div(close, open), div(close, open))")
     assert compiled.stats.cache_hits > 0
     assert compiled.stats.expanded_nodes > 0
+    assert compiled.stats.compile_seconds >= 0.0
 
 
 def test_object_emitter_can_be_consumed_by_downstream_array_op():
@@ -338,3 +339,59 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
         out=out_beta,
     )
     assert out.shape == (3, 3)
+
+def test_groupby_with_nested_ewm_by_minute_of_day_matches_reference():
+    formula = "groupby(mod(mod(ts, 86400000000), 60000000), ewm(close, 3))"
+    eng = build_engine(formula)
+
+    close = np.array(
+        [
+            [10.0, 20.0],
+            [12.0, 18.0],
+            [14.0, np.nan],
+            [16.0, 14.0],
+        ],
+        dtype=np.float64,
+    )
+    ts = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [60_000_000.0, 60_000_000.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+    out = run_batch_from_mapping(eng, {"ts": ts, "close": close}, out_path=None)
+
+    alpha = 2.0 / (3.0 + 1.0)
+    state = {}
+    expected = np.empty_like(close)
+    for t in range(close.shape[0]):
+        for i in range(close.shape[1]):
+            bucket = int((ts[t, i] % 86_400_000_000.0) % 60_000_000.0)
+            key = (i, bucket)
+            x = close[t, i]
+            if key not in state:
+                state[key] = x
+            else:
+                s = state[key]
+                if np.isnan(x):
+                    state[key] = s
+                elif np.isnan(s):
+                    state[key] = x
+                else:
+                    state[key] = alpha * x + (1.0 - alpha) * s
+            expected[t, i] = state[key]
+
+    np.testing.assert_allclose(out, expected, equal_nan=True)
+
+
+def test_groupby_rejects_mixed_keys_within_tick():
+    eng = build_engine("groupby(ts, ewm(close, 3))")
+    with pytest.raises(ValueError, match="single shared key"):
+        update_from_mapping(
+            eng,
+            {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 2.0], dtype=np.float64)},
+        )

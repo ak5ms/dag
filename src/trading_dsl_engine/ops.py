@@ -5,6 +5,7 @@ from typing import Callable
 import numpy as np
 from numba import boolean, float64, int64, literal_unroll, njit, types
 from numba.experimental import jitclass
+from numba.typed import List
 
 from trading_dsl_engine.registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
 
@@ -445,6 +446,90 @@ def _col_builder(children: list[CompiledNode], literals: list[float]) -> Compile
     return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx))
 
 
+def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 2:
+        raise ValueError("groupby expects 2 args: key, op")
+    if types[0].kind != "vector":
+        raise ValueError("groupby key arg must be vector")
+    if types[1].kind == "object":
+        raise ValueError("groupby op arg must emit scalar/vector/matrix, not object")
+    return types[1]
+
+
+def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    key_node = children[0]
+    op_node = children[1]
+    groups_list_type = types.ListType(op_node.instance_type)
+    max_groups = 256
+
+    spec = [
+        ("key_node", key_node.instance_type),
+        ("groups", groups_list_type),
+        ("group_keys", int64[:]),
+        ("n_groups", int64),
+        ("active_group_idx", int64),
+    ]
+
+    @jitclass(spec)
+    class GroupByOp:
+        def __init__(self, key_node, groups):
+            self.key_node = key_node
+            self.groups = groups
+            self.group_keys = np.empty(max_groups, dtype=np.int64)
+            for i in range(max_groups):
+                self.group_keys[i] = -1
+            self.n_groups = 0
+            self.active_group_idx = -1
+
+        def _find_group(self, key: int64):
+            for i in range(self.n_groups):
+                if self.group_keys[i] == key:
+                    return i
+            return -1
+
+        def _append_group(self, key: int64):
+            if self.n_groups >= self.group_keys.shape[0]:
+                raise ValueError("groupby exceeded max groups (256)")
+            self.group_keys[self.n_groups] = key
+            self.n_groups += 1
+            return self.n_groups - 1
+
+        def on_data(self, frame2d):
+            self.key_node.on_data(frame2d)
+            k = self.key_node.emit()
+            first = k[0, 0]
+            if np.isnan(first):
+                raise ValueError("groupby key cannot be NaN")
+            key = int(first)
+            for i in range(1, k.shape[0]):
+                if np.isnan(k[i, 0]) or int(k[i, 0]) != key:
+                    raise ValueError("groupby currently requires a single shared key across instruments per tick")
+
+            idx = self._find_group(key)
+            if idx < 0:
+                idx = self._append_group(key)
+            self.active_group_idx = idx
+            self.groups[idx].on_data(frame2d)
+
+        def emit(self):
+            if self.active_group_idx < 0:
+                raise ValueError("groupby has no active group")
+            return self.groups[self.active_group_idx].emit()
+
+    return CompiledNode(
+        children[1].type_info,
+        GroupByOp.class_type.instance_type,
+        lambda: GroupByOp(key_node.ctor(), _build_group_slots(op_node.ctor, max_groups, op_node.instance_type)),
+    )
+
+
+def _build_group_slots(group_ctor, n_slots: int, instance_type):
+    groups = List.empty_list(instance_type)
+    for _ in range(n_slots):
+        groups.append(group_ctor())
+    return groups
+
+
 _ridge_state_spec = [
     ("initialized", boolean),
     ("n_instruments", int64),
@@ -820,11 +905,13 @@ def register_builtin_ops() -> None:
     make_binary_op("div", lambda a, b: a / b)
     make_binary_op("add", lambda a, b: a + b)
     make_binary_op("sub", lambda a, b: a - b)
+    make_binary_op("mod", lambda a, b: a % b)
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
     REGISTRY.register(OpSpec(name="xs_rank", validator=_xs_rank_validator, builder=_xs_rank_builder))
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
     REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
+    REGISTRY.register(OpSpec(name="groupby", validator=_groupby_validator, builder=_groupby_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
     REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))
     REGISTRY.register(OpSpec(name="get_preds", validator=_get_preds_validator, builder=_get_preds_builder))

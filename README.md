@@ -66,7 +66,7 @@ def hlc3(high, low, close):
 
 Then compile with `compile_formula(..., dsl_registry=my_registry)`.
 
-The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compile-time common-subexpression hashing behavior can be validated.
+The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile_seconds`) so compile-time CSE behavior and compile latency can be validated.
 
 ## Data contract
 
@@ -82,6 +82,8 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`) so compi
 - `xs_rank` ranks only valid values and emits NaN where input is NaN.
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
+- `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
+- `groupby(key, op)` runs partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
 
 ## Ridge regression op (cross-sectional)
 
