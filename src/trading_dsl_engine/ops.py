@@ -446,6 +446,112 @@ def _col_builder(children: list[CompiledNode], literals: list[float]) -> Compile
     return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx))
 
 
+def _rolling_quantile_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 3:
+        raise ValueError("rolling_quantile expects 3 args: x, window, q")
+    if types[0].kind != "vector":
+        raise ValueError("rolling_quantile first arg must be vector")
+    if types[1].kind != "scalar" or types[2].kind != "scalar":
+        raise ValueError("rolling_quantile window and q args must be scalars")
+    return VECTOR
+
+
+@njit(inline="always")
+def _nan_quantile_linear(buf: np.ndarray, n: int64, q: float) -> float:
+    if n <= 0:
+        return np.nan
+    vals = np.empty(n, dtype=np.float64)
+    m = 0
+    for i in range(n):
+        v = buf[i]
+        if not np.isnan(v):
+            vals[m] = v
+            m += 1
+    if m == 0:
+        return np.nan
+    vals = np.sort(vals[:m])
+    if m == 1:
+        return vals[0]
+    pos = q * (m - 1.0)
+    lo = int(np.floor(pos))
+    hi = int(np.ceil(pos))
+    if lo == hi:
+        return vals[lo]
+    w = pos - lo
+    return vals[lo] * (1.0 - w) + vals[hi] * w
+
+
+def _rolling_quantile_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    window = int(round(literals[1]))
+    q = literals[2]
+    if window <= 0:
+        raise ValueError("rolling_quantile window must be >= 1")
+    if np.isnan(q) or q < 0.0 or q > 1.0:
+        raise ValueError("rolling_quantile q must be between 0 and 1")
+    spec = [
+        ("src", src.instance_type),
+        ("initialized", boolean),
+        ("window", int64),
+        ("q", float64),
+        ("head", int64),
+        ("size", int64),
+        ("ring", float64[:, :]),
+        ("scratch", float64[:]),
+        ("out", float64[:, :]),
+    ]
+
+    @jitclass(spec)
+    class RollingQuantileOp:
+        def __init__(self, src, window, q):
+            self.src = src
+            self.initialized = False
+            self.window = window
+            self.q = q
+            self.head = 0
+            self.size = 0
+            self.ring = np.empty((1, 1), dtype=np.float64)
+            self.scratch = np.empty(window, dtype=np.float64)
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            x = self.src.emit()
+            n = x.shape[0]
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.ring = np.empty((n, self.window), dtype=np.float64)
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.head = 0
+                self.size = 0
+                for i in range(n):
+                    for j in range(self.window):
+                        self.ring[i, j] = np.nan
+                self.initialized = True
+            for i in range(n):
+                self.ring[i, self.head] = x[i, 0]
+            self.head += 1
+            if self.head == self.window:
+                self.head = 0
+            if self.size < self.window:
+                self.size += 1
+            for i in range(n):
+                for j in range(self.size):
+                    idx = self.head - self.size + j
+                    if idx < 0:
+                        idx += self.window
+                    self.scratch[j] = self.ring[i, idx]
+                self.out[i, 0] = _nan_quantile_linear(self.scratch, self.size, self.q)
+
+        def emit(self):
+            return self.out
+
+    return CompiledNode(
+        VECTOR,
+        RollingQuantileOp.class_type.instance_type,
+        lambda: RollingQuantileOp(src.ctor(), window, q),
+    )
+
+
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) != 2:
         raise ValueError("groupby expects 2 args: key, op")
@@ -911,6 +1017,7 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="outer", validator=_outer_validator, builder=_outer_builder))
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
     REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
+    REGISTRY.register(OpSpec(name="rolling_quantile", validator=_rolling_quantile_validator, builder=_rolling_quantile_builder))
     REGISTRY.register(OpSpec(name="groupby", validator=_groupby_validator, builder=_groupby_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
     REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))

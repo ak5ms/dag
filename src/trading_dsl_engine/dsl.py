@@ -70,6 +70,7 @@ groupby = op("groupby")
 Ridge = op("Ridge")
 get_beta = op("get_beta")
 get_preds = op("get_preds")
+rolling_quantile = op("rolling_quantile")
 
 
 @register_dsl_function("ratio")

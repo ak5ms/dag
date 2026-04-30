@@ -133,6 +133,38 @@ def test_nan_handling_div_ewm_and_xs_rank():
     assert not np.isnan(out[1, 2])
 
 
+def test_rolling_quantile_matches_reference_and_streams():
+    eng = build_engine("rolling_quantile(close, 3, 0.5)")
+    close = np.array(
+        [
+            [1.0, np.nan],
+            [3.0, 2.0],
+            [2.0, 1.0],
+            [5.0, np.nan],
+        ],
+        dtype=np.float64,
+    )
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+    expected = np.array(
+        [
+            [1.0, np.nan],
+            [2.0, 2.0],
+            [2.0, 1.5],
+            [3.0, 1.5],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(out, expected, equal_nan=True)
+
+    eng_stream = build_engine("rolling_quantile(close, 3, 0.25)")
+    y1 = update_from_mapping(eng_stream, {"close": np.array([1.0, 2.0])}).copy()
+    y2 = update_from_mapping(eng_stream, {"close": np.array([5.0, np.nan])}).copy()
+    y3 = update_from_mapping(eng_stream, {"close": np.array([3.0, 4.0])}).copy()
+    np.testing.assert_allclose(y1[:, 0], np.array([1.0, 2.0]), equal_nan=True)
+    np.testing.assert_allclose(y2[:, 0], np.array([2.0, 2.0]), equal_nan=True)
+    np.testing.assert_allclose(y3[:, 0], np.array([2.0, 2.5]), equal_nan=True)
+
+
 def test_chunked_batch_matches_full_batch():
     eng1 = build_engine("ewm(div(close, open), 5)")
     eng2 = build_engine("ewm(div(close, open), 5)")
