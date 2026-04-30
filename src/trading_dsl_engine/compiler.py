@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 from numba import int64, types
 from numba.experimental import jitclass
@@ -20,6 +21,7 @@ class FormulaCompileError(ValueError):
 class CompileStats:
     expanded_nodes: int
     cache_hits: int
+    compile_seconds: float
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ def _expr_key(node: Expr) -> tuple:
 
 
 def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = None) -> CompiledFormulaArtifact:
+    started_at = perf_counter()
     register_builtin_ops()
     ast_expr = parse_formula(formula)
     inputs: dict[str, int] = {}
@@ -139,10 +142,15 @@ def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = Non
         typed_names.append(n)
 
     compiled = CompiledFormula(root.ctor(), typed_names, output_code)
+    compile_seconds = perf_counter() - started_at
     return CompiledFormulaArtifact(
         compiled=compiled,
         compiled_type=CompiledFormula.class_type.instance_type,
         input_names=ordered_names,
         output_kind=root.type_info.kind,
-        stats=CompileStats(expanded_nodes=expanded_nodes, cache_hits=cache_hits),
+        stats=CompileStats(
+            expanded_nodes=expanded_nodes,
+            cache_hits=cache_hits,
+            compile_seconds=compile_seconds,
+        ),
     )
