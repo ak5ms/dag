@@ -60,6 +60,7 @@ def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry
 add = op("add")
 sub = op("sub")
 mod = op("mod")
+shift = op("shift")
 div = op("div")
 ewm = op("ewm")
 xs_rank = op("xs_rank")
@@ -76,3 +77,8 @@ rolling_quantile = op("rolling_quantile")
 @register_dsl_function("ratio")
 def ratio(a: Expr, b: Expr) -> Expr:
     return div(a, b)
+
+
+@register_dsl_function("diff")
+def diff(x: Expr, nlag=1.0, max_size=1.0) -> Expr:
+    return sub(x, shift(x, nlag, max_size))

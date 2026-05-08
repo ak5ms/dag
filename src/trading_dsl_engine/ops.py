@@ -143,78 +143,6 @@ def make_nary_op(name: str, arity: int, kernel: Callable[[np.ndarray], float]) -
     REGISTRY.register(OpSpec(name=name, validator=validator, builder=builder))
 
 
-def make_binary_op(name: str, kernel: Callable[[float, float], float], *, nan_on_zero_divisor: bool = False) -> None:
-    kernel_jit = njit(inline="always")(kernel)
-
-    def validator(types: list[TypeInfo]) -> TypeInfo:
-        if len(types) != 2:
-            raise ValueError(f"{name} expects exactly 2 args")
-        kinds = {t.kind for t in types}
-        if kinds <= {"scalar"}:
-            return SCALAR
-        if kinds <= {"scalar", "vector"}:
-            return VECTOR
-        if kinds <= {"scalar", "matrix"}:
-            return MATRIX
-        if kinds == {"vector"}:
-            return VECTOR
-        if kinds == {"matrix"}:
-            return MATRIX
-        raise ValueError(f"{name} received incompatible arg kinds: {sorted(kinds)}")
-
-    def builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
-        left, right = children
-        spec = [
-            ("left", left.instance_type),
-            ("right", right.instance_type),
-            ("initialized", boolean),
-            ("out", float64[:, :]),
-        ]
-
-        @jitclass(spec)
-        class BinaryOp:
-            def __init__(self, left, right):
-                self.left = left
-                self.right = right
-                self.initialized = False
-                self.out = np.empty((1, 1), dtype=np.float64)
-
-            def on_data(self, frame2d):
-                self.left.on_data(frame2d)
-                self.right.on_data(frame2d)
-                a = self.left.emit()
-                b = self.right.emit()
-                rows = a.shape[0] if a.shape[0] != 1 else b.shape[0]
-                cols = a.shape[1] if a.shape[1] != 1 else b.shape[1]
-                if not self.initialized or self.out.shape[0] != rows or self.out.shape[1] != cols:
-                    self.out = np.empty((rows, cols), dtype=np.float64)
-                    self.initialized = True
-                for i in range(rows):
-                    ai = i if a.shape[0] > 1 else 0
-                    bi = i if b.shape[0] > 1 else 0
-                    for j in range(cols):
-                        aj = j if a.shape[1] > 1 else 0
-                        bj = j if b.shape[1] > 1 else 0
-                        av = a[ai, aj]
-                        bv = b[bi, bj]
-                        if np.isnan(av) or np.isnan(bv):
-                            self.out[i, j] = np.nan
-                        elif nan_on_zero_divisor and bv == 0.0:
-                            self.out[i, j] = np.nan
-                        else:
-                            self.out[i, j] = kernel_jit(av, bv)
-
-            def emit(self):
-                return self.out
-
-        out_type = validator([left.type_info, right.type_info])
-        return CompiledNode(out_type, BinaryOp.class_type.instance_type, lambda: BinaryOp(left.ctor(), right.ctor()))
-
-    REGISTRY.register(OpSpec(name=name, validator=validator, builder=builder))
-
-
-
-
 def _cumsum_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) != 1 or types[0].kind != "vector":
         raise ValueError("cumsum expects one vector arg")
@@ -254,24 +182,44 @@ def _cumsum_builder(children: list[CompiledNode], literals: list[float]) -> Comp
 
 
 def _shift_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) != 2 or types[0].kind != "vector" or types[1].kind != "scalar":
-        raise ValueError("shift expects args: vector, periods")
+    if len(types) not in (2, 3):
+        raise ValueError("shift expects args: vector, nlag[, max_size]")
+    if types[0].kind != "vector":
+        raise ValueError("shift first arg must be vector")
+    if types[1].kind != "scalar":
+        raise ValueError("shift nlag arg must be scalar")
+    if len(types) == 3 and types[2].kind != "scalar":
+        raise ValueError("shift max_size arg must be scalar")
     return VECTOR
 
 
 def _shift_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     src = children[0]
-    periods = int(round(literals[1]))
-    if periods < 0:
-        raise ValueError("shift periods must be >= 0")
-    spec = [("src", src.instance_type), ("initialized", boolean), ("periods", int64), ("ring", float64[:, :]), ("head", int64), ("size", int64), ("out", float64[:, :])]
+    nlag = children[1]
+    max_size_literal = literals[2] if len(children) == 3 else literals[1]
+    if np.isnan(max_size_literal):
+        raise ValueError("shift max_size must be a static numeric literal")
+    max_size = int(round(max_size_literal))
+    if max_size < 0:
+        raise ValueError("shift max_size must be >= 0")
+    spec = [
+        ("src", src.instance_type),
+        ("nlag", nlag.instance_type),
+        ("initialized", boolean),
+        ("max_size", int64),
+        ("ring", float64[:, :]),
+        ("head", int64),
+        ("size", int64),
+        ("out", float64[:, :]),
+    ]
 
     @jitclass(spec)
     class ShiftOp:
-        def __init__(self, src, periods):
+        def __init__(self, src, nlag, max_size):
             self.src = src
+            self.nlag = nlag
             self.initialized = False
-            self.periods = periods
+            self.max_size = max_size
             self.ring = np.empty((1, 1), dtype=np.float64)
             self.head = 0
             self.size = 0
@@ -279,9 +227,11 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
         def on_data(self, frame2d):
             self.src.on_data(frame2d)
+            self.nlag.on_data(frame2d)
             x = self.src.emit()
+            lag_value = self.nlag.emit()[0, 0]
             n = x.shape[0]
-            ring_len = self.periods + 1
+            ring_len = self.max_size + 1
             if (not self.initialized) or self.out.shape[0] != n:
                 self.ring = np.empty((n, ring_len), dtype=np.float64)
                 self.out = np.empty((n, 1), dtype=np.float64)
@@ -293,18 +243,22 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 self.initialized = True
             for i in range(n):
                 self.ring[i, self.head] = x[i, 0]
-            if self.size >= self.periods:
-                idx = self.head - self.periods
-                if idx < 0:
-                    idx += ring_len
-                for i in range(n):
-                    self.out[i, 0] = self.ring[i, idx]
-            elif self.periods == 0:
-                for i in range(n):
-                    self.out[i, 0] = x[i, 0]
-            else:
+            if np.isnan(lag_value):
                 for i in range(n):
                     self.out[i, 0] = np.nan
+            else:
+                lag = int(round(lag_value))
+                if lag < 0 or lag > self.max_size:
+                    raise ValueError("shift nlag must be between 0 and max_size")
+                if self.size >= lag:
+                    idx = self.head - lag
+                    if idx < 0:
+                        idx += ring_len
+                    for i in range(n):
+                        self.out[i, 0] = self.ring[i, idx]
+                else:
+                    for i in range(n):
+                        self.out[i, 0] = np.nan
             self.head += 1
             if self.head == ring_len:
                 self.head = 0
@@ -314,7 +268,7 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, ShiftOp.class_type.instance_type, lambda: ShiftOp(src.ctor(), periods))
+    return CompiledNode(VECTOR, ShiftOp.class_type.instance_type, lambda: ShiftOp(src.ctor(), nlag.ctor(), max_size))
 
 
 def _ewm_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -1189,18 +1143,18 @@ def register_builtin_ops() -> None:
     if getattr(register_builtin_ops, "_done", False):
         return
 
-    make_binary_op("div", lambda a, b: a / b, nan_on_zero_divisor=True)
-    make_binary_op("add", lambda a, b: a + b)
-    make_binary_op("sub", lambda a, b: a - b)
-    make_binary_op("mod", lambda a, b: a % b)
-    make_binary_op("mul", lambda a, b: a * b)
-    make_binary_op("eq", lambda a, b: 1.0 if a == b else 0.0)
-    make_binary_op("ne", lambda a, b: 1.0 if a != b else 0.0)
-    make_binary_op("and", lambda a, b: 1.0 if (a != 0.0 and b != 0.0) else 0.0)
-    make_binary_op("or", lambda a, b: 1.0 if (a != 0.0 or b != 0.0) else 0.0)
-    make_binary_op("and_", lambda a, b: 1.0 if (a != 0.0 and b != 0.0) else 0.0)
-    make_binary_op("or_", lambda a, b: 1.0 if (a != 0.0 or b != 0.0) else 0.0)
-    make_binary_op("xor", lambda a, b: 1.0 if ((a != 0.0) != (b != 0.0)) else 0.0)
+    make_nary_op("div", 2, lambda args: np.nan if args[1] == 0.0 else args[0] / args[1])
+    make_nary_op("add", 2, lambda args: args[0] + args[1])
+    make_nary_op("sub", 2, lambda args: args[0] - args[1])
+    make_nary_op("mod", 2, lambda args: args[0] % args[1])
+    make_nary_op("mul", 2, lambda args: args[0] * args[1])
+    make_nary_op("eq", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if args[0] == args[1] else 0.0))
+    make_nary_op("ne", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if args[0] != args[1] else 0.0))
+    make_nary_op("and", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if (args[0] != 0.0 and args[1] != 0.0) else 0.0))
+    make_nary_op("or", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if (args[0] != 0.0 or args[1] != 0.0) else 0.0))
+    make_nary_op("and_", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if (args[0] != 0.0 and args[1] != 0.0) else 0.0))
+    make_nary_op("or_", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if (args[0] != 0.0 or args[1] != 0.0) else 0.0))
+    make_nary_op("xor", 2, lambda args: np.nan if (np.isnan(args[0]) or np.isnan(args[1])) else (1.0 if ((args[0] != 0.0) != (args[1] != 0.0)) else 0.0))
     make_nary_op("where", 3, lambda args: args[1] if args[0] != 0.0 else args[2])
     make_nary_op("abs", 1, lambda args: np.abs(args[0]))
     make_nary_op("isnan", 1, lambda args: 1.0 if np.isnan(args[0]) else 0.0)

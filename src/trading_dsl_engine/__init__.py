@@ -14,8 +14,10 @@ from trading_dsl_engine.dsl import (
     op,
     outer,
     ratio,
+    diff,
     register_dsl_function,
     sub,
+    shift,
     xs_rank,
 )
 from trading_dsl_engine.engine import build_engine, run_batch_from_mapping, update_from_mapping
@@ -45,6 +47,8 @@ __all__ = [
     "get_beta",
     "get_preds",
     "ratio",
+    "diff",
+    "shift",
     "FormulaCompileError",
     "parse_formula",
     "FormulaParseError",

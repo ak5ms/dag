@@ -17,7 +17,7 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 - `src/trading_dsl_engine/parser.py`
   - Formula parser (`parse_formula`) using Python AST with strict validation.
 - `src/trading_dsl_engine/dsl.py`
-  - Python DSL constructors (`add`, `div`, `ewm`, `xs_rank`, etc.) and `DSLFunctionRegistry`.
+  - Python DSL constructors (`add`, `div`, `shift`, `ewm`, `xs_rank`, etc.), composed helpers like `diff`, and `DSLFunctionRegistry`.
 - `src/trading_dsl_engine/registry.py`
   - Operator metadata and registration primitives.
 - `src/trading_dsl_engine/ops.py`
@@ -64,7 +64,7 @@ def hlc3(high, low, close):
     return div(add(add(high, low), close), 3.0)
 ```
 
-Then compile with `compile_formula(..., dsl_registry=my_registry)`.
+Then compile with `compile_formula(..., dsl_registry=my_registry)`. Built-in composed DSL functions include `diff(x, nlag=1, max_size=1)`, which expands to `sub(x, shift(x, nlag, max_size))`.
 
 The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile_seconds`) so compile-time CSE behavior and compile latency can be validated.
 
@@ -78,6 +78,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 
 - Binary ops propagate NaN values.
 - `div` returns NaN on divide-by-zero.
+- `shift(x, nlag, max_size)` stores a static ring capacity from numeric literal `max_size` while reading `x` and scalar `nlag` as sources; `shift(x, literal_nlag)` remains supported by using the literal lag as capacity.
 - `ewm` skips updates for NaN inputs and can recover from NaN state.
 - `xs_rank` ranks only valid values and emits NaN where input is NaN.
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).

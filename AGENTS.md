@@ -15,6 +15,7 @@ Priorities, in order:
 
 - Every operation should follow strict `on_data(...)` + `emit(...)` behavior (including stateless ops).
 - Live updates must be incremental; do not recompute full history in update paths.
+- Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - Support arity > 1 cleanly.

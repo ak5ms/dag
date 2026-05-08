@@ -472,7 +472,7 @@ def test_isnan_and_abs_streaming():
 
 
 def test_cumsum_shift_streaming():
-    eng = build_engine("shift(cumsum(close), 1)")
+    eng = build_engine("shift(cumsum(close), 1, 1)")
     y1 = update_from_mapping(eng, {"close": np.array([1.0, np.nan])}).copy()
     y2 = update_from_mapping(eng, {"close": np.array([-2.0, 4.0])}).copy()
     y3 = update_from_mapping(eng, {"close": np.array([3.0, -1.0])}).copy()
@@ -480,3 +480,36 @@ def test_cumsum_shift_streaming():
     np.testing.assert_allclose(y1[:, 0], np.array([np.nan, np.nan]), equal_nan=True)
     np.testing.assert_allclose(y2[:, 0], np.array([1.0, 0.0]), equal_nan=True)
     np.testing.assert_allclose(y3[:, 0], np.array([-1.0, 4.0]), equal_nan=True)
+
+
+def test_shift_uses_static_max_size_for_lag_capacity():
+    eng = build_engine("shift(close, 2, 2)")
+    y1 = update_from_mapping(eng, {"close": np.array([1.0, 10.0])}).copy()
+    y2 = update_from_mapping(eng, {"close": np.array([2.0, 20.0])}).copy()
+    y3 = update_from_mapping(eng, {"close": np.array([3.0, 30.0])}).copy()
+
+    np.testing.assert_allclose(y1[:, 0], np.array([np.nan, np.nan]), equal_nan=True)
+    np.testing.assert_allclose(y2[:, 0], np.array([np.nan, np.nan]), equal_nan=True)
+    np.testing.assert_allclose(y3[:, 0], np.array([1.0, 10.0]), equal_nan=True)
+
+
+def test_diff_dsl_function_defaults_to_one_lag():
+    eng = build_engine("diff(close)")
+    y1 = update_from_mapping(eng, {"close": np.array([1.0, 2.0])}).copy()
+    y2 = update_from_mapping(eng, {"close": np.array([3.0, 5.0])}).copy()
+
+    np.testing.assert_allclose(y1[:, 0], np.array([np.nan, np.nan]), equal_nan=True)
+    np.testing.assert_allclose(y2[:, 0], np.array([2.0, 3.0]), equal_nan=True)
+
+
+def test_diff_dsl_function_accepts_lag_and_max_size():
+    eng = build_engine("diff(close, 2, 2)")
+    for values in (np.array([1.0, 10.0]), np.array([2.0, 20.0])):
+        np.testing.assert_allclose(
+            update_from_mapping(eng, {"close": values})[:, 0],
+            np.array([np.nan, np.nan]),
+            equal_nan=True,
+        )
+    y3 = update_from_mapping(eng, {"close": np.array([4.0, 25.0])}).copy()
+
+    np.testing.assert_allclose(y3[:, 0], np.array([3.0, 15.0]), equal_nan=True)
