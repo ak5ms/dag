@@ -33,6 +33,73 @@ def _manual_formula(close, open_, span):
     return np.array(out)[:, :, 0]
 
 
+
+
+def _reference_online_ewm_ridge(features, y, weights, hl, ridge):
+    n_steps = y.shape[0]
+    n_features = len(features)
+    rho = 0.0 if hl <= 0.0 or np.isnan(hl) else np.exp(np.log(0.5) / hl)
+    alpha = float(np.clip(1.0 - rho, 0.0, 1.0))
+    xx = np.zeros((n_features, n_features), dtype=np.float64)
+    xy = np.zeros(n_features, dtype=np.float64)
+    last_xx = np.zeros((n_features, n_features), dtype=np.int64)
+    last_xy = np.zeros(n_features, dtype=np.int64)
+    has_xx = np.zeros((n_features, n_features), dtype=bool)
+    has_xy = np.zeros(n_features, dtype=bool)
+    beta = np.zeros(n_features, dtype=np.float64)
+    out = np.empty((n_steps, n_features), dtype=np.float64)
+
+    for t in range(n_steps):
+        x = np.column_stack([feature[t] for feature in features])
+        yt = y[t]
+        wt = weights[t]
+        valid_x = np.isfinite(x)
+        valid_y = np.isfinite(yt)
+        valid_w = np.isfinite(wt)
+        x0 = np.where(valid_x, x, 0.0)
+        y0 = np.where(valid_y, yt, 0.0)
+        w0 = np.where(valid_w, wt, 0.0)
+
+        xw = x0 * w0[:, None]
+        xx_new = x0.T @ xw
+        xx_counts = valid_x.astype(np.int64).T @ (valid_x & valid_w[:, None]).astype(np.int64)
+        xx_valid = xx_counts > 0
+
+        xy_new = x0.T @ (w0 * y0)
+        xy_counts = valid_x.astype(np.int64).T @ (valid_y & valid_w).astype(np.int64)
+        xy_valid = xy_counts > 0
+
+        for j in range(n_features):
+            if xy_valid[j]:
+                if has_xy[j]:
+                    a = alpha ** (t - last_xy[j])
+                    xy[j] = xy[j] * (1.0 - a) + xy_new[j] * a
+                else:
+                    xy[j] = xy_new[j]
+                    has_xy[j] = True
+                last_xy[j] = t
+            for k in range(j, n_features):
+                if xx_valid[j, k]:
+                    if has_xx[j, k]:
+                        a = alpha ** (t - last_xx[j, k])
+                        xx[j, k] = xx[j, k] * (1.0 - a) + xx_new[j, k] * a
+                    else:
+                        xx[j, k] = xx_new[j, k]
+                        has_xx[j, k] = True
+                    last_xx[j, k] = t
+                    xx[k, j] = xx[j, k]
+                    last_xx[k, j] = last_xx[j, k]
+                    has_xx[k, j] = has_xx[j, k]
+
+        system = xx + ridge * np.diag(np.diag(xx))
+        try:
+            beta = np.linalg.solve(system, xy)
+        except np.linalg.LinAlgError:
+            beta = beta.copy()
+        out[t] = beta
+    return out
+
+
 def test_compile_collects_inputs_and_runs_formula():
     c = compile_formula("xs_rank(ewm(div(close, open), 21))")
     assert c.input_names == ("close", "open")
@@ -305,6 +372,47 @@ def test_object_emitter_can_be_consumed_by_downstream_array_op():
 
     expected = np.array([[1.5, 1.5], [4.0, 4.0], [9.0, 9.0]])
     np.testing.assert_allclose(out, expected)
+
+
+def test_ridge_pairwise_nan_ewm_matches_numpy_reference():
+    rng = np.random.default_rng(42)
+    t = 8
+    n = 5
+    close = rng.normal(size=(t, n))
+    open_ = rng.normal(size=(t, n))
+    volume = rng.normal(size=(t, n))
+    target = rng.normal(size=(t, n))
+    weights = rng.uniform(0.5, 2.0, size=(t, n))
+
+    # Exercise random NaNs, complete feature outages, complete weight outages,
+    # and pairwise-only valid updates where one feature is missing but another
+    # feature can still update its own sufficient statistics.
+    close[1, [0, 3]] = np.nan
+    open_[2, :] = np.nan
+    volume[3, [1, 2, 4]] = np.nan
+    target[4, [0, 2]] = np.nan
+    weights[5, :] = np.nan
+    close[6, 0] = np.nan
+    open_[6, 1:] = np.nan
+
+    formula = "get_beta(Ridge(close, open, volume, target, weights, 4, 0.1))"
+    eng = build_engine(formula)
+    actual = np.empty((t, 3), dtype=np.float64)
+    for i in range(t):
+        actual[i] = update_from_mapping(
+            eng,
+            {
+                "close": close[i],
+                "open": open_[i],
+                "volume": volume[i],
+                "target": target[i],
+                "weights": weights[i],
+            },
+        )[:, 0]
+
+    expected = _reference_online_ewm_ridge([close, open_, volume], target, weights, hl=4.0, ridge=0.1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+    assert np.isfinite(actual).all()
 
 
 def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():

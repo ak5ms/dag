@@ -90,8 +90,10 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 
 - `Ridge(x1, x2, ..., xk, y, weights, hl, lambda)` emits an object state and performs cross-sectional EWMA ridge updates each tick.
 - Ridge feature args can be vectors and/or matrices; matrix features are expanded by columns internally, so `Ridge(bspline(...), y, w, hl, lambda)` works without manual `col(...)` calls.
-- `weights` is mandatory per timestep and can be either a vector `(n, 1)`/`(n,)` (treated as diagonal weights) or a matrix `(n, n)`.
-- State uses exponentially-weighted sufficient statistics and a Sherman-Morrison inverse update path for the feature precision matrix.
+- `weights` is mandatory per timestep and is consumed as a vector `(n, 1)`/`(n,)` of sample weights.
+- State uses pairwise-NaN-aware exponentially weighted sufficient statistics (`X'WX`, `X'Wy`) with per-statistic clocks, then solves `beta = (G + lambda * diag(G))^-1 h` fresh each tick.
+- Pairwise clocks only advance when the corresponding `xx[j, k]` or `xy[j]` statistic receives at least one finite observation; missing rows or full outages leave only the affected statistics unchanged.
+- A visual checklist for NaN behavior is available in `docs/ewm_regression_nan_handling.svg`.
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
