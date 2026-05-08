@@ -775,8 +775,13 @@ _ridge_state_spec = [
     ("initialized", boolean),
     ("n_instruments", int64),
     ("n_features", int64),
-    ("b", float64[:]),
-    ("p", float64[:, :]),
+    ("t", int64),
+    ("xx", float64[:, :]),
+    ("xy", float64[:]),
+    ("last_xx", int64[:, :]),
+    ("last_xy", int64[:]),
+    ("has_xx", boolean[:, :]),
+    ("has_xy", boolean[:]),
     ("beta", float64[:]),
     ("preds", float64[:, :]),
     ("beta_out", float64[:, :]),
@@ -789,31 +794,16 @@ class _RidgeState:
         self.initialized = False
         self.n_instruments = 0
         self.n_features = 0
-        self.b = np.empty(1, dtype=np.float64)
-        self.p = np.empty((1, 1), dtype=np.float64)
+        self.t = 0
+        self.xx = np.empty((1, 1), dtype=np.float64)
+        self.xy = np.empty(1, dtype=np.float64)
+        self.last_xx = np.empty((1, 1), dtype=np.int64)
+        self.last_xy = np.empty(1, dtype=np.int64)
+        self.has_xx = np.empty((1, 1), dtype=np.bool_)
+        self.has_xy = np.empty(1, dtype=np.bool_)
         self.beta = np.empty(1, dtype=np.float64)
         self.preds = np.empty((1, 1), dtype=np.float64)
         self.beta_out = np.empty((1, 1), dtype=np.float64)
-
-
-@njit(inline="always")
-def _sm_update_matrix(p, u):
-    k = p.shape[0]
-    v = np.empty(k, dtype=np.float64)
-    for i in range(k):
-        acc = 0.0
-        for j in range(k):
-            acc += p[i, j] * u[j]
-        v[i] = acc
-    den = 1.0
-    for i in range(k):
-        den += u[i] * v[i]
-    if den <= 1e-12 or np.isnan(den):
-        return
-    inv_den = 1.0 / den
-    for i in range(k):
-        for j in range(k):
-            p[i, j] -= v[i] * v[j] * inv_den
 
 
 @njit(inline="always")
@@ -822,6 +812,159 @@ def _dot_vec(a, b):
     for i in range(a.shape[0]):
         acc += a[i] * b[i]
     return acc
+
+
+@njit
+def _pairwise_weighted_moments(x, y, w):
+    """Build pairwise-NaN-aware X'WX and X'Wy snapshots.
+
+    This mirrors the intended NumPy semantics without requiring BLAS at runtime:
+    valid_x = np.isfinite(x); x0 = np.where(valid_x, x, 0.0)
+    xx_new[j, k] = np.sum(x0[:, j] * x0[:, k] * w0)
+    with a separate validity mask for each statistic.
+    """
+    n = x.shape[0]
+    k = x.shape[1]
+    xx_new = np.zeros((k, k), dtype=np.float64)
+    xy_new = np.zeros(k, dtype=np.float64)
+    xx_valid = np.zeros((k, k), dtype=np.bool_)
+    xy_valid = np.zeros(k, dtype=np.bool_)
+
+    valid_x = np.isfinite(x)
+    valid_y = np.isfinite(y)
+    valid_w = np.isfinite(w)
+    x0 = np.where(valid_x, x, 0.0)
+    y0 = np.where(valid_y, y, 0.0)
+    w0 = np.where(valid_w, w, 0.0)
+
+    for j in range(k):
+        xy_acc = 0.0
+        xy_seen = False
+        for i in range(n):
+            if valid_x[i, j] and valid_y[i] and valid_w[i]:
+                xy_acc += x0[i, j] * y0[i] * w0[i]
+                xy_seen = True
+        xy_new[j] = xy_acc
+        xy_valid[j] = xy_seen
+
+        for m in range(j, k):
+            xx_acc = 0.0
+            xx_seen = False
+            for i in range(n):
+                if valid_x[i, j] and valid_x[i, m] and valid_w[i]:
+                    xx_acc += x0[i, j] * x0[i, m] * w0[i]
+                    xx_seen = True
+            xx_new[j, m] = xx_acc
+            xx_new[m, j] = xx_acc
+            xx_valid[j, m] = xx_seen
+            xx_valid[m, j] = xx_seen
+
+    return xx_new, xy_new, xx_valid, xy_valid
+
+
+@njit
+def _pairwise_weighted_moments_matrix(x, y, w):
+    """Build pairwise-NaN-aware X'WX and X'Wy snapshots for a dense W."""
+    n = x.shape[0]
+    k = x.shape[1]
+    xx_new = np.zeros((k, k), dtype=np.float64)
+    xy_new = np.zeros(k, dtype=np.float64)
+    xx_valid = np.zeros((k, k), dtype=np.bool_)
+    xy_valid = np.zeros(k, dtype=np.bool_)
+
+    valid_x = np.isfinite(x)
+    valid_y = np.isfinite(y)
+    valid_w = np.isfinite(w)
+    x0 = np.where(valid_x, x, 0.0)
+    y0 = np.where(valid_y, y, 0.0)
+    w0 = np.where(valid_w, w, 0.0)
+
+    for j in range(k):
+        xy_acc = 0.0
+        xy_seen = False
+        for r in range(n):
+            if valid_x[r, j]:
+                for c in range(n):
+                    if valid_w[r, c] and valid_y[c]:
+                        xy_acc += x0[r, j] * w0[r, c] * y0[c]
+                        xy_seen = True
+        xy_new[j] = xy_acc
+        xy_valid[j] = xy_seen
+
+        for m in range(k):
+            xx_acc = 0.0
+            xx_seen = False
+            for r in range(n):
+                if valid_x[r, j]:
+                    for c in range(n):
+                        if valid_w[r, c] and valid_x[c, m]:
+                            xx_acc += x0[r, j] * w0[r, c] * x0[c, m]
+                            xx_seen = True
+            xx_new[j, m] = xx_acc
+            xx_valid[j, m] = xx_seen
+
+    return xx_new, xy_new, xx_valid, xy_valid
+
+
+@njit
+def _solve_linear_system(a, b, out):
+    """Small dense Gaussian solve used to avoid a SciPy/BLAS runtime dependency."""
+    n = b.shape[0]
+    aug = np.empty((n, n + 1), dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            aug[i, j] = a[i, j]
+        aug[i, n] = b[i]
+
+    eps = 1e-12
+    for col in range(n):
+        pivot = col
+        pivot_abs = abs(aug[col, col])
+        for row in range(col + 1, n):
+            candidate = abs(aug[row, col])
+            if candidate > pivot_abs:
+                pivot = row
+                pivot_abs = candidate
+        if pivot_abs <= eps or np.isnan(pivot_abs):
+            return False
+        if pivot != col:
+            for j in range(col, n + 1):
+                tmp = aug[col, j]
+                aug[col, j] = aug[pivot, j]
+                aug[pivot, j] = tmp
+
+        pivot_value = aug[col, col]
+        for row in range(col + 1, n):
+            factor = aug[row, col] / pivot_value
+            aug[row, col] = 0.0
+            for j in range(col + 1, n + 1):
+                aug[row, j] -= factor * aug[col, j]
+
+    for i in range(n - 1, -1, -1):
+        rhs = aug[i, n]
+        for j in range(i + 1, n):
+            rhs -= aug[i, j] * out[j]
+        diag = aug[i, i]
+        if abs(diag) <= eps or np.isnan(diag):
+            return False
+        out[i] = rhs / diag
+    return True
+
+
+@njit
+def _solve_scaled_ridge(xx, xy, ridge, beta):
+    k = xy.shape[0]
+    system = np.empty((k, k), dtype=np.float64)
+    for i in range(k):
+        for j in range(k):
+            system[i, j] = xx[i, j]
+        system[i, i] += ridge * xx[i, i]
+    candidate = np.empty(k, dtype=np.float64)
+    ok = _solve_linear_system(system, xy, candidate)
+    if ok:
+        for i in range(k):
+            beta[i] = candidate[i]
+    return ok
 
 
 def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -865,6 +1008,21 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.lam_node = lam_node
             self.state = _RidgeState()
 
+        def _reset_state(self, n, k):
+            self.state.initialized = True
+            self.state.n_instruments = n
+            self.state.n_features = k
+            self.state.t = 0
+            self.state.xx = np.zeros((k, k), dtype=np.float64)
+            self.state.xy = np.zeros(k, dtype=np.float64)
+            self.state.last_xx = np.zeros((k, k), dtype=np.int64)
+            self.state.last_xy = np.zeros(k, dtype=np.int64)
+            self.state.has_xx = np.zeros((k, k), dtype=np.bool_)
+            self.state.has_xy = np.zeros(k, dtype=np.bool_)
+            self.state.beta = np.zeros(k, dtype=np.float64)
+            self.state.preds = np.empty((n, 1), dtype=np.float64)
+            self.state.beta_out = np.zeros((k, 1), dtype=np.float64)
+
         def on_data(self, frame2d):
             self.y_node.on_data(frame2d)
             self.w_node.on_data(frame2d)
@@ -872,41 +1030,43 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.lam_node.on_data(frame2d)
             for node in literal_unroll(self.x_nodes):
                 node.on_data(frame2d)
-            y = self.y_node.emit()
-            w = self.w_node.emit()
+
+            y2d = self.y_node.emit()
+            w2d = self.w_node.emit()
             hl = self.hl_node.emit()[0, 0]
             lam = self.lam_node.emit()[0, 0]
-            n = y.shape[0]
+            n = y2d.shape[0]
             total_k = 0
             for node in literal_unroll(self.x_nodes):
-                x = node.emit()
-                total_k += x.shape[1]
+                total_k += node.emit().shape[1]
 
             if (not self.state.initialized) or self.state.n_instruments != n or self.state.n_features != total_k:
-                self.state.initialized = True
-                self.state.n_instruments = n
-                self.state.n_features = total_k
-                self.state.b = np.zeros(total_k, dtype=np.float64)
-                self.state.p = np.empty((total_k, total_k), dtype=np.float64)
-                self.state.beta = np.zeros(total_k, dtype=np.float64)
-                for i in range(total_k):
-                    for j in range(total_k):
-                        self.state.p[i, j] = 1e6 if i == j else 0.0
-                self.state.preds = np.empty((n, 1), dtype=np.float64)
-                self.state.beta_out = np.empty((total_k, 1), dtype=np.float64)
+                self._reset_state(n, total_k)
 
             k = self.state.n_features
-            xmat = np.empty((k, n), dtype=np.float64)
+            xmat = np.empty((n, k), dtype=np.float64)
             idx = 0
             for node in literal_unroll(self.x_nodes):
                 feat = node.emit()
-                feat_width = feat.shape[1]
-                for j in range(feat_width):
-                    for i in range(n):
-                        xmat[idx, i] = feat[i, j]
-                    idx += 1
+                width = feat.shape[1]
+                for col in range(width):
+                    xmat[:, idx + col] = feat[:, col]
+                idx += width
 
-            xvec = np.empty(k, dtype=np.float64)
+            for i in range(n):
+                has_nan = np.isnan(y2d[i, 0])
+                for j in range(k):
+                    if np.isnan(xmat[i, j]):
+                        has_nan = True
+                if has_nan:
+                    self.state.preds[i, 0] = np.nan
+                else:
+                    self.state.preds[i, 0] = _dot_vec(self.state.beta, xmat[i, :])
+
+            w_cols = w2d.shape[1]
+            if w2d.shape[0] != n or (w_cols != 1 and w_cols != n):
+                raise ValueError("Ridge weights shape must be (n, 1) or (n, n)")
+
             if np.isnan(hl) or hl <= 0.0:
                 rho = 0.0
             else:
@@ -918,154 +1078,53 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 alpha = 1.0
             if np.isnan(lam) or lam < 0.0:
                 lam = 0.0
-            eps = 1e-12
-            inv_rho = 1.0 / (rho if rho > eps else eps)
-            # EW forgetting:
-            # - b_t = rho * b_{t-1} + alpha * X'Wy
-            # - cov_t = rho * cov_{t-1} + alpha * X'WX
-            # state.p stores an inverse-like precision term, so scaling cov by rho
-            # corresponds to scaling precision by 1/rho.
-            for i in range(k):
-                self.state.b[i] = rho * self.state.b[i]
-                for j in range(k):
-                    self.state.p[i, j] *= inv_rho
 
-            w_cols = w.shape[1]
-            if w.shape[0] != n or (w_cols != 1 and w_cols != n):
-                raise ValueError("Ridge weights shape must be (n,1) or (n,n)")
-
-            for i in range(n):
-                for j in range(k):
-                    xvec[j] = xmat[j, i]
-                target = y[i, 0]
-                has_nan = np.isnan(target)
-                if not has_nan:
-                    for j in range(k):
-                        if np.isnan(xvec[j]):
-                            has_nan = True
-                            break
-                if has_nan:
-                    self.state.preds[i, 0] = np.nan
-                    continue
-                self.state.preds[i, 0] = _dot_vec(self.state.beta, xvec)
-
-            u = np.empty(k, dtype=np.float64)
+            y = y2d[:, 0]
             if w_cols == 1:
-                # Vector weights path: W = diag(w). Each instrument contributes one
-                # rank-1 update using sqrt(alpha * w_i) * x_i, then optional
-                # diagonal ridge stabilization via per-feature rank-1 updates.
-                for i in range(n):
-                    wi = w[i, 0]
-                    target = y[i, 0]
-                    # NaN/invalid handling:
-                    # - ignore rows with invalid/non-positive weights
-                    # - ignore rows with NaN target or NaN features
-                    if np.isnan(wi) or wi <= 0.0 or np.isnan(target):
-                        continue
-                    has_nan = False
-                    for j in range(k):
-                        xvec[j] = xmat[j, i]
-                        if np.isnan(xvec[j]):
-                            has_nan = True
-                    if has_nan:
-                        continue
-                    for j in range(k):
-                        self.state.b[j] += alpha * wi * xvec[j] * target
-                    scale = np.sqrt(alpha * wi)
-                    for j in range(k):
-                        u[j] = scale * xvec[j]
-                    _sm_update_matrix(self.state.p, u)
-                    if lam > 0.0:
-                        for j in range(k):
-                            if xvec[j] == 0.0:
-                                continue
-                            for m in range(k):
-                                u[m] = 0.0
-                            u[j] = np.sqrt(alpha * lam * wi) * abs(xvec[j])
-                            _sm_update_matrix(self.state.p, u)
+                xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments(xmat, y, w2d[:, 0])
             else:
-                # Matrix weights path:
-                # b contribution uses alpha * X'Wy.
-                for i in range(n):
-                    wi_target = 0.0
-                    valid = True
-                    for j in range(n):
-                        wij = w[i, j]
-                        yj = y[j, 0]
-                        if np.isnan(wij) or np.isnan(yj):
-                            valid = False
-                            break
-                        wi_target += wij * yj
-                    if (not valid) or np.isnan(y[i, 0]):
-                        continue
-                    for j in range(k):
-                        xvec[j] = xmat[j, i]
-                    has_nan = False
-                    for j in range(k):
-                        if np.isnan(xvec[j]):
-                            has_nan = True
-                    if has_nan:
-                        continue
-                    for j in range(k):
-                        self.state.b[j] += alpha * xvec[j] * wi_target
-                # cov contribution uses alpha * X'WX.
-                # For each row r, build u = (W[r, :] @ X)^T and apply a normalized
-                # rank-1 Sherman-Morrison-style update. The normalization keeps the
-                # rank-1 term aligned with x_r' W x_r and avoids unstable negative
-                # / NaN square roots.
-                for r in range(n):
-                    for j in range(k):
-                        u[j] = 0.0
-                    valid = True
-                    for c in range(n):
-                        wrc = w[r, c]
-                        if np.isnan(wrc):
-                            valid = False
-                            break
-                        xc = xmat[:, c]
-                        for j in range(k):
-                            if np.isnan(xc[j]):
-                                valid = False
-                                break
-                            u[j] += wrc * xc[j]
-                        if not valid:
-                            break
-                    if not valid:
-                        continue
-                    for j in range(k):
-                        xvec[j] = xmat[j, r]
-                    has_nan = False
-                    for j in range(k):
-                        if np.isnan(xvec[j]):
-                            has_nan = True
-                    if has_nan:
-                        continue
-                    proj = _dot_vec(xvec, u)
-                    # If projected weight is non-positive/NaN, skip that update to
-                    # preserve numeric stability and keep inverse updates valid.
-                    if proj <= 0.0 or np.isnan(proj):
-                        continue
-                    scale = np.sqrt(alpha / proj)
-                    for j in range(k):
-                        u[j] = scale * u[j]
-                    _sm_update_matrix(self.state.p, u)
-                    if lam > 0.0:
-                        # Apply ridge adjustment as diagonal rank-1 increments.
-                        for j in range(k):
-                            diag_contrib = alpha * lam * xvec[j] * u[j]
-                            if diag_contrib <= 0.0 or np.isnan(diag_contrib):
-                                continue
-                            for m in range(k):
-                                u[m] = 0.0
-                            u[j] = np.sqrt(diag_contrib)
-                            _sm_update_matrix(self.state.p, u)
+                xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments_matrix(xmat, y, w2d)
+            now = self.state.t
 
+            for j in range(k):
+                if xy_valid[j]:
+                    if self.state.has_xy[j]:
+                        dt = now - self.state.last_xy[j]
+                        a = alpha**dt
+                        self.state.xy[j] = self.state.xy[j] * (1.0 - a) + xy_new[j] * a
+                    else:
+                        self.state.xy[j] = xy_new[j]
+                        self.state.has_xy[j] = True
+                    self.state.last_xy[j] = now
+
+                for m in range(k):
+                    if xx_valid[j, m]:
+                        if self.state.has_xx[j, m]:
+                            dt = now - self.state.last_xx[j, m]
+                            a = alpha**dt
+                            self.state.xx[j, m] = self.state.xx[j, m] * (1.0 - a) + xx_new[j, m] * a
+                        else:
+                            self.state.xx[j, m] = xx_new[j, m]
+                            self.state.has_xx[j, m] = True
+                        self.state.last_xx[j, m] = now
+
+            for j in range(k):
+                for m in range(j + 1, k):
+                    self.state.xx[j, m] = 0.5 * (self.state.xx[j, m] + self.state.xx[m, j])
+                    self.state.xx[m, j] = self.state.xx[j, m]
+                    last = self.state.last_xx[j, m]
+                    if self.state.last_xx[m, j] > last:
+                        last = self.state.last_xx[m, j]
+                    self.state.last_xx[j, m] = last
+                    self.state.last_xx[m, j] = last
+                    has = self.state.has_xx[j, m] or self.state.has_xx[m, j]
+                    self.state.has_xx[j, m] = has
+                    self.state.has_xx[m, j] = has
+
+            _solve_scaled_ridge(self.state.xx, self.state.xy, lam, self.state.beta)
             for i in range(k):
-                acc = 0.0
-                for j in range(k):
-                    acc += self.state.p[i, j] * self.state.b[j]
-                self.state.beta[i] = acc
-                self.state.beta_out[i, 0] = acc
+                self.state.beta_out[i, 0] = self.state.beta[i]
+            self.state.t += 1
 
         def emit(self):
             return self.state

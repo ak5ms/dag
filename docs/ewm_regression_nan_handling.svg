@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="520" viewBox="0 0 920 520" role="img" aria-labelledby="title desc">
+  <title id="title">Pairwise NaN-aware EWM ridge regression update flow</title>
+  <desc id="desc">Diagram showing finite masks, pairwise XX and XY statistic gates, per-statistic clocks, and scaled ridge solve.</desc>
+  <defs>
+    <style>
+      .bg{fill:#fbfcfe}.box{fill:#fff;stroke:#243b53;stroke-width:2;rx:12}.gate{fill:#eef8ff;stroke:#0b7285;stroke-width:2;rx:12}.hold{fill:#fff4e6;stroke:#d9480f;stroke-width:2;rx:12}.solve{fill:#f3f0ff;stroke:#5f3dc4;stroke-width:2;rx:12}.txt{font:16px sans-serif;fill:#102a43}.small{font:13px sans-serif;fill:#334e68}.code{font:14px monospace;fill:#102a43}.arrow{stroke:#334e68;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.good{fill:#2f9e44}.bad{fill:#e03131}.muted{fill:#adb5bd}
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#334e68"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="920" height="520"/>
+  <text class="txt" x="36" y="38" font-weight="700">EWMRegression pairwise NaN handling</text>
+  <text class="small" x="36" y="62">Rows are ignored only for the statistic whose required values are non-finite.</text>
+
+  <rect class="box" x="36" y="92" width="190" height="104"/>
+  <text class="txt" x="56" y="122" font-weight="700">Inputs at t</text>
+  <text class="code" x="56" y="150">X: n × p</text>
+  <text class="code" x="56" y="172">y: n</text>
+  <text class="code" x="56" y="194">w: n or n × n</text>
+
+  <rect class="gate" x="286" y="80" width="260" height="132"/>
+  <text class="txt" x="306" y="110" font-weight="700">Finite masks</text>
+  <circle class="good" cx="316" cy="140" r="7"/><text class="small" x="332" y="145">valid_x = finite(X)</text>
+  <circle class="good" cx="316" cy="166" r="7"/><text class="small" x="332" y="171">valid_y = finite(y)</text>
+  <circle class="good" cx="316" cy="192" r="7"/><text class="small" x="332" y="197">valid_w = finite(w)</text>
+
+  <rect class="gate" x="610" y="78" width="274" height="136"/>
+  <text class="txt" x="630" y="108" font-weight="700">Vectorized snapshot</text>
+  <text class="code" x="630" y="136">X0 = where(valid_x, X, 0)</text>
+  <text class="code" x="630" y="160">w0 = where(valid_w, w, 0)</text>
+  <text class="code" x="630" y="184">xx_new = X0' @ (X0*w0)</text>
+  <text class="code" x="630" y="206">xy_new = X0' @ (w0*y0)</text>
+
+  <path class="arrow" d="M226 144 H286"/><path class="arrow" d="M546 146 H610"/>
+
+  <rect class="gate" x="76" y="278" width="330" height="124"/>
+  <text class="txt" x="96" y="308" font-weight="700">XX gate for pair (j, k)</text>
+  <text class="small" x="96" y="338">Contribute row i only if finite:</text>
+  <text class="code" x="96" y="366">vector: x[i,j], x[i,k], w[i]</text>
+  <text class="code" x="96" y="386">matrix: x[r,j], x[c,k], W[r,c]</text>
+  <text class="small" x="96" y="410">No valid rows/pairs → keep xx[j,k] and clock unchanged.</text>
+
+  <rect class="gate" x="514" y="278" width="330" height="124"/>
+  <text class="txt" x="534" y="308" font-weight="700">XY gate for feature j</text>
+  <text class="small" x="534" y="338">Contribute row i only if finite:</text>
+  <text class="code" x="534" y="366">vector: x[i,j], y[i], w[i]</text>
+  <text class="code" x="534" y="386">matrix: x[r,j], y[c], W[r,c]</text>
+  <text class="small" x="534" y="410">No valid rows/pairs → keep xy[j] and clock unchanged.</text>
+
+  <path class="arrow" d="M735 214 C735 245 265 245 250 278"/>
+  <path class="arrow" d="M762 214 C762 245 678 247 678 278"/>
+
+  <rect class="hold" x="116" y="430" width="286" height="64"/>
+  <text class="txt" x="136" y="456" font-weight="700">If valid update exists</text>
+  <text class="code" x="136" y="480">old*(1-alpha^dt) + new*alpha^dt</text>
+
+  <rect class="solve" x="514" y="430" width="330" height="64"/>
+  <text class="txt" x="534" y="456" font-weight="700">Solve after symmetry sync</text>
+  <text class="code" x="534" y="480">beta = solve(G + lambda*diag(G), h)</text>
+
+  <path class="arrow" d="M250 402 V430"/><path class="arrow" d="M678 402 V430"/><path class="arrow" d="M402 462 H514"/>
+
+  <g transform="translate(41 226)">
+    <text class="small" x="0" y="0" font-weight="700">Legend:</text>
+    <circle class="good" cx="74" cy="-5" r="7"/><text class="small" x="88" y="0">finite</text>
+    <circle class="bad" cx="150" cy="-5" r="7"/><text class="small" x="164" y="0">NaN ignored for affected stat</text>
+    <circle class="muted" cx="345" cy="-5" r="7"/><text class="small" x="359" y="0">unchanged when no valid rows</text>
+  </g>
+</svg>
