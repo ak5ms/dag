@@ -863,6 +863,50 @@ def _pairwise_weighted_moments(x, y, w):
 
 
 @njit
+def _pairwise_weighted_moments_matrix(x, y, w):
+    """Build pairwise-NaN-aware X'WX and X'Wy snapshots for a dense W."""
+    n = x.shape[0]
+    k = x.shape[1]
+    xx_new = np.zeros((k, k), dtype=np.float64)
+    xy_new = np.zeros(k, dtype=np.float64)
+    xx_valid = np.zeros((k, k), dtype=np.bool_)
+    xy_valid = np.zeros(k, dtype=np.bool_)
+
+    valid_x = np.isfinite(x)
+    valid_y = np.isfinite(y)
+    valid_w = np.isfinite(w)
+    x0 = np.where(valid_x, x, 0.0)
+    y0 = np.where(valid_y, y, 0.0)
+    w0 = np.where(valid_w, w, 0.0)
+
+    for j in range(k):
+        xy_acc = 0.0
+        xy_seen = False
+        for r in range(n):
+            if valid_x[r, j]:
+                for c in range(n):
+                    if valid_w[r, c] and valid_y[c]:
+                        xy_acc += x0[r, j] * w0[r, c] * y0[c]
+                        xy_seen = True
+        xy_new[j] = xy_acc
+        xy_valid[j] = xy_seen
+
+        for m in range(k):
+            xx_acc = 0.0
+            xx_seen = False
+            for r in range(n):
+                if valid_x[r, j]:
+                    for c in range(n):
+                        if valid_w[r, c] and valid_x[c, m]:
+                            xx_acc += x0[r, j] * w0[r, c] * x0[c, m]
+                            xx_seen = True
+            xx_new[j, m] = xx_acc
+            xx_valid[j, m] = xx_seen
+
+    return xx_new, xy_new, xx_valid, xy_valid
+
+
+@njit
 def _solve_linear_system(a, b, out):
     """Small dense Gaussian solve used to avoid a SciPy/BLAS runtime dependency."""
     n = b.shape[0]
@@ -931,8 +975,8 @@ def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
             raise ValueError("Ridge feature args must be vector or matrix")
     if types[-4].kind != "vector":
         raise ValueError("Ridge y must be vector")
-    if types[-3].kind != "vector":
-        raise ValueError("Ridge weights must be vector")
+    if types[-3].kind not in ("vector", "matrix"):
+        raise ValueError("Ridge weights must be vector or matrix")
     if types[-2].kind != "scalar" or types[-1].kind != "scalar":
         raise ValueError("Ridge hl and lambda must be scalar")
     return OBJECT
@@ -1019,8 +1063,9 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 else:
                     self.state.preds[i, 0] = _dot_vec(self.state.beta, xmat[i, :])
 
-            if w2d.shape[0] != n or w2d.shape[1] != 1:
-                raise ValueError("Ridge weights must be a vector with shape (n, 1)")
+            w_cols = w2d.shape[1]
+            if w2d.shape[0] != n or (w_cols != 1 and w_cols != n):
+                raise ValueError("Ridge weights shape must be (n, 1) or (n, n)")
 
             if np.isnan(hl) or hl <= 0.0:
                 rho = 0.0
@@ -1035,8 +1080,10 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 lam = 0.0
 
             y = y2d[:, 0]
-            w = w2d[:, 0]
-            xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments(xmat, y, w)
+            if w_cols == 1:
+                xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments(xmat, y, w2d[:, 0])
+            else:
+                xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments_matrix(xmat, y, w2d)
             now = self.state.t
 
             for j in range(k):
@@ -1050,7 +1097,7 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                         self.state.has_xy[j] = True
                     self.state.last_xy[j] = now
 
-                for m in range(j, k):
+                for m in range(k):
                     if xx_valid[j, m]:
                         if self.state.has_xx[j, m]:
                             dt = now - self.state.last_xx[j, m]
@@ -1060,9 +1107,19 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                             self.state.xx[j, m] = xx_new[j, m]
                             self.state.has_xx[j, m] = True
                         self.state.last_xx[j, m] = now
-                        self.state.xx[m, j] = self.state.xx[j, m]
-                        self.state.last_xx[m, j] = self.state.last_xx[j, m]
-                        self.state.has_xx[m, j] = self.state.has_xx[j, m]
+
+            for j in range(k):
+                for m in range(j + 1, k):
+                    self.state.xx[j, m] = 0.5 * (self.state.xx[j, m] + self.state.xx[m, j])
+                    self.state.xx[m, j] = self.state.xx[j, m]
+                    last = self.state.last_xx[j, m]
+                    if self.state.last_xx[m, j] > last:
+                        last = self.state.last_xx[m, j]
+                    self.state.last_xx[j, m] = last
+                    self.state.last_xx[m, j] = last
+                    has = self.state.has_xx[j, m] or self.state.has_xx[m, j]
+                    self.state.has_xx[j, m] = has
+                    self.state.has_xx[m, j] = has
 
             _solve_scaled_ridge(self.state.xx, self.state.xy, lam, self.state.beta)
             for i in range(k):

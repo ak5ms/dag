@@ -35,6 +35,40 @@ def _manual_formula(close, open_, span):
 
 
 
+def _reference_weighted_snapshot(x, y, w):
+    valid_x = np.isfinite(x)
+    valid_y = np.isfinite(y)
+    valid_w = np.isfinite(w)
+    x0 = np.where(valid_x, x, 0.0)
+    y0 = np.where(valid_y, y, 0.0)
+    w0 = np.where(valid_w, w, 0.0)
+
+    if w.ndim == 1:
+        xw = x0 * w0[:, None]
+        xx_new = x0.T @ xw
+        xx_counts = valid_x.astype(np.int64).T @ (valid_x & valid_w[:, None]).astype(np.int64)
+        xx_valid = xx_counts > 0
+        xy_new = x0.T @ (w0 * y0)
+        xy_counts = valid_x.astype(np.int64).T @ (valid_y & valid_w).astype(np.int64)
+        xy_valid = xy_counts > 0
+        return xx_new, xy_new, xx_valid, xy_valid
+
+    n_features = x.shape[1]
+    xx_new = np.zeros((n_features, n_features), dtype=np.float64)
+    xx_valid = np.zeros((n_features, n_features), dtype=bool)
+    xy_new = np.zeros(n_features, dtype=np.float64)
+    xy_valid = np.zeros(n_features, dtype=bool)
+    for j in range(n_features):
+        xy_mask = valid_x[:, [j]] & valid_w & valid_y[None, :]
+        xy_new[j] = np.sum(x0[:, [j]] * w0 * y0[None, :])
+        xy_valid[j] = xy_mask.any()
+        for k in range(n_features):
+            xx_mask = valid_x[:, [j]] & valid_w & valid_x[:, k][None, :]
+            xx_new[j, k] = np.sum(x0[:, [j]] * w0 * x0[:, k][None, :])
+            xx_valid[j, k] = xx_mask.any()
+    return xx_new, xy_new, xx_valid, xy_valid
+
+
 def _reference_online_ewm_ridge(features, y, weights, hl, ridge):
     n_steps = y.shape[0]
     n_features = len(features)
@@ -51,23 +85,7 @@ def _reference_online_ewm_ridge(features, y, weights, hl, ridge):
 
     for t in range(n_steps):
         x = np.column_stack([feature[t] for feature in features])
-        yt = y[t]
-        wt = weights[t]
-        valid_x = np.isfinite(x)
-        valid_y = np.isfinite(yt)
-        valid_w = np.isfinite(wt)
-        x0 = np.where(valid_x, x, 0.0)
-        y0 = np.where(valid_y, yt, 0.0)
-        w0 = np.where(valid_w, wt, 0.0)
-
-        xw = x0 * w0[:, None]
-        xx_new = x0.T @ xw
-        xx_counts = valid_x.astype(np.int64).T @ (valid_x & valid_w[:, None]).astype(np.int64)
-        xx_valid = xx_counts > 0
-
-        xy_new = x0.T @ (w0 * y0)
-        xy_counts = valid_x.astype(np.int64).T @ (valid_y & valid_w).astype(np.int64)
-        xy_valid = xy_counts > 0
+        xx_new, xy_new, xx_valid, xy_valid = _reference_weighted_snapshot(x, y[t], weights[t])
 
         for j in range(n_features):
             if xy_valid[j]:
@@ -78,7 +96,7 @@ def _reference_online_ewm_ridge(features, y, weights, hl, ridge):
                     xy[j] = xy_new[j]
                     has_xy[j] = True
                 last_xy[j] = t
-            for k in range(j, n_features):
+            for k in range(n_features):
                 if xx_valid[j, k]:
                     if has_xx[j, k]:
                         a = alpha ** (t - last_xx[j, k])
@@ -87,9 +105,10 @@ def _reference_online_ewm_ridge(features, y, weights, hl, ridge):
                         xx[j, k] = xx_new[j, k]
                         has_xx[j, k] = True
                     last_xx[j, k] = t
-                    xx[k, j] = xx[j, k]
-                    last_xx[k, j] = last_xx[j, k]
-                    has_xx[k, j] = has_xx[j, k]
+
+        xx = 0.5 * (xx + xx.T)
+        last_xx = np.maximum(last_xx, last_xx.T)
+        has_xx |= has_xx.T
 
         system = xx + ridge * np.diag(np.diag(xx))
         try:
@@ -413,6 +432,39 @@ def test_ridge_pairwise_nan_ewm_matches_numpy_reference():
     expected = _reference_online_ewm_ridge([close, open_, volume], target, weights, hl=4.0, ridge=0.1)
     np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
     assert np.isfinite(actual).all()
+
+
+def _periodic_bspline_reference(values, n_basis):
+    centers = np.linspace(0.0, 1.0, n_basis, endpoint=False)
+    sigma = 1.0 / n_basis
+    out = np.empty((values.shape[0], n_basis), dtype=np.float64)
+    for i, value in enumerate(values):
+        if np.isnan(value):
+            out[i, :] = np.nan
+            continue
+        diff = np.abs(np.clip(value, 0.0, 1.0) - centers)
+        circ_diff = np.minimum(diff, 1.0 - diff)
+        row = np.exp(-0.5 * (circ_diff / sigma) ** 2)
+        out[i] = row / row.sum()
+    return out
+
+
+def test_ridge_accepts_matrix_weights_and_matches_numpy_reference():
+    close = np.array([[0.2, 0.8], [0.4, np.nan], [0.7, 0.1], [0.9, 0.3]], dtype=np.float64)
+    open_ = np.array([[1.1, 1.4], [1.3, 1.5], [np.nan, 1.7], [1.8, 1.2]], dtype=np.float64)
+    target = np.array([[0.5, 1.0], [0.7, 1.1], [0.8, np.nan], [1.0, 1.4]], dtype=np.float64)
+    weight_key = np.array([[0.0, 0.5], [0.25, 0.75], [np.nan, 0.4], [0.6, 0.1]], dtype=np.float64)
+    matrix_weights = np.stack([_periodic_bspline_reference(row, 2) for row in weight_key])
+
+    eng = build_engine("get_beta(Ridge(close, open, target, bspline(weight_key, 2), 4, 0.1))")
+    actual = run_batch_from_mapping(
+        eng,
+        {"close": close, "open": open_, "target": target, "weight_key": weight_key},
+        out_path=None,
+    )
+
+    expected = _reference_online_ewm_ridge([close, open_], target, matrix_weights, hl=4.0, ridge=0.1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
 
 
 def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
