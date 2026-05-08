@@ -211,8 +211,7 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
             self._ensure_frame(n_inputs, n_instruments)
             for k in range(n_inputs):
                 source = inputs[k]
-                for j in range(n_instruments):
-                    self.frame[k, j] = source[t, j]
+                self.frame[k, :] = source[t, :]
 
         def run_batch_scalar_aligned(self, inputs, out1d, start: int64, stop: int64):
             for t in range(start, stop):
@@ -227,8 +226,7 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
                 self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
-                for i in range(y.shape[0]):
-                    out2d[t, i] = y[i, 0]
+                out2d[t, :] = y[:, 0]
             return out2d
 
         def run_batch_matrix_aligned(self, inputs, out3d, start: int64, stop: int64):
@@ -236,9 +234,7 @@ def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
                 self._load_tick(inputs, t)
                 self.compiled.on_data(self.frame)
                 y = self.compiled.emit()
-                for i in range(y.shape[0]):
-                    for j in range(y.shape[1]):
-                        out3d[t, i, j] = y[i, j]
+                out3d[t, :, :] = y
             return out3d
 
     return EngineArtifact(compiled_artifact.compiled)
