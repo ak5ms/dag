@@ -35,6 +35,8 @@ Priorities, in order:
 - Do not add Python-level per-timestep loops in runtime hot paths.
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
+- Prefer clear NumPy/Numba slice and vectorized operations over unnecessary scalar loops, especially nested loops that only copy or assign contiguous rows, columns, or blocks (for example, use `dst[:] = src`, `dst[:, i:j] = block`, or `out[t, :] = values` where supported).
+- Keep numerical code human-readable: avoid mechanically expanded, deeply nested NumPy/Numba code when a supported vectorized expression or slice assignment communicates the same semantics without changing streaming behavior.
 - Keep batch output disk-backed by default (`run_batch_from_mapping(..., out_path=...)`) to avoid large RAM materialization; use `out_path=None` only when in-memory output is explicitly desired.
 - If adding ops that emit non-ndarray state objects (`TypeInfo("object")`), keep the batch timestep loop in compiled/JIT code; project object state back to scalar/vector/matrix before root output.
 - For any algorithmic change, consider complexity across ~1 year minutely x ~150 instruments (or larger).
