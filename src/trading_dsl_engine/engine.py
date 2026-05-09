@@ -58,20 +58,19 @@ def _alloc_output(engine, t: int, n_instruments: int):
     raise ValueError(f"Unknown output code: {output_code}")
 
 
-def _probe_vector_output(engine, inputs: List) -> np.ndarray:
+def _first_tick_frame(inputs: List) -> np.ndarray:
     n_inputs = len(inputs)
     n_instruments = inputs[0].shape[1]
     frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
     for k in range(n_inputs):
-        source = inputs[k]
-        for j in range(n_instruments):
-            frame[k, j] = source[0, j]
-    engine.compiled.on_data(frame)
+        frame[k, :] = inputs[k][0, :]
+    return frame
+
+
+def _probe_vector_output(engine, inputs: List) -> np.ndarray:
+    engine.compiled.on_data(_first_tick_frame(inputs))
     y = engine.compiled.emit()
-    out0 = np.empty(y.shape[0], dtype=np.float64)
-    for i in range(y.shape[0]):
-        out0[i] = y[i, 0]
-    return out0
+    return y[:, 0].copy()
 
 
 def _output_shape(engine, t: int, n_instruments: int) -> tuple[int, ...]:
@@ -90,14 +89,7 @@ def _alloc_memmap_output(engine, t: int, n_instruments: int, out_path: str):
 
 
 def _probe_matrix_output(engine, inputs: List) -> int:
-    n_inputs = len(inputs)
-    n_instruments = inputs[0].shape[1]
-    frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
-    for k in range(n_inputs):
-        source = inputs[k]
-        for j in range(n_instruments):
-            frame[k, j] = source[0, j]
-    engine.compiled.on_data(frame)
+    engine.compiled.on_data(_first_tick_frame(inputs))
     y = engine.compiled.emit()
     return y.shape[1]
 
@@ -163,8 +155,7 @@ def run_batch_from_mapping(
 
     start_idx = 0
     if output_code == 1 and inferred_vector_t0 is not None:
-        for j in range(inferred_vector_width):
-            out[0, j] = inferred_vector_t0[j]
+        out[0, :] = inferred_vector_t0
         start_idx = 1
 
     for i in range(start_idx, t, chunk_size):

@@ -35,8 +35,7 @@ def _make_input_node(input_index: int) -> CompiledNode:
             if (not self.initialized) or self.out.shape[0] != row.shape[0]:
                 self.out = np.empty((row.shape[0], 1), dtype=np.float64)
                 self.initialized = True
-            for i in range(row.shape[0]):
-                self.out[i, 0] = row[i]
+            self.out[:, 0] = row
 
         def emit(self):
             return self.out
@@ -237,15 +236,11 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 self.out = np.empty((n, 1), dtype=np.float64)
                 self.head = 0
                 self.size = 0
-                for i in range(n):
-                    for j in range(ring_len):
-                        self.ring[i, j] = np.nan
+                self.ring[:, :] = np.nan
                 self.initialized = True
-            for i in range(n):
-                self.ring[i, self.head] = x[i, 0]
+            self.ring[:, self.head] = x[:, 0]
             if np.isnan(lag_value):
-                for i in range(n):
-                    self.out[i, 0] = np.nan
+                self.out[:, 0] = np.nan
             else:
                 lag = int(round(lag_value))
                 if lag < 0 or lag > self.max_size:
@@ -254,11 +249,9 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                     idx = self.head - lag
                     if idx < 0:
                         idx += ring_len
-                    for i in range(n):
-                        self.out[i, 0] = self.ring[i, idx]
+                    self.out[:, 0] = self.ring[:, idx]
                 else:
-                    for i in range(n):
-                        self.out[i, 0] = np.nan
+                    self.out[:, 0] = np.nan
             self.head += 1
             if self.head == ring_len:
                 self.head = 0
@@ -314,9 +307,7 @@ def _ewm_builder(children: list[CompiledNode], literals: list[float]) -> Compile
                 self.out = np.empty((rows, cols), dtype=np.float64)
                 self.initialized = True
             if not self.has_state:
-                for i in range(rows):
-                    for j in range(cols):
-                        self.state[i, j] = x[i, j]
+                self.state[:, :] = x
                 self.has_state = True
             else:
                 a = self.alpha
@@ -331,9 +322,7 @@ def _ewm_builder(children: list[CompiledNode], literals: list[float]) -> Compile
                             self.state[i, j] = xv
                         else:
                             self.state[i, j] = a * xv + b * sv
-            for i in range(rows):
-                for j in range(cols):
-                    self.out[i, j] = self.state[i, j]
+            self.out[:, :] = self.state
 
         def emit(self):
             return self.out
@@ -513,8 +502,7 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
             for i in range(n):
                 xv = x[i, 0]
                 if np.isnan(xv):
-                    for j in range(self.n_basis):
-                        self.out[i, j] = np.nan
+                    self.out[i, :] = np.nan
                     continue
                 if xv < 0.0:
                     xv = 0.0
@@ -572,8 +560,7 @@ def _col_builder(children: list[CompiledNode], literals: list[float]) -> Compile
             if (not self.initialized) or self.out.shape[0] != n:
                 self.out = np.empty((n, 1), dtype=np.float64)
                 self.initialized = True
-            for i in range(n):
-                self.out[i, 0] = x[i, self.idx]
+            self.out[:, 0] = x[:, self.idx]
 
         def emit(self):
             return self.out
@@ -658,12 +645,9 @@ def _rolling_quantile_builder(children: list[CompiledNode], literals: list[float
                 self.out = np.empty((n, 1), dtype=np.float64)
                 self.head = 0
                 self.size = 0
-                for i in range(n):
-                    for j in range(self.window):
-                        self.ring[i, j] = np.nan
+                self.ring[:, :] = np.nan
                 self.initialized = True
-            for i in range(n):
-                self.ring[i, self.head] = x[i, 0]
+            self.ring[:, self.head] = x[:, 0]
             self.head += 1
             if self.head == self.window:
                 self.head = 0
@@ -784,7 +768,6 @@ _ridge_state_spec = [
     ("has_xy", boolean[:]),
     ("beta", float64[:]),
     ("preds", float64[:, :]),
-    ("beta_out", float64[:, :]),
 ]
 
 
@@ -803,7 +786,6 @@ class _RidgeState:
         self.has_xy = np.empty(1, dtype=np.bool_)
         self.beta = np.empty(1, dtype=np.float64)
         self.preds = np.empty((1, 1), dtype=np.float64)
-        self.beta_out = np.empty((1, 1), dtype=np.float64)
 
 
 @njit(inline="always")
@@ -1021,7 +1003,6 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.state.has_xy = np.zeros(k, dtype=np.bool_)
             self.state.beta = np.zeros(k, dtype=np.float64)
             self.state.preds = np.empty((n, 1), dtype=np.float64)
-            self.state.beta_out = np.zeros((k, 1), dtype=np.float64)
 
         def on_data(self, frame2d):
             self.y_node.on_data(frame2d)
@@ -1049,16 +1030,11 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             for node in literal_unroll(self.x_nodes):
                 feat = node.emit()
                 width = feat.shape[1]
-                for col in range(width):
-                    xmat[:, idx + col] = feat[:, col]
+                xmat[:, idx : idx + width] = feat
                 idx += width
 
             for i in range(n):
-                has_nan = np.isnan(y2d[i, 0])
-                for j in range(k):
-                    if np.isnan(xmat[i, j]):
-                        has_nan = True
-                if has_nan:
+                if np.isnan(y2d[i, 0]) or np.any(np.isnan(xmat[i, :])):
                     self.state.preds[i, 0] = np.nan
                 else:
                     self.state.preds[i, 0] = _dot_vec(self.state.beta, xmat[i, :])
@@ -1122,8 +1098,6 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                     self.state.has_xx[m, j] = has
 
             _solve_scaled_ridge(self.state.xx, self.state.xy, lam, self.state.beta)
-            for i in range(k):
-                self.state.beta_out[i, 0] = self.state.beta[i]
             self.state.t += 1
 
         def emit(self):
@@ -1161,11 +1135,10 @@ def _get_beta_builder(children: list[CompiledNode], literals: list[float]) -> Co
         def on_data(self, frame2d):
             self.src.on_data(frame2d)
             state = self.src.emit()
-            k = state.beta_out.shape[0]
+            k = state.beta.shape[0]
             if self.out.shape[0] != k:
                 self.out = np.empty((k, 1), dtype=np.float64)
-            for i in range(k):
-                self.out[i, 0] = state.beta_out[i, 0]
+            self.out[:, 0] = state.beta
 
         def emit(self):
             return self.out
