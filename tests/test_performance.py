@@ -21,11 +21,6 @@ def test_perf_in_memory_one_year_minutely():
     open_ = rng.lognormal(mean=0.0, sigma=0.03, size=(T_1Y_MINUTES, N_INSTRUMENTS)).astype(np.float64)
 
     eng = build_engine("xs_rank(ewm(div(close, open), 21))")
-    run_batch_from_mapping(
-        build_engine("xs_rank(ewm(div(close, open), 21))"),
-        {"close": close[:257], "open": open_[:257]},
-        out_path=None,
-    )
 
     t0 = time.perf_counter()
     out = run_batch_from_mapping(eng, {"close": close, "open": open_})
