@@ -55,10 +55,10 @@ def _expr_key(node: Expr) -> tuple:
     raise FormulaCompileError(f"Unhandled expression node for hashing: {node}")
 
 
-def compile_formula(formula: str, dsl_registry: DSLFunctionRegistry | None = None) -> CompiledFormulaArtifact:
+def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> CompiledFormulaArtifact:
     started_at = perf_counter()
     register_builtin_ops()
-    ast_expr = parse_formula(formula)
+    ast_expr = parse_formula(formula) if isinstance(formula, str) else formula
     inputs: dict[str, int] = {}
     dsl_registry = dsl_registry or DEFAULT_DSL_REGISTRY
     cache: dict[tuple, CompiledNode] = {}

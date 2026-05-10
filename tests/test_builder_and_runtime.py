@@ -673,3 +673,29 @@ def test_diff_dsl_function_accepts_lag_and_max_size():
     y3 = update_from_mapping(eng, {"close": np.array([4.0, 25.0])}).copy()
 
     np.testing.assert_allclose(y3[:, 0], np.array([3.0, 15.0]), equal_nan=True)
+
+
+def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
+    from trading_dsl_engine import Ridge, get_beta, var
+
+    close = np.array([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5], [2.0, 3.0, 4.0]], dtype=np.float64)
+    open_ = np.array([[2.0, 1.0, 0.5], [2.2, 1.2, 0.7], [2.4, 1.4, 0.9]], dtype=np.float64)
+    target = np.array([[1.0, 1.5, 2.0], [1.2, 1.7, 2.2], [1.4, 1.9, 2.4]], dtype=np.float64)
+    ones = np.ones_like(target)
+    scalar_weights = np.full_like(target, 0.3)
+
+    expected_one_feature = _reference_online_ewm_ridge([close], target, ones, hl=3.0, ridge=0.1)
+    expected_two_features = _reference_online_ewm_ridge([close, open_], target, ones, hl=3.0, ridge=0.1)
+    expected_scalar_weights = _reference_online_ewm_ridge([close, open_], target, scalar_weights, hl=3.0, ridge=0.1)
+    string_engine = build_engine("get_beta(Ridge(close, target, 3, 0.1))")
+    python_engine = build_engine(
+        get_beta(Ridge(var("close"), var("open"), y=var("target"), hl=3.0, lambda_=0.1))
+    )
+    scalar_weight_engine = build_engine(
+        get_beta(Ridge(var("close"), var("open"), y=var("target"), weights=0.3, hl=3.0, lambda_=0.1))
+    )
+
+    data = {"close": close, "open": open_, "target": target}
+    np.testing.assert_allclose(run_batch_from_mapping(string_engine, data, out_path=None), expected_one_feature)
+    np.testing.assert_allclose(run_batch_from_mapping(python_engine, data, out_path=None), expected_two_features)
+    np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, data, out_path=None), expected_scalar_weights)

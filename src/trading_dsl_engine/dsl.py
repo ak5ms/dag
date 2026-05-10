@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from trading_dsl_engine.parser import Call, Expr, Number
+from trading_dsl_engine.parser import Call, Expr, Identifier, Number
 
 
 class DSLFunctionRegistry:
@@ -27,6 +27,10 @@ def ensure_expr(value) -> Expr:
     if isinstance(value, (int, float)):
         return Number(float(value))
     raise TypeError(f"Expected Expr|int|float, got {type(value).__name__}")
+
+
+def var(name: str) -> Identifier:
+    return Identifier(name)
 
 
 def call(name: str, *args) -> Expr:
@@ -59,16 +63,39 @@ def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry
 
 add = op("add")
 sub = op("sub")
-mod = op("mod")
-shift = op("shift")
+mul = op("mul")
 div = op("div")
+mod = op("mod")
+eq = op("eq")
+ne = op("ne")
+and_ = op("and_")
+or_ = op("or_")
+xor = op("xor")
+where = op("where")
+abs = op("abs")
+isnan = op("isnan")
+fillna = op("fillna")
+cumsum = op("cumsum")
+shift = op("shift")
 ewm = op("ewm")
 xs_rank = op("xs_rank")
 outer = op("outer")
 bspline = op("bspline")
 col = op("col")
 groupby = op("groupby")
-Ridge = op("Ridge")
+
+
+def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> Expr:  # noqa: N802
+    ridge_lambda = lambda_ if lambda_ is not None else lam
+    if y is None or hl is None or ridge_lambda is None:
+        if weights is not None:
+            raise TypeError("Ridge positional form cannot combine positional y/hl/lambda with keyword weights")
+        return call("Ridge", *features)
+    if weights is None:
+        return call("Ridge", *features, y, 1.0, hl, ridge_lambda)
+    return call("Ridge", *features, y, weights, hl, ridge_lambda)
+
+
 get_beta = op("get_beta")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")

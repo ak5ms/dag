@@ -950,24 +950,35 @@ def _solve_scaled_ridge(xx, xy, ridge, beta):
 
 
 def _ridge_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) < 5:
-        raise ValueError("Ridge expects at least 5 args: x..., y, weights, hl, lambda")
-    for t in types[:-4]:
+    if len(types) < 4:
+        raise ValueError("Ridge expects x..., y, hl, lambda or x..., y, weights, hl, lambda")
+    has_explicit_weights = len(types) >= 5
+    feature_types = types[:-4] if has_explicit_weights else types[:-3]
+    if len(feature_types) == 0:
+        raise ValueError("Ridge expects at least one feature arg")
+    for t in feature_types:
         if t.kind not in ("vector", "matrix"):
             raise ValueError("Ridge feature args must be vector or matrix")
-    if types[-4].kind != "vector":
+    y_type = types[-4] if has_explicit_weights else types[-3]
+    if y_type.kind != "vector":
         raise ValueError("Ridge y must be vector")
-    if types[-3].kind not in ("vector", "matrix"):
-        raise ValueError("Ridge weights must be vector or matrix")
+    if has_explicit_weights and types[-3].kind not in ("scalar", "vector", "matrix"):
+        raise ValueError("Ridge weights must be scalar, vector, or matrix")
     if types[-2].kind != "scalar" or types[-1].kind != "scalar":
         raise ValueError("Ridge hl and lambda must be scalar")
     return OBJECT
 
 
 def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
-    feature_nodes = children[:-4]
-    y_node = children[-4]
-    w_node = children[-3]
+    has_explicit_weights = len(children) >= 5
+    if has_explicit_weights:
+        feature_nodes = children[:-4]
+        y_node = children[-4]
+        w_node = children[-3]
+    else:
+        feature_nodes = children[:-3]
+        y_node = children[-3]
+        w_node = _make_literal_node(1.0)
     hl_node = children[-2]
     lam_node = children[-1]
     x_nodes_type = types.Tuple(tuple(node.instance_type for node in feature_nodes))
@@ -1040,8 +1051,9 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                     self.state.preds[i, 0] = _dot_vec(self.state.beta, xmat[i, :])
 
             w_cols = w2d.shape[1]
-            if w2d.shape[0] != n or (w_cols != 1 and w_cols != n):
-                raise ValueError("Ridge weights shape must be (n, 1) or (n, n)")
+            scalar_weight = w2d.shape[0] == 1 and w_cols == 1
+            if (not scalar_weight) and (w2d.shape[0] != n or (w_cols != 1 and w_cols != n)):
+                raise ValueError("Ridge weights shape must be scalar, (n, 1), or (n, n)")
 
             if np.isnan(hl) or hl <= 0.0:
                 rho = 0.0
@@ -1056,7 +1068,11 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
                 lam = 0.0
 
             y = y2d[:, 0]
-            if w_cols == 1:
+            if scalar_weight:
+                wvec = np.empty(n, dtype=np.float64)
+                wvec[:] = w2d[0, 0]
+                xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments(xmat, y, wvec)
+            elif w_cols == 1:
                 xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments(xmat, y, w2d[:, 0])
             else:
                 xx_new, xy_new, xx_valid, xy_valid = _pairwise_weighted_moments_matrix(xmat, y, w2d)

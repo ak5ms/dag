@@ -19,6 +19,8 @@ Priorities, in order:
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - Support arity > 1 cleanly.
+- Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
+- Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
 ## Where to change what
 

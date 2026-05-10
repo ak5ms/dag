@@ -9,6 +9,7 @@ from numba.typed import List
 
 from trading_dsl_engine.compiler import compile_formula
 from trading_dsl_engine.dsl import DSLFunctionRegistry
+from trading_dsl_engine.parser import Expr
 
 
 def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
@@ -169,7 +170,7 @@ def run_batch_from_mapping(
     return out
 
 
-def build_engine(formula: str, dsl_registry: DSLFunctionRegistry | None = None):
+def build_engine(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None):
     compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry)
 
     spec = [
