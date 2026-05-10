@@ -73,6 +73,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 ## Data contract
 
 - Inputs are aligned 2D arrays with shape `(time, n_instruments)`.
+- Optional `column_names` passed to `compile_formula(...)`/`build_engine(...)` maps universe ticker names to input column positions for static column grouping.
 - Live `update` expects 1D vectors with shape `(n_instruments,)`.
 - Some ops may emit matrix outputs (e.g., `outer`, `bspline`), with shape `(n_instruments, width)` where `width` can differ from `n_instruments`.
 
@@ -87,6 +88,8 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 - `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
 - `groupby(key, op)` runs partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
+- `groupby(univ(...), op)` runs the same scalar/vector/matrix op independently on static column universes and scatters each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`.
+- `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar, which is useful inside universe grouping to broadcast per-group means.
 
 ## Ridge regression op (cross-sectional)
 

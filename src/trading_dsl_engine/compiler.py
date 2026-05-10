@@ -8,8 +8,8 @@ from numba.experimental import jitclass
 from numba.typed import List
 
 from trading_dsl_engine.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
-from trading_dsl_engine.ops import _make_input_node, _make_literal_node, register_builtin_ops
-from trading_dsl_engine.parser import Call, Expr, Identifier, Number, parse_formula
+from trading_dsl_engine.ops import _make_input_node, _make_literal_node, _make_universe_groupby_node, register_builtin_ops
+from trading_dsl_engine.parser import Call, Expr, Identifier, Number, Universe, parse_formula
 from trading_dsl_engine.registry import REGISTRY, CompiledNode
 
 
@@ -52,14 +52,45 @@ def _expr_key(node: Expr) -> tuple:
         return ("num", node.value)
     if isinstance(node, Call):
         return ("call", node.fn, tuple(_expr_key(arg) for arg in node.args))
+    if isinstance(node, Universe):
+        return ("univ", node.groups)
     raise FormulaCompileError(f"Unhandled expression node for hashing: {node}")
 
 
-def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> CompiledFormulaArtifact:
+def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str, int]) -> tuple[tuple[int, ...], ...]:
+    groups: list[tuple[int, ...]] = []
+    seen: set[int] = set()
+    for group in universe.groups:
+        resolved: list[int] = []
+        for member in group:
+            if isinstance(member, int):
+                idx = member
+            else:
+                if member not in column_name_to_index:
+                    raise FormulaCompileError(
+                        f"Unknown universe column '{member}'. Pass column_names to compile_formula/build_engine."
+                    )
+                idx = column_name_to_index[member]
+            if idx < 0:
+                raise FormulaCompileError("Universe column indexes must be >= 0")
+            if idx in seen:
+                raise FormulaCompileError(f"Universe column index {idx} appears in more than one group")
+            seen.add(idx)
+            resolved.append(idx)
+        groups.append(tuple(resolved))
+    return tuple(groups)
+
+
+def compile_formula(
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    column_names: list[str] | tuple[str, ...] | None = None,
+) -> CompiledFormulaArtifact:
     started_at = perf_counter()
     register_builtin_ops()
     ast_expr = parse_formula(formula) if isinstance(formula, str) else formula
     inputs: dict[str, int] = {}
+    column_name_to_index = {name: i for i, name in enumerate(column_names or ())}
     dsl_registry = dsl_registry or DEFAULT_DSL_REGISTRY
     cache: dict[tuple, CompiledNode] = {}
     cache_hits = 0
@@ -95,17 +126,25 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
         elif isinstance(node, Number):
             compiled = _make_literal_node(node.value)
         elif isinstance(node, Call):
-            try:
-                spec = REGISTRY.get(node.fn)
-            except KeyError as exc:
-                raise FormulaCompileError(str(exc)) from exc
-            children = [build(a, depth + 1) for a in node.args]
-            try:
-                _ = spec.validator([c.type_info for c in children])
-            except ValueError as exc:
-                raise FormulaCompileError(f"Invalid call {node.fn}: {exc}") from exc
-            literal_args = [a.value if isinstance(a, Number) else float("nan") for a in node.args]
-            compiled = spec.builder(children, literal_args)
+            if node.fn == "groupby" and len(node.args) == 2 and isinstance(node.args[0], Universe):
+                op_child = build(node.args[1], depth + 1)
+                groups = _resolve_universe_groups(node.args[0], column_name_to_index)
+                try:
+                    compiled = _make_universe_groupby_node(op_child, groups)
+                except ValueError as exc:
+                    raise FormulaCompileError(f"Invalid call groupby: {exc}") from exc
+            else:
+                try:
+                    spec = REGISTRY.get(node.fn)
+                except KeyError as exc:
+                    raise FormulaCompileError(str(exc)) from exc
+                children = [build(a, depth + 1) for a in node.args]
+                try:
+                    _ = spec.validator([c.type_info for c in children])
+                except ValueError as exc:
+                    raise FormulaCompileError(f"Invalid call {node.fn}: {exc}") from exc
+                literal_args = [a.value if isinstance(a, Number) else float("nan") for a in node.args]
+                compiled = spec.builder(children, literal_args)
         else:
             raise FormulaCompileError(f"Unhandled expression node: {node}")
 

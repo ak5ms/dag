@@ -170,8 +170,12 @@ def run_batch_from_mapping(
     return out
 
 
-def build_engine(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None):
-    compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry)
+def build_engine(
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    column_names: list[str] | tuple[str, ...] | None = None,
+):
+    compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry, column_names=column_names)
 
     spec = [
         ("compiled", compiled_artifact.compiled_type),

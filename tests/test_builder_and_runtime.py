@@ -699,3 +699,56 @@ def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
     np.testing.assert_allclose(run_batch_from_mapping(string_engine, data, out_path=None), expected_one_feature)
     np.testing.assert_allclose(run_batch_from_mapping(python_engine, data, out_path=None), expected_two_features)
     np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, data, out_path=None), expected_scalar_weights)
+
+
+def test_universe_groupby_mean_broadcasts_column_group_results():
+    from trading_dsl_engine import groupby, mean, univ, var
+
+    formula = groupby(univ(["6E", "6C"], ["6A"]), mean(var("close")))
+    eng = build_engine(formula, column_names=["6E", "6C", "6A"])
+    close = np.array(
+        [
+            [1.0, 3.0, 10.0],
+            [2.0, np.nan, 20.0],
+        ],
+        dtype=np.float64,
+    )
+
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+
+    expected = np.array(
+        [
+            [2.0, 2.0, 10.0],
+            [2.0, 2.0, 20.0],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(out, expected, equal_nan=True)
+
+
+def test_universe_groupby_string_formula_uses_column_names():
+    eng = build_engine('groupby(univ(["6E", "6C"], ["6A"]), mean(close))', column_names=["6E", "6C", "6A"])
+    close = np.array([[4.0, 8.0, 1.0]], dtype=np.float64)
+
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+
+    np.testing.assert_allclose(out, np.array([[6.0, 6.0, 1.0]], dtype=np.float64))
+
+
+def test_universe_groupby_preserves_state_per_column_group():
+    from trading_dsl_engine import ewm, groupby, univ, var
+
+    formula = groupby(univ([0, 1], [2]), ewm(var("close"), 3.0))
+    eng = build_engine(formula)
+    close = np.array(
+        [
+            [10.0, 20.0, 100.0],
+            [12.0, 18.0, 200.0],
+        ],
+        dtype=np.float64,
+    )
+
+    out = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+
+    np.testing.assert_allclose(out[0], close[0])
+    np.testing.assert_allclose(out[1], np.array([11.0, 19.0, 150.0], dtype=np.float64))
