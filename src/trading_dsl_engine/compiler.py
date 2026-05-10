@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from time import perf_counter
 
-from numba import int64, types
+from numba import int64
 from numba.experimental import jitclass
-from numba.typed import List
 
 from trading_dsl_engine.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.ops import _make_input_node, _make_literal_node, _make_universe_groupby_node, register_builtin_ops
@@ -31,6 +30,21 @@ class CompiledFormulaArtifact:
     input_names: tuple[str, ...]
     output_kind: str
     stats: CompileStats
+
+
+@dataclass(frozen=True)
+class _CompiledFormulaPlan:
+    formula_class: object
+    feature_ctor: object
+    compiled_type: object
+    input_names: tuple[str, ...]
+    output_kind: str
+    output_code: int
+    expanded_nodes: int
+    cache_hits: int
+
+
+_COMPILE_PLAN_CACHE: dict[tuple, _CompiledFormulaPlan] = {}
 
 
 def _kind_to_code(kind: str) -> int:
@@ -92,6 +106,27 @@ def compile_formula(
     inputs: dict[str, int] = {}
     column_name_to_index = {name: i for i, name in enumerate(column_names or ())}
     dsl_registry = dsl_registry or DEFAULT_DSL_REGISTRY
+    plan_cache_key = None
+    if dsl_registry is DEFAULT_DSL_REGISTRY:
+        plan_cache_key = (_expr_key(ast_expr), tuple(column_names or ()))
+        cached_plan = _COMPILE_PLAN_CACHE.get(plan_cache_key)
+        if cached_plan is not None:
+            compiled = cached_plan.formula_class(
+                cached_plan.feature_ctor(),
+                len(cached_plan.input_names),
+                cached_plan.output_code,
+            )
+            return CompiledFormulaArtifact(
+                compiled=compiled,
+                compiled_type=cached_plan.compiled_type,
+                input_names=cached_plan.input_names,
+                output_kind=cached_plan.output_kind,
+                stats=CompileStats(
+                    expanded_nodes=cached_plan.expanded_nodes,
+                    cache_hits=cached_plan.cache_hits + 1,
+                    compile_seconds=perf_counter() - started_at,
+                ),
+            )
     cache: dict[tuple, CompiledNode] = {}
     cache_hits = 0
     expanded_nodes = 0
@@ -158,16 +193,14 @@ def compile_formula(
         ("feature", root.instance_type),
         ("n_inputs", int64),
         ("output_code", int64),
-        ("input_names", types.ListType(types.unicode_type)),
     ]
 
     @jitclass(spec)
     class CompiledFormula:  # noqa: N801
-        def __init__(self, feature, names, output_code):
+        def __init__(self, feature, n_inputs: int, output_code: int):
             self.feature = feature
-            self.n_inputs = len(names)
+            self.n_inputs = n_inputs
             self.output_code = output_code
-            self.input_names = names
 
         def on_data(self, frame2d):
             self.feature.on_data(frame2d)
@@ -176,11 +209,19 @@ def compile_formula(
             return self.feature.emit()
 
     ordered_names = tuple(inputs.keys())
-    typed_names = List()
-    for n in ordered_names:
-        typed_names.append(n)
+    if plan_cache_key is not None:
+        _COMPILE_PLAN_CACHE[plan_cache_key] = _CompiledFormulaPlan(
+            formula_class=CompiledFormula,
+            feature_ctor=root.ctor,
+            compiled_type=CompiledFormula.class_type.instance_type,
+            input_names=ordered_names,
+            output_kind=root.type_info.kind,
+            output_code=output_code,
+            expanded_nodes=expanded_nodes,
+            cache_hits=cache_hits,
+        )
 
-    compiled = CompiledFormula(root.ctor(), typed_names, output_code)
+    compiled = CompiledFormula(root.ctor(), len(ordered_names), output_code)
     compile_seconds = perf_counter() - started_at
     return CompiledFormulaArtifact(
         compiled=compiled,

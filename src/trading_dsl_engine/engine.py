@@ -5,33 +5,62 @@ import tempfile
 import numpy as np
 from numba import boolean, float64, int64
 from numba.experimental import jitclass
-from numba.typed import List
 
 from trading_dsl_engine.compiler import compile_formula
 from trading_dsl_engine.dsl import DSLFunctionRegistry
 from trading_dsl_engine.parser import Expr
 
 
+_ENGINE_CLASS_CACHE: dict[object, object] = {}
+
+
+class EngineHandle:
+    def __init__(self, engine, input_names, output_code):
+        self._engine = engine
+        self.compiled = self._engine.compiled
+        self.input_names = input_names
+        self.output_code = output_code
+
+    @property
+    def _numba_type_(self):
+        return self._engine._numba_type_
+
+    def on_data(self, frame2d):
+        return self._engine.on_data(frame2d)
+
+    def emit(self):
+        return self._engine.emit()
+
+    def run_batch_scalar_aligned(self, inputs, out1d, start: int64, stop: int64):
+        return self._engine.run_batch_scalar_aligned(inputs, out1d, start, stop)
+
+    def run_batch_vector_aligned(self, inputs, out2d, start: int64, stop: int64):
+        return self._engine.run_batch_vector_aligned(inputs, out2d, start, stop)
+
+    def run_batch_matrix_aligned(self, inputs, out3d, start: int64, stop: int64):
+        return self._engine.run_batch_matrix_aligned(inputs, out3d, start, stop)
+
+
 def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
-    names = engine.compiled.input_names
+    names = engine.input_names
     frame = np.empty((len(names), data[names[0]].shape[0]), dtype=np.float64)
     for i in range(len(names)):
         frame[i] = data[names[i]]
     return frame
 
 
-def _as_aligned_inputs(engine, data: dict[str, np.ndarray]) -> List:
-    names = engine.compiled.input_names
-    inputs = List()
+def _as_aligned_inputs(engine, data: dict[str, np.ndarray]) -> tuple[np.ndarray, ...]:
+    names = engine.input_names
+    inputs = []
     for i in range(len(names)):
         arr = np.asarray(data[names[i]], dtype=np.float64)
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D input for '{names[i]}', got shape {arr.shape}")
         inputs.append(arr)
-    return inputs
+    return tuple(inputs)
 
 
-def _validate_aligned_inputs(inputs: List) -> tuple[int, int]:
+def _validate_aligned_inputs(inputs: tuple[np.ndarray, ...]) -> tuple[int, int]:
     if len(inputs) == 0:
         raise ValueError("No input arrays provided")
     t = inputs[0].shape[0]
@@ -44,12 +73,12 @@ def _validate_aligned_inputs(inputs: List) -> tuple[int, int]:
 
 def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
     frame = _pack_tick(engine, data)
-    engine.on_data(frame)
-    return engine.emit()
+    engine.compiled.on_data(frame)
+    return engine.compiled.emit()
 
 
 def _alloc_output(engine, t: int, n_instruments: int):
-    output_code = engine.compiled.output_code
+    output_code = engine.output_code
     if output_code == 0:
         return np.empty(t, dtype=np.float64)
     if output_code == 1:
@@ -59,7 +88,7 @@ def _alloc_output(engine, t: int, n_instruments: int):
     raise ValueError(f"Unknown output code: {output_code}")
 
 
-def _first_tick_frame(inputs: List) -> np.ndarray:
+def _first_tick_frame(inputs: tuple[np.ndarray, ...]) -> np.ndarray:
     n_inputs = len(inputs)
     n_instruments = inputs[0].shape[1]
     frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
@@ -68,14 +97,14 @@ def _first_tick_frame(inputs: List) -> np.ndarray:
     return frame
 
 
-def _probe_vector_output(engine, inputs: List) -> np.ndarray:
+def _probe_vector_output(engine, inputs: tuple[np.ndarray, ...]) -> np.ndarray:
     engine.compiled.on_data(_first_tick_frame(inputs))
     y = engine.compiled.emit()
     return y[:, 0].copy()
 
 
 def _output_shape(engine, t: int, n_instruments: int) -> tuple[int, ...]:
-    output_code = engine.compiled.output_code
+    output_code = engine.output_code
     if output_code == 0:
         return (t,)
     if output_code == 1:
@@ -89,7 +118,7 @@ def _alloc_memmap_output(engine, t: int, n_instruments: int, out_path: str):
     return np.memmap(out_path, mode="w+", dtype=np.float64, shape=_output_shape(engine, t, n_instruments))
 
 
-def _probe_matrix_output(engine, inputs: List) -> int:
+def _probe_matrix_output(engine, inputs: tuple[np.ndarray, ...]) -> int:
     engine.compiled.on_data(_first_tick_frame(inputs))
     y = engine.compiled.emit()
     return y.shape[1]
@@ -105,7 +134,7 @@ def run_batch_from_mapping(
     inputs = _as_aligned_inputs(engine, data)
     t, n_instruments = _validate_aligned_inputs(inputs)
 
-    output_code = engine.compiled.output_code
+    output_code = engine.output_code
     if output_code == 3:
         raise ValueError(
             "Root object outputs are not supported in batch mode. "
@@ -170,15 +199,13 @@ def run_batch_from_mapping(
     return out
 
 
-def build_engine(
-    formula: str | Expr,
-    dsl_registry: DSLFunctionRegistry | None = None,
-    column_names: list[str] | tuple[str, ...] | None = None,
-):
-    compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry, column_names=column_names)
+def _engine_class_for(compiled_type):
+    cached = _ENGINE_CLASS_CACHE.get(compiled_type)
+    if cached is not None:
+        return cached
 
     spec = [
-        ("compiled", compiled_artifact.compiled_type),
+        ("compiled", compiled_type),
         ("frame_initialized", boolean),
         ("frame", float64[:, :]),
     ]
@@ -233,4 +260,16 @@ def build_engine(
                 out3d[t, :, :] = y
             return out3d
 
-    return EngineArtifact(compiled_artifact.compiled)
+    _ENGINE_CLASS_CACHE[compiled_type] = EngineArtifact
+    return EngineArtifact
+
+
+def build_engine(
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    column_names: list[str] | tuple[str, ...] | None = None,
+):
+    compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry, column_names=column_names)
+    engine_class = _engine_class_for(compiled_artifact.compiled_type)
+    engine = engine_class(compiled_artifact.compiled)
+    return EngineHandle(engine, compiled_artifact.input_names, compiled_artifact.compiled.output_code)

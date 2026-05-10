@@ -16,7 +16,15 @@ SCALAR = TypeInfo("scalar")
 OBJECT = TypeInfo("object")
 
 
+_INPUT_NODE_CACHE: dict[int, CompiledNode] = {}
+_LITERAL_NODE_CACHE: dict[float, CompiledNode] = {}
+
+
 def _make_input_node(input_index: int) -> CompiledNode:
+    cached = _INPUT_NODE_CACHE.get(input_index)
+    if cached is not None:
+        return cached
+
     spec = [
         ("input_index", int64),
         ("initialized", boolean),
@@ -40,10 +48,16 @@ def _make_input_node(input_index: int) -> CompiledNode:
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, InputOp.class_type.instance_type, lambda: InputOp(input_index))
+    node = CompiledNode(VECTOR, InputOp.class_type.instance_type, lambda: InputOp(input_index))
+    _INPUT_NODE_CACHE[input_index] = node
+    return node
 
 
 def _make_literal_node(value: float) -> CompiledNode:
+    cached = _LITERAL_NODE_CACHE.get(value)
+    if cached is not None:
+        return cached
+
     spec = [
         ("value", float64),
         ("out", float64[:, :]),
@@ -62,7 +76,9 @@ def _make_literal_node(value: float) -> CompiledNode:
         def emit(self):
             return self.out
 
-    return CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value))
+    node = CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value))
+    _LITERAL_NODE_CACHE[value] = node
+    return node
 
 
 def make_nary_op(
@@ -108,8 +124,14 @@ def make_nary_op(
             return MATRIX
         raise ValueError(f"{name} received incompatible arg kinds: {sorted(kinds)}")
 
+    node_cache: dict[tuple[object, ...], CompiledNode] = {}
+
     def builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
         child_types = tuple(child.instance_type for child in children)
+        cached = node_cache.get(child_types)
+        if cached is not None:
+            return cached
+
         spec = [
             ("children", types.Tuple(child_types)),
             ("initialized", boolean),
@@ -203,7 +225,9 @@ def make_nary_op(
             nodes = tuple(fn() for fn in child_ctors)
             return NaryOp(nodes)
 
-        return CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor)
+        node = CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor)
+        node_cache[child_types] = node
+        return node
 
     REGISTRY.register(OpSpec(name=name, validator=validator, builder=builder))
 
