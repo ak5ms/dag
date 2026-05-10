@@ -35,3 +35,17 @@ xs_rank(
 """)
     assert isinstance(expr, Call)
     assert expr.fn == "xs_rank"
+
+
+def test_parse_infix_operators():
+    expr = parse_formula("(close + open) * 2 % 3 | (volume != 0)")
+    assert isinstance(expr, Call)
+    assert expr.fn == "or_"
+    left = expr.args[0]
+    assert isinstance(left, Call)
+    assert left.fn == "mod"
+    assert isinstance(left.args[0], Call)
+    assert left.args[0].fn == "mul"
+    right = expr.args[1]
+    assert isinstance(right, Call)
+    assert right.fn == "ne"

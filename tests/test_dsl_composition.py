@@ -66,3 +66,57 @@ def test_dsl_expansion_is_cached_for_repeated_calls():
     compiled = compile_formula("add(counted(close), counted(close))", dsl_registry=reg)
     assert compiled.stats.cache_hits > 0
     assert call_count["n"] == 1
+
+
+def test_python_expr_infix_formula_matches_prefix_string():
+    from trading_dsl_engine import var
+
+    close = var("close")
+    open_ = var("open")
+    volume = var("volume")
+    formula = xs_rank(ewm(((close + open_) * 2.0 % 5.0) | (volume != 0.0), 3.0))
+    infix_engine = build_engine(formula)
+    prefix_engine = build_engine("xs_rank(ewm(or_(mod(mul(add(close, open), 2), 5), ne(volume, 0)), 3))")
+
+    close_np = np.array([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]], dtype=np.float64)
+    open_np = np.array([[0.5, 1.0, 1.5], [0.7, 1.2, 1.7]], dtype=np.float64)
+    volume_np = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 1.0]], dtype=np.float64)
+    data = {"close": close_np, "open": open_np, "volume": volume_np}
+    np.testing.assert_allclose(
+        run_batch_from_mapping(infix_engine, data, out_path=None),
+        run_batch_from_mapping(prefix_engine, data, out_path=None),
+    )
+
+
+def test_all_builtin_dsl_operator_helpers_are_importable():
+    import trading_dsl_engine.dsl as dsl
+
+    for name in (
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "mod",
+        "eq",
+        "ne",
+        "and_",
+        "or_",
+        "xor",
+        "where",
+        "abs",
+        "isnan",
+        "fillna",
+        "cumsum",
+        "shift",
+        "ewm",
+        "xs_rank",
+        "outer",
+        "bspline",
+        "col",
+        "groupby",
+        "rolling_quantile",
+        "Ridge",
+        "get_beta",
+        "get_preds",
+    ):
+        assert callable(getattr(dsl, name))
