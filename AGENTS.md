@@ -19,6 +19,7 @@ Priorities, in order:
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - Support arity > 1 cleanly.
+- Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe without interpreter fallback.
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
@@ -55,6 +56,7 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
 - Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
 - Grouped-state behavior for keyed operators (e.g., `groupby`) including key NaNs, per-key state transitions, and key consistency expectations.
+- Static universe grouping behavior (`groupby(univ(...), op)`) including ticker-to-column mapping, per-universe state isolation, scatter/broadcast shape behavior, and NaN handling in reducers such as `mean`.
 
 ## Test expectations
 
@@ -76,6 +78,7 @@ If perf tests are too heavy for the environment, clearly note that and at least 
 - Always use absolute imports (e.g., `from trading_dsl_engine...`), not relative imports.
 - Keep implementations concise and generic; avoid repetitive boilerplate.
 - Prefer factories/templates/registries over hardcoded branching.
+- Prefer `make_nary_op` for stateless scalar/vector/matrix operators, including axis reducers, before adding custom operator classes.
 - Do not wrap imports in try/except blocks.
 - Make extension points obvious for future ops (including potential matrix/tensor emitters and optimizer/model workflow nodes).
 

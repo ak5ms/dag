@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Union
 import ast
 import re
 
@@ -107,6 +108,14 @@ class Call(Expr):
     args: tuple[Expr, ...]
 
 
+UniverseItem = Union[str, int]
+
+
+@dataclass(frozen=True, eq=False)
+class Universe(Expr):
+    groups: tuple[tuple[UniverseItem, ...], ...]
+
+
 class FormulaParseError(ValueError):
     pass
 
@@ -166,8 +175,34 @@ class _AstParser:
                 raise FormulaParseError("Keyword arguments are not supported")
             if not isinstance(node.func, ast.Name):
                 raise FormulaParseError("Only direct function names are supported")
+            if node.func.id == "univ":
+                return self._universe(node)
             return Call(node.func.id, tuple(self._expr(arg) for arg in node.args))
         raise FormulaParseError(f"Unsupported syntax: {ast.dump(node, include_attributes=False)}")
+
+    def _universe(self, node: ast.Call) -> Universe:
+        groups: list[tuple[UniverseItem, ...]] = []
+        for arg in node.args:
+            if isinstance(arg, (ast.List, ast.Tuple)):
+                members = tuple(self._universe_item(item) for item in arg.elts)
+            else:
+                members = (self._universe_item(arg),)
+            if len(members) == 0:
+                raise FormulaParseError("Universe groups cannot be empty")
+            groups.append(members)
+        if len(groups) == 0:
+            raise FormulaParseError("univ expects at least one group")
+        return Universe(tuple(groups))
+
+    def _universe_item(self, node: ast.AST) -> UniverseItem:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return node.value
+            if isinstance(node.value, int):
+                return node.value
+        raise FormulaParseError(f"Unsupported universe member: {ast.dump(node, include_attributes=False)}")
 
     def _binop_name(self, op: ast.operator) -> str:
         try:

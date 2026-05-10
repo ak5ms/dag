@@ -65,12 +65,36 @@ def _make_literal_node(value: float) -> CompiledNode:
     return CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value))
 
 
-def make_nary_op(name: str, arity: int, kernel: Callable[[np.ndarray], float]) -> None:
+def make_nary_op(
+    name: str,
+    arity: int,
+    kernel: Callable[[np.ndarray], float],
+    *,
+    axis: int | None = None,
+) -> None:
+    if axis not in (None, -1, 0, 1):
+        raise ValueError(f"{name} axis must be one of None, -1, 0, or 1")
+    if axis is not None and arity != 1:
+        raise ValueError(f"{name} axis reducers currently support exactly one arg")
+
     kernel_jit = njit(inline="always")(kernel)
+    reduce_axis = -2 if axis is None else axis
 
     def validator(types: list[TypeInfo]) -> TypeInfo:
         if len(types) != arity:
             raise ValueError(f"{name} expects exactly {arity} args")
+        if reduce_axis == -1:
+            if types[0].kind == "object":
+                raise ValueError(f"{name} arg must emit scalar/vector/matrix, not object")
+            return SCALAR
+        if reduce_axis == 0:
+            if types[0].kind == "object":
+                raise ValueError(f"{name} arg must emit scalar/vector/matrix, not object")
+            return SCALAR if types[0].kind in ("scalar", "vector") else MATRIX
+        if reduce_axis == 1:
+            if types[0].kind == "object":
+                raise ValueError(f"{name} arg must emit scalar/vector/matrix, not object")
+            return SCALAR if types[0].kind == "scalar" else VECTOR
         kinds = {t.kind for t in types}
         if kinds <= {"scalar"}:
             return SCALAR
@@ -101,6 +125,15 @@ def make_nary_op(name: str, arity: int, kernel: Callable[[np.ndarray], float]) -
                 self.out = np.empty((1, 1), dtype=np.float64)
                 self.scratch = np.empty(arity, dtype=np.float64)
 
+            def _ensure_out(self, rows: int64, cols: int64):
+                if not self.initialized or self.out.shape[0] != rows or self.out.shape[1] != cols:
+                    self.out = np.empty((rows, cols), dtype=np.float64)
+                    self.initialized = True
+
+            def _ensure_scratch(self, size: int64):
+                if self.scratch.shape[0] != size:
+                    self.scratch = np.empty(size, dtype=np.float64)
+
             def on_data(self, frame2d):
                 for child in literal_unroll(self.children):
                     child.on_data(frame2d)
@@ -112,9 +145,42 @@ def make_nary_op(name: str, arity: int, kernel: Callable[[np.ndarray], float]) -
                         rows = v.shape[0]
                     if v.shape[1] != 1:
                         cols = v.shape[1]
-                if not self.initialized or self.out.shape[0] != rows or self.out.shape[1] != cols:
-                    self.out = np.empty((rows, cols), dtype=np.float64)
-                    self.initialized = True
+
+                if reduce_axis == -1:
+                    src = self.children[0].emit()
+                    n = src.shape[0] * src.shape[1]
+                    self._ensure_out(1, 1)
+                    self._ensure_scratch(n)
+                    idx = 0
+                    for i in range(src.shape[0]):
+                        for j in range(src.shape[1]):
+                            self.scratch[idx] = src[i, j]
+                            idx += 1
+                    self.out[0, 0] = kernel_jit(self.scratch)
+                    return
+
+                if reduce_axis == 0:
+                    src = self.children[0].emit()
+                    self._ensure_out(1, src.shape[1])
+                    self._ensure_scratch(src.shape[0])
+                    for j in range(src.shape[1]):
+                        for i in range(src.shape[0]):
+                            self.scratch[i] = src[i, j]
+                        self.out[0, j] = kernel_jit(self.scratch)
+                    return
+
+                if reduce_axis == 1:
+                    src = self.children[0].emit()
+                    self._ensure_out(src.shape[0], 1)
+                    self._ensure_scratch(src.shape[1])
+                    for i in range(src.shape[0]):
+                        for j in range(src.shape[1]):
+                            self.scratch[j] = src[i, j]
+                        self.out[i, 0] = kernel_jit(self.scratch)
+                    return
+
+                self._ensure_out(rows, cols)
+                self._ensure_scratch(arity)
                 for i in range(rows):
                     for j in range(cols):
                         idx = 0
@@ -671,6 +737,89 @@ def _rolling_quantile_builder(children: list[CompiledNode], literals: list[float
     )
 
 
+def _typed_universe_groups(groups: tuple[tuple[int, ...], ...]):
+    typed_groups = List()
+    for group in groups:
+        arr = np.empty(len(group), dtype=np.int64)
+        for i, idx in enumerate(group):
+            arr[i] = idx
+        typed_groups.append(arr)
+    return typed_groups
+
+
+def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, ...], ...]) -> CompiledNode:
+    if len(groups) == 0:
+        raise ValueError("groupby universe expects at least one group")
+    if op_node.type_info.kind == "object":
+        raise ValueError("groupby universe op arg must emit scalar/vector/matrix, not object")
+    out_type = VECTOR if op_node.type_info.kind == "scalar" else op_node.type_info
+    groups_list_type = types.ListType(types.Array(int64, 1, "C"))
+    op_list_type = types.ListType(op_node.instance_type)
+
+    spec = [
+        ("group_indices", groups_list_type),
+        ("ops", op_list_type),
+        ("initialized", boolean),
+        ("out", float64[:, :]),
+    ]
+
+    @jitclass(spec)
+    class UniverseGroupByOp:
+        def __init__(self, group_indices, ops):
+            self.group_indices = group_indices
+            self.ops = ops
+            self.initialized = False
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def _ensure_out(self, n_cols: int64, width: int64):
+            if (not self.initialized) or self.out.shape[0] != n_cols or self.out.shape[1] != width:
+                self.out = np.empty((n_cols, width), dtype=np.float64)
+                self.initialized = True
+
+        def on_data(self, frame2d):
+            n_inputs = frame2d.shape[0]
+            n_cols = frame2d.shape[1]
+            width = 1
+            for g in range(len(self.group_indices)):
+                idxs = self.group_indices[g]
+                for j in range(idxs.shape[0]):
+                    if idxs[j] >= n_cols:
+                        raise ValueError("universe column index out of bounds for input width")
+                group_frame = np.empty((n_inputs, idxs.shape[0]), dtype=np.float64)
+                for r in range(n_inputs):
+                    for c in range(idxs.shape[0]):
+                        group_frame[r, c] = frame2d[r, idxs[c]]
+                self.ops[g].on_data(group_frame)
+                y = self.ops[g].emit()
+                if y.shape[1] > width:
+                    width = y.shape[1]
+
+            self._ensure_out(n_cols, width)
+            self.out[:, :] = np.nan
+            for g in range(len(self.group_indices)):
+                idxs = self.group_indices[g]
+                y = self.ops[g].emit()
+                for member_pos in range(idxs.shape[0]):
+                    dest = idxs[member_pos]
+                    src_row = member_pos if y.shape[0] == idxs.shape[0] else 0
+                    for w in range(width):
+                        src_col = w if y.shape[1] > 1 else 0
+                        self.out[dest, w] = y[src_row, src_col]
+
+        def emit(self):
+            return self.out
+
+    op_ctors = [op_node.ctor for _ in groups]
+
+    def _ctor():
+        ops = List.empty_list(op_node.instance_type)
+        for make_op in op_ctors:
+            ops.append(make_op())
+        return UniverseGroupByOp(_typed_universe_groups(groups), ops)
+
+    return CompiledNode(out_type, UniverseGroupByOp.class_type.instance_type, _ctor)
+
+
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) != 2:
         raise ValueError("groupby expects 2 args: key, op")
@@ -1215,6 +1364,7 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
     REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
     REGISTRY.register(OpSpec(name="rolling_quantile", validator=_rolling_quantile_validator, builder=_rolling_quantile_builder))
+    make_nary_op("mean", 1, lambda args: np.nanmean(args), axis=-1)
     REGISTRY.register(OpSpec(name="groupby", validator=_groupby_validator, builder=_groupby_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))
     REGISTRY.register(OpSpec(name="get_beta", validator=_get_beta_validator, builder=_get_beta_builder))
@@ -1222,4 +1372,12 @@ def register_builtin_ops() -> None:
     register_builtin_ops._done = True
 
 
-__all__ = ["register_builtin_ops", "_make_input_node", "_make_literal_node", "VECTOR", "SCALAR", "MATRIX"]
+__all__ = [
+    "register_builtin_ops",
+    "_make_input_node",
+    "_make_literal_node",
+    "_make_universe_groupby_node",
+    "VECTOR",
+    "SCALAR",
+    "MATRIX",
+]

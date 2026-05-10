@@ -115,6 +115,8 @@ def test_all_builtin_dsl_operator_helpers_are_importable():
         "col",
         "groupby",
         "rolling_quantile",
+        "mean",
+        "univ",
         "Ridge",
         "get_beta",
         "get_preds",

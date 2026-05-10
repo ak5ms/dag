@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
-from trading_dsl_engine.parser import Call, Expr, Identifier, Number
+from trading_dsl_engine.parser import Call, Expr, Identifier, Number, Universe, UniverseItem
 
 
 class DSLFunctionRegistry:
@@ -27,6 +27,24 @@ def ensure_expr(value) -> Expr:
     if isinstance(value, (int, float)):
         return Number(float(value))
     raise TypeError(f"Expected Expr|int|float, got {type(value).__name__}")
+
+
+def univ(*groups: Sequence[UniverseItem] | UniverseItem) -> Universe:
+    normalized: list[tuple[UniverseItem, ...]] = []
+    for group in groups:
+        if isinstance(group, (str, int)):
+            members = (group,)
+        else:
+            members = tuple(group)
+        if len(members) == 0:
+            raise ValueError("Universe groups cannot be empty")
+        for member in members:
+            if not isinstance(member, (str, int)):
+                raise TypeError(f"Universe members must be str or int, got {type(member).__name__}")
+        normalized.append(members)
+    if len(normalized) == 0:
+        raise ValueError("univ expects at least one group")
+    return Universe(tuple(normalized))
 
 
 def var(name: str) -> Identifier:
@@ -99,6 +117,7 @@ def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> E
 get_beta = op("get_beta")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")
+mean = op("mean")
 
 
 @register_dsl_function("ratio")
