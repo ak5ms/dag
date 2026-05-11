@@ -580,19 +580,68 @@ def test_groupby_with_nested_ewm_by_minute_of_day_matches_reference():
     np.testing.assert_allclose(out, expected, equal_nan=True)
 
 
-def test_groupby_rejects_mixed_keys_within_tick():
+def test_groupby_supports_mixed_keys_within_tick_per_instrument():
     eng = build_engine("groupby(ts, ewm(close, 3))")
-    with pytest.raises(ValueError, match="single shared key"):
-        update_from_mapping(
+
+    first = update_from_mapping(
+        eng,
+        {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 10.0], dtype=np.float64)},
+    ).copy()
+    second = update_from_mapping(
+        eng,
+        {"ts": np.array([1.0, 0.0], dtype=np.float64), "close": np.array([3.0, 20.0], dtype=np.float64)},
+    ).copy()
+    third = update_from_mapping(
+        eng,
+        {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([5.0, 30.0], dtype=np.float64)},
+    ).copy()
+
+    np.testing.assert_allclose(first[:, 0], np.array([1.0, 10.0]))
+    np.testing.assert_allclose(second[:, 0], np.array([3.0, 20.0]))
+    np.testing.assert_allclose(third[:, 0], np.array([3.0, 20.0]))
+
+
+def test_groupby_supports_more_than_256_groups():
+    eng = build_engine("groupby(ts, ewm(close, 3))")
+
+    for key in range(300):
+        out = update_from_mapping(
             eng,
-            {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 2.0], dtype=np.float64)},
+            {"ts": np.array([float(key)], dtype=np.float64), "close": np.array([float(key + 1)], dtype=np.float64)},
         )
+        np.testing.assert_allclose(out[:, 0], np.array([float(key + 1)]))
+
+    out = update_from_mapping(
+        eng,
+        {"ts": np.array([0.0], dtype=np.float64), "close": np.array([5.0], dtype=np.float64)},
+    )
+    np.testing.assert_allclose(out[:, 0], np.array([3.0]))
 
 
 def test_groupby_can_box_nested_ridge_slots_without_pickling_error():
     eng = build_engine("groupby(ts, get_beta(Ridge(x, y, w, 2, 0)))")
 
     assert eng.input_names == ("ts", "x", "y", "w")
+
+
+
+def test_groupby_can_construct_nested_ridge_formula_from_compiled_path():
+    formula = "groupby(ts, cumsum(get_preds(Ridge(x, y, w, 2, 0))))"
+    eng = build_engine(formula)
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "ts": np.arange(5.0, dtype=np.float64).reshape(5, 1),
+            "x": np.arange(10.0, 15.0, dtype=np.float64).reshape(5, 1),
+            "y": np.arange(1.0, 6.0, dtype=np.float64).reshape(5, 1),
+            "w": np.ones((5, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    assert out.shape == (5, 1)
+    assert np.all(np.isfinite(out))
 
 
 def test_logical_eq_ne_and_mul_ops():
