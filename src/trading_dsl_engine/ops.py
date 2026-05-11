@@ -48,7 +48,11 @@ def _make_input_node(input_index: int) -> CompiledNode:
         def emit(self):
             return self.out
 
-    node = CompiledNode(VECTOR, InputOp.class_type.instance_type, lambda: InputOp(input_index))
+    @njit
+    def _jit_ctor():
+        return InputOp(input_index)
+
+    node = CompiledNode(VECTOR, InputOp.class_type.instance_type, lambda: InputOp(input_index), _jit_ctor)
     _INPUT_NODE_CACHE[input_index] = node
     return node
 
@@ -76,7 +80,11 @@ def _make_literal_node(value: float) -> CompiledNode:
         def emit(self):
             return self.out
 
-    node = CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value))
+    @njit
+    def _jit_ctor():
+        return LiteralOp(value)
+
+    node = CompiledNode(SCALAR, LiteralOp.class_type.instance_type, lambda: LiteralOp(value), _jit_ctor)
     _LITERAL_NODE_CACHE[value] = node
     return node
 
@@ -220,12 +228,18 @@ def make_nary_op(
 
         out_type = validator([child.type_info for child in children])
         child_ctors = tuple(child.ctor for child in children)
+        child_jit_ctors = tuple(child.jit_ctor for child in children)
 
         def _ctor():
             nodes = tuple(fn() for fn in child_ctors)
             return NaryOp(nodes)
 
-        node = CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor)
+        @njit
+        def _jit_ctor():
+            nodes = tuple(fn() for fn in literal_unroll(child_jit_ctors))
+            return NaryOp(nodes)
+
+        node = CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor, _jit_ctor)
         node_cache[child_types] = node
         return node
 
@@ -267,7 +281,13 @@ def _cumsum_builder(children: list[CompiledNode], literals: list[float]) -> Comp
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, CumSumOp.class_type.instance_type, lambda: CumSumOp(src.ctor()))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return CumSumOp(src_jit_ctor())
+
+    return CompiledNode(VECTOR, CumSumOp.class_type.instance_type, lambda: CumSumOp(src.ctor()), _jit_ctor)
 
 
 def _shift_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -351,7 +371,14 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, ShiftOp.class_type.instance_type, lambda: ShiftOp(src.ctor(), nlag.ctor(), max_size))
+    src_jit_ctor = src.jit_ctor
+    nlag_jit_ctor = nlag.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return ShiftOp(src_jit_ctor(), nlag_jit_ctor(), max_size)
+
+    return CompiledNode(VECTOR, ShiftOp.class_type.instance_type, lambda: ShiftOp(src.ctor(), nlag.ctor(), max_size), _jit_ctor)
 
 
 def _ewm_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -417,7 +444,13 @@ def _ewm_builder(children: list[CompiledNode], literals: list[float]) -> Compile
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, EWMOp.class_type.instance_type, lambda: EWMOp(src.ctor(), alpha))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return EWMOp(src_jit_ctor(), alpha)
+
+    return CompiledNode(VECTOR, EWMOp.class_type.instance_type, lambda: EWMOp(src.ctor(), alpha), _jit_ctor)
 
 
 def _xs_rank_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -484,7 +517,13 @@ def _xs_rank_builder(children: list[CompiledNode], literals: list[float]) -> Com
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, XsRankOp.class_type.instance_type, lambda: XsRankOp(src.ctor()))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return XsRankOp(src_jit_ctor())
+
+    return CompiledNode(VECTOR, XsRankOp.class_type.instance_type, lambda: XsRankOp(src.ctor()), _jit_ctor)
 
 
 def _outer_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -522,7 +561,13 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
         def emit(self):
             return self.out
 
-    return CompiledNode(MATRIX, OuterOp.class_type.instance_type, lambda: OuterOp(src.ctor()))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return OuterOp(src_jit_ctor())
+
+    return CompiledNode(MATRIX, OuterOp.class_type.instance_type, lambda: OuterOp(src.ctor()), _jit_ctor)
 
 
 def _bspline_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -604,10 +649,17 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
         def emit(self):
             return self.out
 
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return BSplineOp(src_jit_ctor(), n_basis)
+
     return CompiledNode(
         MATRIX,
         BSplineOp.class_type.instance_type,
         lambda: BSplineOp(src.ctor(), n_basis),
+        _jit_ctor,
     )
 
 
@@ -655,7 +707,13 @@ def _col_builder(children: list[CompiledNode], literals: list[float]) -> Compile
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return ColOp(src_jit_ctor(), idx)
+
+    return CompiledNode(VECTOR, ColOp.class_type.instance_type, lambda: ColOp(src.ctor(), idx), _jit_ctor)
 
 
 def _rolling_quantile_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -754,10 +812,17 @@ def _rolling_quantile_builder(children: list[CompiledNode], literals: list[float
         def emit(self):
             return self.out
 
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return RollingQuantileOp(src_jit_ctor(), window, q)
+
     return CompiledNode(
         VECTOR,
         RollingQuantileOp.class_type.instance_type,
         lambda: RollingQuantileOp(src.ctor(), window, q),
+        _jit_ctor,
     )
 
 
@@ -857,15 +922,24 @@ def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
 def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     key_node = children[0]
     op_node = children[1]
+    if op_node.jit_ctor is None:
+        raise ValueError("groupby op does not support dynamic compiled construction")
     groups_list_type = types.ListType(op_node.instance_type)
-    max_groups = 256
+    op_jit_ctor = op_node.jit_ctor
+
+    @njit
+    def _new_group():
+        return op_jit_ctor()
 
     spec = [
         ("key_node", key_node.instance_type),
         ("groups", groups_list_type),
         ("group_keys", int64[:]),
-        ("n_groups", int64),
-        ("active_group_idx", int64),
+        ("group_instruments", int64[:]),
+        ("active_group_indices", int64[:]),
+        ("scratch", float64[:, :]),
+        ("out", float64[:, :]),
+        ("initialized", boolean),
     ]
 
     @jitclass(spec)
@@ -873,52 +947,82 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
         def __init__(self, key_node, groups):
             self.key_node = key_node
             self.groups = groups
-            self.group_keys = np.empty(max_groups, dtype=np.int64)
-            for i in range(max_groups):
-                self.group_keys[i] = -1
-            self.n_groups = 0
-            self.active_group_idx = -1
+            self.group_keys = np.empty(0, dtype=np.int64)
+            self.group_instruments = np.empty(0, dtype=np.int64)
+            self.active_group_indices = np.empty(0, dtype=np.int64)
+            self.scratch = np.empty((1, 1), dtype=np.float64)
+            self.out = np.empty((1, 1), dtype=np.float64)
+            self.initialized = False
 
-        def _find_group(self, key: int64):
-            for i in range(self.n_groups):
-                if self.group_keys[i] == key:
+        def _find_group(self, instrument: int64, key: int64):
+            for i in range(self.group_keys.shape[0]):
+                if self.group_instruments[i] == instrument and self.group_keys[i] == key:
                     return i
             return -1
 
-        def _append_group(self, key: int64):
-            if self.n_groups >= self.group_keys.shape[0]:
-                raise ValueError("groupby exceeded max groups (256)")
-            self.group_keys[self.n_groups] = key
-            self.n_groups += 1
-            return self.n_groups - 1
+        def _append_group(self, instrument: int64, key: int64):
+            n = self.group_keys.shape[0]
+            next_keys = np.empty(n + 1, dtype=np.int64)
+            next_instruments = np.empty(n + 1, dtype=np.int64)
+            for i in range(n):
+                next_keys[i] = self.group_keys[i]
+                next_instruments[i] = self.group_instruments[i]
+            next_keys[n] = key
+            next_instruments[n] = instrument
+            self.group_keys = next_keys
+            self.group_instruments = next_instruments
+            self.groups.append(_new_group())
+            return n
+
+        def _ensure_tick_buffers(self, n_inputs: int64, n_instruments: int64):
+            if self.active_group_indices.shape[0] != n_instruments:
+                self.active_group_indices = np.empty(n_instruments, dtype=np.int64)
+            if self.scratch.shape[0] != n_inputs or self.scratch.shape[1] != 1:
+                self.scratch = np.empty((n_inputs, 1), dtype=np.float64)
+
+        def _ensure_out(self, rows: int64, cols: int64):
+            if (not self.initialized) or self.out.shape[0] != rows or self.out.shape[1] != cols:
+                self.out = np.empty((rows, cols), dtype=np.float64)
+                self.initialized = True
 
         def on_data(self, frame2d):
             self.key_node.on_data(frame2d)
             k = self.key_node.emit()
-            first = k[0, 0]
-            if np.isnan(first):
-                raise ValueError("groupby key cannot be NaN")
-            key = int(first)
-            for i in range(1, k.shape[0]):
-                if np.isnan(k[i, 0]) or int(k[i, 0]) != key:
-                    raise ValueError("groupby currently requires a single shared key across instruments per tick")
+            n_instruments = k.shape[0]
+            self._ensure_tick_buffers(frame2d.shape[0], n_instruments)
 
-            idx = self._find_group(key)
-            if idx < 0:
-                idx = self._append_group(key)
-            self.active_group_idx = idx
-            self.groups[idx].on_data(frame2d)
+            width = 1
+            for instrument in range(n_instruments):
+                kv = k[instrument, 0]
+                if np.isnan(kv):
+                    raise ValueError("groupby key cannot be NaN")
+                key = int(kv)
+                idx = self._find_group(instrument, key)
+                if idx < 0:
+                    idx = self._append_group(instrument, key)
+                self.active_group_indices[instrument] = idx
+
+                for r in range(frame2d.shape[0]):
+                    self.scratch[r, 0] = frame2d[r, instrument]
+                self.groups[idx].on_data(self.scratch)
+                y = self.groups[idx].emit()
+                if y.shape[1] > width:
+                    width = y.shape[1]
+
+            self._ensure_out(n_instruments, width)
+            for instrument in range(n_instruments):
+                y = self.groups[self.active_group_indices[instrument]].emit()
+                for col in range(width):
+                    src_col = col if y.shape[1] > 1 else 0
+                    self.out[instrument, col] = y[0, src_col]
 
         def emit(self):
-            if self.active_group_idx < 0:
-                raise ValueError("groupby has no active group")
-            return self.groups[self.active_group_idx].emit()
+            return self.out
 
-    return CompiledNode(
-        children[1].type_info,
-        GroupByOp.class_type.instance_type,
-        lambda: GroupByOp(key_node.ctor(), _build_group_slots(op_node.ctor, max_groups, op_node.instance_type)),
-    )
+    def _ctor():
+        return GroupByOp(key_node.ctor(), List.empty_list(op_node.instance_type))
+
+    return CompiledNode(children[1].type_info, GroupByOp.class_type.instance_type, _ctor)
 
 
 def _build_group_slots(group_ctor, n_slots: int, instance_type):
@@ -1063,46 +1167,13 @@ def _pairwise_weighted_moments_matrix(x, y, w):
 
 @njit
 def _solve_linear_system(a, b, out):
-    """Small dense Gaussian solve used to avoid a SciPy/BLAS runtime dependency."""
-    n = b.shape[0]
-    aug = np.empty((n, n + 1), dtype=np.float64)
-    for i in range(n):
-        for j in range(n):
-            aug[i, j] = a[i, j]
-        aug[i, n] = b[i]
-
-    eps = 1e-12
-    for col in range(n):
-        pivot = col
-        pivot_abs = abs(aug[col, col])
-        for row in range(col + 1, n):
-            candidate = abs(aug[row, col])
-            if candidate > pivot_abs:
-                pivot = row
-                pivot_abs = candidate
-        if pivot_abs <= eps or np.isnan(pivot_abs):
-            return False
-        if pivot != col:
-            for j in range(col, n + 1):
-                tmp = aug[col, j]
-                aug[col, j] = aug[pivot, j]
-                aug[pivot, j] = tmp
-
-        pivot_value = aug[col, col]
-        for row in range(col + 1, n):
-            factor = aug[row, col] / pivot_value
-            aug[row, col] = 0.0
-            for j in range(col + 1, n + 1):
-                aug[row, j] -= factor * aug[col, j]
-
-    for i in range(n - 1, -1, -1):
-        rhs = aug[i, n]
-        for j in range(i + 1, n):
-            rhs -= aug[i, j] * out[j]
-        diag = aug[i, i]
-        if abs(diag) <= eps or np.isnan(diag):
-            return False
-        out[i] = rhs / diag
+    """Solve a dense system through Numba-backed LAPACK/SciPy instead of a local solver."""
+    try:
+        candidate = np.linalg.solve(a, b)
+    except Exception:
+        return False
+    for i in range(candidate.shape[0]):
+        out[i] = candidate[i]
     return True
 
 
@@ -1293,16 +1364,26 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             return self.state
 
     feature_ctors = [node.ctor for node in feature_nodes]
+    feature_jit_ctors = tuple(node.jit_ctor for node in feature_nodes)
     y_ctor = y_node.ctor
+    y_jit_ctor = y_node.jit_ctor
     w_ctor = w_node.ctor
+    w_jit_ctor = w_node.jit_ctor
     hl_ctor = hl_node.ctor
+    hl_jit_ctor = hl_node.jit_ctor
     lam_ctor = lam_node.ctor
+    lam_jit_ctor = lam_node.jit_ctor
 
     def _ctor():
         x_nodes = tuple(fn() for fn in feature_ctors)
         return RidgeOp(x_nodes, y_ctor(), w_ctor(), hl_ctor(), lam_ctor(), _RidgeState())
 
-    return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor)
+    @njit
+    def _jit_ctor():
+        x_nodes = tuple(fn() for fn in literal_unroll(feature_jit_ctors))
+        return RidgeOp(x_nodes, y_jit_ctor(), w_jit_ctor(), hl_jit_ctor(), lam_jit_ctor(), _RidgeState())
+
+    return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor, _jit_ctor)
 
 
 def _get_beta_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -1332,7 +1413,13 @@ def _get_beta_builder(children: list[CompiledNode], literals: list[float]) -> Co
         def emit(self):
             return self.out
 
-    return CompiledNode(VECTOR, GetBetaOp.class_type.instance_type, lambda: GetBetaOp(src.ctor()))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return GetBetaOp(src_jit_ctor())
+
+    return CompiledNode(VECTOR, GetBetaOp.class_type.instance_type, lambda: GetBetaOp(src.ctor()), _jit_ctor)
 
 
 def _get_preds_validator(types: list[TypeInfo]) -> TypeInfo:
@@ -1357,7 +1444,13 @@ def _get_preds_builder(children: list[CompiledNode], literals: list[float]) -> C
             state = self.src.emit()
             return state.preds
 
-    return CompiledNode(VECTOR, GetPredsOp.class_type.instance_type, lambda: GetPredsOp(src.ctor()))
+    src_jit_ctor = src.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return GetPredsOp(src_jit_ctor())
+
+    return CompiledNode(VECTOR, GetPredsOp.class_type.instance_type, lambda: GetPredsOp(src.ctor()), _jit_ctor)
 
 
 def register_builtin_ops() -> None:

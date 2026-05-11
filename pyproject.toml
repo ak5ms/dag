@@ -7,7 +7,7 @@ name = "trading_dsl_engine"
 version = "0.1.0"
 description = "Numba-compiled streaming DSL engine for trading features"
 requires-python = ">=3.10"
-dependencies = ["numpy", "numba"]
+dependencies = ["numpy", "numba", "scipy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
