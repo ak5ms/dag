@@ -1365,6 +1365,7 @@ def register_builtin_ops() -> None:
         return
 
     make_nary_op("div", 2, lambda args: np.nan if args[1] == 0.0 else args[0] / args[1])
+    make_nary_op("floordiv", 2, lambda args: np.nan if args[1] == 0.0 else args[0] // args[1])
     make_nary_op("add", 2, lambda args: args[0] + args[1])
     make_nary_op("sub", 2, lambda args: args[0] - args[1])
     make_nary_op("mod", 2, lambda args: args[0] % args[1])
