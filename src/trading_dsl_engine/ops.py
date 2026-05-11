@@ -1166,13 +1166,13 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
     @jitclass(spec)
     class RidgeOp:
-        def __init__(self, x_nodes, y_node, w_node, hl_node, lam_node):
+        def __init__(self, x_nodes, y_node, w_node, hl_node, lam_node, state):
             self.x_nodes = x_nodes
             self.y_node = y_node
             self.w_node = w_node
             self.hl_node = hl_node
             self.lam_node = lam_node
-            self.state = _RidgeState()
+            self.state = state
 
         def _reset_state(self, n, k):
             self.state.initialized = True
@@ -1300,7 +1300,7 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
 
     def _ctor():
         x_nodes = tuple(fn() for fn in feature_ctors)
-        return RidgeOp(x_nodes, y_ctor(), w_ctor(), hl_ctor(), lam_ctor())
+        return RidgeOp(x_nodes, y_ctor(), w_ctor(), hl_ctor(), lam_ctor(), _RidgeState())
 
     return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor)
 
