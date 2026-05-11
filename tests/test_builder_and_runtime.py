@@ -624,6 +624,26 @@ def test_groupby_can_box_nested_ridge_slots_without_pickling_error():
     assert eng.input_names == ("ts", "x", "y", "w")
 
 
+
+def test_groupby_can_construct_nested_ridge_formula_from_compiled_path():
+    formula = "groupby(ts, cumsum(get_preds(Ridge(x, y, w, 2, 0))))"
+    eng = build_engine(formula)
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "ts": np.arange(5.0, dtype=np.float64).reshape(5, 1),
+            "x": np.arange(10.0, 15.0, dtype=np.float64).reshape(5, 1),
+            "y": np.arange(1.0, 6.0, dtype=np.float64).reshape(5, 1),
+            "w": np.ones((5, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    assert out.shape == (5, 1)
+    assert np.all(np.isfinite(out))
+
+
 def test_logical_eq_ne_and_mul_ops():
     eng = build_engine("and(eq(close, open), ne(volume, 0))")
     out = run_batch_from_mapping(

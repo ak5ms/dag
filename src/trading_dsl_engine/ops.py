@@ -20,6 +20,28 @@ _INPUT_NODE_CACHE: dict[int, CompiledNode] = {}
 _LITERAL_NODE_CACHE: dict[float, CompiledNode] = {}
 
 
+def _ctor_call_tuple_expr(prefix: str, n_items: int) -> str:
+    if n_items == 0:
+        return "()"
+    calls = ", ".join(f"{prefix}{i}()" for i in range(n_items))
+    if n_items == 1:
+        calls += ","
+    return f"({calls})"
+
+
+def _compile_njit_nullary_ctor(body: str, namespace: dict[str, object]):
+    exec_namespace = {"njit": njit, **namespace}
+    exec(f"@njit\ndef _jit_ctor():\n    {body}\n", exec_namespace)
+    return exec_namespace["_jit_ctor"]
+
+
+def _compile_jit_tuple_node_ctor(op_class, child_jit_ctors: tuple[object, ...]):
+    namespace = {"OpClass": op_class}
+    for i, ctor in enumerate(child_jit_ctors):
+        namespace[f"c{i}"] = ctor
+    return _compile_njit_nullary_ctor(f"return OpClass({_ctor_call_tuple_expr('c', len(child_jit_ctors))})", namespace)
+
+
 def _make_input_node(input_index: int) -> CompiledNode:
     cached = _INPUT_NODE_CACHE.get(input_index)
     if cached is not None:
@@ -234,10 +256,7 @@ def make_nary_op(
             nodes = tuple(fn() for fn in child_ctors)
             return NaryOp(nodes)
 
-        @njit
-        def _jit_ctor():
-            nodes = tuple(fn() for fn in literal_unroll(child_jit_ctors))
-            return NaryOp(nodes)
+        _jit_ctor = _compile_jit_tuple_node_ctor(NaryOp, child_jit_ctors)
 
         node = CompiledNode(out_type, NaryOp.class_type.instance_type, _ctor, _jit_ctor)
         node_cache[child_types] = node
@@ -1378,10 +1397,22 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
         x_nodes = tuple(fn() for fn in feature_ctors)
         return RidgeOp(x_nodes, y_ctor(), w_ctor(), hl_ctor(), lam_ctor(), _RidgeState())
 
-    @njit
-    def _jit_ctor():
-        x_nodes = tuple(fn() for fn in literal_unroll(feature_jit_ctors))
-        return RidgeOp(x_nodes, y_jit_ctor(), w_jit_ctor(), hl_jit_ctor(), lam_jit_ctor(), _RidgeState())
+    ridge_ctor_namespace = {
+        "RidgeOp": RidgeOp,
+        "y_ctor": y_jit_ctor,
+        "w_ctor": w_jit_ctor,
+        "hl_ctor": hl_jit_ctor,
+        "lam_ctor": lam_jit_ctor,
+        "_RidgeState": _RidgeState,
+    }
+    for i, ctor in enumerate(feature_jit_ctors):
+        ridge_ctor_namespace[f"x{i}"] = ctor
+    _jit_ctor = _compile_njit_nullary_ctor(
+        "return RidgeOp("
+        + _ctor_call_tuple_expr("x", len(feature_jit_ctors))
+        + ", y_ctor(), w_ctor(), hl_ctor(), lam_ctor(), _RidgeState())",
+        ridge_ctor_namespace,
+    )
 
     return CompiledNode(OBJECT, RidgeOp.class_type.instance_type, _ctor, _jit_ctor)
 
