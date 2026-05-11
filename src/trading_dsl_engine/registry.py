@@ -14,6 +14,7 @@ class CompiledNode:
     type_info: TypeInfo
     instance_type: object
     ctor: Callable[[], object]
+    jit_ctor: Callable[[], object] | None = None
 
 
 @dataclass(frozen=True)

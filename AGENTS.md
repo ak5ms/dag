@@ -55,7 +55,7 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ridge pairwise sufficient-statistic behavior: `xx[j, k]` and `xy[j]` update only when their own finite row requirements are met, and their per-statistic clocks do not advance during outages.
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
 - Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
-- Grouped-state behavior for keyed operators (e.g., `groupby`) including key NaNs, per-key state transitions, and key consistency expectations.
+- Grouped-state behavior for keyed operators (e.g., `groupby`) including key NaNs, per-`(instrument, key)` state transitions, multiple different keys in the same tick, and unbounded lazy group creation instead of fixed preallocated slot counts.
 - Static universe grouping behavior (`groupby(univ(...), op)`) including ticker-to-column mapping, per-universe state isolation, scatter/broadcast shape behavior, and NaN handling in reducers such as `mean`.
 
 ## Test expectations

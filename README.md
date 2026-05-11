@@ -87,7 +87,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 - `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
-- `groupby(key, op)` runs partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
+- `groupby(key, op)` runs partitioned streaming state by `(instrument, key)` for any scalar/vector/matrix-emitting op, supports different keys in different instrument columns on the same tick, and creates keyed state lazily so the number of observed groups is not capped by a fixed preallocated slot count.
 - `groupby(univ(...), op)` runs the same scalar/vector/matrix op independently on static column universes and scatters each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`.
 - `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar, which is useful inside universe grouping to broadcast per-group means.
 

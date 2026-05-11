@@ -580,19 +580,41 @@ def test_groupby_with_nested_ewm_by_minute_of_day_matches_reference():
     np.testing.assert_allclose(out, expected, equal_nan=True)
 
 
-def test_groupby_rejects_mixed_keys_within_tick():
+def test_groupby_supports_mixed_keys_within_tick():
     eng = build_engine("groupby(ts, ewm(close, 3))")
-    with pytest.raises(ValueError, match="single shared key"):
-        update_from_mapping(
-            eng,
-            {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 2.0], dtype=np.float64)},
-        )
+
+    first = update_from_mapping(
+        eng,
+        {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([1.0, 10.0], dtype=np.float64)},
+    ).copy()
+    second = update_from_mapping(
+        eng,
+        {"ts": np.array([1.0, 0.0], dtype=np.float64), "close": np.array([20.0, 3.0], dtype=np.float64)},
+    ).copy()
+    third = update_from_mapping(
+        eng,
+        {"ts": np.array([0.0, 1.0], dtype=np.float64), "close": np.array([5.0, 14.0], dtype=np.float64)},
+    ).copy()
+
+    np.testing.assert_allclose(first[:, 0], np.array([1.0, 10.0], dtype=np.float64))
+    np.testing.assert_allclose(second[:, 0], np.array([20.0, 3.0], dtype=np.float64))
+    np.testing.assert_allclose(third[:, 0], np.array([3.0, 12.0], dtype=np.float64))
 
 
 def test_groupby_can_box_nested_ridge_slots_without_pickling_error():
     eng = build_engine("groupby(ts, get_beta(Ridge(x, y, w, 2, 0)))")
 
     assert eng.input_names == ("ts", "x", "y", "w")
+
+
+def test_groupby_supports_more_than_legacy_preallocated_groups():
+    eng = build_engine("groupby(ts, ewm(close, 3))")
+    ts = np.arange(300, dtype=np.float64).reshape(300, 1)
+    close = (ts + 100.0).copy()
+
+    out = run_batch_from_mapping(eng, {"ts": ts, "close": close}, out_path=None)
+
+    np.testing.assert_allclose(out[:, 0], close[:, 0])
 
 
 def test_logical_eq_ne_and_mul_ops():
