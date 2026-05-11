@@ -1380,6 +1380,7 @@ def register_builtin_ops() -> None:
     make_nary_op("abs", 1, lambda args: np.abs(args[0]))
     make_nary_op("isnan", 1, lambda args: 1.0 if np.isnan(args[0]) else 0.0)
     make_nary_op("fillna", 2, lambda args: args[0] if np.isnan(args[1]) else args[0])
+    make_nary_op("ln", 1, lambda args: np.log(args[0]))
     REGISTRY.register(OpSpec(name="ewm", validator=_ewm_validator, builder=_ewm_builder))
     REGISTRY.register(OpSpec(name="cumsum", validator=_cumsum_validator, builder=_cumsum_builder))
     REGISTRY.register(OpSpec(name="shift", validator=_shift_validator, builder=_shift_builder))

@@ -9,8 +9,8 @@ class DSLFunctionRegistry:
     def __init__(self) -> None:
         self._fns: dict[str, Callable[..., Expr]] = {}
 
-    def register(self, name: str, fn: Callable[..., Expr]) -> None:
-        if name in self._fns:
+    def register(self, name: str, fn: Callable[..., Expr], overwrite: bool = True) -> None:
+        if not overwrite and name in self._fns:
             raise ValueError(f"DSL function already registered: {name}")
         self._fns[name] = fn
 
