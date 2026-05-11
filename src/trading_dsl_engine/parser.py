@@ -91,6 +91,9 @@ class Expr:
     def __ne__(self, other):
         return self._call("ne", other)
 
+    def __floordiv__(self, other):
+        return self._call("floordiv", other)
+
 
 @dataclass(frozen=True, eq=False)
 class Identifier(Expr):
@@ -129,6 +132,7 @@ _BINOP_NAMES: dict[type[ast.operator], str] = {
     ast.BitAnd: "and_",
     ast.BitOr: "or_",
     ast.BitXor: "xor",
+    ast.FloorDiv: "floordiv",
 }
 
 _CMP_NAMES: dict[type[ast.cmpop], str] = {
