@@ -589,6 +589,12 @@ def test_groupby_rejects_mixed_keys_within_tick():
         )
 
 
+def test_groupby_can_box_nested_ridge_slots_without_pickling_error():
+    eng = build_engine("groupby(ts, get_beta(Ridge(x, y, w, 2, 0)))")
+
+    assert eng.input_names == ("ts", "x", "y", "w")
+
+
 def test_logical_eq_ne_and_mul_ops():
     eng = build_engine("and(eq(close, open), ne(volume, 0))")
     out = run_batch_from_mapping(

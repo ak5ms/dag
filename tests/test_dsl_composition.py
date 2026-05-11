@@ -106,6 +106,7 @@ def test_all_builtin_dsl_operator_helpers_are_importable():
         "abs",
         "isnan",
         "fillna",
+        "ln",
         "cumsum",
         "shift",
         "ewm",
