@@ -15,6 +15,7 @@ class CompiledNode:
     instance_type: object
     ctor: Callable[[], object]
     jit_ctor: object | None = None
+    stateless: bool = False
 
 
 @dataclass(frozen=True)
