@@ -55,6 +55,35 @@ def call(name: str, *args) -> Expr:
     return Call(name, tuple(ensure_expr(a) for a in args))
 
 
+GROUPBY_VALUE_PLACEHOLDER = "self_"
+self_ = var(GROUPBY_VALUE_PLACEHOLDER)
+
+
+class GroupedExpr:
+    def __init__(self, lhs, key) -> None:
+        self.lhs = ensure_expr(lhs)
+        self.key = ensure_expr(key)
+
+    def apply(self, rhs, *args) -> Expr:
+        if callable(rhs):
+            rhs_expr = rhs(var(GROUPBY_VALUE_PLACEHOLDER), *args)
+        elif args:
+            raise TypeError("GroupedExpr.apply args require a callable rhs")
+        else:
+            rhs_expr = rhs
+        return call("groupby", self.key, self.lhs, rhs_expr)
+
+    def __getattr__(self, name: str):
+        def _grouped_op(*args) -> Expr:
+            return self.apply(lambda value: call(name, value, *args))
+
+        return _grouped_op
+
+
+def grouped(lhs, key) -> GroupedExpr:
+    return GroupedExpr(lhs, key)
+
+
 def op(name: str) -> Callable[..., Expr]:
     def _op(*args) -> Expr:
         return call(name, *args)

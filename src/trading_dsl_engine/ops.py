@@ -5,7 +5,7 @@ from typing import Callable
 import numpy as np
 from numba import boolean, float64, int64, literal_unroll, njit, types
 from numba.experimental import jitclass
-from numba.typed import List
+from numba.typed import Dict, List
 
 from trading_dsl_engine.registry import REGISTRY, CompiledNode, OpSpec, TypeInfo
 
@@ -77,6 +77,38 @@ def _make_input_node(input_index: int) -> CompiledNode:
     node = CompiledNode(VECTOR, InputOp.class_type.instance_type, lambda: InputOp(input_index), _jit_ctor)
     _INPUT_NODE_CACHE[input_index] = node
     return node
+
+
+def _make_local_value_node(type_info: TypeInfo) -> CompiledNode:
+    if type_info.kind not in ("scalar", "vector", "matrix"):
+        raise ValueError("groupby lhs must emit scalar/vector/matrix, not object")
+
+    spec = [("initialized", boolean), ("out", float64[:, :])]
+
+    @jitclass(spec)
+    class LocalValueOp:
+        def __init__(self):
+            self.initialized = False
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            if (
+                (not self.initialized)
+                or self.out.shape[0] != frame2d.shape[0]
+                or self.out.shape[1] != frame2d.shape[1]
+            ):
+                self.out = np.empty((frame2d.shape[0], frame2d.shape[1]), dtype=np.float64)
+                self.initialized = True
+            self.out[:, :] = frame2d
+
+        def emit(self):
+            return self.out
+
+    @njit
+    def _jit_ctor():
+        return LocalValueOp()
+
+    return CompiledNode(type_info, LocalValueOp.class_type.instance_type, LocalValueOp, _jit_ctor)
 
 
 def _make_literal_node(value: float) -> CompiledNode:
@@ -929,18 +961,23 @@ def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, 
 
 
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) != 2:
-        raise ValueError("groupby expects 2 args: key, op")
+    if len(types) not in (2, 3):
+        raise ValueError("groupby expects 2 args: key, op or 3 args: key, lhs, op")
     if types[0].kind != "vector":
         raise ValueError("groupby key arg must be vector")
-    if types[1].kind == "object":
+    if len(types) == 3 and types[1].kind == "object":
+        raise ValueError("groupby lhs arg must emit scalar/vector/matrix, not object")
+    op_type = types[-1]
+    if op_type.kind == "object":
         raise ValueError("groupby op arg must emit scalar/vector/matrix, not object")
-    return types[1]
+    return op_type
 
 
 def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     key_node = children[0]
-    op_node = children[1]
+    has_lhs = len(children) == 3
+    lhs_node = children[1] if has_lhs else key_node
+    op_node = children[2] if has_lhs else children[1]
     if op_node.jit_ctor is None:
         raise ValueError("groupby op does not support dynamic compiled construction")
     groups_list_type = types.ListType(op_node.instance_type)
@@ -952,63 +989,74 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
 
     spec = [
         ("key_node", key_node.instance_type),
+        ("lhs_node", lhs_node.instance_type),
         ("groups", groups_list_type),
-        ("group_keys", int64[:]),
-        ("group_instruments", int64[:]),
+        ("group_lookup", types.DictType(types.UniTuple(int64, 2), int64)),
         ("active_group_indices", int64[:]),
         ("scratch", float64[:, :]),
         ("out", float64[:, :]),
+        ("has_lhs", boolean),
         ("initialized", boolean),
     ]
 
     @jitclass(spec)
     class GroupByOp:
-        def __init__(self, key_node, groups):
+        def __init__(self, key_node, lhs_node, groups, group_lookup, has_lhs: bool):
             self.key_node = key_node
+            self.lhs_node = lhs_node
             self.groups = groups
-            self.group_keys = np.empty(0, dtype=np.int64)
-            self.group_instruments = np.empty(0, dtype=np.int64)
+            self.group_lookup = group_lookup
             self.active_group_indices = np.empty(0, dtype=np.int64)
             self.scratch = np.empty((1, 1), dtype=np.float64)
             self.out = np.empty((1, 1), dtype=np.float64)
+            self.has_lhs = has_lhs
             self.initialized = False
 
         def _find_group(self, instrument: int64, key: int64):
-            for i in range(self.group_keys.shape[0]):
-                if self.group_instruments[i] == instrument and self.group_keys[i] == key:
-                    return i
+            pair = (instrument, key)
+            if pair in self.group_lookup:
+                return self.group_lookup[pair]
             return -1
 
         def _append_group(self, instrument: int64, key: int64):
-            n = self.group_keys.shape[0]
-            next_keys = np.empty(n + 1, dtype=np.int64)
-            next_instruments = np.empty(n + 1, dtype=np.int64)
-            for i in range(n):
-                next_keys[i] = self.group_keys[i]
-                next_instruments[i] = self.group_instruments[i]
-            next_keys[n] = key
-            next_instruments[n] = instrument
-            self.group_keys = next_keys
-            self.group_instruments = next_instruments
+            n = len(self.groups)
             self.groups.append(_new_group())
+            self.group_lookup[(instrument, key)] = n
             return n
 
-        def _ensure_tick_buffers(self, n_inputs: int64, n_instruments: int64):
+        def _ensure_scratch(self, rows: int64, cols: int64, n_instruments: int64):
             if self.active_group_indices.shape[0] != n_instruments:
                 self.active_group_indices = np.empty(n_instruments, dtype=np.int64)
-            if self.scratch.shape[0] != n_inputs or self.scratch.shape[1] != 1:
-                self.scratch = np.empty((n_inputs, 1), dtype=np.float64)
+            if self.scratch.shape[0] != rows or self.scratch.shape[1] != cols:
+                self.scratch = np.empty((rows, cols), dtype=np.float64)
 
         def _ensure_out(self, rows: int64, cols: int64):
             if (not self.initialized) or self.out.shape[0] != rows or self.out.shape[1] != cols:
                 self.out = np.empty((rows, cols), dtype=np.float64)
                 self.initialized = True
 
+        def _copy_group_input(self, frame2d, x, instrument: int64):
+            if self.has_lhs:
+                src_row = 0 if x.shape[0] == 1 else instrument
+                for col in range(x.shape[1]):
+                    self.scratch[0, col] = x[src_row, col]
+            else:
+                for row in range(frame2d.shape[0]):
+                    self.scratch[row, 0] = frame2d[row, instrument]
+
         def on_data(self, frame2d):
             self.key_node.on_data(frame2d)
+            if self.has_lhs:
+                self.lhs_node.on_data(frame2d)
+                x = self.lhs_node.emit()
+                scratch_rows, scratch_cols = 1, x.shape[1]
+            else:
+                x = self.scratch
+                scratch_rows, scratch_cols = frame2d.shape[0], 1
+
             k = self.key_node.emit()
             n_instruments = k.shape[0]
-            self._ensure_tick_buffers(frame2d.shape[0], n_instruments)
+            self._ensure_scratch(scratch_rows, scratch_cols, n_instruments)
 
             width = 1
             for instrument in range(n_instruments):
@@ -1021,8 +1069,7 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
                     idx = self._append_group(instrument, key)
                 self.active_group_indices[instrument] = idx
 
-                for r in range(frame2d.shape[0]):
-                    self.scratch[r, 0] = frame2d[r, instrument]
+                self._copy_group_input(frame2d, x, instrument)
                 self.groups[idx].on_data(self.scratch)
                 y = self.groups[idx].emit()
                 if y.shape[1] > width:
@@ -1039,9 +1086,16 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
             return self.out
 
     def _ctor():
-        return GroupByOp(key_node.ctor(), List.empty_list(op_node.instance_type))
+        group_lookup = Dict.empty(key_type=types.UniTuple(int64, 2), value_type=int64)
+        return GroupByOp(
+            key_node.ctor(),
+            lhs_node.ctor(),
+            List.empty_list(op_node.instance_type),
+            group_lookup,
+            has_lhs,
+        )
 
-    return CompiledNode(children[1].type_info, GroupByOp.class_type.instance_type, _ctor)
+    return CompiledNode(op_node.type_info, GroupByOp.class_type.instance_type, _ctor)
 
 
 def _build_group_slots(group_ctor, n_slots: int, instance_type):
@@ -1526,6 +1580,7 @@ __all__ = [
     "register_builtin_ops",
     "_make_input_node",
     "_make_literal_node",
+    "_make_local_value_node",
     "_make_universe_groupby_node",
     "VECTOR",
     "SCALAR",

@@ -807,3 +807,131 @@ def test_universe_groupby_preserves_state_per_column_group():
 
     np.testing.assert_allclose(out[0], close[0])
     np.testing.assert_allclose(out[1], np.array([11.0, 19.0, 150.0], dtype=np.float64))
+
+
+def test_groupby_lhs_form_computes_lhs_outside_keyed_op_state():
+    eng = build_engine("groupby(key, cumsum(x), cumsum(self_))")
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "key": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+            "x": np.ones((4, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 4.0, 6.0]))
+
+
+def test_groupby_lhs_form_supports_other_stateful_ops():
+    eng = build_engine("groupby(key, cumsum(x), ewm(self_, 3))")
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "key": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+            "x": np.ones((4, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 2.0, 3.0]))
+
+
+def test_grouped_expr_apply_sugar_matches_three_arg_groupby():
+    import trading_dsl_engine as tde
+    from trading_dsl_engine import cumsum, var
+
+    formula = cumsum(var("x")).groupby(var("key")).apply(cumsum(tde.self_))
+    eng = build_engine(formula)
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "key": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+            "x": np.ones((4, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 4.0, 6.0]))
+
+
+def test_grouped_expr_apply_accepts_nary_callable_args():
+    from trading_dsl_engine import add, var
+
+    formula = var("x").groupby(var("key")).apply(add, 2.0)
+    out = run_batch_from_mapping(
+        build_engine(formula),
+        {
+            "key": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+            "x": np.array([[1.0], [2.0], [3.0], [4.0]], dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(out[:, 0], np.array([3.0, 4.0, 5.0, 6.0]))
+
+
+def test_universe_groupby_output_can_feed_keyed_apply_with_self_placeholder():
+    import trading_dsl_engine as tde
+    from trading_dsl_engine import cumsum, groupby, mean, univ, var
+
+    lhs = groupby(univ([0, 1], [2]), mean(var("x")))
+    formula = lhs.groupby(var("key")).apply(cumsum(tde.self_))
+    out = run_batch_from_mapping(
+        build_engine(formula),
+        {
+            "key": np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                    [0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                ],
+                dtype=np.float64,
+            ),
+            "x": np.array(
+                [
+                    [1.0, 2.0, 10.0],
+                    [3.0, 4.0, 20.0],
+                    [5.0, 6.0, 30.0],
+                    [7.0, 8.0, 40.0],
+                ],
+                dtype=np.float64,
+            ),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(
+        out,
+        np.array(
+            [
+                [1.5, 1.5, 10.0],
+                [3.5, 3.5, 20.0],
+                [7.0, 7.0, 40.0],
+                [11.0, 11.0, 60.0],
+            ],
+            dtype=np.float64,
+        ),
+    )
+
+
+def test_grouped_expr_operator_method_sugar_matches_three_arg_groupby():
+    from trading_dsl_engine import cumsum, var
+
+    formula = cumsum(var("x")).groupby(var("key")).cumsum()
+    eng = build_engine(formula)
+
+    out = run_batch_from_mapping(
+        eng,
+        {
+            "key": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+            "x": np.ones((4, 1), dtype=np.float64),
+        },
+        out_path=None,
+    )
+
+    np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 4.0, 6.0]))
