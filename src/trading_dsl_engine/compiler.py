@@ -7,7 +7,13 @@ from numba import int64
 from numba.experimental import jitclass
 
 from trading_dsl_engine.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
-from trading_dsl_engine.ops import _make_input_node, _make_literal_node, _make_universe_groupby_node, register_builtin_ops
+from trading_dsl_engine.ops import (
+    _make_input_node,
+    _make_literal_node,
+    _make_local_value_node,
+    _make_universe_groupby_node,
+    register_builtin_ops,
+)
 from trading_dsl_engine.parser import Call, Expr, Identifier, Number, Universe, parse_formula
 from trading_dsl_engine.registry import REGISTRY, CompiledNode
 
@@ -131,16 +137,18 @@ def compile_formula(
     cache_hits = 0
     expanded_nodes = 0
 
-    def build(node: Expr, depth: int = 0) -> CompiledNode:
+    def build(node: Expr, depth: int = 0, local_inputs: dict[str, CompiledNode] | None = None) -> CompiledNode:
         nonlocal cache_hits, expanded_nodes
         if depth > 256:
             raise FormulaCompileError("Exceeded max DSL expansion depth (256)")
 
+        use_cache = not local_inputs
         key = _expr_key(node)
-        cached = cache.get(key)
-        if cached is not None:
-            cache_hits += 1
-            return cached
+        if use_cache:
+            cached = cache.get(key)
+            if cached is not None:
+                cache_hits += 1
+                return cached
 
         if isinstance(node, Call):
             py_fn = dsl_registry.get(node.fn)
@@ -149,31 +157,53 @@ def compile_formula(
                     expanded = py_fn(*node.args)
                 except Exception as exc:
                     raise FormulaCompileError(f"Failed expanding DSL function '{node.fn}': {exc}") from exc
-                compiled_expanded = build(expanded, depth + 1)
-                cache[key] = compiled_expanded
+                compiled_expanded = build(expanded, depth + 1, local_inputs)
+                if use_cache:
+                    cache[key] = compiled_expanded
                 return compiled_expanded
 
         expanded_nodes += 1
         if isinstance(node, Identifier):
-            if node.name not in inputs:
-                inputs[node.name] = len(inputs)
-            compiled = _make_input_node(inputs[node.name])
+            if local_inputs is not None:
+                if node.name not in local_inputs:
+                    raise FormulaCompileError("groupby local op expressions may only reference the 'self_' lhs placeholder")
+                compiled = local_inputs[node.name]
+            else:
+                if node.name not in inputs:
+                    inputs[node.name] = len(inputs)
+                compiled = _make_input_node(inputs[node.name])
         elif isinstance(node, Number):
             compiled = _make_literal_node(node.value)
         elif isinstance(node, Call):
             if node.fn == "groupby" and len(node.args) == 2 and isinstance(node.args[0], Universe):
-                op_child = build(node.args[1], depth + 1)
+                op_child = build(node.args[1], depth + 1, local_inputs)
                 groups = _resolve_universe_groups(node.args[0], column_name_to_index)
                 try:
                     compiled = _make_universe_groupby_node(op_child, groups)
                 except ValueError as exc:
                     raise FormulaCompileError(f"Invalid call groupby: {exc}") from exc
+            elif node.fn == "groupby" and len(node.args) == 3:
+                try:
+                    spec = REGISTRY.get(node.fn)
+                except KeyError as exc:
+                    raise FormulaCompileError(str(exc)) from exc
+                key_child = build(node.args[0], depth + 1, local_inputs)
+                lhs_child = build(node.args[1], depth + 1, local_inputs)
+                local_value = _make_local_value_node(lhs_child.type_info)
+                rhs_child = build(node.args[2], depth + 1, {"self_": local_value})
+                children = [key_child, lhs_child, rhs_child]
+                try:
+                    _ = spec.validator([c.type_info for c in children])
+                except ValueError as exc:
+                    raise FormulaCompileError(f"Invalid call {node.fn}: {exc}") from exc
+                literal_args = [float("nan"), float("nan"), float("nan")]
+                compiled = spec.builder(children, literal_args)
             else:
                 try:
                     spec = REGISTRY.get(node.fn)
                 except KeyError as exc:
                     raise FormulaCompileError(str(exc)) from exc
-                children = [build(a, depth + 1) for a in node.args]
+                children = [build(a, depth + 1, local_inputs) for a in node.args]
                 try:
                     _ = spec.validator([c.type_info for c in children])
                 except ValueError as exc:
@@ -183,7 +213,8 @@ def compile_formula(
         else:
             raise FormulaCompileError(f"Unhandled expression node: {node}")
 
-        cache[key] = compiled
+        if use_cache:
+            cache[key] = compiled
         return compiled
 
     root = build(ast_expr, 0)

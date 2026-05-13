@@ -20,7 +20,8 @@ Priorities, in order:
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - Support arity > 1 cleanly.
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe without interpreter fallback.
-- Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
+- Preserve both keyed grouping scopes: `groupby(key, op)` groups the full op subtree, while `groupby(key, lhs, op_using_self_)` computes `lhs` outside the keyed scope and groups only the local op that consumes `self_`.
+- Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
 ## Where to change what

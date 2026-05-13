@@ -94,6 +94,11 @@ class Expr:
     def __floordiv__(self, other):
         return self._call("floordiv", other)
 
+    def groupby(self, key):
+        from trading_dsl_engine.dsl import grouped
+
+        return grouped(self, key)
+
 
 @dataclass(frozen=True, eq=False)
 class Identifier(Expr):

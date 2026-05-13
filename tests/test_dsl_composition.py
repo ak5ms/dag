@@ -115,6 +115,7 @@ def test_all_builtin_dsl_operator_helpers_are_importable():
         "bspline",
         "col",
         "groupby",
+        "grouped",
         "rolling_quantile",
         "mean",
         "univ",

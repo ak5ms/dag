@@ -87,7 +87,9 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 - `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
-- `groupby(key, op)` runs partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
+- `groupby(key, op)` runs the full `op` subtree as partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
+- `groupby(key, lhs, op_using_self_)` evaluates `lhs` once in the outer stream, then runs only `op_using_self_` as keyed state over the emitted `lhs` values; the local op expression must reference the outer value through the `self_` placeholder, e.g. `groupby(day, get_preds(Ridge(...)), cumsum(self_))`.
+- Python-composed formulas can spell the local-op form as `lhs.groupby(key).apply(op_fn, *args)`, `lhs.groupby(key).apply(op_expr_using_self_)`, or `lhs.groupby(key).some_op(...)`; for example, `reg.groupby(day).cumsum()` lowers to `groupby(day, reg, cumsum(self_))`.
 - `groupby(univ(...), op)` runs the same scalar/vector/matrix op independently on static column universes and scatters each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`.
 - `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar, which is useful inside universe grouping to broadcast per-group means.
 

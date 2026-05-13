@@ -90,3 +90,24 @@ def test_profile_engine_vs_numpy_baseline_smoke():
     assert np.isfinite(engine_elapsed)
     assert np.isfinite(baseline_elapsed)
     assert pstats.Stats(profiler).total_tt > 0.0
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_groupby_many_keys_one_year_minutely():
+    rng = np.random.default_rng(2025)
+    n_instruments = 9
+    n_groups = 200
+    shape = (T_1Y_MINUTES, n_instruments)
+    open_ = rng.lognormal(mean=0.0, sigma=0.03, size=shape).astype(np.float64)
+    close = rng.lognormal(mean=0.0, sigma=0.03, size=shape).astype(np.float64)
+    key = np.broadcast_to((np.arange(T_1Y_MINUTES) % n_groups).reshape(-1, 1), shape).astype(
+        np.float64
+    )
+    eng = build_engine("groupby(key, open + close)")
+
+    t0 = time.perf_counter()
+    out = run_batch_from_mapping(eng, {"key": key, "open": open_, "close": close})
+    elapsed = time.perf_counter() - t0
+
+    assert out.shape == (T_1Y_MINUTES, n_instruments)
+    assert elapsed < 45.0
