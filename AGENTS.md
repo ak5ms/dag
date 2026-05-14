@@ -13,10 +13,11 @@ Priorities, in order:
 
 ## Key invariants
 
-- Every operation should follow strict `on_data(...)` + `emit(...)` behavior (including stateless ops).
+- Every operation should follow strict `on_data(inputs, t)` + `emit(...)` behavior (including stateless ops), where `inputs` is the compiler-ordered, schema-bound tuple of aligned arrays.
 - Live updates must be incremental; do not recompute full history in update paths.
 - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
+- Preserve positional input schema binding: compile freezes input order, `program.input_schema` exposes it, `program.bind(**arrays)` validates names/dtype/layout/shape once, and hot batch loops must not repack per-tick frames.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - Support arity > 1 cleanly.
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe without interpreter fallback.
