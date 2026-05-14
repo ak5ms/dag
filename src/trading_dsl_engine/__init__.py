@@ -53,6 +53,23 @@ from trading_dsl_engine.dsl import (
 )
 from trading_dsl_engine.engine import build_engine, run_batch_from_mapping, update_from_mapping
 from trading_dsl_engine.parser import FormulaParseError, parse_formula
+from trading_dsl_engine.program import (
+    ArrayType,
+    BoundProgram,
+    CompiledProgram,
+    Float32,
+    Float64,
+    Instrument,
+    Int32,
+    Int64,
+    IRNode,
+    OutputSchema,
+    RuntimePlan,
+    Schema,
+    ShapeInfo,
+    Time,
+    compile_program,
+)
 
 __all__ = [
     "CompileStats",
@@ -114,4 +131,19 @@ __all__ = [
     "purify",
     "arctan",
     "pow",
+    "ArrayType",
+    "BoundProgram",
+    "CompiledProgram",
+    "Float32",
+    "Float64",
+    "Instrument",
+    "Int32",
+    "Int64",
+    "IRNode",
+    "OutputSchema",
+    "RuntimePlan",
+    "Schema",
+    "ShapeInfo",
+    "Time",
+    "compile_program",
 ]

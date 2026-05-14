@@ -72,6 +72,11 @@ def _validate_aligned_inputs(inputs: tuple[np.ndarray, ...]) -> tuple[int, int]:
 
 
 def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
+    if hasattr(engine, "new_state") and hasattr(engine, "step"):
+        if not hasattr(engine, "_compat_live_state"):
+            engine._compat_live_state = engine.new_state()
+            engine._compat_live_workspace = engine.new_workspace()
+        return engine.step(engine._compat_live_state, data, workspace=engine._compat_live_workspace)
     frame = _pack_tick(engine, data)
     engine.compiled.on_data(frame)
     return engine.compiled.emit()
@@ -131,6 +136,8 @@ def run_batch_from_mapping(
     out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_out.memmap",
     chunk_size: int = 8192,
 ):
+    if hasattr(engine, "bind") and hasattr(engine, "output_schema"):
+        return engine.bind(**data).run_batch(out=out, out_path=out_path)
     inputs = _as_aligned_inputs(engine, data)
     t, n_instruments = _validate_aligned_inputs(inputs)
 
@@ -268,7 +275,12 @@ def build_engine(
     formula: str | Expr,
     dsl_registry: DSLFunctionRegistry | None = None,
     column_names: list[str] | tuple[str, ...] | None = None,
+    schema=None,
 ):
+    if schema is not None:
+        from trading_dsl_engine.program import compile_program
+
+        return compile_program(formula, schema=schema, dsl_registry=dsl_registry)
     compiled_artifact = compile_formula(formula, dsl_registry=dsl_registry, column_names=column_names)
     engine_class = _engine_class_for(compiled_artifact.compiled_type)
     engine = engine_class(compiled_artifact.compiled)
