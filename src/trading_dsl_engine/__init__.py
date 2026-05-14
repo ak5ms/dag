@@ -40,6 +40,16 @@ from trading_dsl_engine.dsl import (
     where,
     xor,
     xs_rank,
+    lt,
+    gt,
+    ceil,
+    floor,
+    exp,
+    sign,
+    fraction,
+    purify,
+    arctan,
+    pow,
 )
 from trading_dsl_engine.engine import build_engine, run_batch_from_mapping, update_from_mapping
 from trading_dsl_engine.parser import FormulaParseError, parse_formula
@@ -94,4 +104,14 @@ __all__ = [
     "FormulaCompileError",
     "parse_formula",
     "FormulaParseError",
+    "lt",
+    "gt",
+    "ceil",
+    "floor",
+    "exp",
+    "sign",
+    "fraction",
+    "purify",
+    "arctan",
+    "pow",
 ]

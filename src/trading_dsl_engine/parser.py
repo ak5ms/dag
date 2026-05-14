@@ -138,11 +138,14 @@ _BINOP_NAMES: dict[type[ast.operator], str] = {
     ast.BitOr: "or_",
     ast.BitXor: "xor",
     ast.FloorDiv: "floordiv",
+    ast.Pow: "pow",
 }
 
 _CMP_NAMES: dict[type[ast.cmpop], str] = {
     ast.Eq: "eq",
     ast.NotEq: "ne",
+    ast.Gt: "gt",
+    ast.Lt: "lt",
 }
 
 
