@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 
 import numpy as np
-from numba import boolean, float64, int64
+from numba import int64
 from numba.experimental import jitclass
 
 from trading_dsl_engine.compiler import compile_formula
@@ -20,13 +20,17 @@ class EngineHandle:
         self.compiled = self._engine.compiled
         self.input_names = input_names
         self.output_code = output_code
+        self.input_schema = _input_schema(self.input_names)
 
     @property
     def _numba_type_(self):
         return self._engine._numba_type_
 
-    def on_data(self, frame2d):
-        return self._engine.on_data(frame2d)
+    def bind(self, **arrays: np.ndarray) -> tuple[np.ndarray, ...]:
+        return _bind_inputs(self.input_names, arrays)
+
+    def on_data(self, inputs, t: int = 0):
+        return self._engine.on_data(inputs, t)
 
     def emit(self):
         return self._engine.emit()
@@ -41,23 +45,94 @@ class EngineHandle:
         return self._engine.run_batch_matrix_aligned(inputs, out3d, start, stop)
 
 
-def _pack_tick(engine, data: dict[str, np.ndarray]) -> np.ndarray:
-    names = engine.input_names
-    frame = np.empty((len(names), data[names[0]].shape[0]), dtype=np.float64)
-    for i in range(len(names)):
-        frame[i] = data[names[i]]
-    return frame
+def _input_schema(input_names: tuple[str, ...]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {"name": name, "index": i, "dtype": np.float64, "ndim": 2, "layout": "C"}
+        for i, name in enumerate(input_names)
+    )
 
 
-def _as_aligned_inputs(engine, data: dict[str, np.ndarray]) -> tuple[np.ndarray, ...]:
-    names = engine.input_names
-    inputs = []
-    for i in range(len(names)):
-        arr = np.asarray(data[names[i]], dtype=np.float64)
-        if arr.ndim != 2:
-            raise ValueError(f"Expected 2D input for '{names[i]}', got shape {arr.shape}")
-        inputs.append(arr)
-    return tuple(inputs)
+def _validate_array(name: str, arr: np.ndarray) -> np.ndarray:
+    if not isinstance(arr, np.ndarray):
+        raise TypeError(f"Input '{name}' must be a numpy.ndarray")
+    if arr.dtype != np.float64:
+        raise TypeError(f"Input '{name}' must have dtype float64, got {arr.dtype}")
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
+    if not arr.flags.c_contiguous:
+        raise ValueError(f"Input '{name}' must be C-contiguous for row-aligned batch execution")
+    return arr
+
+
+def _validate_bound_inputs(input_names: tuple[str, ...], inputs: tuple[np.ndarray, ...]) -> tuple[int, int]:
+    if len(inputs) != len(input_names):
+        raise ValueError(f"Expected {len(input_names)} input arrays, got {len(inputs)}")
+    if len(inputs) == 0:
+        raise ValueError("No input arrays provided")
+    first = _validate_array(input_names[0], inputs[0])
+    t = first.shape[0]
+    n = first.shape[1]
+    for i in range(1, len(inputs)):
+        arr = _validate_array(input_names[i], inputs[i])
+        if arr.shape[0] != t or arr.shape[1] != n:
+            raise ValueError("All inputs must share aligned shape (time, n_instruments)")
+    return t, n
+
+
+def _bind_inputs(input_names: tuple[str, ...], arrays: dict[str, np.ndarray]) -> tuple[np.ndarray, ...]:
+    expected = set(input_names)
+    provided = set(arrays)
+    missing = tuple(name for name in input_names if name not in arrays)
+    extra = tuple(sorted(provided - expected))
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing inputs: {missing}")
+        if extra:
+            details.append(f"unexpected inputs: {extra}")
+        raise ValueError("Input names do not match compiled schema (" + "; ".join(details) + ")")
+    inputs = tuple(_validate_array(name, arrays[name]) for name in input_names)
+    _validate_bound_inputs(input_names, inputs)
+    return inputs
+
+
+def _bind_tick(input_names: tuple[str, ...], arrays: dict[str, np.ndarray]) -> tuple[np.ndarray, ...]:
+    expected = set(input_names)
+    provided = set(arrays)
+    missing = tuple(name for name in input_names if name not in arrays)
+    extra = tuple(sorted(provided - expected))
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing inputs: {missing}")
+        if extra:
+            details.append(f"unexpected inputs: {extra}")
+        raise ValueError("Input names do not match compiled schema (" + "; ".join(details) + ")")
+    rows = []
+    width = -1
+    for name in input_names:
+        arr = arrays[name]
+        if not isinstance(arr, np.ndarray):
+            raise TypeError(f"Input '{name}' must be a numpy.ndarray")
+        if arr.dtype != np.float64:
+            raise TypeError(f"Input '{name}' must have dtype float64, got {arr.dtype}")
+        if arr.ndim != 1:
+            raise ValueError(f"Expected 1D tick input for '{name}', got shape {arr.shape}")
+        if not arr.flags.c_contiguous:
+            raise ValueError(f"Input '{name}' must be C-contiguous")
+        if width < 0:
+            width = arr.shape[0]
+        elif arr.shape[0] != width:
+            raise ValueError("All tick inputs must share instrument width")
+        rows.append(arr.reshape(1, arr.shape[0]))
+    return tuple(rows)
+
+
+def _as_aligned_inputs(engine, data: dict[str, np.ndarray] | tuple[np.ndarray, ...]) -> tuple[np.ndarray, ...]:
+    if isinstance(data, tuple):
+        _validate_bound_inputs(engine.input_names, data)
+        return data
+    return engine.bind(**data)
 
 
 def _validate_aligned_inputs(inputs: tuple[np.ndarray, ...]) -> tuple[int, int]:
@@ -72,8 +147,8 @@ def _validate_aligned_inputs(inputs: tuple[np.ndarray, ...]) -> tuple[int, int]:
 
 
 def update_from_mapping(engine, data: dict[str, np.ndarray]) -> np.ndarray:
-    frame = _pack_tick(engine, data)
-    engine.compiled.on_data(frame)
+    inputs = _bind_tick(engine.input_names, data)
+    engine.compiled.on_data(inputs, 0)
     return engine.compiled.emit()
 
 
@@ -88,17 +163,8 @@ def _alloc_output(engine, t: int, n_instruments: int):
     raise ValueError(f"Unknown output code: {output_code}")
 
 
-def _first_tick_frame(inputs: tuple[np.ndarray, ...]) -> np.ndarray:
-    n_inputs = len(inputs)
-    n_instruments = inputs[0].shape[1]
-    frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
-    for k in range(n_inputs):
-        frame[k, :] = inputs[k][0, :]
-    return frame
-
-
 def _probe_vector_output(engine, inputs: tuple[np.ndarray, ...]) -> np.ndarray:
-    engine.compiled.on_data(_first_tick_frame(inputs))
+    engine.compiled.on_data(inputs, 0)
     y = engine.compiled.emit()
     return y[:, 0].copy()
 
@@ -119,14 +185,14 @@ def _alloc_memmap_output(engine, t: int, n_instruments: int, out_path: str):
 
 
 def _probe_matrix_output(engine, inputs: tuple[np.ndarray, ...]) -> int:
-    engine.compiled.on_data(_first_tick_frame(inputs))
+    engine.compiled.on_data(inputs, 0)
     y = engine.compiled.emit()
     return y.shape[1]
 
 
 def run_batch_from_mapping(
     engine,
-    data: dict[str, np.ndarray],
+    data: dict[str, np.ndarray] | tuple[np.ndarray, ...],
     out: np.ndarray | None = None,
     out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_out.memmap",
     chunk_size: int = 8192,
@@ -204,65 +270,42 @@ def _engine_class_for(compiled_type):
     if cached is not None:
         return cached
 
-    spec = [
-        ("compiled", compiled_type),
-        ("frame_initialized", boolean),
-        ("frame", float64[:, :]),
-    ]
+    spec = [("compiled", compiled_type)]
 
     @jitclass(spec)
     class EngineArtifact:  # noqa: N801
         def __init__(self, compiled):
             self.compiled = compiled
-            self.frame_initialized = False
-            self.frame = np.empty((1, 1), dtype=np.float64)
 
-        def _ensure_frame(self, n_inputs: int, n_instruments: int):
-            if (not self.frame_initialized) or self.frame.shape[0] != n_inputs or self.frame.shape[1] != n_instruments:
-                self.frame = np.empty((n_inputs, n_instruments), dtype=np.float64)
-                self.frame_initialized = True
-
-        def on_data(self, frame2d):
-            self.compiled.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.compiled.on_data(inputs, t)
 
         def emit(self):
             return self.compiled.emit()
 
-        def _load_tick(self, inputs, t: int64):
-            n_inputs = len(inputs)
-            n_instruments = inputs[0].shape[1]
-            self._ensure_frame(n_inputs, n_instruments)
-            for k in range(n_inputs):
-                source = inputs[k]
-                self.frame[k, :] = source[t, :]
-
         def run_batch_scalar_aligned(self, inputs, out1d, start: int64, stop: int64):
             for t in range(start, stop):
-                self._load_tick(inputs, t)
-                self.compiled.on_data(self.frame)
+                self.compiled.on_data(inputs, t)
                 y = self.compiled.emit()
                 out1d[t] = y[0, 0]
             return out1d
 
         def run_batch_vector_aligned(self, inputs, out2d, start: int64, stop: int64):
             for t in range(start, stop):
-                self._load_tick(inputs, t)
-                self.compiled.on_data(self.frame)
+                self.compiled.on_data(inputs, t)
                 y = self.compiled.emit()
                 out2d[t, :] = y[:, 0]
             return out2d
 
         def run_batch_matrix_aligned(self, inputs, out3d, start: int64, stop: int64):
             for t in range(start, stop):
-                self._load_tick(inputs, t)
-                self.compiled.on_data(self.frame)
+                self.compiled.on_data(inputs, t)
                 y = self.compiled.emit()
                 out3d[t, :, :] = y
             return out3d
 
     _ENGINE_CLASS_CACHE[compiled_type] = EngineArtifact
     return EngineArtifact
-
 
 def build_engine(
     formula: str | Expr,

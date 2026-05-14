@@ -34,6 +34,7 @@ class CompiledFormulaArtifact:
     compiled: object
     compiled_type: object
     input_names: tuple[str, ...]
+    input_schema: tuple[dict[str, object], ...]
     output_kind: str
     stats: CompileStats
 
@@ -51,6 +52,13 @@ class _CompiledFormulaPlan:
 
 
 _COMPILE_PLAN_CACHE: dict[tuple, _CompiledFormulaPlan] = {}
+
+
+def _input_schema(input_names: tuple[str, ...]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {"name": name, "index": i, "dtype": "float64", "ndim": 2, "layout": "C"}
+        for i, name in enumerate(input_names)
+    )
 
 
 def _kind_to_code(kind: str) -> int:
@@ -126,6 +134,7 @@ def compile_formula(
                 compiled=compiled,
                 compiled_type=cached_plan.compiled_type,
                 input_names=cached_plan.input_names,
+                input_schema=_input_schema(cached_plan.input_names),
                 output_kind=cached_plan.output_kind,
                 stats=CompileStats(
                     expanded_nodes=cached_plan.expanded_nodes,
@@ -233,8 +242,8 @@ def compile_formula(
             self.n_inputs = n_inputs
             self.output_code = output_code
 
-        def on_data(self, frame2d):
-            self.feature.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.feature.on_data(inputs, t)
 
         def emit(self):
             return self.feature.emit()
@@ -258,6 +267,7 @@ def compile_formula(
         compiled=compiled,
         compiled_type=CompiledFormula.class_type.instance_type,
         input_names=ordered_names,
+        input_schema=_input_schema(ordered_names),
         output_kind=root.type_info.kind,
         stats=CompileStats(
             expanded_nodes=expanded_nodes,

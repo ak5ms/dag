@@ -41,10 +41,16 @@ engine = build_engine("xs_rank(ewm(div(close, open), 21))")
 out = engine.update_from_mapping({"open": open_t, "close": close_t})
 
 # batch run (disk-backed output by default)
-out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)  # memmap shape (time, n_instruments) for vector outputs
+# engine.input_schema exposes the compiler-selected positional input order.
+bound_inputs = engine.bind(open=open_2d, close=close_2d)  # validates dtype/layout/shape once and stores a tuple
+out2d = run_batch_from_mapping(engine, bound_inputs, chunk_size=4096)  # memmap shape (time, n_instruments) for vector outputs
+# mapping input remains available and binds to the same positional tuple internally
+out2d_from_mapping = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)
 # opt into RAM materialization instead
-out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
+out2d_ram = run_batch_from_mapping(engine, bound_inputs, out_path=None)
 ```
+
+Batch inputs are schema-bound as a `tuple[np.ndarray, ...]` ordered by `engine.input_schema`; arrays must be `float64`, two-dimensional, C-contiguous, and shape-aligned at bind time so the compiled timestep loop can read `inputs[input_index][t, :]` directly without repacking per-tick frames.
 
 Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
 

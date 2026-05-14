@@ -60,8 +60,8 @@ def _make_input_node(input_index: int) -> CompiledNode:
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            row = frame2d[self.input_index]
+        def on_data(self, inputs, t: int64):
+            row = inputs[self.input_index][t, :]
             if (not self.initialized) or self.out.shape[0] != row.shape[0]:
                 self.out = np.empty((row.shape[0], 1), dtype=np.float64)
                 self.initialized = True
@@ -91,15 +91,16 @@ def _make_local_value_node(type_info: TypeInfo) -> CompiledNode:
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
+        def on_data(self, inputs, t: int64):
+            values = inputs[0]
             if (
                 (not self.initialized)
-                or self.out.shape[0] != frame2d.shape[0]
-                or self.out.shape[1] != frame2d.shape[1]
+                or self.out.shape[0] != values.shape[0]
+                or self.out.shape[1] != values.shape[1]
             ):
-                self.out = np.empty((frame2d.shape[0], frame2d.shape[1]), dtype=np.float64)
+                self.out = np.empty((values.shape[0], values.shape[1]), dtype=np.float64)
                 self.initialized = True
-            self.out[:, :] = frame2d
+            self.out[:, :] = values
 
         def emit(self):
             return self.out
@@ -128,7 +129,7 @@ def _make_literal_node(value: float) -> CompiledNode:
             self.out = np.empty((1, 1), dtype=np.float64)
             self.out[0, 0] = value
 
-        def on_data(self, frame2d):
+        def on_data(self, inputs, t: int64):
             return
 
         def emit(self):
@@ -218,9 +219,9 @@ def make_nary_op(
                 if self.scratch.shape[0] != size:
                     self.scratch = np.empty(size, dtype=np.float64)
 
-            def on_data(self, frame2d):
+            def on_data(self, inputs, t: int64):
                 for child in literal_unroll(self.children):
-                    child.on_data(frame2d)
+                    child.on_data(inputs, t)
                 rows = 1
                 cols = 1
                 for child in literal_unroll(self.children):
@@ -315,8 +316,8 @@ def _cumsum_builder(children: list[CompiledNode], literals: list[float]) -> Comp
             self.state = np.empty((1, 1), dtype=np.float64)
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if (not self.initialized) or self.out.shape[0] != n:
@@ -385,9 +386,9 @@ def _shift_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.size = 0
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
-            self.nlag.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
+            self.nlag.on_data(inputs, t)
             x = self.src.emit()
             lag_value = self.nlag.emit()[0, 0]
             n = x.shape[0]
@@ -466,8 +467,8 @@ def _ewm_builder(children: list[CompiledNode], literals: list[float]) -> Compile
             self.state = np.empty((1, 1), dtype=np.float64)
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             rows, cols = x.shape
             if not self.initialized:
@@ -527,8 +528,8 @@ def _xs_rank_builder(children: list[CompiledNode], literals: list[float]) -> Com
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if not self.initialized:
@@ -598,8 +599,8 @@ def _outer_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.initialized = False
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if not self.initialized:
@@ -678,8 +679,8 @@ def _bspline_builder(children: list[CompiledNode], literals: list[float]) -> Com
             for i in range(n_basis):
                 self.centers[i] = i / n_basis
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if (not self.initialized) or self.out.shape[0] != n:
@@ -744,8 +745,8 @@ def _col_builder(children: list[CompiledNode], literals: list[float]) -> Compile
             self.idx = idx
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if self.idx >= x.shape[1]:
@@ -835,8 +836,8 @@ def _rolling_quantile_builder(children: list[CompiledNode], literals: list[float
             self.scratch = np.empty(window, dtype=np.float64)
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             x = self.src.emit()
             n = x.shape[0]
             if (not self.initialized) or self.out.shape[0] != n:
@@ -916,9 +917,9 @@ def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, 
                 self.out = np.empty((n_cols, width), dtype=np.float64)
                 self.initialized = True
 
-        def on_data(self, frame2d):
-            n_inputs = frame2d.shape[0]
-            n_cols = frame2d.shape[1]
+        def on_data(self, inputs, t: int64):
+            n_inputs = len(inputs)
+            n_cols = inputs[0].shape[1]
             width = 1
             for g in range(len(self.group_indices)):
                 idxs = self.group_indices[g]
@@ -928,8 +929,11 @@ def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, 
                 group_frame = np.empty((n_inputs, idxs.shape[0]), dtype=np.float64)
                 for r in range(n_inputs):
                     for c in range(idxs.shape[0]):
-                        group_frame[r, c] = frame2d[r, idxs[c]]
-                self.ops[g].on_data(group_frame)
+                        group_frame[r, c] = inputs[r][t, idxs[c]]
+                group_inputs = List()
+                for r in range(n_inputs):
+                    group_inputs.append(group_frame[r:r + 1, :])
+                self.ops[g].on_data(group_inputs, 0)
                 y = self.ops[g].emit()
                 if y.shape[1] > width:
                     width = y.shape[1]
@@ -969,9 +973,9 @@ def _make_key_validated_node(key_node: CompiledNode, op_node: CompiledNode) -> C
             self.key_node = key_node
             self.op_node = op_node
 
-        def on_data(self, frame2d):
-            self.key_node.on_data(frame2d)
-            self.op_node.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.key_node.on_data(inputs, t)
+            self.op_node.on_data(inputs, t)
             k = self.key_node.emit()
             for i in range(k.shape[0]):
                 if np.isnan(k[i, 0]):
@@ -1064,24 +1068,24 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
                 self.out = np.empty((rows, cols), dtype=np.float64)
                 self.initialized = True
 
-        def _copy_group_input(self, frame2d, x, instrument: int64):
+        def _copy_group_input(self, inputs, t: int64, x, instrument: int64):
             if self.has_lhs:
                 src_row = 0 if x.shape[0] == 1 else instrument
                 for col in range(x.shape[1]):
                     self.scratch[0, col] = x[src_row, col]
             else:
-                for row in range(frame2d.shape[0]):
-                    self.scratch[row, 0] = frame2d[row, instrument]
+                for row in range(len(inputs)):
+                    self.scratch[row, 0] = inputs[row][t, instrument]
 
-        def on_data(self, frame2d):
-            self.key_node.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.key_node.on_data(inputs, t)
             if self.has_lhs:
-                self.lhs_node.on_data(frame2d)
+                self.lhs_node.on_data(inputs, t)
                 x = self.lhs_node.emit()
                 scratch_rows, scratch_cols = 1, x.shape[1]
             else:
                 x = self.scratch
-                scratch_rows, scratch_cols = frame2d.shape[0], 1
+                scratch_rows, scratch_cols = len(inputs), 1
 
             k = self.key_node.emit()
             n_instruments = k.shape[0]
@@ -1101,8 +1105,14 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
                     self.group_lookup[pair] = group
                 self.active_keys[instrument] = key
 
-                self._copy_group_input(frame2d, x, instrument)
-                group.on_data(self.scratch)
+                self._copy_group_input(inputs, t, x, instrument)
+                scratch_inputs = List()
+                if self.has_lhs:
+                    scratch_inputs.append(self.scratch)
+                else:
+                    for row in range(self.scratch.shape[0]):
+                        scratch_inputs.append(self.scratch[row:row + 1, :])
+                group.on_data(scratch_inputs, 0)
                 y = group.emit()
                 if y.shape[1] > width:
                     width = y.shape[1]
@@ -1358,13 +1368,13 @@ def _ridge_builder(children: list[CompiledNode], literals: list[float]) -> Compi
             self.state.beta = np.zeros(k, dtype=np.float64)
             self.state.preds = np.empty((n, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.y_node.on_data(frame2d)
-            self.w_node.on_data(frame2d)
-            self.hl_node.on_data(frame2d)
-            self.lam_node.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.y_node.on_data(inputs, t)
+            self.w_node.on_data(inputs, t)
+            self.hl_node.on_data(inputs, t)
+            self.lam_node.on_data(inputs, t)
             for node in literal_unroll(self.x_nodes):
-                node.on_data(frame2d)
+                node.on_data(inputs, t)
 
             y2d = self.y_node.emit()
             w2d = self.w_node.emit()
@@ -1513,8 +1523,8 @@ def _get_beta_builder(children: list[CompiledNode], literals: list[float]) -> Co
             self.src = src
             self.out = np.empty((1, 1), dtype=np.float64)
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
             state = self.src.emit()
             k = state.beta.shape[0]
             if self.out.shape[0] != k:
@@ -1548,8 +1558,8 @@ def _get_preds_builder(children: list[CompiledNode], literals: list[float]) -> C
         def __init__(self, src):
             self.src = src
 
-        def on_data(self, frame2d):
-            self.src.on_data(frame2d)
+        def on_data(self, inputs, t: int64):
+            self.src.on_data(inputs, t)
 
         def emit(self):
             state = self.src.emit()

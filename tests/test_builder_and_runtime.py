@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from numba import boolean, float64
+from numba import boolean, float64, int64
 from numba.experimental import jitclass
 
 from trading_dsl_engine import build_engine, compile_formula, run_batch_from_mapping, update_from_mapping
@@ -275,6 +275,26 @@ def test_batch_path_does_not_require_np_stack(monkeypatch):
     np.testing.assert_allclose(out, close + 1.0)
 
 
+def test_input_schema_bind_and_tuple_batch_path():
+    eng = build_engine("add(close, open)")
+    assert tuple(item["name"] for item in eng.input_schema) == ("close", "open")
+    assert tuple(item["index"] for item in eng.input_schema) == (0, 1)
+
+    close = np.ascontiguousarray(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64))
+    open_ = np.ascontiguousarray(np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float64))
+
+    bound = eng.bind(close=close, open=open_)
+    assert bound == (close, open_)
+    np.testing.assert_allclose(run_batch_from_mapping(eng, bound, out_path=None), close + open_)
+
+    with pytest.raises(TypeError, match="dtype float64"):
+        eng.bind(close=close.astype(np.float32), open=open_)
+    with pytest.raises(ValueError, match="C-contiguous"):
+        eng.bind(close=np.asfortranarray(close), open=open_)
+    with pytest.raises(ValueError, match="missing inputs"):
+        eng.bind(close=close)
+
+
 def test_vector_batch_output_is_2d():
     vec = build_engine("add(close, 1)")
     close = np.arange(12, dtype=np.float64).reshape(3, 4)
@@ -333,8 +353,8 @@ def test_object_emitter_can_be_consumed_by_downstream_array_op():
                 self.src = src
                 self.state = MeanState()
 
-            def on_data(self, frame2d):
-                self.src.on_data(frame2d)
+            def on_data(self, inputs, t: int64):
+                self.src.on_data(inputs, t)
                 x = self.src.emit()
                 total = 0.0
                 n = x.shape[0]
@@ -367,10 +387,10 @@ def test_object_emitter_can_be_consumed_by_downstream_array_op():
                 self.initialized = False
                 self.out = np.empty((1, 1), dtype=np.float64)
 
-            def on_data(self, frame2d):
-                self.src.on_data(frame2d)
+            def on_data(self, inputs, t: int64):
+                self.src.on_data(inputs, t)
                 state = self.src.emit()
-                row = frame2d[0]
+                row = inputs[0][t, :]
                 if (not self.initialized) or self.out.shape[0] != row.shape[0]:
                     self.out = np.empty((row.shape[0], 1), dtype=np.float64)
                     self.initialized = True
@@ -750,10 +770,11 @@ def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
         get_beta(Ridge(var("close"), var("open"), y=var("target"), weights=0.3, hl=3.0, lambda_=0.1))
     )
 
-    data = {"close": close, "open": open_, "target": target}
-    np.testing.assert_allclose(run_batch_from_mapping(string_engine, data, out_path=None), expected_one_feature)
-    np.testing.assert_allclose(run_batch_from_mapping(python_engine, data, out_path=None), expected_two_features)
-    np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, data, out_path=None), expected_scalar_weights)
+    one_feature_data = {"close": close, "target": target}
+    two_feature_data = {"close": close, "open": open_, "target": target}
+    np.testing.assert_allclose(run_batch_from_mapping(string_engine, one_feature_data, out_path=None), expected_one_feature)
+    np.testing.assert_allclose(run_batch_from_mapping(python_engine, two_feature_data, out_path=None), expected_two_features)
+    np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, two_feature_data, out_path=None), expected_scalar_weights)
 
 
 def test_universe_groupby_mean_broadcasts_column_group_results():
