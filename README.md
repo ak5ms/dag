@@ -50,6 +50,37 @@ Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.
 
 Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
 
+
+## Schema-bound compiled programs
+
+`compile_program(...)` is the new primary runtime API for fixed-shape production workloads. It compiles a string formula or Python-composed `Expr` against an explicit `Schema` that declares input names, dtypes, time/instrument layout, instrument count, optional column names, static universes, and bounded key domains. The resulting `CompiledProgram` exposes a deterministic `output_schema` and a typed `runtime_plan` before the first tick is processed.
+
+```python
+from trading_dsl_engine import Float64, Instrument, Schema, Time, compile_program
+
+program = compile_program(
+    "xs_rank(ewm(div(close, open), 21))",
+    schema=Schema(
+        inputs={
+            "open": Float64[Time, Instrument],
+            "close": Float64[Time, Instrument],
+        },
+        n_instruments=150,
+        layout="time_major",
+    ),
+)
+
+bound = program.bind(open=open_arr, close=close_arr)
+out = bound.run_batch(out_path="features.memmap")
+
+state, workspace = program.initialize()
+program.step(state, {"open": open_tick, "close": close_tick}, tick_out)
+```
+
+The fast path lowers formulas to typed IR, performs compile-time shape inference, plans persistent state/scratch/output buffers, records allocation counters, and runs batch mode directly over aligned positional input arrays rather than copying each tick into an intermediate live frame. Stateless elementwise chains are represented as fusible plan regions and execute into preallocated buffers. Stateful operators such as `ewm`, `cumsum`, `shift`, `xs_rank`, and `rolling_quantile` allocate their state and scratch buffers during `program.new_state()`/`program.new_workspace()` instead of probing shapes on the first tick.
+
+The compatibility APIs remain available. `build_engine(..., schema=schema)` returns a `CompiledProgram`, and `run_batch_from_mapping(...)`/`update_from_mapping(...)` delegate to the program runtime when they receive one. Operators or dynamic behavior that cannot yet be planned from schema are explicitly routed to the existing jitclass compatibility runtime with a warning, preserving correctness while making fallback behavior visible.
+
 ## DSL composition
 
 You can define reusable macro-like composed functions with an explicit registry namespace:
