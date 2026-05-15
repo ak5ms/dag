@@ -18,6 +18,7 @@ Priorities, in order:
 - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
+- For the optional JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution.
 - Support arity > 1 cleanly.
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe without interpreter fallback.
 - Preserve both keyed grouping scopes: `groupby(key, op)` groups the full op subtree, while `groupby(key, lhs, op_using_self_)` computes `lhs` outside the keyed scope and groups only the local op that consumes `self_`.
@@ -32,6 +33,7 @@ Priorities, in order:
 - Builtin op kernels and factories: `src/trading_dsl_engine/ops.py`
 - Compile/lower pipeline: `src/trading_dsl_engine/compiler.py`
 - Runtime execution and batch/live helpers: `src/trading_dsl_engine/engine.py`
+- Optional JAX + Equinox backend: `src/trading_dsl_engine/jax_backend/`
 - Behavior regression tests: `tests/`
 
 ## Performance guardrails

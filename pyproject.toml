@@ -9,6 +9,9 @@ description = "Numba-compiled streaming DSL engine for trading features"
 requires-python = ">=3.10"
 dependencies = ["numpy", "numba", "scipy"]
 
+[project.optional-dependencies]
+jax = ["jax[cpu]", "equinox"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --durations=0"

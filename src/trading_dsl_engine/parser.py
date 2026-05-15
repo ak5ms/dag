@@ -94,6 +94,25 @@ class Expr:
     def __floordiv__(self, other):
         return self._call("floordiv", other)
 
+    def __rfloordiv__(self, other):
+        from trading_dsl_engine.dsl import call
+
+        return call("floordiv", other, self)
+
+    def __pow__(self, other):
+        return self._call("pow", other)
+
+    def __rpow__(self, other):
+        from trading_dsl_engine.dsl import call
+
+        return call("pow", other, self)
+
+    def __lt__(self, other):
+        return self._call("lt", other)
+
+    def __gt__(self, other):
+        return self._call("gt", other)
+
     def groupby(self, key):
         from trading_dsl_engine.dsl import grouped
 

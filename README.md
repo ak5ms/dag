@@ -2,7 +2,7 @@
 
 A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution.
+This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. An optional parallel JAX + Equinox backend is available for formulas supported by `trading_dsl_engine.jax_backend`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
 
 ## Core goals
 
@@ -26,6 +26,8 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
   - Compile path from expression to `CompiledFormula` jitclass artifact, with CSE hash/cache stats.
 - `src/trading_dsl_engine/engine.py`
   - Runtime `StreamingFeatureEngine` jitclass and batch/live helpers.
+- `src/trading_dsl_engine/jax_backend/`
+  - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
 - `tests/`
   - Parser, composition, runtime correctness, shape, state persistence, and performance tests.
 
@@ -105,11 +107,26 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
+## Optional JAX backend
+
+Install the optional dependencies with `python -m pip install -e ".[jax]"`. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax_backend`:
+
+```python
+from trading_dsl_engine.jax_backend import build_jax_engine, run_batch_from_mapping
+
+engine = build_jax_engine("xs_rank(ewm(div(close, open), 21))")
+out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
+```
+
+The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby(key).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, static-universe `groupby(univ(...), op)`, dynamic keyed `groupby(key, op)`, scoped `groupby(key, lhs, op_using_self_)`, and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
+
 ## Development quickstart
 
 ```bash
 python -m pip install -e .
 python -m pip install pytest numpy numba
+# Optional JAX backend
+python -m pip install -e ".[jax]"
 pytest -q
 ```
 
