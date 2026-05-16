@@ -47,6 +47,32 @@ def _combine_kind(child_kinds: tuple[str, ...]) -> str:
     return "scalar"
 
 
+def _tree_broadcast_slots(tree, n_slots: int):
+    return jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (n_slots,) + x.shape), tree)
+
+
+def _tree_take_slots(tree, slots):
+    return jax.tree_util.tree_map(lambda x: x[slots], tree)
+
+
+def _tree_set_slots(tree, slots, values):
+    return jax.tree_util.tree_map(lambda x, y: x.at[slots].set(y), tree, values)
+
+
+def _tree_has_leaves(tree) -> bool:
+    return bool(jax.tree_util.tree_leaves(tree))
+
+
+def _vmap_child_tick(child, selected_state, local_frames):
+    if _tree_has_leaves(selected_state):
+        return jax.vmap(lambda slot_state, frame: child.tick(slot_state, frame))(selected_state, local_frames)
+    return jax.vmap(lambda frame: child.tick(selected_state, frame))(local_frames)
+
+
+def _op_is_stateless(op) -> bool:
+    return not _tree_has_leaves(op.init_state(1))
+
+
 class InputOp(eqx.Module):
     index: int = eqx.field(static=True)
     output_kind: str = eqx.field(static=True, default="vector")
@@ -302,7 +328,7 @@ class GroupByOp(eqx.Module):
     def init_state(self, n_instruments: int):
         return (
             self.key.init_state(n_instruments),
-            self.child.init_state(n_instruments * self.capacity),
+            _tree_broadcast_slots(self.child.init_state(1), n_instruments * self.capacity),
             jnp.full((n_instruments, self.capacity), jnp.nan),
             jnp.zeros((n_instruments, self.capacity), dtype=bool),
         )
@@ -311,24 +337,36 @@ class GroupByOp(eqx.Module):
         key_state, child_state, keys, occupied = state
         new_key_state, key_values = self.key.tick(key_state, frame2d)
         key_vector = key_values[:, 0]
-        if frame2d.shape[0] == self.n_inputs:
-            source = frame2d
-        else:
-            source = frame2d[: self.n_inputs]
+        source = frame2d[: self.n_inputs]
         matches = occupied & (keys == key_vector[:, None])
         has_match = jnp.any(matches, axis=1)
         first_free = jnp.argmax(~occupied, axis=1)
         slot = jnp.where(has_match, jnp.argmax(matches, axis=1), first_free)
         row_idx = jnp.arange(frame2d.shape[1])
+        flat_slot = row_idx * self.capacity + slot
         new_keys = keys.at[row_idx, slot].set(key_vector)
         new_occupied = occupied.at[row_idx, slot].set(True)
 
-        grouped_frame = jnp.full((self.n_inputs, frame2d.shape[1] * self.capacity), jnp.nan)
-        flat_slot = row_idx * self.capacity + slot
-        grouped_frame = grouped_frame.at[:, flat_slot].set(source)
-        new_child_state, grouped_out = self.child.tick(child_state, grouped_frame)
-        out = grouped_out[flat_slot, :]
-        return (new_key_state, new_child_state, new_keys, new_occupied), out
+        selected_state = _tree_take_slots(child_state, flat_slot)
+        local_frames = jnp.swapaxes(source[:, :, None], 0, 1)
+        new_selected_state, grouped_out = _vmap_child_tick(self.child, selected_state, local_frames)
+        new_child_state = _tree_set_slots(child_state, flat_slot, new_selected_state)
+        return (new_key_state, new_child_state, new_keys, new_occupied), grouped_out[:, 0, :]
+
+
+class KeyValidatedOp(eqx.Module):
+    key: Any = eqx.field(static=True)
+    child: Any = eqx.field(static=True)
+    output_kind: str = eqx.field(static=True)
+
+    def init_state(self, n_instruments: int):
+        return self.key.init_state(n_instruments), self.child.init_state(n_instruments)
+
+    def tick(self, state, frame2d):
+        key_state, child_state = state
+        new_key_state, _ = self.key.tick(key_state, frame2d)
+        new_child_state, out = self.child.tick(child_state, frame2d)
+        return (new_key_state, new_child_state), out
 
 
 class ScopedGroupByOp(eqx.Module):
@@ -341,7 +379,7 @@ class ScopedGroupByOp(eqx.Module):
     def init_state(self, n_instruments: int):
         return (
             _children_init((self.key, self.lhs), n_instruments),
-            self.child.init_state(n_instruments * self.capacity),
+            _tree_broadcast_slots(self.child.init_state(1), n_instruments * self.capacity),
             jnp.full((n_instruments, self.capacity), jnp.nan),
             jnp.zeros((n_instruments, self.capacity), dtype=bool),
         )
@@ -355,20 +393,20 @@ class ScopedGroupByOp(eqx.Module):
         first_free = jnp.argmax(~occupied, axis=1)
         slot = jnp.where(has_match, jnp.argmax(matches, axis=1), first_free)
         row_idx = jnp.arange(frame2d.shape[1])
+        flat_slot = row_idx * self.capacity + slot
         new_keys = keys.at[row_idx, slot].set(key_vector)
         new_occupied = occupied.at[row_idx, slot].set(True)
 
-        flat_slot = row_idx * self.capacity + slot
-        local_cols = frame2d.shape[1] * self.capacity
-        if lhs_values.ndim == 1:
-            local_frame = jnp.full((local_cols, 1), jnp.nan)
-            local_frame = local_frame.at[flat_slot, 0].set(lhs_values)
-        else:
-            local_frame = jnp.full((local_cols, lhs_values.shape[1]), jnp.nan)
-            local_frame = local_frame.at[flat_slot, :].set(lhs_values)
-        new_child_state, grouped_out = self.child.tick(child_state, local_frame)
-        out = grouped_out[flat_slot, :]
-        return (new_outer_states, new_child_state, new_keys, new_occupied), out
+        selected_state = _tree_take_slots(child_state, flat_slot)
+        local_values = (
+            jnp.broadcast_to(lhs_values[0], (frame2d.shape[1], lhs_values.shape[1]))
+            if lhs_values.shape[0] == 1
+            else lhs_values
+        )
+        local_frames = local_values[:, None, :]
+        new_selected_state, grouped_out = _vmap_child_tick(self.child, selected_state, local_frames)
+        new_child_state = _tree_set_slots(child_state, flat_slot, new_selected_state)
+        return (new_outer_states, new_child_state, new_keys, new_occupied), grouped_out[:, 0, :]
 
 
 

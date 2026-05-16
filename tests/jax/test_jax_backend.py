@@ -49,6 +49,12 @@ def test_jax_backend_dynamic_key_groupby_matches_numba():
     _compare_batch("groupby(ts, ewm(close, 3))", {"ts": ts, "close": close})
 
 
+def test_jax_backend_stateless_groupby_matches_numba_validation_path():
+    close = np.array([[1.0, 10.0], [3.0, 20.0]], dtype=np.float64)
+    ts = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+    _compare_batch("groupby(ts, mean(close))", {"ts": ts, "close": close})
+
+
 def test_jax_backend_scoped_groupby_apply_matches_numba():
     close = np.array([[1.0], [2.0], [10.0], [3.0]], dtype=np.float64)
     ts = np.array([[0.0], [0.0], [1.0], [0.0]], dtype=np.float64)
@@ -66,6 +72,16 @@ def test_jax_backend_ridge_projection_shapes_match_numba():
     out = run_batch_from_mapping(build_jax_engine("groupby(ts, get_preds(Ridge(x, y, w, 2, 0)))"), data, out_path=None)
     assert out.shape == (5, 1)
     assert np.all(np.isfinite(out))
+
+
+def test_jax_backend_groupby_nested_ridge_cumsum_matches_numba():
+    data = {
+        "ts": np.array([[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64),
+        "x": np.array([[10.0, 20.0], [11.0, 21.0], [12.0, 22.0], [13.0, 23.0]], dtype=np.float64),
+        "y": np.array([[1.0, 2.0], [1.5, 2.5], [2.0, 3.0], [2.5, 3.5]], dtype=np.float64),
+        "w": np.ones((4, 2), dtype=np.float64),
+    }
+    _compare_batch("groupby(ts, cumsum(get_preds(Ridge(x, y, w, 2, 0))))", data)
 
 
 def test_jax_backend_python_composition_infix_and_dsl_function_match_string():
