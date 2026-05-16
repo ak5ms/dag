@@ -27,14 +27,15 @@ Priorities, in order:
 
 ## Where to change what
 
-- Parser/validation changes: `src/trading_dsl_engine/parser.py`
-- DSL macro composition + registry isolation: `src/trading_dsl_engine/dsl.py`
-- Operator plugin specs: `src/trading_dsl_engine/registry.py`
-- Builtin op kernels and factories: `src/trading_dsl_engine/ops.py`
-- Compile/lower pipeline: `src/trading_dsl_engine/compiler.py`
-- Runtime execution and batch/live helpers: `src/trading_dsl_engine/engine.py`
-- Optional JAX + Equinox backend: `src/trading_dsl_engine/jax_backend/`
-- Behavior regression tests: `tests/`
+- Shared parser/validation changes: `src/trading_dsl_engine/base/parser.py`
+- Shared DSL macro composition + registry isolation: `src/trading_dsl_engine/base/dsl.py`
+- Shared operator plugin specs: `src/trading_dsl_engine/base/registry.py`
+- Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
+- Numba op kernels/factories: `src/trading_dsl_engine/numba/ops.py`
+- Numba runtime execution and batch/live helpers: `src/trading_dsl_engine/numba/engine.py`
+- Optional JAX + Equinox backend: `src/trading_dsl_engine/jax/`
+- Numba behavior/performance regression tests: `tests/numba/`
+- JAX correspondence regression tests: `tests/jax/`
 
 ## Performance guardrails
 
@@ -67,7 +68,7 @@ Run these locally before finalizing:
 
 ```bash
 pytest -q
-RUN_PERF_TESTS=1 pytest tests/test_performance.py -q
+RUN_PERF_TESTS=1 pytest tests/numba/test_performance.py -q
 ```
 
 If perf tests are too heavy for the environment, clearly note that and at least run core tests.

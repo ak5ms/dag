@@ -2,7 +2,7 @@
 
 A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. An optional parallel JAX + Equinox backend is available for formulas supported by `trading_dsl_engine.jax_backend`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
+This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. An optional parallel JAX + Equinox backend is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
 
 ## Core goals
 
@@ -14,22 +14,18 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 
 ## Project layout
 
-- `src/trading_dsl_engine/parser.py`
-  - Formula parser (`parse_formula`) using Python AST with strict validation.
-- `src/trading_dsl_engine/dsl.py`
-  - Python DSL constructors (`add`, `div`, `shift`, `ewm`, `xs_rank`, etc.), composed helpers like `diff`, and `DSLFunctionRegistry`.
-- `src/trading_dsl_engine/registry.py`
-  - Operator metadata and registration primitives.
-- `src/trading_dsl_engine/ops.py`
-  - Built-in op implementations and generic op builders.
-- `src/trading_dsl_engine/compiler.py`
-  - Compile path from expression to `CompiledFormula` jitclass artifact, with CSE hash/cache stats.
-- `src/trading_dsl_engine/engine.py`
-  - Runtime `StreamingFeatureEngine` jitclass and batch/live helpers.
-- `src/trading_dsl_engine/jax_backend/`
+- `src/trading_dsl_engine/base/`
+  - Shared parser (`parse_formula`), Python DSL constructors, registry metadata, and compile/lower pipeline.
+- `src/trading_dsl_engine/numba/`
+  - Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
+- `src/trading_dsl_engine/jax/`
   - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
-- `tests/`
-  - Parser, composition, runtime correctness, shape, state persistence, and performance tests.
+- `src/trading_dsl_engine/{parser,dsl,registry,compiler,ops,engine}.py`
+  - Backward-compatible import shims for the reorganized packages.
+- `tests/numba/`
+  - Parser, composition, Numba runtime correctness, shape, state persistence, and performance tests.
+- `tests/jax/`
+  - JAX backend correspondence tests against the Numba runtime.
 
 ## Typical usage
 
@@ -109,10 +105,10 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 
 ## Optional JAX backend
 
-Install the optional dependencies with `python -m pip install -e ".[jax]"`. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax_backend`:
+Install the optional dependencies with `python -m pip install -e ".[jax]"`. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax`:
 
 ```python
-from trading_dsl_engine.jax_backend import build_jax_engine, run_batch_from_mapping
+from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping
 
 engine = build_jax_engine("xs_rank(ewm(div(close, open), 21))")
 out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
@@ -133,7 +129,7 @@ pytest -q
 Performance tests (opt-in):
 
 ```bash
-RUN_PERF_TESTS=1 pytest tests/test_performance.py -q
+RUN_PERF_TESTS=1 pytest tests/numba/test_performance.py -q
 ```
 
 ## Notes for future work
