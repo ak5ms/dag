@@ -1,86 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import tempfile
-from time import perf_counter
 from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
-
 jax.config.update("jax_enable_x64", True)
 
-from trading_dsl_engine.base.compiler import CompileStats, FormulaCompileError
-from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, Universe, parse_formula
-
-
-@dataclass(frozen=True)
-class JaxCompiledArtifact:
-    compiled: "JaxProgram"
-    input_names: tuple[str, ...]
-    output_kind: str
-    stats: CompileStats
-
-
-class JaxProgram(eqx.Module):
-    """Static Equinox module containing a compiled operator tree."""
-
-    root: Any = eqx.field(static=True)
-    n_inputs: int = eqx.field(static=True)
-    output_kind: str = eqx.field(static=True)
-
-    def init_state(self, n_instruments: int):
-        return self.root.init_state(n_instruments)
-
-    def tick(self, state, frame2d):
-        new_state, out = self.root.tick(state, frame2d)
-        return new_state, _project_output(out, self.output_kind)
-
-    def run_batch(self, inputs):
-        n_instruments = inputs[0].shape[1]
-        state0 = self.init_state(n_instruments)
-
-        def step(state, rows):
-            frame = jnp.stack(rows, axis=0)
-            new_state, out = self.tick(state, frame)
-            return new_state, out
-
-        _, outputs = jax.lax.scan(step, state0, inputs)
-        return outputs
-
-
-@eqx.filter_jit
-def _jit_tick(program: JaxProgram, state, frame2d):
-    return program.tick(state, frame2d)
-
-
-@eqx.filter_jit
-def _jit_batch(program: JaxProgram, inputs):
-    return program.run_batch(inputs)
-
-
-class JaxEngineHandle:
-    def __init__(self, compiled: JaxProgram, input_names: tuple[str, ...], output_kind: str):
-        self.compiled = compiled
-        self.input_names = input_names
-        self.output_kind = output_kind
-        self.output_code = {"scalar": 0, "vector": 1, "matrix": 2, "object": 3}[output_kind]
-        self._state = None
-        self._n_instruments = None
-
-    def on_data(self, frame2d):
-        frame = jnp.asarray(frame2d, dtype=jnp.float64)
-        if self._state is None or self._n_instruments != frame.shape[1]:
-            self._state = self.compiled.init_state(frame.shape[1])
-            self._n_instruments = frame.shape[1]
-        self._state, self._last = _jit_tick(self.compiled, self._state, frame)
-        return self._last
-
-    def emit(self):
-        return np.asarray(self._last)
+from trading_dsl_engine.base.compiler import FormulaCompileError
+from trading_dsl_engine.base.parser import Expr, Number
 
 
 def _scalar_value(x):
@@ -184,130 +112,6 @@ class BinaryOp(eqx.Module):
         new_right_state, right = self.right.tick(right_state, frame2d)
         return (new_left_state, new_right_state), self.apply(left, right)
 
-
-class AbsOp(UnaryOp):
-    def apply(self, x):
-        return jnp.abs(x)
-
-
-class LnOp(UnaryOp):
-    def apply(self, x):
-        return jnp.log(x)
-
-
-class CeilOp(UnaryOp):
-    def apply(self, x):
-        return jnp.ceil(x)
-
-
-class FloorOp(UnaryOp):
-    def apply(self, x):
-        return jnp.floor(x)
-
-
-class ExpOp(UnaryOp):
-    def apply(self, x):
-        return jnp.exp(x)
-
-
-class SignOp(UnaryOp):
-    def apply(self, x):
-        return jnp.sign(x)
-
-
-class ArctanOp(UnaryOp):
-    def apply(self, x):
-        return jnp.arctan(x)
-
-
-class IsNanOp(UnaryOp):
-    def apply(self, x):
-        return jnp.where(jnp.isnan(x), 1.0, 0.0)
-
-
-class PurifyOp(UnaryOp):
-    def apply(self, x):
-        return jnp.where(jnp.isfinite(x), x, jnp.nan)
-
-
-class FractionOp(UnaryOp):
-    def apply(self, x):
-        return x - jnp.floor(x)
-
-
-class AddOp(BinaryOp):
-    def apply(self, left, right):
-        return left + right
-
-
-class SubOp(BinaryOp):
-    def apply(self, left, right):
-        return left - right
-
-
-class MulOp(BinaryOp):
-    def apply(self, left, right):
-        return left * right
-
-
-class ModOp(BinaryOp):
-    def apply(self, left, right):
-        return jnp.mod(left, right)
-
-
-class PowOp(BinaryOp):
-    def apply(self, left, right):
-        return left**right
-
-
-class DivOp(BinaryOp):
-    def apply(self, left, right):
-        return jnp.where(right == 0.0, jnp.nan, left / right)
-
-
-class FloorDivOp(BinaryOp):
-    def apply(self, left, right):
-        return jnp.where(right == 0.0, jnp.nan, left // right)
-
-
-class EqOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, left == right)
-
-
-class NeOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, left != right)
-
-
-class LtOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, left < right)
-
-
-class GtOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, left > right)
-
-
-class AndOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, (left != 0.0) & (right != 0.0))
-
-
-class OrOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, (left != 0.0) | (right != 0.0))
-
-
-class XorOp(BinaryOp):
-    def apply(self, left, right):
-        return _nan_cmp(left, right, (left != 0.0) ^ (right != 0.0))
-
-
-class FillNaOp(BinaryOp):
-    def apply(self, left, right):
-        return jnp.where(jnp.isnan(left), right, left)
 
 
 class WhereOp(eqx.Module):
@@ -703,81 +507,38 @@ class UniverseGroupByOp(eqx.Module):
         return tuple(new_states), out
 
 
-def _unary_op(name: str, fn):
-    return type(f"{name}Op", (UnaryOp,), {"apply": lambda self, x, _fn=fn: _fn(x)})
-
-
-def _binary_op(name: str, fn):
-    return type(f"{name}Op", (BinaryOp,), {"apply": lambda self, left, right, _fn=fn: _fn(left, right)})
-
-
 _UNARY_OPS = {
-    "abs": _unary_op("Abs", jnp.abs),
-    "ln": _unary_op("Ln", jnp.log),
-    "ceil": _unary_op("Ceil", jnp.ceil),
-    "floor": _unary_op("Floor", jnp.floor),
-    "exp": _unary_op("Exp", jnp.exp),
-    "sign": _unary_op("Sign", jnp.sign),
-    "arctan": _unary_op("Arctan", jnp.arctan),
-    "isnan": _unary_op("IsNan", lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0)),
-    "purify": _unary_op("Purify", lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan)),
-    "fraction": _unary_op("Fraction", lambda x: x - jnp.floor(x)),
+    "abs": type("AbsOp", (UnaryOp,), {"apply": lambda self, x: jnp.abs(x)}),
+    "ln": type("LnOp", (UnaryOp,), {"apply": lambda self, x: jnp.log(x)}),
+    "ceil": type("CeilOp", (UnaryOp,), {"apply": lambda self, x: jnp.ceil(x)}),
+    "floor": type("FloorOp", (UnaryOp,), {"apply": lambda self, x: jnp.floor(x)}),
+    "exp": type("ExpOp", (UnaryOp,), {"apply": lambda self, x: jnp.exp(x)}),
+    "sign": type("SignOp", (UnaryOp,), {"apply": lambda self, x: jnp.sign(x)}),
+    "arctan": type("ArctanOp", (UnaryOp,), {"apply": lambda self, x: jnp.arctan(x)}),
+    "isnan": type("IsNanOp", (UnaryOp,), {"apply": lambda self, x: jnp.where(jnp.isnan(x), 1.0, 0.0)}),
+    "purify": type("PurifyOp", (UnaryOp,), {"apply": lambda self, x: jnp.where(jnp.isfinite(x), x, jnp.nan)}),
+    "fraction": type("FractionOp", (UnaryOp,), {"apply": lambda self, x: x - jnp.floor(x)}),
 }
 
 _BINARY_OPS = {
-    "add": _binary_op("Add", lambda left, right: left + right),
-    "sub": _binary_op("Sub", lambda left, right: left - right),
-    "mul": _binary_op("Mul", lambda left, right: left * right),
-    "mod": _binary_op("Mod", jnp.mod),
-    "pow": _binary_op("Pow", lambda left, right: left**right),
-    "div": _binary_op("Div", lambda left, right: jnp.where(right == 0.0, jnp.nan, left / right)),
-    "floordiv": _binary_op("FloorDiv", lambda left, right: jnp.where(right == 0.0, jnp.nan, left // right)),
-    "eq": _binary_op("Eq", lambda left, right: _nan_cmp(left, right, left == right)),
-    "ne": _binary_op("Ne", lambda left, right: _nan_cmp(left, right, left != right)),
-    "lt": _binary_op("Lt", lambda left, right: _nan_cmp(left, right, left < right)),
-    "gt": _binary_op("Gt", lambda left, right: _nan_cmp(left, right, left > right)),
-    "and": _binary_op("And", lambda left, right: _nan_cmp(left, right, (left != 0.0) & (right != 0.0))),
-    "and_": _binary_op("And", lambda left, right: _nan_cmp(left, right, (left != 0.0) & (right != 0.0))),
-    "or": _binary_op("Or", lambda left, right: _nan_cmp(left, right, (left != 0.0) | (right != 0.0))),
-    "or_": _binary_op("Or", lambda left, right: _nan_cmp(left, right, (left != 0.0) | (right != 0.0))),
-    "xor": _binary_op("Xor", lambda left, right: _nan_cmp(left, right, (left != 0.0) ^ (right != 0.0))),
-    "fillna": _binary_op("FillNa", lambda left, right: jnp.where(jnp.isnan(left), right, left)),
+    "add": type("AddOp", (BinaryOp,), {"apply": lambda self, left, right: left + right}),
+    "sub": type("SubOp", (BinaryOp,), {"apply": lambda self, left, right: left - right}),
+    "mul": type("MulOp", (BinaryOp,), {"apply": lambda self, left, right: left * right}),
+    "mod": type("ModOp", (BinaryOp,), {"apply": lambda self, left, right: jnp.mod(left, right)}),
+    "pow": type("PowOp", (BinaryOp,), {"apply": lambda self, left, right: left**right}),
+    "div": type("DivOp", (BinaryOp,), {"apply": lambda self, left, right: jnp.where(right == 0.0, jnp.nan, left / right)}),
+    "floordiv": type("FloorDivOp", (BinaryOp,), {"apply": lambda self, left, right: jnp.where(right == 0.0, jnp.nan, left // right)}),
+    "eq": type("EqOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, left == right)}),
+    "ne": type("NeOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, left != right)}),
+    "lt": type("LtOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, left < right)}),
+    "gt": type("GtOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, left > right)}),
+    "and": type("AndOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, (left != 0.0) & (right != 0.0))}),
+    "and_": type("AndOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, (left != 0.0) & (right != 0.0))}),
+    "or": type("OrOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, (left != 0.0) | (right != 0.0))}),
+    "or_": type("OrOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, (left != 0.0) | (right != 0.0))}),
+    "xor": type("XorOp", (BinaryOp,), {"apply": lambda self, left, right: _nan_cmp(left, right, (left != 0.0) ^ (right != 0.0))}),
+    "fillna": type("FillNaOp", (BinaryOp,), {"apply": lambda self, left, right: jnp.where(jnp.isnan(left), right, left)}),
 }
-
-
-def _expr_key(node: Expr):
-    if isinstance(node, Identifier):
-        return ("id", node.name)
-    if isinstance(node, Number):
-        return ("num", float(node.value))
-    if isinstance(node, Universe):
-        return ("univ", node.groups)
-    if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
-    raise FormulaCompileError(f"Unsupported expression node: {node}")
-
-
-def _resolve_universe_groups(universe: Universe, column_names):
-    name_to_idx = {name: i for i, name in enumerate(column_names or ())}
-    groups = []
-    seen = set()
-    for group in universe.groups:
-        resolved = []
-        for item in group:
-            if isinstance(item, int):
-                idx = item
-            else:
-                if item not in name_to_idx:
-                    raise FormulaCompileError(
-                        f"Unknown universe column {item!r}. Pass column_names to compile_formula/build_engine."
-                    )
-                idx = name_to_idx[item]
-            if idx in seen:
-                raise FormulaCompileError(f"Universe column index {idx} appears in more than one group")
-            seen.add(idx)
-            resolved.append(int(idx))
-        groups.append(tuple(resolved))
-    return tuple(groups)
 
 
 def _literal_arg(expr: Expr, op_name: str, position: int) -> float:
@@ -871,125 +632,3 @@ def _make_call_op(fn: str, args: tuple[Expr, ...], children: tuple[Any, ...]):
     if builder is None:
         raise FormulaCompileError(f"JAX backend does not support op '{fn}' yet")
     return builder(args, children)
-
-
-def compile_formula(
-    formula: str | Expr,
-    dsl_registry: DSLFunctionRegistry | None = None,
-    column_names: list[str] | tuple[str, ...] | None = None,
-) -> JaxCompiledArtifact:
-    started_at = perf_counter()
-    ast_expr = parse_formula(formula) if isinstance(formula, str) else formula
-    dsl_registry = dsl_registry or DEFAULT_DSL_REGISTRY
-    inputs: dict[str, int] = {}
-    cache: dict[tuple, Any] = {}
-    cache_hits = 0
-    expanded_nodes = 0
-
-    def build(expr: Expr, local_inputs: dict[str, Any] | None = None) -> Any:
-        nonlocal cache_hits, expanded_nodes
-        use_cache = local_inputs is None
-        key = _expr_key(expr)
-        if use_cache and key in cache:
-            cache_hits += 1
-            return cache[key]
-        expanded_nodes += 1
-        if isinstance(expr, Identifier):
-            if local_inputs is not None:
-                if expr.name not in local_inputs:
-                    raise FormulaCompileError("groupby local op expressions may only reference the 'self_' lhs placeholder")
-                op = local_inputs[expr.name]
-            else:
-                inputs.setdefault(expr.name, len(inputs))
-                op = InputOp(inputs[expr.name])
-        elif isinstance(expr, Number):
-            op = LiteralOp(float(expr.value))
-        elif isinstance(expr, Call):
-            macro = dsl_registry.get(expr.fn)
-            if macro is not None:
-                op = build(macro(*expr.args), local_inputs)
-            elif expr.fn == "groupby" and len(expr.args) == 2 and isinstance(expr.args[0], Universe):
-                child = build(expr.args[1], local_inputs)
-                op = UniverseGroupByOp(child, _resolve_universe_groups(expr.args[0], column_names))
-            elif expr.fn == "groupby" and len(expr.args) == 2:
-                key_child = build(expr.args[0], local_inputs)
-                op_child = build(expr.args[1], local_inputs)
-                op = GroupByOp(key_child, op_child, len(inputs), output_kind=op_child.output_kind)
-            elif expr.fn == "groupby" and len(expr.args) == 3:
-                key_child = build(expr.args[0], local_inputs)
-                lhs_child = build(expr.args[1], local_inputs)
-                local_value = LocalValueOp(lhs_child.output_kind, lhs_child.output_kind)
-                rhs_child = build(expr.args[2], {"self_": local_value})
-                op = ScopedGroupByOp(key_child, lhs_child, rhs_child, output_kind=rhs_child.output_kind)
-            else:
-                children = tuple(build(arg, local_inputs) for arg in expr.args)
-                op = _make_call_op(expr.fn, expr.args, children)
-        else:
-            raise FormulaCompileError(f"Unsupported expression node: {expr}")
-        if use_cache:
-            cache[key] = op
-        return op
-
-    root = build(ast_expr)
-    return JaxCompiledArtifact(
-        compiled=JaxProgram(root, len(inputs), root.output_kind),
-        input_names=tuple(inputs.keys()),
-        output_kind=root.output_kind,
-        stats=CompileStats(
-            expanded_nodes=expanded_nodes,
-            cache_hits=cache_hits,
-            compile_seconds=perf_counter() - started_at,
-        ),
-    )
-
-
-def build_jax_engine(
-    formula: str | Expr,
-    dsl_registry: DSLFunctionRegistry | None = None,
-    column_names: list[str] | tuple[str, ...] | None = None,
-):
-    artifact = compile_formula(formula, dsl_registry=dsl_registry, column_names=column_names)
-    return JaxEngineHandle(artifact.compiled, artifact.input_names, artifact.output_kind)
-
-
-build_engine = build_jax_engine
-
-
-def _as_aligned_inputs(engine: JaxEngineHandle, data: dict[str, np.ndarray]):
-    arrays = []
-    for name in engine.input_names:
-        arr = np.asarray(data[name], dtype=np.float64)
-        if arr.ndim != 2:
-            raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
-        arrays.append(jnp.asarray(arr))
-    return tuple(arrays)
-
-
-def run_batch_from_mapping(
-    engine: JaxEngineHandle,
-    data: dict[str, np.ndarray],
-    out=None,
-    out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_jax_out.memmap",
-    chunk_size: int = 8192,
-):
-    inputs = _as_aligned_inputs(engine, data)
-    result = np.asarray(_jit_batch(engine.compiled, inputs))
-    if out is not None:
-        out[...] = result
-        return out
-    if out_path is not None:
-        mapped = np.memmap(out_path, mode="w+", dtype=np.float64, shape=result.shape)
-        mapped[...] = result
-        return mapped
-    return result
-
-
-def update_from_mapping(engine: JaxEngineHandle, data: dict[str, np.ndarray]):
-    frame = np.empty(
-        (len(engine.input_names), np.asarray(data[engine.input_names[0]]).shape[0]),
-        dtype=np.float64,
-    )
-    for i, name in enumerate(engine.input_names):
-        frame[i, :] = np.asarray(data[name], dtype=np.float64)
-    engine.on_data(frame)
-    return engine.emit()
