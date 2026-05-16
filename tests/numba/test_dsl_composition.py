@@ -1,7 +1,7 @@
 import numpy as np
 
 from trading_dsl_engine import DSLFunctionRegistry, build_engine, compile_formula, register_dsl_function, run_batch_from_mapping
-from trading_dsl_engine.dsl import add, div, ewm, ratio, xs_rank
+from trading_dsl_engine.base.dsl import add, div, ewm, ratio, xs_rank
 
 
 @register_dsl_function("hlc3")
@@ -103,7 +103,7 @@ def test_python_expr_extended_math_magic_methods_match_prefix_string():
 
 
 def test_all_builtin_dsl_operator_helpers_are_importable():
-    import trading_dsl_engine.dsl as dsl
+    import trading_dsl_engine.base.dsl as dsl
 
     for name in (
         "add",

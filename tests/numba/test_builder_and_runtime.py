@@ -4,7 +4,7 @@ from numba import boolean, float64
 from numba.experimental import jitclass
 
 from trading_dsl_engine import build_engine, compile_formula, run_batch_from_mapping, update_from_mapping
-from trading_dsl_engine.registry import CompiledNode, OpSpec, REGISTRY, TypeInfo
+from trading_dsl_engine.base.registry import CompiledNode, OpSpec, REGISTRY, TypeInfo
 
 
 def _manual_formula(close, open_, span):

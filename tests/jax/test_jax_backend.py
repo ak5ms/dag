@@ -1,12 +1,12 @@
 import numpy as np
 import pytest
 
-jax_backend = pytest.importorskip("trading_dsl_engine.jax_backend")
+jax_backend = pytest.importorskip("trading_dsl_engine.jax")
 pytest.importorskip("equinox")
 
 from trading_dsl_engine import build_engine as build_numba_engine
 from trading_dsl_engine import run_batch_from_mapping as run_numba_batch
-from trading_dsl_engine.jax_backend import build_jax_engine, run_batch_from_mapping, update_from_mapping
+from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping, update_from_mapping
 
 
 def _compare_batch(formula, data, **kwargs):

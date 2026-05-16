@@ -20,8 +20,6 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
   - Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
 - `src/trading_dsl_engine/jax/`
   - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
-- `src/trading_dsl_engine/{parser,dsl,registry,compiler,ops,engine}.py`
-  - Backward-compatible import shims for the reorganized packages.
 - `tests/numba/`
   - Parser, composition, Numba runtime correctness, shape, state persistence, and performance tests.
 - `tests/jax/`
