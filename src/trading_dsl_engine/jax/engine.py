@@ -18,7 +18,6 @@ from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, Unive
 from trading_dsl_engine.jax.ops import (
     GroupByOp,
     InputOp,
-    KeyValidatedOp,
     LiteralOp,
     LocalValueOp,
     ScopedGroupByOp,
@@ -171,10 +170,13 @@ def compile_formula(
             elif expr.fn == "groupby" and len(expr.args) == 2:
                 key_child = build(expr.args[0], local_inputs)
                 op_child = build(expr.args[1], local_inputs)
-                if _op_is_stateless(op_child):
-                    op = KeyValidatedOp(key_child, op_child, output_kind=op_child.output_kind)
-                else:
-                    op = GroupByOp(key_child, op_child, len(inputs), output_kind=op_child.output_kind)
+                op = GroupByOp(
+                    key_child,
+                    op_child,
+                    len(inputs),
+                    stateless_child=_op_is_stateless(op_child),
+                    output_kind=op_child.output_kind,
+                )
             elif expr.fn == "groupby" and len(expr.args) == 3:
                 key_child = build(expr.args[0], local_inputs)
                 lhs_child = build(expr.args[1], local_inputs)
