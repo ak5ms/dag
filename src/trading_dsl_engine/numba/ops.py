@@ -960,48 +960,6 @@ def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, 
     return CompiledNode(out_type, UniverseGroupByOp.class_type.instance_type, _ctor)
 
 
-def _make_key_validated_node(key_node: CompiledNode, op_node: CompiledNode) -> CompiledNode:
-    spec = [("key_node", key_node.instance_type), ("op_node", op_node.instance_type)]
-
-    @jitclass(spec)
-    class KeyValidatedOp:
-        def __init__(self, key_node, op_node):
-            self.key_node = key_node
-            self.op_node = op_node
-
-        def on_data(self, frame2d):
-            self.key_node.on_data(frame2d)
-            self.op_node.on_data(frame2d)
-            k = self.key_node.emit()
-            for i in range(k.shape[0]):
-                if np.isnan(k[i, 0]):
-                    raise ValueError("groupby key cannot be NaN")
-
-        def emit(self):
-            return self.op_node.emit()
-
-    def _ctor():
-        return KeyValidatedOp(key_node.ctor(), op_node.ctor())
-
-    _jit_ctor = None
-    if key_node.jit_ctor is not None and op_node.jit_ctor is not None:
-        key_jit_ctor = key_node.jit_ctor
-        op_jit_ctor = op_node.jit_ctor
-
-        @njit
-        def _jit_ctor_impl():
-            return KeyValidatedOp(key_jit_ctor(), op_jit_ctor())
-
-        _jit_ctor = _jit_ctor_impl
-
-    return CompiledNode(
-        op_node.type_info,
-        KeyValidatedOp.class_type.instance_type,
-        _ctor,
-        _jit_ctor,
-        key_node.stateless and op_node.stateless,
-    )
-
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) not in (2, 3):
         raise ValueError("groupby expects 2 args: key, op or 3 args: key, lhs, op")
@@ -1012,7 +970,7 @@ def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
     op_type = types[-1]
     if op_type.kind == "object":
         raise ValueError("groupby op arg must emit scalar/vector/matrix, not object")
-    return op_type
+    return VECTOR if op_type.kind == "scalar" else op_type
 
 
 def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
@@ -1020,8 +978,6 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
     has_lhs = len(children) == 3
     lhs_node = children[1] if has_lhs else key_node
     op_node = children[2] if has_lhs else children[1]
-    if (not has_lhs) and op_node.stateless:
-        return _make_key_validated_node(key_node, op_node)
     if op_node.jit_ctor is None:
         raise ValueError("groupby op does not support dynamic compiled construction")
     op_jit_ctor = op_node.jit_ctor
@@ -1121,7 +1077,8 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
         group_lookup = Dict.empty(key_type=types.UniTuple(int64, 2), value_type=op_node.instance_type)
         return GroupByOp(key_node.ctor(), lhs_node.ctor(), group_lookup, has_lhs)
 
-    return CompiledNode(op_node.type_info, GroupByOp.class_type.instance_type, _ctor)
+    out_type = VECTOR if op_node.type_info.kind == "scalar" else op_node.type_info
+    return CompiledNode(out_type, GroupByOp.class_type.instance_type, _ctor)
 
 
 def _build_group_slots(group_ctor, n_slots: int, instance_type):

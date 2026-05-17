@@ -20,8 +20,8 @@ Priorities, in order:
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - For the optional JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution.
 - Support arity > 1 cleanly.
-- Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe without interpreter fallback.
-- Preserve both keyed grouping scopes: `groupby(key, op)` groups the full op subtree, while `groupby(key, lhs, op_using_self_)` computes `lhs` outside the keyed scope and groups only the local op that consumes `self_`.
+- Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe on group sub-frames without interpreter fallback.
+- Preserve both dynamic keyed grouping scopes: `groupby(key, op)` groups the full op subtree in each instrument/key single-column scope, while `groupby(key, lhs, op_using_self_)` computes `lhs` outside the keyed scope and groups only the local op that consumes `self_`. Do not special-case stateless ops into cross-sectional execution for dynamic keyed groupby; cross-column grouping belongs to `groupby(univ(...), op)`.
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
@@ -59,8 +59,8 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ridge pairwise sufficient-statistic behavior: `xx[j, k]` and `xy[j]` update only when their own finite row requirements are met, and their per-statistic clocks do not advance during outages.
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
 - Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
-- Grouped-state behavior for keyed operators (e.g., `groupby`) including key NaNs, per-key state transitions, and key consistency expectations.
-- Static universe grouping behavior (`groupby(univ(...), op)`) including ticker-to-column mapping, per-universe state isolation, scatter/broadcast shape behavior, and NaN handling in reducers such as `mean`.
+- Grouped-state behavior for dynamic keyed operators (e.g., `groupby(key, op)`) including key NaNs, per-instrument/per-key state transitions, singleton local stream behavior for stateless reducers, and key consistency expectations.
+- Static universe grouping behavior (`groupby(univ(...), op)`) including ticker-to-column mapping, per-universe sub-frame state isolation, scatter/broadcast shape behavior, and NaN handling in cross-column reducers such as `mean`.
 
 ## Test expectations
 

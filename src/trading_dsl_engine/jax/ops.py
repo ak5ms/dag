@@ -69,10 +69,6 @@ def _vmap_child_tick(child, selected_state, local_frames):
     return jax.vmap(lambda frame: child.tick(selected_state, frame))(local_frames)
 
 
-def _op_is_stateless(op) -> bool:
-    return not _tree_has_leaves(op.init_state(1))
-
-
 class InputOp(eqx.Module):
     index: int = eqx.field(static=True)
     output_kind: str = eqx.field(static=True, default="vector")
@@ -322,19 +318,13 @@ class GroupByOp(eqx.Module):
     key: Any = eqx.field(static=True)
     child: Any = eqx.field(static=True)
     n_inputs: int = eqx.field(static=True)
-    stateless_child: bool = eqx.field(static=True, default=False)
     capacity: int = eqx.field(static=True, default=4096)
     output_kind: str = eqx.field(static=True, default="vector")
 
     def init_state(self, n_instruments: int):
-        child_state = (
-            self.child.init_state(n_instruments)
-            if self.stateless_child
-            else _tree_broadcast_slots(self.child.init_state(1), n_instruments * self.capacity)
-        )
         return (
             self.key.init_state(n_instruments),
-            child_state,
+            _tree_broadcast_slots(self.child.init_state(1), n_instruments * self.capacity),
             jnp.full((n_instruments, self.capacity), jnp.nan),
             jnp.zeros((n_instruments, self.capacity), dtype=bool),
         )
@@ -342,10 +332,6 @@ class GroupByOp(eqx.Module):
     def tick(self, state, frame2d):
         key_state, child_state, keys, occupied = state
         new_key_state, key_values = self.key.tick(key_state, frame2d)
-        if self.stateless_child:
-            new_child_state, out = self.child.tick(child_state, frame2d)
-            return (new_key_state, new_child_state, keys, occupied), out
-
         key_vector = key_values[:, 0]
         source = frame2d[: self.n_inputs]
         matches = occupied & (keys == key_vector[:, None])

@@ -49,7 +49,7 @@ def test_jax_backend_dynamic_key_groupby_matches_numba():
     _compare_batch("groupby(ts, ewm(close, 3))", {"ts": ts, "close": close})
 
 
-def test_jax_backend_stateless_groupby_matches_numba_validation_path():
+def test_jax_backend_dynamic_groupby_stateless_child_uses_keyed_singleton_scope():
     close = np.array([[1.0, 10.0], [3.0, 20.0]], dtype=np.float64)
     ts = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
     _compare_batch("groupby(ts, mean(close))", {"ts": ts, "close": close})

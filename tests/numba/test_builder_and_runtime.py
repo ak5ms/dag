@@ -756,6 +756,16 @@ def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
     np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, data, out_path=None), expected_scalar_weights)
 
 
+def test_dynamic_groupby_mean_uses_single_instrument_keyed_scope():
+    eng = build_engine("groupby(ts, mean(close))")
+    close = np.array([[1.0, 10.0], [3.0, 20.0]], dtype=np.float64)
+    ts = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+
+    out = run_batch_from_mapping(eng, {"ts": ts, "close": close}, out_path=None)
+
+    np.testing.assert_allclose(out, close)
+
+
 def test_universe_groupby_mean_broadcasts_column_group_results():
     from trading_dsl_engine import groupby, mean, univ, var
 

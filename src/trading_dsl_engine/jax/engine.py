@@ -23,7 +23,6 @@ from trading_dsl_engine.jax.ops import (
     ScopedGroupByOp,
     UniverseGroupByOp,
     _make_call_op,
-    _op_is_stateless,
     _project_output,
 )
 
@@ -170,19 +169,15 @@ def compile_formula(
             elif expr.fn == "groupby" and len(expr.args) == 2:
                 key_child = build(expr.args[0], local_inputs)
                 op_child = build(expr.args[1], local_inputs)
-                op = GroupByOp(
-                    key_child,
-                    op_child,
-                    len(inputs),
-                    stateless_child=_op_is_stateless(op_child),
-                    output_kind=op_child.output_kind,
-                )
+                output_kind = "vector" if op_child.output_kind == "scalar" else op_child.output_kind
+                op = GroupByOp(key_child, op_child, len(inputs), output_kind=output_kind)
             elif expr.fn == "groupby" and len(expr.args) == 3:
                 key_child = build(expr.args[0], local_inputs)
                 lhs_child = build(expr.args[1], local_inputs)
                 local_value = LocalValueOp(lhs_child.output_kind, lhs_child.output_kind)
                 rhs_child = build(expr.args[2], {"self_": local_value})
-                op = ScopedGroupByOp(key_child, lhs_child, rhs_child, output_kind=rhs_child.output_kind)
+                output_kind = "vector" if rhs_child.output_kind == "scalar" else rhs_child.output_kind
+                op = ScopedGroupByOp(key_child, lhs_child, rhs_child, output_kind=output_kind)
             else:
                 children = tuple(build(arg, local_inputs) for arg in expr.args)
                 op = _make_call_op(expr.fn, expr.args, children)
