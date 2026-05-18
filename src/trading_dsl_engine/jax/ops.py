@@ -470,7 +470,7 @@ class RidgeOp(eqx.Module):
         last_xx = jnp.maximum(last_xx, last_xx.T)
         has_xx = has_xx | has_xx.T
         system = xx + lam * jnp.diag(jnp.diag(xx))
-        beta_new = jnp.linalg.pinv(system) @ xy
+        beta_new = jnp.linalg.solve(system, xy)
         beta = jnp.where(jnp.all(jnp.isfinite(beta_new)), beta_new, beta)
         return (new_child_states, xx, xy, has_xx, has_xy, last_xx, last_xy, beta, preds, t + 1), (
             beta,
