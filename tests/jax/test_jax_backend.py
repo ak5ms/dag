@@ -55,6 +55,16 @@ def test_jax_backend_dynamic_groupby_stateless_child_uses_keyed_singleton_scope(
     _compare_batch("groupby(ts, mean(close))", {"ts": ts, "close": close})
 
 
+
+def test_jax_backend_tuple_key_with_universe_matches_numba():
+    data = {
+        "ts": np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        "close": np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]], dtype=np.float64),
+    }
+    _compare_batch("groupby((univ([0, 1]), ts), mean(close))", data)
+    _compare_batch("groupby((univ([0], [1]), ts), cumsum(close))", data)
+
+
 def test_jax_backend_scoped_groupby_apply_matches_numba():
     close = np.array([[1.0], [2.0], [10.0], [3.0]], dtype=np.float64)
     ts = np.array([[0.0], [0.0], [1.0], [0.0]], dtype=np.float64)

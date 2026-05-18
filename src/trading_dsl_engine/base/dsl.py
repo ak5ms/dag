@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, Universe, UniverseItem
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, UniverseItem
 
 
 class DSLFunctionRegistry:
@@ -24,6 +24,10 @@ DEFAULT_DSL_REGISTRY = DSLFunctionRegistry()
 def ensure_expr(value) -> Expr:
     if isinstance(value, Expr):
         return value
+    if isinstance(value, tuple):
+        if len(value) == 0:
+            raise TypeError("Key tuples cannot be empty")
+        return KeyTuple(tuple(ensure_expr(item) for item in value))
     if isinstance(value, (int, float)):
         return Number(float(value))
     raise TypeError(f"Expected Expr|int|float, got {type(value).__name__}")

@@ -14,13 +14,15 @@ jax.config.update("jax_enable_x64", True)
 
 from trading_dsl_engine.base.compiler import CompileStats, FormulaCompileError
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, Universe, parse_formula
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
 from trading_dsl_engine.jax.ops import (
     GroupByOp,
     InputOp,
     LiteralOp,
     LocalValueOp,
     ScopedGroupByOp,
+    TupleKeyOp,
+    UniverseDynamicGroupByOp,
     UniverseGroupByOp,
     _make_call_op,
     _project_output,
@@ -100,6 +102,8 @@ def _expr_key(node: Expr):
         return ("num", float(node.value))
     if isinstance(node, Universe):
         return ("univ", node.groups)
+    if isinstance(node, KeyTuple):
+        return ("tuple", tuple(_expr_key(item) for item in node.items))
     if isinstance(node, Call):
         return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
     raise FormulaCompileError(f"Unsupported expression node: {node}")
@@ -127,6 +131,18 @@ def _resolve_universe_groups(universe: Universe, column_names):
         groups.append(tuple(resolved))
     return tuple(groups)
 
+
+
+def _split_groupby_key_tuple(key: Expr) -> tuple[Universe | None, tuple[Expr, ...]]:
+    if isinstance(key, Universe):
+        return key, ()
+    if isinstance(key, KeyTuple):
+        universe_items = [item for item in key.items if isinstance(item, Universe)]
+        if len(universe_items) > 1:
+            raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
+        dynamic_items = tuple(item for item in key.items if not isinstance(item, Universe))
+        return (universe_items[0] if universe_items else None), dynamic_items
+    return None, (key,)
 
 def compile_formula(
     formula: str | Expr,
@@ -163,14 +179,21 @@ def compile_formula(
             macro = dsl_registry.get(expr.fn)
             if macro is not None:
                 op = build(macro(*expr.args), local_inputs)
-            elif expr.fn == "groupby" and len(expr.args) == 2 and isinstance(expr.args[0], Universe):
-                child = build(expr.args[1], local_inputs)
-                op = UniverseGroupByOp(child, _resolve_universe_groups(expr.args[0], column_names))
             elif expr.fn == "groupby" and len(expr.args) == 2:
-                key_child = build(expr.args[0], local_inputs)
+                universe, dynamic_keys = _split_groupby_key_tuple(expr.args[0])
+                key_children = tuple(build(key, local_inputs) for key in dynamic_keys)
                 op_child = build(expr.args[1], local_inputs)
                 output_kind = "vector" if op_child.output_kind == "scalar" else op_child.output_kind
-                op = GroupByOp(key_child, op_child, len(inputs), output_kind=output_kind)
+                if universe is not None:
+                    groups = _resolve_universe_groups(universe, column_names)
+                    if len(dynamic_keys) == 0:
+                        op = UniverseGroupByOp(op_child, groups)
+                    else:
+                        key_child = key_children[0] if len(key_children) == 1 else TupleKeyOp(key_children)
+                        op = UniverseDynamicGroupByOp(key_child, op_child, groups, output_kind=output_kind)
+                else:
+                    key_child = key_children[0] if len(key_children) == 1 else TupleKeyOp(key_children)
+                    op = GroupByOp(key_child, op_child, len(inputs), output_kind=output_kind)
             elif expr.fn == "groupby" and len(expr.args) == 3:
                 key_child = build(expr.args[0], local_inputs)
                 lhs_child = build(expr.args[1], local_inputs)

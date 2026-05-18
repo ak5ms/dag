@@ -960,6 +960,204 @@ def _make_universe_groupby_node(op_node: CompiledNode, groups: tuple[tuple[int, 
     return CompiledNode(out_type, UniverseGroupByOp.class_type.instance_type, _ctor)
 
 
+
+def _make_tuple_key_node(key_nodes: list[CompiledNode]) -> CompiledNode:
+    if len(key_nodes) == 0:
+        raise ValueError("tuple groupby key expects at least one dynamic key")
+    for node in key_nodes:
+        if node.type_info.kind not in ("scalar", "vector"):
+            raise ValueError("tuple groupby key elements must emit scalar or vector")
+    nodes_type = types.Tuple(tuple(node.instance_type for node in key_nodes))
+    spec = [("nodes", nodes_type), ("initialized", boolean), ("out", float64[:, :])]
+
+    @jitclass(spec)
+    class TupleKeyOp:
+        def __init__(self, nodes):
+            self.nodes = nodes
+            self.initialized = False
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def _ensure_out(self, rows: int64):
+            if (not self.initialized) or self.out.shape[0] != rows:
+                self.out = np.empty((rows, 1), dtype=np.float64)
+                self.initialized = True
+
+        def on_data(self, frame2d):
+            rows = frame2d.shape[1]
+            for node in literal_unroll(self.nodes):
+                node.on_data(frame2d)
+            self._ensure_out(rows)
+            for i in range(rows):
+                acc = 0.0
+                valid = True
+                for node in literal_unroll(self.nodes):
+                    value = node.emit()
+                    src_row = i if value.shape[0] > 1 else 0
+                    v = value[src_row, 0]
+                    if np.isnan(v):
+                        valid = False
+                    else:
+                        acc = np.mod(acc * 1009.0 + float(int(v)) + 1024.0, 2147483647.0)
+                self.out[i, 0] = acc if valid else np.nan
+
+        def emit(self):
+            return self.out
+
+    child_ctors = tuple(node.ctor for node in key_nodes)
+    child_jit_ctors = tuple(node.jit_ctor for node in key_nodes)
+
+    def _ctor():
+        return TupleKeyOp(tuple(fn() for fn in child_ctors))
+
+    _jit_ctor = _compile_jit_tuple_node_ctor(TupleKeyOp, child_jit_ctors)
+    return CompiledNode(VECTOR, TupleKeyOp.class_type.instance_type, _ctor, _jit_ctor, all(node.stateless for node in key_nodes))
+
+
+def _make_universe_dynamic_groupby_node(
+    key_node: CompiledNode,
+    op_node: CompiledNode,
+    groups: tuple[tuple[int, ...], ...],
+) -> CompiledNode:
+    if len(groups) == 0:
+        raise ValueError("tuple groupby universe expects at least one group")
+    if key_node.type_info.kind != "vector":
+        raise ValueError("tuple groupby dynamic key must emit vector")
+    if op_node.type_info.kind == "object":
+        raise ValueError("tuple groupby op arg must emit scalar/vector/matrix, not object")
+    if op_node.jit_ctor is None:
+        raise ValueError("tuple groupby op does not support dynamic compiled construction")
+    out_type = VECTOR if op_node.type_info.kind == "scalar" else op_node.type_info
+    groups_list_type = types.ListType(types.Array(int64, 1, "C"))
+    key_list_type = types.ListType(key_node.instance_type)
+    op_dict_type = types.DictType(types.UniTuple(int64, 2), op_node.instance_type)
+    op_jit_ctor = op_node.jit_ctor
+
+    @njit
+    def _new_group():
+        return op_jit_ctor()
+
+    spec = [
+        ("group_indices", groups_list_type),
+        ("key_nodes", key_list_type),
+        ("group_lookup", op_dict_type),
+        ("scratch", float64[:, :]),
+        ("out", float64[:, :]),
+        ("initialized", boolean),
+    ]
+
+    @jitclass(spec)
+    class UniverseDynamicGroupByOp:
+        def __init__(self, group_indices, key_nodes, group_lookup):
+            self.group_indices = group_indices
+            self.key_nodes = key_nodes
+            self.group_lookup = group_lookup
+            self.scratch = np.empty((1, 1), dtype=np.float64)
+            self.out = np.empty((1, 1), dtype=np.float64)
+            self.initialized = False
+
+        def _ensure_scratch(self, rows: int64, cols: int64):
+            if self.scratch.shape[0] != rows or self.scratch.shape[1] != cols:
+                self.scratch = np.empty((rows, cols), dtype=np.float64)
+
+        def _ensure_out(self, rows: int64, cols: int64):
+            if (not self.initialized) or self.out.shape[0] != rows or self.out.shape[1] != cols:
+                new_out = np.empty((rows, cols), dtype=np.float64)
+                new_out[:, :] = np.nan
+                if self.initialized and self.out.shape[0] == rows:
+                    copy_cols = self.out.shape[1]
+                    if cols < copy_cols:
+                        copy_cols = cols
+                    for r in range(rows):
+                        for c in range(copy_cols):
+                            new_out[r, c] = self.out[r, c]
+                self.out = new_out
+                self.initialized = True
+
+        def _fill_group_frame(self, frame2d, idxs, group_frame):
+            for r in range(frame2d.shape[0]):
+                for c in range(idxs.shape[0]):
+                    group_frame[r, c] = frame2d[r, idxs[c]]
+
+        def _fill_key_scratch(self, group_frame, key_values, key: int64):
+            for r in range(group_frame.shape[0]):
+                for c in range(group_frame.shape[1]):
+                    if int(key_values[c, 0]) == key:
+                        self.scratch[r, c] = group_frame[r, c]
+                    else:
+                        self.scratch[r, c] = np.nan
+
+        def _already_processed(self, processed, n_processed: int64, key: int64):
+            for i in range(n_processed):
+                if processed[i] == key:
+                    return True
+            return False
+
+        def on_data(self, frame2d):
+            n_inputs = frame2d.shape[0]
+            n_cols = frame2d.shape[1]
+            width = 1
+            self._ensure_out(n_cols, width)
+            self.out[:, :] = np.nan
+
+            for g in range(len(self.group_indices)):
+                idxs = self.group_indices[g]
+                for j in range(idxs.shape[0]):
+                    if idxs[j] >= n_cols:
+                        raise ValueError("universe column index out of bounds for input width")
+                group_frame = np.empty((n_inputs, idxs.shape[0]), dtype=np.float64)
+                self._fill_group_frame(frame2d, idxs, group_frame)
+                key_node = self.key_nodes[g]
+                key_node.on_data(group_frame)
+                key_values = key_node.emit()
+                self._ensure_scratch(n_inputs, idxs.shape[0])
+                processed = np.empty(idxs.shape[0], dtype=np.int64)
+                n_processed = 0
+
+                for member_pos in range(idxs.shape[0]):
+                    kv = key_values[member_pos, 0]
+                    if np.isnan(kv):
+                        raise ValueError("groupby key cannot be NaN")
+                    key = int(kv)
+                    if self._already_processed(processed, n_processed, key):
+                        continue
+                    processed[n_processed] = key
+                    n_processed += 1
+                    pair = (g, key)
+                    if pair in self.group_lookup:
+                        op = self.group_lookup[pair]
+                    else:
+                        op = _new_group()
+                        self.group_lookup[pair] = op
+                    self._fill_key_scratch(group_frame, key_values, key)
+                    op.on_data(self.scratch)
+                    y = op.emit()
+                    if y.shape[1] > width:
+                        width = y.shape[1]
+                        self._ensure_out(n_cols, width)
+
+                for member_pos in range(idxs.shape[0]):
+                    key = int(key_values[member_pos, 0])
+                    y = self.group_lookup[(g, key)].emit()
+                    dest = idxs[member_pos]
+                    src_row = member_pos if y.shape[0] > 1 else 0
+                    for col in range(width):
+                        src_col = col if y.shape[1] > 1 else 0
+                        self.out[dest, col] = y[src_row, src_col]
+
+        def emit(self):
+            return self.out
+
+    key_ctors = [key_node.ctor for _ in groups]
+
+    def _ctor():
+        key_nodes = List.empty_list(key_node.instance_type)
+        for make_key in key_ctors:
+            key_nodes.append(make_key())
+        group_lookup = Dict.empty(key_type=types.UniTuple(int64, 2), value_type=op_node.instance_type)
+        return UniverseDynamicGroupByOp(_typed_universe_groups(groups), key_nodes, group_lookup)
+
+    return CompiledNode(out_type, UniverseDynamicGroupByOp.class_type.instance_type, _ctor)
+
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
     if len(types) not in (2, 3):
         raise ValueError("groupby expects 2 args: key, op or 3 args: key, lhs, op")
@@ -1574,6 +1772,8 @@ __all__ = [
     "_make_input_node",
     "_make_literal_node",
     "_make_local_value_node",
+    "_make_tuple_key_node",
+    "_make_universe_dynamic_groupby_node",
     "_make_universe_groupby_node",
     "VECTOR",
     "SCALAR",

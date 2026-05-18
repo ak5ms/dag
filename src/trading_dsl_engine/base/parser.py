@@ -143,6 +143,11 @@ class Universe(Expr):
     groups: tuple[tuple[UniverseItem, ...], ...]
 
 
+@dataclass(frozen=True, eq=False)
+class KeyTuple(Expr):
+    items: tuple[Expr, ...]
+
+
 class FormulaParseError(ValueError):
     pass
 
@@ -196,6 +201,10 @@ class _AstParser:
         if isinstance(node, ast.BinOp):
             op_name = self._binop_name(node.op)
             return Call(op_name, (self._expr(node.left), self._expr(node.right)))
+        if isinstance(node, ast.Tuple):
+            if len(node.elts) == 0:
+                raise FormulaParseError("Key tuples cannot be empty")
+            return KeyTuple(tuple(self._expr(item) for item in node.elts))
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise FormulaParseError("Chained comparisons are not supported")

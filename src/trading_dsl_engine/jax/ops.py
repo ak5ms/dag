@@ -69,6 +69,29 @@ def _vmap_child_tick(child, selected_state, local_frames):
     return jax.vmap(lambda frame: child.tick(selected_state, frame))(local_frames)
 
 
+
+
+class TupleKeyOp(eqx.Module):
+    children: tuple[Any, ...] = eqx.field(static=True)
+    output_kind: str = eqx.field(static=True, default="vector")
+
+    def init_state(self, n_instruments: int):
+        return _children_init(self.children, n_instruments)
+
+    def tick(self, state, frame2d):
+        new_state, values = _children_tick(self.children, state, frame2d)
+        n_cols = frame2d.shape[1]
+        acc = jnp.zeros((n_cols,), dtype=jnp.float64)
+        valid = jnp.ones((n_cols,), dtype=bool)
+        for value in values:
+            vector = jnp.full((n_cols,), value[0, 0], dtype=jnp.float64) if value.shape[0] == 1 else value[:, 0]
+            finite = jnp.isfinite(vector)
+            valid = valid & finite
+            encoded = jnp.where(finite, vector, 0.0).astype(jnp.int64).astype(jnp.float64)
+            acc = jnp.mod(acc * 1009.0 + encoded + 1024.0, 2147483647.0)
+        return new_state, jnp.where(valid, acc, jnp.nan)[:, None]
+
+
 class InputOp(eqx.Module):
     index: int = eqx.field(static=True)
     output_kind: str = eqx.field(static=True, default="vector")
@@ -499,6 +522,83 @@ def _ridge_vector_weight_moments(x0, y0, w, valid_x, valid_y, valid_w):
     xy_new = x0.T @ (w * y0)
     xy_counts = valid_x.astype(jnp.int64).T @ (valid_y & valid_w).astype(jnp.int64)
     return xx_new, xy_new, xx_counts > 0, xy_counts > 0
+
+
+
+
+class UniverseDynamicGroupByOp(eqx.Module):
+    key: Any = eqx.field(static=True)
+    child: Any = eqx.field(static=True)
+    groups: tuple[tuple[int, ...], ...] = eqx.field(static=True)
+    capacity: int = eqx.field(static=True, default=4096)
+    output_kind: str = eqx.field(static=True, default="vector")
+
+    def init_state(self, n_instruments: int):
+        return tuple(
+            (
+                self.key.init_state(len(group)),
+                _tree_broadcast_slots(self.child.init_state(len(group)), self.capacity),
+                jnp.full((self.capacity,), jnp.nan),
+                jnp.zeros((self.capacity,), dtype=bool),
+            )
+            for group in self.groups
+        )
+
+    def _tick_group(self, state, frame2d, group: tuple[int, ...]):
+        key_state, child_state, keys, occupied = state
+        idx = jnp.asarray(group, dtype=jnp.int64)
+        group_frame = frame2d[:, idx]
+        new_key_state, key_values = self.key.tick(key_state, group_frame)
+        key_vector = key_values[:, 0]
+        group_width = idx.shape[0]
+        output_width = group_width if self.child.output_kind == "matrix" else 1
+        group_result = jnp.full((group_width, output_width), jnp.nan)
+        new_child_state = child_state
+        new_keys = keys
+        new_occupied = occupied
+
+        for member_pos in range(len(group)):
+            key = key_vector[member_pos]
+            already_processed = jnp.any(key_vector[:member_pos] == key)
+            matches = new_occupied & (new_keys == key)
+            has_match = jnp.any(matches)
+            first_free = jnp.argmax(~new_occupied)
+            slot = jnp.where(has_match, jnp.argmax(matches), first_free)
+            mask = key_vector == key
+            local_frame = jnp.where(mask[None, :], group_frame, jnp.nan)
+
+            def process(args):
+                child_state_arg, keys_arg, occupied_arg, result_arg = args
+                selected_state = _tree_take_slots(child_state_arg, slot)
+                updated_state, child_out = self.child.tick(selected_state, local_frame)
+                child_state_arg = _tree_set_slots(child_state_arg, slot, updated_state)
+                keys_arg = keys_arg.at[slot].set(key)
+                occupied_arg = occupied_arg.at[slot].set(True)
+                value = (
+                    jnp.broadcast_to(_scalar_value(child_out), (group_width, 1))
+                    if child_out.shape[0] == 1
+                    else child_out[:, :output_width]
+                )
+                result_arg = jnp.where(mask[:, None], value, result_arg)
+                return child_state_arg, keys_arg, occupied_arg, result_arg
+
+            new_child_state, new_keys, new_occupied, group_result = jax.lax.cond(
+                already_processed,
+                lambda args: args,
+                process,
+                (new_child_state, new_keys, new_occupied, group_result),
+            )
+        return (new_key_state, new_child_state, new_keys, new_occupied), idx, group_result
+
+    def tick(self, state, frame2d):
+        output_width = frame2d.shape[1] if self.child.output_kind == "matrix" else 1
+        out = jnp.full((frame2d.shape[1], output_width), jnp.nan)
+        new_states = []
+        for group_state, group in zip(state, self.groups):
+            new_state, idx, group_result = self._tick_group(group_state, frame2d, group)
+            out = out.at[idx, :].set(group_result)
+            new_states.append(new_state)
+        return tuple(new_states), out
 
 
 class UniverseGroupByOp(eqx.Module):

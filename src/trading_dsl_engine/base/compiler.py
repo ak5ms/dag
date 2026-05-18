@@ -11,10 +11,12 @@ from trading_dsl_engine.numba.ops import (
     _make_input_node,
     _make_literal_node,
     _make_local_value_node,
+    _make_tuple_key_node,
+    _make_universe_dynamic_groupby_node,
     _make_universe_groupby_node,
     register_builtin_ops,
 )
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, Universe, parse_formula
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
 from trading_dsl_engine.base.registry import REGISTRY, CompiledNode
 
 
@@ -74,6 +76,8 @@ def _expr_key(node: Expr) -> tuple:
         return ("call", node.fn, tuple(_expr_key(arg) for arg in node.args))
     if isinstance(node, Universe):
         return ("univ", node.groups)
+    if isinstance(node, KeyTuple):
+        return ("tuple", tuple(_expr_key(item) for item in node.items))
     raise FormulaCompileError(f"Unhandled expression node for hashing: {node}")
 
 
@@ -100,6 +104,18 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
         groups.append(tuple(resolved))
     return tuple(groups)
 
+
+
+def _split_groupby_key_tuple(key: Expr) -> tuple[Universe | None, tuple[Expr, ...]]:
+    if isinstance(key, Universe):
+        return key, ()
+    if isinstance(key, KeyTuple):
+        universe_items = [item for item in key.items if isinstance(item, Universe)]
+        if len(universe_items) > 1:
+            raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
+        dynamic_items = tuple(item for item in key.items if not isinstance(item, Universe))
+        return (universe_items[0] if universe_items else None), dynamic_items
+    return None, (key,)
 
 def compile_formula(
     formula: str | Expr,
@@ -175,11 +191,36 @@ def compile_formula(
         elif isinstance(node, Number):
             compiled = _make_literal_node(node.value)
         elif isinstance(node, Call):
-            if node.fn == "groupby" and len(node.args) == 2 and isinstance(node.args[0], Universe):
-                op_child = build(node.args[1], depth + 1, local_inputs)
-                groups = _resolve_universe_groups(node.args[0], column_name_to_index)
+            if node.fn == "groupby" and len(node.args) == 2:
+                universe, dynamic_keys = _split_groupby_key_tuple(node.args[0])
                 try:
-                    compiled = _make_universe_groupby_node(op_child, groups)
+                    key_children = [build(key, depth + 1, local_inputs) for key in dynamic_keys]
+                    op_child = build(node.args[1], depth + 1, local_inputs)
+                    if universe is not None:
+                        groups = _resolve_universe_groups(universe, column_name_to_index)
+                        if len(dynamic_keys) == 0:
+                            compiled = _make_universe_groupby_node(op_child, groups)
+                        else:
+                            key_child = key_children[0] if len(key_children) == 1 else _make_tuple_key_node(key_children)
+                            compiled = _make_universe_dynamic_groupby_node(key_child, op_child, groups)
+                    elif len(dynamic_keys) > 1:
+                        try:
+                            spec = REGISTRY.get(node.fn)
+                        except KeyError as exc:
+                            raise FormulaCompileError(str(exc)) from exc
+                        key_child = _make_tuple_key_node(key_children)
+                        children = [key_child, op_child]
+                        _ = spec.validator([c.type_info for c in children])
+                        compiled = spec.builder(children, [float("nan"), float("nan")])
+                    else:
+                        try:
+                            spec = REGISTRY.get(node.fn)
+                        except KeyError as exc:
+                            raise FormulaCompileError(str(exc)) from exc
+                        key_child = key_children[0]
+                        children = [key_child, op_child]
+                        _ = spec.validator([c.type_info for c in children])
+                        compiled = spec.builder(children, [float("nan"), float("nan")])
                 except ValueError as exc:
                     raise FormulaCompileError(f"Invalid call groupby: {exc}") from exc
             elif node.fn == "groupby" and len(node.args) == 3:

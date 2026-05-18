@@ -819,6 +819,44 @@ def test_universe_groupby_preserves_state_per_column_group():
     np.testing.assert_allclose(out[1], np.array([11.0, 19.0, 150.0], dtype=np.float64))
 
 
+
+def test_tuple_key_groupby_combines_dynamic_keys():
+    eng = build_engine("groupby((day, bucket), cumsum(close))")
+    data = {
+        "day": np.array([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64),
+        "bucket": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+        "close": np.array([[1.0], [10.0], [2.0], [20.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, np.array([[1.0], [10.0], [3.0], [30.0]], dtype=np.float64))
+
+
+def test_tuple_key_with_universe_groups_columns_before_dynamic_key():
+    eng = build_engine("groupby((univ([0, 1]), ts), mean(close))")
+    data = {
+        "ts": np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        "close": np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [6.0, 6.0]]))
+
+
+def test_tuple_key_with_single_column_universes_preserves_column_local_grouping():
+    eng = build_engine("groupby((univ([0], [1]), ts), mean(close))")
+    data = {
+        "ts": np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        "close": np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, data["close"])
+
+
 def test_groupby_lhs_form_computes_lhs_outside_keyed_op_state():
     eng = build_engine("groupby(key, cumsum(x), cumsum(self_))")
 
