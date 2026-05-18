@@ -2,7 +2,7 @@
 
 A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. An optional parallel JAX + Equinox backend is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
+This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. A JAX + Equinox backend is installed as a standard dependency and is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
 
 ## Core goals
 
@@ -101,9 +101,9 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
-## Optional JAX backend
+## JAX backend
 
-Install the optional dependencies with `python -m pip install -e ".[jax]"`. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax`:
+JAX and Equinox are required project dependencies. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax`:
 
 ```python
 from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping
@@ -117,17 +117,18 @@ The JAX backend accepts the same string formulas and Python-composed `Expr` tree
 ## Development quickstart
 
 ```bash
-python -m pip install -e .
-python -m pip install pytest numpy numba
-# Optional JAX backend
-python -m pip install -e ".[jax]"
-pytest -q
+python -m venv .venv
+. .venv/bin/activate
+PIP_CACHE_DIR=.pip-cache python -m pip install -e .
+pytest -q  # configured to use pytest-xdist with 12 workers
 ```
+
+The `.venv/` and `.pip-cache/` paths are gitignored so cloud/agent environments can reuse a repo-local virtualenv and wheel/download cache between iterations without committing environment artifacts.
 
 Performance tests (opt-in):
 
 ```bash
-RUN_PERF_TESTS=1 pytest tests/numba/test_performance.py -q
+RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
 ```
 
 ## Notes for future work

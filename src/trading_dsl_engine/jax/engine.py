@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import tempfile
 from time import perf_counter
 from typing import Any
@@ -11,6 +12,15 @@ import jax.numpy as jnp
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)
+
+_DEFAULT_MEMMAP_OUT = "__trading_dsl_engine_jax_default_memmap__"
+
+
+def _fresh_memmap_path(prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
+    os.close(fd)
+    return path
+
 
 from trading_dsl_engine.base.compiler import CompileStats, FormulaCompileError
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -249,7 +259,7 @@ def run_batch_from_mapping(
     engine: JaxEngineHandle,
     data: dict[str, np.ndarray],
     out=None,
-    out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_jax_out.memmap",
+    out_path: str | None = _DEFAULT_MEMMAP_OUT,
     chunk_size: int = 8192,
 ):
     inputs = _as_aligned_inputs(engine, data)
@@ -257,6 +267,8 @@ def run_batch_from_mapping(
     if out is not None:
         out[...] = result
         return out
+    if out_path == _DEFAULT_MEMMAP_OUT:
+        out_path = _fresh_memmap_path("trading_dsl_engine_jax_out_")
     if out_path is not None:
         mapped = np.memmap(out_path, mode="w+", dtype=np.float64, shape=result.shape)
         mapped[...] = result

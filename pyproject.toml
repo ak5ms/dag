@@ -7,13 +7,18 @@ name = "trading_dsl_engine"
 version = "0.1.0"
 description = "Numba-compiled streaming DSL engine for trading features"
 requires-python = ">=3.10"
-dependencies = ["numpy", "numba", "scipy"]
-
-[project.optional-dependencies]
-jax = ["jax[cpu]", "equinox"]
+dependencies = [
+    "numpy",
+    "numba",
+    "scipy",
+    "jax[cpu]",
+    "equinox",
+    "pytest",
+    "pytest-xdist",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --durations=0"
+addopts = "-ra --durations=0 -n 12"
 
 markers = ["perf: performance tests"]
