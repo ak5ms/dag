@@ -1,7 +1,7 @@
 import numpy as np
 
 from trading_dsl_engine import DSLFunctionRegistry, build_engine, compile_formula, register_dsl_function, run_batch_from_mapping
-from trading_dsl_engine.dsl import add, div, ewm, ratio, xs_rank
+from trading_dsl_engine.base.dsl import add, div, ewm, ratio, xs_rank
 
 
 @register_dsl_function("hlc3")
@@ -88,8 +88,22 @@ def test_python_expr_infix_formula_matches_prefix_string():
     )
 
 
+def test_python_expr_extended_math_magic_methods_match_prefix_string():
+    from trading_dsl_engine import build_engine, run_batch_from_mapping, var
+
+    close = var("close")
+    formula = (10.0 // close) + (2.0**close) + (3.0 > close) + (close < 2.0)
+    prefix_engine = build_engine("add(add(add(floordiv(10, close), pow(2, close)), gt(3, close)), lt(close, 2))")
+    infix_engine = build_engine(formula)
+    data = {"close": np.array([[1.0, 2.0, 4.0]], dtype=np.float64)}
+    np.testing.assert_allclose(
+        run_batch_from_mapping(infix_engine, data, out_path=None),
+        run_batch_from_mapping(prefix_engine, data, out_path=None),
+    )
+
+
 def test_all_builtin_dsl_operator_helpers_are_importable():
-    import trading_dsl_engine.dsl as dsl
+    import trading_dsl_engine.base.dsl as dsl
 
     for name in (
         "add",

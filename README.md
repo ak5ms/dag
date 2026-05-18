@@ -2,7 +2,7 @@
 
 A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution.
+This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. A JAX + Equinox backend is installed as a standard dependency and is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
 
 ## Core goals
 
@@ -14,20 +14,16 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 
 ## Project layout
 
-- `src/trading_dsl_engine/parser.py`
-  - Formula parser (`parse_formula`) using Python AST with strict validation.
-- `src/trading_dsl_engine/dsl.py`
-  - Python DSL constructors (`add`, `div`, `shift`, `ewm`, `xs_rank`, etc.), composed helpers like `diff`, and `DSLFunctionRegistry`.
-- `src/trading_dsl_engine/registry.py`
-  - Operator metadata and registration primitives.
-- `src/trading_dsl_engine/ops.py`
-  - Built-in op implementations and generic op builders.
-- `src/trading_dsl_engine/compiler.py`
-  - Compile path from expression to `CompiledFormula` jitclass artifact, with CSE hash/cache stats.
-- `src/trading_dsl_engine/engine.py`
-  - Runtime `StreamingFeatureEngine` jitclass and batch/live helpers.
-- `tests/`
-  - Parser, composition, runtime correctness, shape, state persistence, and performance tests.
+- `src/trading_dsl_engine/base/`
+  - Shared parser (`parse_formula`), Python DSL constructors, registry metadata, and compile/lower pipeline.
+- `src/trading_dsl_engine/numba/`
+  - Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
+- `src/trading_dsl_engine/jax/`
+  - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
+- `tests/numba/`
+  - Parser, composition, Numba runtime correctness, shape, state persistence, and performance tests.
+- `tests/jax/`
+  - JAX backend correspondence tests against the Numba runtime.
 
 ## Typical usage
 
@@ -87,11 +83,11 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 - `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
-- `groupby(key, op)` runs the full `op` subtree as partitioned state by key for any scalar/vector/matrix-emitting op and routes each tick to the keyed op instance.
-- `groupby(key, lhs, op_using_self_)` evaluates `lhs` once in the outer stream, then runs only `op_using_self_` as keyed state over the emitted `lhs` values; the local op expression must reference the outer value through the `self_` placeholder, e.g. `groupby(day, get_preds(Ridge(...)), cumsum(self_))`.
+- `groupby(key, op)` is dynamic keyed grouping: for each instrument, the full `op` subtree runs in that instrument/key scope over a single-column local stream. This is true even for stateless operators, so `groupby(day, mean(close))` means the mean of the one-column keyed stream, not a cross-sectional day-bucket mean. Dynamic keys can be tuples, e.g. `groupby((day, bucket), cumsum(close))`. Use `groupby(univ(...), mean(close))` for static cross-column group means.
+- `groupby(key, lhs, op_using_self_)` evaluates `lhs` once in the outer stream, then runs only `op_using_self_` as keyed state over the emitted `lhs` values in the instrument/key scope; the local op expression must reference the outer value through the `self_` placeholder, e.g. `groupby(day, get_preds(Ridge(...)), cumsum(self_))`.
 - Python-composed formulas can spell the local-op form as `lhs.groupby(key).apply(op_fn, *args)`, `lhs.groupby(key).apply(op_expr_using_self_)`, or `lhs.groupby(key).some_op(...)`; for example, `reg.groupby(day).cumsum()` lowers to `groupby(day, reg, cumsum(self_))`.
-- `groupby(univ(...), op)` runs the same scalar/vector/matrix op independently on static column universes and scatters each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`.
-- `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar, which is useful inside universe grouping to broadcast per-group means.
+- `groupby(univ(...), op)` is static universe grouping: it slices the input columns into declared column groups, runs `op` independently on each group sub-frame, and scatters/broadcasts each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`. A universe can also be part of a tuple key, e.g. `groupby((univ([0, 1]), ts), mean(close))`, which first slices to each universe group and then routes masked columns within that group by the dynamic key.
+- `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar. In dynamic keyed `groupby(key, mean(x))`, it sees one instrument at a time; in static universe `groupby(univ(...), mean(x))`, it sees all columns in that universe group and broadcasts the group mean.
 
 ## Ridge regression op (cross-sectional)
 
@@ -105,18 +101,34 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
+## JAX backend
+
+JAX and Equinox are required project dependencies. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax`:
+
+```python
+from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping
+
+engine = build_jax_engine("xs_rank(ewm(div(close, open), 21))")
+out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
+```
+
+The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby(key).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, static-universe `groupby(univ(...), op)`, dynamic keyed `groupby(key, op)`, scoped `groupby(key, lhs, op_using_self_)`, and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
+
 ## Development quickstart
 
 ```bash
-python -m pip install -e .
-python -m pip install pytest numpy numba
-pytest -q
+python -m venv .venv
+. .venv/bin/activate
+PIP_CACHE_DIR=.pip-cache python -m pip install -e .
+pytest -q  # configured to use pytest-xdist with 12 workers
 ```
+
+The `.venv/` and `.pip-cache/` paths are gitignored so cloud/agent environments can reuse a repo-local virtualenv and wheel/download cache between iterations without committing environment artifacts.
 
 Performance tests (opt-in):
 
 ```bash
-RUN_PERF_TESTS=1 pytest tests/test_performance.py -q
+RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
 ```
 
 ## Notes for future work

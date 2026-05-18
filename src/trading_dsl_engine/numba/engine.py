@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import os
 import tempfile
 
 import numpy as np
 from numba import boolean, float64, int64
 from numba.experimental import jitclass
 
-from trading_dsl_engine.compiler import compile_formula
-from trading_dsl_engine.dsl import DSLFunctionRegistry
-from trading_dsl_engine.parser import Expr
+from trading_dsl_engine.base.compiler import compile_formula
+from trading_dsl_engine.base.dsl import DSLFunctionRegistry
+from trading_dsl_engine.base.parser import Expr
 
 
 _ENGINE_CLASS_CACHE: dict[object, object] = {}
+_DEFAULT_MEMMAP_OUT = "__trading_dsl_engine_default_memmap__"
+
+
+def _fresh_memmap_path(prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
+    os.close(fd)
+    return path
 
 
 class EngineHandle:
@@ -128,9 +136,12 @@ def run_batch_from_mapping(
     engine,
     data: dict[str, np.ndarray],
     out: np.ndarray | None = None,
-    out_path: str | None = f"{tempfile.gettempdir()}/trading_dsl_engine_out.memmap",
+    out_path: str | None = _DEFAULT_MEMMAP_OUT,
     chunk_size: int = 8192,
 ):
+    if out_path == _DEFAULT_MEMMAP_OUT:
+        out_path = _fresh_memmap_path("trading_dsl_engine_out_")
+
     inputs = _as_aligned_inputs(engine, data)
     t, n_instruments = _validate_aligned_inputs(inputs)
 

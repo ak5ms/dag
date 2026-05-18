@@ -1,5 +1,5 @@
-from trading_dsl_engine.compiler import CompileStats, CompiledFormulaArtifact, FormulaCompileError, compile_formula
-from trading_dsl_engine.dsl import (
+from trading_dsl_engine.base.compiler import CompileStats, CompiledFormulaArtifact, FormulaCompileError, compile_formula
+from trading_dsl_engine.base.dsl import (
     DEFAULT_DSL_REGISTRY,
     DSLFunctionRegistry,
     Ridge,
@@ -51,8 +51,8 @@ from trading_dsl_engine.dsl import (
     arctan,
     pow,
 )
-from trading_dsl_engine.engine import build_engine, run_batch_from_mapping, update_from_mapping
-from trading_dsl_engine.parser import FormulaParseError, parse_formula
+from trading_dsl_engine.numba.engine import build_engine, run_batch_from_mapping, update_from_mapping
+from trading_dsl_engine.base.parser import FormulaParseError, parse_formula
 
 __all__ = [
     "CompileStats",

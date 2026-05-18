@@ -1,6 +1,6 @@
 import pytest
 
-from trading_dsl_engine.parser import parse_formula, Call, Identifier, Number, FormulaParseError
+from trading_dsl_engine.base.parser import parse_formula, Call, Identifier, Number, FormulaParseError
 
 
 def test_parse_nested_call():

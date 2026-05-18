@@ -4,7 +4,7 @@ from numba import boolean, float64
 from numba.experimental import jitclass
 
 from trading_dsl_engine import build_engine, compile_formula, run_batch_from_mapping, update_from_mapping
-from trading_dsl_engine.registry import CompiledNode, OpSpec, REGISTRY, TypeInfo
+from trading_dsl_engine.base.registry import CompiledNode, OpSpec, REGISTRY, TypeInfo
 
 
 def _manual_formula(close, open_, span):
@@ -756,6 +756,16 @@ def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
     np.testing.assert_allclose(run_batch_from_mapping(scalar_weight_engine, data, out_path=None), expected_scalar_weights)
 
 
+def test_dynamic_groupby_mean_uses_single_instrument_keyed_scope():
+    eng = build_engine("groupby(ts, mean(close))")
+    close = np.array([[1.0, 10.0], [3.0, 20.0]], dtype=np.float64)
+    ts = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+
+    out = run_batch_from_mapping(eng, {"ts": ts, "close": close}, out_path=None)
+
+    np.testing.assert_allclose(out, close)
+
+
 def test_universe_groupby_mean_broadcasts_column_group_results():
     from trading_dsl_engine import groupby, mean, univ, var
 
@@ -807,6 +817,44 @@ def test_universe_groupby_preserves_state_per_column_group():
 
     np.testing.assert_allclose(out[0], close[0])
     np.testing.assert_allclose(out[1], np.array([11.0, 19.0, 150.0], dtype=np.float64))
+
+
+
+def test_tuple_key_groupby_combines_dynamic_keys():
+    eng = build_engine("groupby((day, bucket), cumsum(close))")
+    data = {
+        "day": np.array([[1.0], [1.0], [1.0], [1.0]], dtype=np.float64),
+        "bucket": np.array([[0.0], [1.0], [0.0], [1.0]], dtype=np.float64),
+        "close": np.array([[1.0], [10.0], [2.0], [20.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, np.array([[1.0], [10.0], [3.0], [30.0]], dtype=np.float64))
+
+
+def test_tuple_key_with_universe_groups_columns_before_dynamic_key():
+    eng = build_engine("groupby((univ([0, 1]), ts), mean(close))")
+    data = {
+        "ts": np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        "close": np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [6.0, 6.0]]))
+
+
+def test_tuple_key_with_single_column_universes_preserves_column_local_grouping():
+    eng = build_engine("groupby((univ([0], [1]), ts), mean(close))")
+    data = {
+        "ts": np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        "close": np.array([[1.0, 5.0], [2.0, 6.0], [3.0, 7.0], [4.0, 8.0]], dtype=np.float64),
+    }
+
+    out = run_batch_from_mapping(eng, data, out_path=None)
+
+    np.testing.assert_allclose(out, data["close"])
 
 
 def test_groupby_lhs_form_computes_lhs_outside_keyed_op_state():

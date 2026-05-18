@@ -9,7 +9,7 @@ import re
 @dataclass(frozen=True, eq=False)
 class Expr:
     def _call(self, name: str, *args):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call(name, self, *args)
 
@@ -17,7 +17,7 @@ class Expr:
         return self._call("add", other)
 
     def __radd__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("add", other, self)
 
@@ -25,7 +25,7 @@ class Expr:
         return self._call("sub", other)
 
     def __rsub__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("sub", other, self)
 
@@ -33,7 +33,7 @@ class Expr:
         return self._call("mul", other)
 
     def __rmul__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("mul", other, self)
 
@@ -41,7 +41,7 @@ class Expr:
         return self._call("div", other)
 
     def __rtruediv__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("div", other, self)
 
@@ -49,7 +49,7 @@ class Expr:
         return self._call("mod", other)
 
     def __rmod__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("mod", other, self)
 
@@ -57,7 +57,7 @@ class Expr:
         return self._call("and_", other)
 
     def __rand__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("and_", other, self)
 
@@ -65,7 +65,7 @@ class Expr:
         return self._call("or_", other)
 
     def __ror__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("or_", other, self)
 
@@ -73,12 +73,12 @@ class Expr:
         return self._call("xor", other)
 
     def __rxor__(self, other):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("xor", other, self)
 
     def __neg__(self):
-        from trading_dsl_engine.dsl import call
+        from trading_dsl_engine.base.dsl import call
 
         return call("sub", 0.0, self)
 
@@ -94,8 +94,27 @@ class Expr:
     def __floordiv__(self, other):
         return self._call("floordiv", other)
 
+    def __rfloordiv__(self, other):
+        from trading_dsl_engine.base.dsl import call
+
+        return call("floordiv", other, self)
+
+    def __pow__(self, other):
+        return self._call("pow", other)
+
+    def __rpow__(self, other):
+        from trading_dsl_engine.base.dsl import call
+
+        return call("pow", other, self)
+
+    def __lt__(self, other):
+        return self._call("lt", other)
+
+    def __gt__(self, other):
+        return self._call("gt", other)
+
     def groupby(self, key):
-        from trading_dsl_engine.dsl import grouped
+        from trading_dsl_engine.base.dsl import grouped
 
         return grouped(self, key)
 
@@ -122,6 +141,11 @@ UniverseItem = Union[str, int]
 @dataclass(frozen=True, eq=False)
 class Universe(Expr):
     groups: tuple[tuple[UniverseItem, ...], ...]
+
+
+@dataclass(frozen=True, eq=False)
+class KeyTuple(Expr):
+    items: tuple[Expr, ...]
 
 
 class FormulaParseError(ValueError):
@@ -177,6 +201,10 @@ class _AstParser:
         if isinstance(node, ast.BinOp):
             op_name = self._binop_name(node.op)
             return Call(op_name, (self._expr(node.left), self._expr(node.right)))
+        if isinstance(node, ast.Tuple):
+            if len(node.elts) == 0:
+                raise FormulaParseError("Key tuples cannot be empty")
+            return KeyTuple(tuple(self._expr(item) for item in node.elts))
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise FormulaParseError("Chained comparisons are not supported")
