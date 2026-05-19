@@ -151,3 +151,25 @@ def test_jax_backend_reverse_python_math_magics_match_string():
         run_batch_from_mapping(build_jax_engine(formula), data, out_path=None),
         run_batch_from_mapping(build_jax_engine(string_formula), data, out_path=None),
     )
+
+
+@pytest.mark.parametrize(
+    ("close", "expected"),
+    [
+        (
+            np.array([[2.0, 2.0, 1.0]], dtype=np.float64),
+            np.array([[1.0, 1.0, 1.0 / 3.0]], dtype=np.float64),
+        ),
+        (
+            np.array([[np.nan, np.nan, np.nan]], dtype=np.float64),
+            np.array([[np.nan, np.nan, np.nan]], dtype=np.float64),
+        ),
+        (
+            np.array([[3.0, np.nan, 1.0, 3.0]], dtype=np.float64),
+            np.array([[1.0, np.nan, 1.0 / 3.0, 1.0]], dtype=np.float64),
+        ),
+    ],
+)
+def test_jax_backend_xs_rank_ties_and_nan_masking(close, expected):
+    out = run_batch_from_mapping(build_jax_engine("xs_rank(close)"), {"close": close}, out_path=None)
+    np.testing.assert_allclose(out, expected, rtol=1e-10, atol=1e-10, equal_nan=True)
