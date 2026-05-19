@@ -298,8 +298,8 @@ class ShiftOp(eqx.Module):
         cap = buffer.shape[0]
         lag_i = jnp.clip(jnp.asarray(_scalar_value(lag), dtype=jnp.int64), 0, cap - 1)
         read_pos = jnp.mod(pos - lag_i, cap)
-        shifted = jnp.where(count >= lag_i, buffer[read_pos], jnp.nan)
         new_buffer = buffer.at[pos].set(x)
+        shifted = jnp.where(count >= lag_i, buffer[read_pos], jnp.nan)
         return (
             new_child_states,
             new_buffer,
