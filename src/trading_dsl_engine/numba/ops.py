@@ -777,6 +777,85 @@ def _rolling_quantile_validator(types: list[TypeInfo]) -> TypeInfo:
     return VECTOR
 
 
+def _ffill_validator(types: list[TypeInfo]) -> TypeInfo:
+    if len(types) != 2:
+        raise ValueError("ffill expects 2 args: x, limit")
+    if types[0].kind != "vector":
+        raise ValueError("ffill first arg must be vector")
+    if types[1].kind != "scalar":
+        raise ValueError("ffill second arg must be scalar")
+    return VECTOR
+
+
+def _ffill_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
+    src = children[0]
+    limit = children[1]
+    spec = [
+        ("src", src.instance_type),
+        ("limit", limit.instance_type),
+        ("initialized", boolean),
+        ("last", float64[:, :]),
+        ("streak", int64[:]),
+        ("seen", boolean[:]),
+        ("out", float64[:, :]),
+    ]
+
+    @jitclass(spec)
+    class FFillOp:
+        def __init__(self, src, limit):
+            self.src = src
+            self.limit = limit
+            self.initialized = False
+            self.last = np.empty((1, 1), dtype=np.float64)
+            self.streak = np.empty(1, dtype=np.int64)
+            self.seen = np.empty(1, dtype=np.bool_)
+            self.out = np.empty((1, 1), dtype=np.float64)
+
+        def on_data(self, frame2d):
+            self.src.on_data(frame2d)
+            self.limit.on_data(frame2d)
+            x = self.src.emit()
+            limit_value = self.limit.emit()[0, 0]
+            n = x.shape[0]
+            if (not self.initialized) or self.out.shape[0] != n:
+                self.last = np.empty((n, 1), dtype=np.float64)
+                self.out = np.empty((n, 1), dtype=np.float64)
+                self.streak = np.zeros(n, dtype=np.int64)
+                self.seen = np.zeros(n, dtype=np.bool_)
+                self.last[:, 0] = np.nan
+                self.initialized = True
+            if np.isnan(limit_value):
+                self.out[:, 0] = np.nan
+                return
+            limit_int = int(round(limit_value))
+            if limit_int < 0:
+                raise ValueError("ffill limit must be >= 0")
+            for i in range(n):
+                xv = x[i, 0]
+                if not np.isnan(xv):
+                    self.last[i, 0] = xv
+                    self.streak[i] = 0
+                    self.seen[i] = True
+                    self.out[i, 0] = xv
+                elif self.seen[i] and self.streak[i] < limit_int:
+                    self.streak[i] += 1
+                    self.out[i, 0] = self.last[i, 0]
+                else:
+                    self.out[i, 0] = np.nan
+
+        def emit(self):
+            return self.out
+
+    src_jit_ctor = src.jit_ctor
+    limit_jit_ctor = limit.jit_ctor
+
+    @njit
+    def _jit_ctor():
+        return FFillOp(src_jit_ctor(), limit_jit_ctor())
+
+    return CompiledNode(VECTOR, FFillOp.class_type.instance_type, lambda: FFillOp(src.ctor(), limit.ctor()), _jit_ctor)
+
+
 @njit(inline="always")
 def _nan_quantile_linear(buf: np.ndarray, n: int64, q: float) -> float:
     if n <= 0:
@@ -1759,6 +1838,7 @@ def register_builtin_ops() -> None:
     REGISTRY.register(OpSpec(name="bspline", validator=_bspline_validator, builder=_bspline_builder))
     REGISTRY.register(OpSpec(name="col", validator=_col_validator, builder=_col_builder))
     REGISTRY.register(OpSpec(name="rolling_quantile", validator=_rolling_quantile_validator, builder=_rolling_quantile_builder))
+    REGISTRY.register(OpSpec(name="ffill", validator=_ffill_validator, builder=_ffill_builder))
     make_nary_op("mean", 1, lambda args: np.nanmean(args), axis=-1)
     REGISTRY.register(OpSpec(name="groupby", validator=_groupby_validator, builder=_groupby_builder))
     REGISTRY.register(OpSpec(name="Ridge", validator=_ridge_validator, builder=_ridge_builder))

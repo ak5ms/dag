@@ -337,6 +337,32 @@ class RollingQuantileOp(eqx.Module):
         ), out
 
 
+class FfillOp(eqx.Module):
+    child: Any = eqx.field(static=True)
+    limit: Any = eqx.field(static=True)
+    output_kind: str = eqx.field(static=True)
+
+    def init_state(self, n_instruments: int):
+        return (
+            _children_init((self.child, self.limit), n_instruments),
+            jnp.full((n_instruments, 1), jnp.nan),
+            jnp.zeros((n_instruments, 1), dtype=jnp.int64),
+            jnp.zeros((n_instruments, 1), dtype=bool),
+        )
+
+    def tick(self, state, frame2d):
+        child_states, last, streak, seen = state
+        new_child_states, (x, limit) = _children_tick((self.child, self.limit), child_states, frame2d)
+        limit_i = jnp.maximum(jnp.asarray(_scalar_value(limit), dtype=jnp.int64), 0)
+        valid = jnp.isfinite(x)
+        next_last = jnp.where(valid, x, last)
+        next_seen = seen | valid
+        can_fill = (~valid) & next_seen & (streak < limit_i)
+        out = jnp.where(valid, x, jnp.where(can_fill, last, jnp.nan))
+        next_streak = jnp.where(valid, 0, jnp.where(can_fill, streak + 1, streak))
+        return (new_child_states, next_last, next_streak, next_seen), out
+
+
 class GroupByOp(eqx.Module):
     key: Any = eqx.field(static=True)
     child: Any = eqx.field(static=True)
@@ -712,6 +738,10 @@ def _build_rolling_quantile(args, children):
     return RollingQuantileOp(children[0], children[1], children[2], max(1, window), children[0].output_kind)
 
 
+def _build_ffill(args, children):
+    return FfillOp(children[0], children[1], children[0].output_kind)
+
+
 def _build_ridge(args, children):
     has_weights = len(children) >= 5
     features = children[:-4] if has_weights else children[:-3]
@@ -736,6 +766,7 @@ _CALL_BUILDERS = {
     ("shift", 2): _build_shift,
     ("shift", 3): _build_shift,
     ("rolling_quantile", 3): _build_rolling_quantile,
+    ("ffill", 2): _build_ffill,
     ("Ridge", 4): _build_ridge,
     ("Ridge", 5): _build_ridge,
     ("Ridge", 6): _build_ridge,
