@@ -43,7 +43,7 @@ from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping as r
         ),
         (
             "universe_groupby_state",
-            "groupby((univ([0, 1], [2]),), close, mean(ewm(self_, 3)))",
+            "groupby(univ([0, 1], [2]), close, mean(ewm(self_, 3)))",
             {"close": np.array([[1.0, 2.0, 10.0], [3.0, 4.0, 20.0]], dtype=np.float64)},
         ),
         (

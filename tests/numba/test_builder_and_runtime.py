@@ -533,7 +533,7 @@ def test_ridge_supports_variable_feature_arity_and_batch_beta_shape():
     assert out.shape == (3, 3)
 
 def test_groupby_with_nested_ewm_by_minute_of_day_matches_reference():
-    formula = "groupby((mod(mod(ts, 86400000000), 60000000),), close, ewm(self_, 3))"
+    formula = "groupby(mod(mod(ts, 86400000000), 60000000), close, ewm(self_, 3))"
     eng = build_engine(formula)
 
     close = np.array(
@@ -581,7 +581,7 @@ def test_groupby_with_nested_ewm_by_minute_of_day_matches_reference():
 
 
 def test_groupby_supports_mixed_keys_within_tick_per_instrument():
-    eng = build_engine("groupby((ts,), close, ewm(self_, 3))")
+    eng = build_engine("groupby(ts, close, ewm(self_, 3))")
 
     first = update_from_mapping(
         eng,
@@ -602,7 +602,7 @@ def test_groupby_supports_mixed_keys_within_tick_per_instrument():
 
 
 def test_groupby_supports_more_than_256_groups():
-    eng = build_engine("groupby((ts,), close, ewm(self_, 3))")
+    eng = build_engine("groupby(ts, close, ewm(self_, 3))")
 
     for key in range(300):
         out = update_from_mapping(
@@ -619,14 +619,14 @@ def test_groupby_supports_more_than_256_groups():
 
 
 def test_groupby_can_box_nested_ridge_slots_without_pickling_error():
-    eng = build_engine("groupby((ts,), x, get_beta(Ridge(self_, y, w, 2, 0)))")
+    eng = build_engine("groupby(ts, x, get_beta(Ridge(self_, y, w, 2, 0)))")
 
     assert eng.input_names == ("ts", "x", "y", "w")
 
 
 
 def test_groupby_can_construct_nested_ridge_formula_from_compiled_path():
-    formula = "groupby((ts,), x, cumsum(get_preds(Ridge(self_, y, w, 2, 0))))"
+    formula = "groupby(ts, x, cumsum(get_preds(Ridge(self_, y, w, 2, 0))))"
     eng = build_engine(formula)
 
     out = run_batch_from_mapping(
@@ -757,7 +757,7 @@ def test_ridge_defaults_weights_to_one_and_broadcasts_scalar_weights():
 
 
 def test_dynamic_groupby_mean_uses_single_instrument_keyed_scope():
-    eng = build_engine("groupby((ts,), close, mean(self_))")
+    eng = build_engine("groupby(ts, close, mean(self_))")
     close = np.array([[1.0, 10.0], [3.0, 20.0]], dtype=np.float64)
     ts = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
 
@@ -770,7 +770,7 @@ def test_universe_groupby_mean_broadcasts_column_group_results():
     import trading_dsl_engine as tde
     from trading_dsl_engine import groupby, mean, univ, var
 
-    formula = groupby((univ(["6E", "6C"], ["6A"]),), var("close"), mean(tde.self_))
+    formula = groupby(univ(["6E", "6C"], ["6A"]), var("close"), mean(tde.self_))
     eng = build_engine(formula, column_names=["6E", "6C", "6A"])
     close = np.array(
         [
@@ -794,7 +794,7 @@ def test_universe_groupby_mean_broadcasts_column_group_results():
 
 def test_universe_groupby_string_formula_uses_column_names():
     eng = build_engine(
-        'groupby((univ(["6E", "6C"], ["6A"]),), close, mean(self_))',
+        'groupby(univ(["6E", "6C"], ["6A"]), close, mean(self_))',
         column_names=["6E", "6C", "6A"],
     )
     close = np.array([[4.0, 8.0, 1.0]], dtype=np.float64)
@@ -808,7 +808,7 @@ def test_universe_groupby_preserves_state_per_column_group():
     import trading_dsl_engine as tde
     from trading_dsl_engine import ewm, groupby, univ, var
 
-    formula = groupby((univ([0, 1], [2]),), var("close"), ewm(tde.self_, 3.0))
+    formula = groupby(univ([0, 1], [2]), var("close"), ewm(tde.self_, 3.0))
     eng = build_engine(formula)
     close = np.array(
         [
@@ -863,7 +863,7 @@ def test_tuple_key_with_single_column_universes_preserves_column_local_grouping(
 
 
 def test_groupby_lhs_form_computes_lhs_outside_keyed_op_state():
-    eng = build_engine("groupby((key,), cumsum(x), cumsum(self_))")
+    eng = build_engine("groupby(key, cumsum(x), cumsum(self_))")
 
     out = run_batch_from_mapping(
         eng,
