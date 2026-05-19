@@ -892,6 +892,16 @@ def test_groupby_lhs_form_supports_other_stateful_ops():
     np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 2.0, 3.0]))
 
 
+def test_groupby_single_key_is_upcast_to_tuple_form():
+    data = {
+        "key": np.array([[0.0], [0.0], [1.0], [0.0]], dtype=np.float64),
+        "x": np.array([[1.0], [2.0], [3.0], [4.0]], dtype=np.float64),
+    }
+    tuple_form = run_batch_from_mapping(build_engine("groupby((key,), x, cumsum(self_))"), data, out_path=None)
+    upcast_form = run_batch_from_mapping(build_engine("groupby(key, x, cumsum(self_))"), data, out_path=None)
+    np.testing.assert_allclose(upcast_form, tuple_form, equal_nan=True)
+
+
 def test_grouped_expr_apply_sugar_matches_three_arg_groupby():
     import trading_dsl_engine as tde
     from trading_dsl_engine import cumsum, var

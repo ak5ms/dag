@@ -144,9 +144,7 @@ def _resolve_universe_groups(universe: Universe, column_names):
 
 def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
     if not isinstance(key, KeyTuple):
-        raise FormulaCompileError(
-            "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
-        )
+        key = KeyTuple((key,))
     if sum(1 for item in key.items if isinstance(item, Universe)) > 1:
         raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
     return key.items

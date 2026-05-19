@@ -108,9 +108,7 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
 
 def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
     if not isinstance(key, KeyTuple):
-        raise FormulaCompileError(
-            "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
-        )
+        key = KeyTuple((key,))
     universe_count = 0
     for item in key.items:
         if isinstance(item, Universe):

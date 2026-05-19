@@ -71,6 +71,16 @@ def test_jax_backend_scoped_groupby_apply_matches_numba():
     _compare_batch("groupby((ts,), close, cumsum(self_))", {"ts": ts, "close": close})
 
 
+def test_jax_backend_groupby_single_key_is_upcast_to_tuple_form():
+    data = {
+        "ts": np.array([[0.0], [0.0], [1.0], [0.0]], dtype=np.float64),
+        "close": np.array([[1.0], [2.0], [3.0], [4.0]], dtype=np.float64),
+    }
+    tuple_out = run_batch_from_mapping(build_jax_engine("groupby((ts,), close, cumsum(self_))"), data, out_path=None)
+    upcast_out = run_batch_from_mapping(build_jax_engine("groupby(ts, close, cumsum(self_))"), data, out_path=None)
+    np.testing.assert_allclose(upcast_out, tuple_out, equal_nan=True)
+
+
 def test_jax_backend_ridge_projection_shapes_match_numba():
     data = {
         "x": np.arange(10.0, 15.0, dtype=np.float64).reshape(5, 1),

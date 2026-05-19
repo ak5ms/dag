@@ -68,9 +68,7 @@ class GroupedExpr:
         self.lhs = ensure_expr(lhs)
         key_expr = ensure_expr(key)
         if not isinstance(key_expr, KeyTuple):
-            raise TypeError(
-                "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
-            )
+            key_expr = KeyTuple((key_expr,))
         if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
             raise TypeError("groupby key tuple may contain at most one univ(...) element")
         self.key = key_expr
