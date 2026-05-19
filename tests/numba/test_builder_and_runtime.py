@@ -983,3 +983,38 @@ def test_grouped_expr_operator_method_sugar_matches_three_arg_groupby():
     )
 
     np.testing.assert_allclose(out[:, 0], np.array([1.0, 2.0, 4.0, 6.0]))
+
+
+def test_ffill_with_limit_matches_reference_and_streams():
+    eng = build_engine("ffill(close, 2)")
+    close = np.array(
+        [
+            [1.0, np.nan, 5.0],
+            [np.nan, 2.0, np.nan],
+            [np.nan, np.nan, np.nan],
+            [4.0, np.nan, np.nan],
+            [np.nan, np.nan, 9.0],
+            [np.nan, 8.0, np.nan],
+        ],
+        dtype=np.float64,
+    )
+    expected = np.array(
+        [
+            [1.0, np.nan, 5.0],
+            [1.0, 2.0, 5.0],
+            [1.0, 2.0, 5.0],
+            [4.0, 2.0, np.nan],
+            [4.0, np.nan, 9.0],
+            [4.0, 8.0, 9.0],
+        ],
+        dtype=np.float64,
+    )
+
+    out_batch = run_batch_from_mapping(eng, {"close": close}, out_path=None)
+    np.testing.assert_allclose(out_batch, expected, rtol=1e-12, atol=1e-12, equal_nan=True)
+
+    eng_stream = build_engine("ffill(close, 2)")
+    out_stream = np.vstack(
+        [update_from_mapping(eng_stream, {"close": close[t]})[:, 0].copy() for t in range(close.shape[0])]
+    )
+    np.testing.assert_allclose(out_stream, expected, rtol=1e-12, atol=1e-12, equal_nan=True)
