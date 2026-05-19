@@ -51,15 +51,25 @@ class JaxProgram(eqx.Module):
     """Static Equinox module containing a compiled operator tree."""
 
     root: Any = eqx.field(static=True)
+    nodes: tuple[Any, ...] = eqx.field(static=True)
+    node_children: tuple[tuple[int, ...], ...] = eqx.field(static=True)
     n_inputs: int = eqx.field(static=True)
     output_kind: str = eqx.field(static=True)
 
     def init_state(self, n_instruments: int):
-        return self.root.init_state(n_instruments)
+        return tuple(node.init_state(n_instruments) for node in self.nodes)
 
     def tick(self, state, frame2d):
-        new_state, out = self.root.tick(state, frame2d)
-        return new_state, _project_output(out, self.output_kind)
+        new_states = []
+        values = []
+        for node_id, node in enumerate(self.nodes):
+            child_ids = self.node_children[node_id]
+            child_states = tuple(new_states[cid] for cid in child_ids)
+            child_values = tuple(values[cid] for cid in child_ids)
+            node_state, out = node.tick_from_children(state[node_id], frame2d, child_states, child_values)
+            new_states.append(node_state)
+            values.append(out)
+        return tuple(new_states), _project_output(values[-1], self.output_kind)
 
     def run_batch(self, inputs):
         n_instruments = inputs[0].shape[1]
@@ -221,8 +231,10 @@ def compile_formula(
         return op
 
     root = build(ast_expr)
+    from trading_dsl_engine.jax.ops import build_execution_plan
+    nodes, node_children = build_execution_plan(root)
     return JaxCompiledArtifact(
-        compiled=JaxProgram(root, len(inputs), root.output_kind),
+        compiled=JaxProgram(root, nodes, node_children, len(inputs), root.output_kind),
         input_names=tuple(inputs.keys()),
         output_kind=root.output_kind,
         stats=CompileStats(
