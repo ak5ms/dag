@@ -43,7 +43,7 @@ from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping as r
         ),
         (
             "universe_groupby_state",
-            "groupby(univ([0, 1], [2]), mean(ewm(close, 3)))",
+            "groupby(univ([0, 1], [2]), close, mean(ewm(self_, 3)))",
             {"close": np.array([[1.0, 2.0, 10.0], [3.0, 4.0, 20.0]], dtype=np.float64)},
         ),
         (
@@ -61,7 +61,7 @@ def test_jax_corresponds_to_numba_runtime_cases(case_name, formula, data):
     if case_name == "grouped_method_sugar":
         from trading_dsl_engine import cumsum, var
 
-        formula = cumsum(var("x")).groupby(var("key")).cumsum()
+        formula = cumsum(var("x")).groupby((var("key"),)).cumsum()
     numba_engine = build_numba_engine(formula)
     jax_engine = build_jax_engine(formula)
     np.testing.assert_allclose(

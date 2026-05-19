@@ -76,6 +76,7 @@ PIP_CACHE_DIR=.pip-cache python -m pip install -e .
 JAX, Equinox, pytest, and pytest-xdist are mandatory project dependencies in `pyproject.toml`; do not treat the JAX backend as optional in setup or tests. The `.venv/` and `.pip-cache/` directories are gitignored and must not be committed.
 
 During iteration, run only the relevant targeted tests for the files/behavior being changed. Do not repeatedly run the full suite while iterating.
+If a long-running pytest command starts showing failures in streamed output, you may preemptively terminate that run early to iterate faster, then rerun targeted tests after fixes.
 
 Run these locally at the end before finalizing:
 

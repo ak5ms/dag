@@ -92,14 +92,11 @@ def _make_local_value_node(type_info: TypeInfo) -> CompiledNode:
             self.out = np.empty((1, 1), dtype=np.float64)
 
         def on_data(self, frame2d):
-            if (
-                (not self.initialized)
-                or self.out.shape[0] != frame2d.shape[0]
-                or self.out.shape[1] != frame2d.shape[1]
-            ):
-                self.out = np.empty((frame2d.shape[0], frame2d.shape[1]), dtype=np.float64)
+            row = frame2d[frame2d.shape[0] - 1]
+            if (not self.initialized) or self.out.shape[0] != row.shape[0]:
+                self.out = np.empty((row.shape[0], 1), dtype=np.float64)
                 self.initialized = True
-            self.out[:, :] = frame2d
+            self.out[:, 0] = row
 
         def emit(self):
             return self.out
@@ -1074,10 +1071,10 @@ def _make_tuple_key_node(key_nodes: list[CompiledNode]) -> CompiledNode:
                     src_row = i if value.shape[0] > 1 else 0
                     v = value[src_row, 0]
                     if np.isnan(v):
-                        valid = False
+                        acc = np.mod(acc * 1009.0 + 2147483000.0, 2147483647.0)
                     else:
                         acc = np.mod(acc * 1009.0 + float(int(v)) + 1024.0, 2147483647.0)
-                self.out[i, 0] = acc if valid else np.nan
+                self.out[i, 0] = acc
 
         def emit(self):
             return self.out
@@ -1194,9 +1191,7 @@ def _make_universe_dynamic_groupby_node(
 
                 for member_pos in range(idxs.shape[0]):
                     kv = key_values[member_pos, 0]
-                    if np.isnan(kv):
-                        raise ValueError("groupby key cannot be NaN")
-                    key = int(kv)
+                    key = -9223372036854775807 if np.isnan(kv) else int(kv)
                     if self._already_processed(processed, n_processed, key):
                         continue
                     processed[n_processed] = key
@@ -1215,7 +1210,8 @@ def _make_universe_dynamic_groupby_node(
                         self._ensure_out(n_cols, width)
 
                 for member_pos in range(idxs.shape[0]):
-                    key = int(key_values[member_pos, 0])
+                    kv = key_values[member_pos, 0]
+                    key = -9223372036854775807 if np.isnan(kv) else int(kv)
                     y = self.group_lookup[(g, key)].emit()
                     dest = idxs[member_pos]
                     src_row = member_pos if y.shape[0] > 1 else 0
@@ -1238,8 +1234,8 @@ def _make_universe_dynamic_groupby_node(
     return CompiledNode(out_type, UniverseDynamicGroupByOp.class_type.instance_type, _ctor)
 
 def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
-    if len(types) not in (2, 3):
-        raise ValueError("groupby expects 2 args: key, op or 3 args: key, lhs, op")
+    if len(types) != 3:
+        raise ValueError("groupby expects canonical 3 args: tuple_key, lhs, op")
     if types[0].kind != "vector":
         raise ValueError("groupby key arg must be vector")
     if len(types) == 3 and types[1].kind == "object":
@@ -1252,9 +1248,8 @@ def _groupby_validator(types: list[TypeInfo]) -> TypeInfo:
 
 def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> CompiledNode:
     key_node = children[0]
-    has_lhs = len(children) == 3
-    lhs_node = children[1] if has_lhs else key_node
-    op_node = children[2] if has_lhs else children[1]
+    lhs_node = children[1]
+    op_node = children[2]
     if op_node.jit_ctor is None:
         raise ValueError("groupby op does not support dynamic compiled construction")
     op_jit_ctor = op_node.jit_ctor
@@ -1270,20 +1265,18 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
         ("active_keys", int64[:]),
         ("scratch", float64[:, :]),
         ("out", float64[:, :]),
-        ("has_lhs", boolean),
         ("initialized", boolean),
     ]
 
     @jitclass(spec)
     class GroupByOp:
-        def __init__(self, key_node, lhs_node, group_lookup, has_lhs: bool):
+        def __init__(self, key_node, lhs_node, group_lookup):
             self.key_node = key_node
             self.lhs_node = lhs_node
             self.group_lookup = group_lookup
             self.active_keys = np.empty(0, dtype=np.int64)
             self.scratch = np.empty((1, 1), dtype=np.float64)
             self.out = np.empty((1, 1), dtype=np.float64)
-            self.has_lhs = has_lhs
             self.initialized = False
 
         def _ensure_scratch(self, rows: int64, cols: int64, n_instruments: int64):
@@ -1298,23 +1291,17 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
                 self.initialized = True
 
         def _copy_group_input(self, frame2d, x, instrument: int64):
-            if self.has_lhs:
-                src_row = 0 if x.shape[0] == 1 else instrument
-                for col in range(x.shape[1]):
-                    self.scratch[0, col] = x[src_row, col]
-            else:
-                for row in range(frame2d.shape[0]):
-                    self.scratch[row, 0] = frame2d[row, instrument]
+            for row in range(frame2d.shape[0]):
+                self.scratch[row, 0] = frame2d[row, instrument]
+            src_row = 0 if x.shape[0] == 1 else instrument
+            for col in range(x.shape[1]):
+                self.scratch[frame2d.shape[0], col] = x[src_row, col]
 
         def on_data(self, frame2d):
             self.key_node.on_data(frame2d)
-            if self.has_lhs:
-                self.lhs_node.on_data(frame2d)
-                x = self.lhs_node.emit()
-                scratch_rows, scratch_cols = 1, x.shape[1]
-            else:
-                x = self.scratch
-                scratch_rows, scratch_cols = frame2d.shape[0], 1
+            self.lhs_node.on_data(frame2d)
+            x = self.lhs_node.emit()
+            scratch_rows, scratch_cols = frame2d.shape[0] + 1, x.shape[1]
 
             k = self.key_node.emit()
             n_instruments = k.shape[0]
@@ -1323,9 +1310,7 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
             width = 1
             for instrument in range(n_instruments):
                 kv = k[instrument, 0]
-                if np.isnan(kv):
-                    raise ValueError("groupby key cannot be NaN")
-                key = int(kv)
+                key = -9223372036854775807 if np.isnan(kv) else int(kv)
                 pair = (instrument, key)
                 if pair in self.group_lookup:
                     group = self.group_lookup[pair]
@@ -1352,7 +1337,7 @@ def _groupby_builder(children: list[CompiledNode], literals: list[float]) -> Com
 
     def _ctor():
         group_lookup = Dict.empty(key_type=types.UniTuple(int64, 2), value_type=op_node.instance_type)
-        return GroupByOp(key_node.ctor(), lhs_node.ctor(), group_lookup, has_lhs)
+        return GroupByOp(key_node.ctor(), lhs_node.ctor(), group_lookup)
 
     out_type = VECTOR if op_node.type_info.kind == "scalar" else op_node.type_info
     return CompiledNode(out_type, GroupByOp.class_type.instance_type, _ctor)

@@ -30,7 +30,6 @@ from trading_dsl_engine.jax.ops import (
     InputOp,
     LiteralOp,
     LocalValueOp,
-    ScopedGroupByOp,
     TupleKeyOp,
     UniverseDynamicGroupByOp,
     UniverseGroupByOp,
@@ -143,16 +142,22 @@ def _resolve_universe_groups(universe: Universe, column_names):
 
 
 
-def _split_groupby_key_tuple(key: Expr) -> tuple[Universe | None, tuple[Expr, ...]]:
-    if isinstance(key, Universe):
-        return key, ()
-    if isinstance(key, KeyTuple):
-        universe_items = [item for item in key.items if isinstance(item, Universe)]
-        if len(universe_items) > 1:
-            raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
-        dynamic_items = tuple(item for item in key.items if not isinstance(item, Universe))
-        return (universe_items[0] if universe_items else None), dynamic_items
-    return None, (key,)
+def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
+    if not isinstance(key, KeyTuple):
+        key = KeyTuple((key,))
+    if sum(1 for item in key.items if isinstance(item, Universe)) > 1:
+        raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
+    return key.items
+
+
+def _replace_self_placeholder(node: Expr, lhs: Expr) -> Expr:
+    if isinstance(node, Identifier) and node.name == "self_":
+        return lhs
+    if isinstance(node, Call):
+        return Call(node.fn, tuple(_replace_self_placeholder(arg, lhs) for arg in node.args))
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_replace_self_placeholder(item, lhs) for item in node.items))
+    return node
 
 def compile_formula(
     formula: str | Expr,
@@ -177,9 +182,11 @@ def compile_formula(
         expanded_nodes += 1
         if isinstance(expr, Identifier):
             if local_inputs is not None:
-                if expr.name not in local_inputs:
-                    raise FormulaCompileError("groupby local op expressions may only reference the 'self_' lhs placeholder")
-                op = local_inputs[expr.name]
+                if expr.name in local_inputs:
+                    op = local_inputs[expr.name]
+                else:
+                    inputs.setdefault(expr.name, len(inputs))
+                    op = InputOp(inputs[expr.name])
             else:
                 inputs.setdefault(expr.name, len(inputs))
                 op = InputOp(inputs[expr.name])
@@ -189,28 +196,35 @@ def compile_formula(
             macro = dsl_registry.get(expr.fn)
             if macro is not None:
                 op = build(macro(*expr.args), local_inputs)
-            elif expr.fn == "groupby" and len(expr.args) == 2:
-                universe, dynamic_keys = _split_groupby_key_tuple(expr.args[0])
-                key_children = tuple(build(key, local_inputs) for key in dynamic_keys)
-                op_child = build(expr.args[1], local_inputs)
-                output_kind = "vector" if op_child.output_kind == "scalar" else op_child.output_kind
-                if universe is not None:
-                    groups = _resolve_universe_groups(universe, column_names)
-                    if len(dynamic_keys) == 0:
+            elif expr.fn == "groupby" and len(expr.args) == 3:
+                key_items = _canonical_groupby_key_items(expr.args[0])
+                universe_items = [item for item in key_items if isinstance(item, Universe)]
+                dynamic_items = [item for item in key_items if not isinstance(item, Universe)]
+                if universe_items:
+                    op_expr = _replace_self_placeholder(expr.args[2], expr.args[1])
+                    op_child = build(op_expr, local_inputs)
+                    output_kind = "vector" if op_child.output_kind == "scalar" else op_child.output_kind
+                    groups = _resolve_universe_groups(universe_items[0], column_names)
+                    if len(dynamic_items) == 0:
                         op = UniverseGroupByOp(op_child, groups)
                     else:
+                        key_children = tuple(build(key, local_inputs) for key in dynamic_items)
                         key_child = key_children[0] if len(key_children) == 1 else TupleKeyOp(key_children)
                         op = UniverseDynamicGroupByOp(key_child, op_child, groups, output_kind=output_kind)
-                else:
-                    key_child = key_children[0] if len(key_children) == 1 else TupleKeyOp(key_children)
-                    op = GroupByOp(key_child, op_child, len(inputs), output_kind=output_kind)
-            elif expr.fn == "groupby" and len(expr.args) == 3:
-                key_child = build(expr.args[0], local_inputs)
+                    if use_cache:
+                        cache[key] = op
+                    return op
+                key_children = tuple(build(key, local_inputs) for key in key_items)
+                key_child = key_children[0] if len(key_children) == 1 else TupleKeyOp(key_children)
                 lhs_child = build(expr.args[1], local_inputs)
                 local_value = LocalValueOp(lhs_child.output_kind, lhs_child.output_kind)
                 rhs_child = build(expr.args[2], {"self_": local_value})
                 output_kind = "vector" if rhs_child.output_kind == "scalar" else rhs_child.output_kind
-                op = ScopedGroupByOp(key_child, lhs_child, rhs_child, output_kind=output_kind)
+                op = GroupByOp(key_child, rhs_child, len(inputs), lhs=lhs_child, output_kind=output_kind)
+            elif expr.fn == "groupby":
+                raise FormulaCompileError(
+                    "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+                )
             else:
                 children = tuple(build(arg, local_inputs) for arg in expr.args)
                 op = _make_call_op(expr.fn, expr.args, children)
