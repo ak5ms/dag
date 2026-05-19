@@ -11,6 +11,39 @@ from trading_dsl_engine.base.compiler import FormulaCompileError
 from trading_dsl_engine.base.parser import Expr, Number
 
 
+def _child_ops(op):
+    if op.__class__.__name__ in {"GroupByOp", "ScopedGroupByOp", "UniverseDynamicGroupByOp", "UniverseGroupByOp"}:
+        return ()
+    children = []
+    for name in ("child", "left", "right", "condition", "true_value", "false_value", "key", "lhs", "span", "lag", "max_size_source", "window_source", "quantile", "limit", "y", "weights", "half_life", "ridge_lambda"):
+        if hasattr(op, name):
+            value = getattr(op, name)
+            if hasattr(value, "tick"):
+                children.append(value)
+    if hasattr(op, "children"):
+        children.extend([c for c in op.children if hasattr(c, "tick")])
+    if hasattr(op, "features"):
+        children.extend([c for c in op.features if hasattr(c, "tick")])
+    return tuple(children)
+
+
+def build_execution_plan(root):
+    order = []
+    index = {}
+
+    def dfs(node):
+        if id(node) in index:
+            return
+        for child in _child_ops(node):
+            dfs(child)
+        index[id(node)] = len(order)
+        order.append(node)
+
+    dfs(root)
+    node_children = tuple(tuple(index[id(child)] for child in _child_ops(node)) for node in order)
+    return tuple(order), node_children
+
+
 def _scalar_value(x):
     return jnp.ravel(x)[0]
 
@@ -102,6 +135,9 @@ class InputOp(eqx.Module):
     def tick(self, state, frame2d):
         return state, frame2d[self.index][:, None]
 
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        return self.tick(state, frame2d)
+
 
 class LiteralOp(eqx.Module):
     value: float = eqx.field(static=True)
@@ -113,6 +149,9 @@ class LiteralOp(eqx.Module):
     def tick(self, state, frame2d):
         return state, jnp.asarray([[self.value]], dtype=jnp.float64)
 
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        return self.tick(state, frame2d)
+
 
 class LocalValueOp(eqx.Module):
     type_kind: str = eqx.field(static=True)
@@ -122,6 +161,11 @@ class LocalValueOp(eqx.Module):
         return ()
 
     def tick(self, state, frame2d):
+        return state, frame2d
+
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        if child_values:
+            return state, child_values[0]
         return state, frame2d
 
 
@@ -138,6 +182,9 @@ class UnaryOp(eqx.Module):
     def tick(self, state, frame2d):
         new_state, x = self.child.tick(state, frame2d)
         return new_state, self.apply(x)
+
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        return child_states[0], self.apply(child_values[0])
 
 
 class BinaryOp(eqx.Module):
@@ -157,6 +204,9 @@ class BinaryOp(eqx.Module):
         new_right_state, right = self.right.tick(right_state, frame2d)
         return (new_left_state, new_right_state), self.apply(left, right)
 
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        return (child_states[0], child_states[1]), self.apply(child_values[0], child_values[1])
+
 
 
 class WhereOp(eqx.Module):
@@ -175,6 +225,9 @@ class WhereOp(eqx.Module):
             frame2d,
         )
         return new_state, jnp.where(condition != 0.0, true_value, false_value)
+
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        return child_states, jnp.where(child_values[0] != 0.0, child_values[1], child_values[2])
 
 
 class MeanOp(UnaryOp):
@@ -254,6 +307,15 @@ class EwmOp(eqx.Module):
         out = jnp.where(valid | initialized, out, jnp.nan)
         return (new_child_states, out, initialized | valid), out
 
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        _, previous, initialized = state
+        x, span = child_values
+        alpha = 2.0 / (_scalar_value(span) + 1.0)
+        valid = jnp.isfinite(x)
+        out = jnp.where(initialized & valid, alpha * x + (1.0 - alpha) * previous, jnp.where(valid, x, previous))
+        out = jnp.where(valid | initialized, out, jnp.nan)
+        return (child_states, out, initialized | valid), out
+
 
 class CumsumOp(eqx.Module):
     child: Any = eqx.field(static=True)
@@ -274,6 +336,15 @@ class CumsumOp(eqx.Module):
         out = jnp.where(valid, base + x, previous)
         out = jnp.where(valid | initialized, out, jnp.nan)
         return (new_child_state, out, initialized | valid), out
+
+    def tick_from_children(self, state, frame2d, child_states, child_values):
+        _, previous, initialized = state
+        x = child_values[0]
+        valid = jnp.isfinite(x)
+        base = jnp.where(initialized, previous, 0.0)
+        out = jnp.where(valid, base + x, previous)
+        out = jnp.where(valid | initialized, out, jnp.nan)
+        return (child_states[0], out, initialized | valid), out
 
 
 class ShiftOp(eqx.Module):
@@ -781,3 +852,29 @@ def _make_call_op(fn: str, args: tuple[Expr, ...], children: tuple[Any, ...]):
     if builder is None:
         raise FormulaCompileError(f"JAX backend does not support op '{fn}' yet")
     return builder(args, children)
+
+
+def _default_tick_from_children(self, state, frame2d, child_states, child_values):
+    return self.tick(state, frame2d)
+
+
+for _cls in (
+    TupleKeyOp,
+    MeanOp,
+    OuterOp,
+    ColOp,
+    BsplineOp,
+    XsRankOp,
+    ShiftOp,
+    RollingQuantileOp,
+    FfillOp,
+    GroupByOp,
+    ScopedGroupByOp,
+    RidgeOp,
+    GetBetaOp,
+    GetPredsOp,
+    UniverseDynamicGroupByOp,
+    UniverseGroupByOp,
+):
+    if not hasattr(_cls, "tick_from_children"):
+        _cls.tick_from_children = _default_tick_from_children

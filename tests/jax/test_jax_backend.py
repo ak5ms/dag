@@ -32,6 +32,14 @@ def test_jax_backend_live_updates_are_jit_compiled_and_stateful():
     assert eng._state is not None
 
 
+
+
+def test_jax_backend_shared_stateful_subtree_is_evaluated_once_per_tick():
+    close = np.array([[1.0], [2.0], [3.0]], dtype=np.float64)
+    # If ewm(close, 3) is evaluated twice in one tick, this diverges from 2 * ewm(close, 3).
+    shared = run_batch_from_mapping(build_jax_engine("add(ewm(close, 3), ewm(close, 3))"), {"close": close}, out_path=None)
+    baseline = run_batch_from_mapping(build_jax_engine("mul(2, ewm(close, 3))"), {"close": close}, out_path=None)
+    np.testing.assert_allclose(shared, baseline, rtol=1e-10, atol=1e-10, equal_nan=True)
 def test_jax_backend_matches_numba_for_matrix_and_column_ops():
     close = np.array([[0.0, 0.2, 0.6], [0.1, 0.4, 0.9]], dtype=np.float64)
     _compare_batch("bspline(close, 5)", {"close": close})
