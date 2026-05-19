@@ -106,16 +106,28 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
 
 
 
-def _split_groupby_key_tuple(key: Expr) -> tuple[Universe | None, tuple[Expr, ...]]:
-    if isinstance(key, Universe):
-        return key, ()
-    if isinstance(key, KeyTuple):
-        universe_items = [item for item in key.items if isinstance(item, Universe)]
-        if len(universe_items) > 1:
-            raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
-        dynamic_items = tuple(item for item in key.items if not isinstance(item, Universe))
-        return (universe_items[0] if universe_items else None), dynamic_items
-    return None, (key,)
+def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
+    if not isinstance(key, KeyTuple):
+        raise FormulaCompileError(
+            "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+        )
+    universe_count = 0
+    for item in key.items:
+        if isinstance(item, Universe):
+            universe_count += 1
+    if universe_count > 1:
+        raise FormulaCompileError("groupby key tuple may contain at most one univ(...) element")
+    return key.items
+
+
+def _replace_self_placeholder(node: Expr, lhs: Expr) -> Expr:
+    if isinstance(node, Identifier) and node.name == "self_":
+        return lhs
+    if isinstance(node, Call):
+        return Call(node.fn, tuple(_replace_self_placeholder(arg, lhs) for arg in node.args))
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_replace_self_placeholder(item, lhs) for item in node.items))
+    return node
 
 def compile_formula(
     formula: str | Expr,
@@ -181,9 +193,12 @@ def compile_formula(
         expanded_nodes += 1
         if isinstance(node, Identifier):
             if local_inputs is not None:
-                if node.name not in local_inputs:
-                    raise FormulaCompileError("groupby local op expressions may only reference the 'self_' lhs placeholder")
-                compiled = local_inputs[node.name]
+                if node.name in local_inputs:
+                    compiled = local_inputs[node.name]
+                else:
+                    if node.name not in inputs:
+                        inputs[node.name] = len(inputs)
+                    compiled = _make_input_node(inputs[node.name])
             else:
                 if node.name not in inputs:
                     inputs[node.name] = len(inputs)
@@ -191,44 +206,29 @@ def compile_formula(
         elif isinstance(node, Number):
             compiled = _make_literal_node(node.value)
         elif isinstance(node, Call):
-            if node.fn == "groupby" and len(node.args) == 2:
-                universe, dynamic_keys = _split_groupby_key_tuple(node.args[0])
-                try:
-                    key_children = [build(key, depth + 1, local_inputs) for key in dynamic_keys]
-                    op_child = build(node.args[1], depth + 1, local_inputs)
-                    if universe is not None:
-                        groups = _resolve_universe_groups(universe, column_name_to_index)
-                        if len(dynamic_keys) == 0:
-                            compiled = _make_universe_groupby_node(op_child, groups)
-                        else:
-                            key_child = key_children[0] if len(key_children) == 1 else _make_tuple_key_node(key_children)
-                            compiled = _make_universe_dynamic_groupby_node(key_child, op_child, groups)
-                    elif len(dynamic_keys) > 1:
-                        try:
-                            spec = REGISTRY.get(node.fn)
-                        except KeyError as exc:
-                            raise FormulaCompileError(str(exc)) from exc
-                        key_child = _make_tuple_key_node(key_children)
-                        children = [key_child, op_child]
-                        _ = spec.validator([c.type_info for c in children])
-                        compiled = spec.builder(children, [float("nan"), float("nan")])
-                    else:
-                        try:
-                            spec = REGISTRY.get(node.fn)
-                        except KeyError as exc:
-                            raise FormulaCompileError(str(exc)) from exc
-                        key_child = key_children[0]
-                        children = [key_child, op_child]
-                        _ = spec.validator([c.type_info for c in children])
-                        compiled = spec.builder(children, [float("nan"), float("nan")])
-                except ValueError as exc:
-                    raise FormulaCompileError(f"Invalid call groupby: {exc}") from exc
-            elif node.fn == "groupby" and len(node.args) == 3:
+            if node.fn == "groupby" and len(node.args) == 3:
                 try:
                     spec = REGISTRY.get(node.fn)
                 except KeyError as exc:
                     raise FormulaCompileError(str(exc)) from exc
-                key_child = build(node.args[0], depth + 1, local_inputs)
+                key_items = _canonical_groupby_key_items(node.args[0])
+                universe_items = [item for item in key_items if isinstance(item, Universe)]
+                dynamic_items = [item for item in key_items if not isinstance(item, Universe)]
+                if universe_items:
+                    op_expr = _replace_self_placeholder(node.args[2], node.args[1])
+                    op_child = build(op_expr, depth + 1, local_inputs)
+                    groups = _resolve_universe_groups(universe_items[0], column_name_to_index)
+                    if len(dynamic_items) == 0:
+                        compiled = _make_universe_groupby_node(op_child, groups)
+                    else:
+                        key_children = [build(item, depth + 1, local_inputs) for item in dynamic_items]
+                        key_child = key_children[0] if len(key_children) == 1 else _make_tuple_key_node(key_children)
+                        compiled = _make_universe_dynamic_groupby_node(key_child, op_child, groups)
+                    if use_cache:
+                        cache[key] = compiled
+                    return compiled
+                key_children = [build(item, depth + 1, local_inputs) for item in key_items]
+                key_child = key_children[0] if len(key_children) == 1 else _make_tuple_key_node(key_children)
                 lhs_child = build(node.args[1], depth + 1, local_inputs)
                 local_value = _make_local_value_node(lhs_child.type_info)
                 rhs_child = build(node.args[2], depth + 1, {"self_": local_value})
@@ -239,6 +239,10 @@ def compile_formula(
                     raise FormulaCompileError(f"Invalid call {node.fn}: {exc}") from exc
                 literal_args = [float("nan"), float("nan"), float("nan")]
                 compiled = spec.builder(children, literal_args)
+            elif node.fn == "groupby":
+                raise FormulaCompileError(
+                    "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+                )
             else:
                 try:
                     spec = REGISTRY.get(node.fn)

@@ -103,7 +103,7 @@ def test_perf_groupby_many_keys_one_year_minutely():
     key = np.broadcast_to((np.arange(T_1Y_MINUTES) % n_groups).reshape(-1, 1), shape).astype(
         np.float64
     )
-    eng = build_engine("groupby(key, open + close)")
+    eng = build_engine("groupby((key,), open + close, self_)")
 
     t0 = time.perf_counter()
     out = run_batch_from_mapping(eng, {"key": key, "open": open_, "close": close})

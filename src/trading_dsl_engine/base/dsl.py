@@ -66,7 +66,14 @@ self_ = var(GROUPBY_VALUE_PLACEHOLDER)
 class GroupedExpr:
     def __init__(self, lhs, key) -> None:
         self.lhs = ensure_expr(lhs)
-        self.key = ensure_expr(key)
+        key_expr = ensure_expr(key)
+        if not isinstance(key_expr, KeyTuple):
+            raise TypeError(
+                "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+            )
+        if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
+            raise TypeError("groupby key tuple may contain at most one univ(...) element")
+        self.key = key_expr
 
     def apply(self, rhs, *args) -> Expr:
         if callable(rhs):
