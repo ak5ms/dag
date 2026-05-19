@@ -83,11 +83,12 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `bspline(x, n_basis)` emits a per-instrument periodic basis matrix on `[0, 1]` with output width `n_basis` (inputs are clipped to `[0, 1]` and NaNs propagate).
 - `col(matrix, index)` extracts one matrix column as a vector for explicit feature selection/probing.
 - `mod(a, b)` provides elementwise modulo for scalar/vector/matrix combinations supported by binary broadcasting rules.
-- `groupby(key, op)` is dynamic keyed grouping: for each instrument, the full `op` subtree runs in that instrument/key scope over a single-column local stream. This is true even for stateless operators, so `groupby(day, mean(close))` means the mean of the one-column keyed stream, not a cross-sectional day-bucket mean. Dynamic keys can be tuples, e.g. `groupby((day, bucket), cumsum(close))`. Use `groupby(univ(...), mean(close))` for static cross-column group means.
-- `groupby(key, lhs, op_using_self_)` evaluates `lhs` once in the outer stream, then runs only `op_using_self_` as keyed state over the emitted `lhs` values in the instrument/key scope; the local op expression must reference the outer value through the `self_` placeholder, e.g. `groupby(day, get_preds(Ridge(...)), cumsum(self_))`.
-- Python-composed formulas can spell the local-op form as `lhs.groupby(key).apply(op_fn, *args)`, `lhs.groupby(key).apply(op_expr_using_self_)`, or `lhs.groupby(key).some_op(...)`; for example, `reg.groupby(day).cumsum()` lowers to `groupby(day, reg, cumsum(self_))`.
-- `groupby(univ(...), op)` is static universe grouping: it slices the input columns into declared column groups, runs `op` independently on each group sub-frame, and scatters/broadcasts each group result back to its member columns. Universe groups can be built in Python, e.g. `groupby(univ(["6E", "6C"], ["6A"]), mean(close))`, or in string formulas with `column_names=[...]`; string formulas also accept integer column indexes such as `univ([0, 1], [2])`. A universe can also be part of a tuple key, e.g. `groupby((univ([0, 1]), ts), mean(close))`, which first slices to each universe group and then routes masked columns within that group by the dynamic key.
-- `mean(x)` emits the NaN-skipping mean of a scalar/vector/matrix input as a scalar. In dynamic keyed `groupby(key, mean(x))`, it sees one instrument at a time; in static universe `groupby(univ(...), mean(x))`, it sees all columns in that universe group and broadcasts the group mean.
+- `groupby` now has one canonical form: `groupby((key1, key2, ..., maybe_univ, ...), lhs, op_using_self_)`.
+- The tuple key supports arbitrary length. It may contain at most one `univ(...)` element plus any number of dynamic key expressions.
+- The local op expression must consume the outer stream value via `self_`, e.g. `groupby((day, bucket), get_preds(Ridge(...)), cumsum(self_))`.
+- Python-composed formulas use the same canonical lowering via `lhs.groupby((...)).apply(op_expr_using_self_)`.
+- Legacy groupby forms are intentionally removed (no `groupby(key, op)` and no alternate universe-only syntax path).
+- Key NaNs are valid in groupby and are routed into a dedicated NaN-key group instead of raising.
 
 ## Ridge regression op (cross-sectional)
 
@@ -112,7 +113,7 @@ engine = build_jax_engine("xs_rank(ewm(div(close, open), 21))")
 out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
 ```
 
-The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby(key).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, static-universe `groupby(univ(...), op)`, dynamic keyed `groupby(key, op)`, scoped `groupby(key, lhs, op_using_self_)`, and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
+The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby((...)).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, canonical tuple-key groupby `groupby((...), lhs, op_using_self_)` (including optional `univ(...)` inside the key tuple), and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
 
 ## Development quickstart
 
