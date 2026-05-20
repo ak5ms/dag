@@ -223,12 +223,12 @@ class BsplineOp(eqx.Module):
 
 class XsRankOp(UnaryOp):
     def apply(self, x):
-        vector = x[:, 0]
-        valid = jnp.isfinite(vector)
+        x = x[:, 0]
+        valid = jnp.isfinite(x)
         n_valid = jnp.sum(valid).astype(jnp.int32)
-        compact = jnp.where(valid, vector, jnp.inf)
+        compact = jnp.where(valid, x, jnp.inf)
         sorted_compact = jnp.sort(compact)
-        le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, vector, side="right"), n_valid)
+        le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
         ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
         return jnp.where(valid, ranks, jnp.nan)[:, None]
 
