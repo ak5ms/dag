@@ -56,6 +56,26 @@ class JaxDagRuntime(eqx.Module):
         outputs = tuple(_format_output(state_value(new_states[i]), self.program.nodes[i].op.output_kind) for i in self.program.outputs)
         return tuple(new_states), outputs[0] if len(outputs) == 1 else jnp.stack(outputs, axis=0)
 
+    def run_batch(self, states, inputs):
+        if not inputs:
+            raise ValueError("run_batch requires at least one input array")
+        n_steps = inputs[0].shape[0]
+        for arr in inputs[1:]:
+            if arr.shape[0] != n_steps:
+                raise ValueError("All inputs must have identical timestep length")
+        if not states:
+            state0 = self.init_state(inputs[0].shape[1])
+        else:
+            n_instruments = state_value(states[0]).shape[0]
+            if inputs[0].shape[1] != n_instruments:
+                raise ValueError("Input instrument width must match provided state")
+            state0 = states
+
+        def step(states, rows):
+            return self.tick(states, *rows)
+
+        out = jax.lax.scan(step, state0, xs=inputs, unroll=True)
+        return out
 
 def _format_output(value, output_kind: str):
     if output_kind == "vector":
@@ -68,6 +88,9 @@ def _format_output(value, output_kind: str):
 def jit_tick(runtime: JaxDagRuntime, states, *input_rows):
     return runtime.tick(states, *input_rows)
 
+@eqx.filter_jit
+def jit_batch(runtime: JaxDagRuntime, inputs, states=tuple()):
+    return runtime.run_batch(states=states, inputs=inputs)
 
 def _expr_key(node: Expr):
     if isinstance(node, Identifier):

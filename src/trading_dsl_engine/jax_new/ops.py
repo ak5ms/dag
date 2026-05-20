@@ -172,11 +172,13 @@ def _xs_rank(x):
     Tie semantics match the historical JAX backend: ties map to the
     right-edge rank (equivalent to searchsorted(..., side="right")).
     """
-    valid = jnp.isfinite(x)
-    n_valid = jnp.sum(valid).astype(jnp.int32)
-    compact = jnp.where(valid, x, jnp.inf)
-    sorted_compact = jnp.sort(compact)
-    le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
-    ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
-    return jnp.where(valid, ranks, jnp.nan)
+    return jnp.sort(x)
+    # valid = jnp.isfinite(x)
+    # n_valid = jnp.sum(valid).astype(jnp.int32)
+    # compact = jnp.where(valid, x, jnp.inf)
+    # sorted_compact = jnp.sort(compact)
+    # le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
+    # ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
+    # return jnp.where(valid, ranks, jnp.nan)
+
 
