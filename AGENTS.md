@@ -4,68 +4,96 @@ Guidance for AI/code agents working in this repo.
 
 ## Mission context
 
-This project is a performance-sensitive trading-feature DSL engine that compiles formulas into nested Numba `jitclass` state machines.
+This project is a **test-driven, performance-sensitive trading-feature DSL engine** that compiles formulas into nested Numba `jitclass` state machines.
 
-Priorities, in order:
-1. Preserve correctness and streaming state semantics.
-2. Preserve or improve performance (avoid Python loops in hot path).
-3. Keep architecture extensible (registry/composition-driven, no giant central branching).
+Backend direction (current priority):
+- `src/trading_dsl_engine/jax/` is the legacy backend.
+- `src/trading_dsl_engine/jax_new/` is the target backend.
+- Active goal is **reconciliation**: implement missing ops/features in `jax_new` and close parity gaps against Numba while deprecating legacy JAX paths.
 
-## Key invariants
+Primary objective order:
+1. **TDD correctness loop first**: test -> code -> test -> code until the relevant suite is green.
+2. Preserve streaming state semantics (`on_data(...)` + `emit(...)`) and incremental updates.
+3. Preserve or improve runtime performance in hot paths.
+4. Keep architecture extensible via registry/composition patterns.
+5. Move backend effort to `jax_new`; avoid new feature investment in legacy `jax` except migration-critical fixes.
 
-- Every operation should follow strict `on_data(...)` + `emit(...)` behavior (including stateless ops).
-- Live updates must be incremental; do not recompute full history in update paths.
-- Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
-- Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
-- Keep compiler composition nested (no interpreter fallback in execution hot path).
-- For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution.
-- Support arity > 1 cleanly.
-- Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe on group sub-frames without interpreter fallback. `univ(...)` may also appear inside tuple keys such as `groupby((univ([0, 1]), ts), op)` to combine static column slicing with dynamic key routing.
-- Grouped execution must use a single canonical form: `groupby(key_tuple, lhs, op_using_self_)` (or Python sugar `lhs.groupby(key_tuple).apply(op(self_, *others))`). Delete all legacy groupby forms and alternate flow paths. `key_tuple` must support arbitrary-length composite keys and may contain at most one `univ(...)` element.
-- Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
-- Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
+## Required development workflow
 
-## Where to change what
+For all behavior changes:
+1. Add/adjust focused tests first.
+2. Run the smallest relevant failing slice.
+3. Implement minimal code change.
+4. Re-run relevant tests and iterate to green.
+5. Run full non-performance suite before finalizing.
+6. Run performance suite when changing perf-sensitive runtime behavior.
 
-- Shared parser/validation changes: `src/trading_dsl_engine/base/parser.py`
-- Shared DSL macro composition + registry isolation: `src/trading_dsl_engine/base/dsl.py`
-- Shared operator plugin specs: `src/trading_dsl_engine/base/registry.py`
-- Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
-- Numba op kernels/factories: `src/trading_dsl_engine/numba/ops.py`
-- Numba runtime execution and batch/live helpers: `src/trading_dsl_engine/numba/engine.py`
-- JAX + Equinox backend: `src/trading_dsl_engine/jax/`
-- Numba behavior/performance regression tests: `tests/numba/`
-- JAX correspondence regression tests: `tests/jax/`
+Do **not** start with broad refactors detached from tests.
+
+## Repository structure and ownership map
+
+- `src/trading_dsl_engine/base/`
+  - Parser, DSL composition, registry specs, and shared compile/lower pipeline.
+- `src/trading_dsl_engine/numba/`
+  - Reference backend for streaming semantics and primary runtime behavior.
+- `src/trading_dsl_engine/jax/`
+  - Legacy backend; treat as deprecated migration surface.
+- `src/trading_dsl_engine/jax_new/`
+  - Target backend for parity and future development.
+- `tests/numba/`
+  - Ground-truth behavior and performance regression coverage.
+- `tests/jax/`
+  - Legacy JAX correspondence tests.
+- `tests/jax_new/` (if present)
+  - Preferred place for new JAX parity/correctness tests.
+
+When expectations change, update **both** `AGENTS.md` and `README.md` in the same PR.
+
+## Core invariants
+
+- Every op must honor strict `on_data(...)` + `emit(...)` semantics (including stateless ops).
+- Live updates must be incremental; no full-history recomputation in update paths.
+- Keep compiler composition nested; no interpreter fallback in execution hot paths.
+- Avoid requiring `n_instruments` in constructors when shape can be inferred at first tick.
+- Support arity > 1 cleanly across parser, lowering, and backends.
+- Keep Python-composed `Expr` formulas feature-par with string formulas.
+- Ridge weights may be omitted in supported forms and default to unit per-instrument weights.
+
+### Grouping invariants
+
+- Canonical grouped form only:
+  - `groupby(key_tuple, lhs, op_using_self_)`
+  - Python sugar: `lhs.groupby(key_tuple).apply(op(self_, *others))`
+- `key_tuple` supports arbitrary-length composite keys.
+- `key_tuple` may contain at most one `univ(...)` element.
+- Key NaNs are valid and must route to a dedicated NaN-key group.
+
+## Parity and migration rules (`numba` -> `jax_new`)
+
+- Treat Numba behavior as reference when adding missing `jax_new` ops/features.
+- Add tests that assert reconciliation for parser/lowering/runtime semantics.
+- Prefer adding new backend coverage under `tests/jax_new/`; keep legacy `tests/jax/` only for migration confidence.
+- Do not introduce new feature-only APIs in legacy `jax`.
 
 ## Performance guardrails
 
-- Do not add Python-level per-timestep loops in runtime hot paths.
-- Prefer compiled loops in jitclass methods.
-- Minimize extra array copies/materialization in batch mode.
-- Prefer clear NumPy/Numba slice and vectorized operations over unnecessary scalar loops, especially nested loops that only copy or assign contiguous rows, columns, or blocks (for example, use `dst[:] = src`, `dst[:, i:j] = block`, or `out[t, :] = values` where supported).
-- Keep numerical code human-readable: avoid mechanically expanded, deeply nested NumPy/Numba code when a supported vectorized expression or slice assignment communicates the same semantics without changing streaming behavior.
-- Keep batch output disk-backed by default (`run_batch_from_mapping(..., out_path=...)`) to avoid large RAM materialization; use `out_path=None` only when in-memory output is explicitly desired.
-- If adding ops that emit non-ndarray state objects (`TypeInfo("object")`), keep the batch timestep loop in compiled/JIT code; project object state back to scalar/vector/matrix before root output.
-- For any algorithmic change, consider complexity across ~1 year minutely x ~150 instruments (or larger).
+- No Python-level per-timestep loops in runtime hot paths.
+- Prefer compiled/JIT paths (`jitclass`, `jax.jit`/`eqx.filter_jit`, `lax.scan`).
+- Minimize unnecessary array copies/materialization in batch mode.
+- Keep batch output disk-backed by default (`run_batch_from_mapping(..., out_path=...)`) unless explicitly opting in to RAM.
 
-## NaN and numerical behavior
+## Numerical / NaN expectations
 
-When modifying ops, keep NaN handling explicit and tested:
-- Binary propagation behavior.
+When modifying ops, add/update tests covering:
+- Binary NaN propagation.
 - Divide-by-zero behavior.
-- Stateful-op behavior when inputs include NaNs.
+- Stateful-op behavior under NaN outages.
 - Ranking/tie semantics and NaN masking.
-- Ridge/object-op behavior when feature/target/parameter inputs include NaNs.
-- Ridge pairwise sufficient-statistic behavior: `xx[j, k]` and `xy[j]` update only when their own finite row requirements are met, and their per-statistic clocks do not advance during outages.
-- Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
-- Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
-- Grouped-state behavior for canonical keyed operators (`groupby(key_tuple, lhs, op_using_self_)`) including arbitrary-length tuple-key composition, per-instrument/per-key state transitions, and key consistency expectations.
-- Key NaNs in groupby are valid and must route into a dedicated NaN key group (do not raise).
-- Tuple-key universe behavior (`groupby((..., univ(...), ...), lhs, op_using_self_)`) including ticker-to-column mapping, per-universe sub-frame state isolation, dynamic-key masking within universes, and scatter/broadcast shape behavior.
+- Matrix-output shape behavior.
+- Ridge pairwise sufficient-stat clocks and finite-row gating.
+- Canonical `groupby` keyed-state behavior (tuple keys, `univ(...)`, NaN keys).
 
-## Environment and test expectations
-
-Use a repo-local virtualenv and pip cache when setting up a fresh cloud/agent environment so dependency downloads and wheels can be reused between iterations:
+## Environment and tests
 
 ```bash
 python -m venv .venv
@@ -73,33 +101,33 @@ python -m venv .venv
 PIP_CACHE_DIR=.pip-cache python -m pip install -e .
 ```
 
-JAX, Equinox, pytest, and pytest-xdist are mandatory project dependencies in `pyproject.toml`; do not treat the JAX backend as optional in setup or tests. The `.venv/` and `.pip-cache/` directories are gitignored and must not be committed.
-
-During iteration, run only the relevant targeted tests for the files/behavior being changed. Do not repeatedly run the full suite while iterating.
-If a long-running pytest command starts showing failures in streamed output, you may preemptively terminate that run early to iterate faster, then rerun targeted tests after fixes.
-
-Run these locally at the end before finalizing:
+During iteration, run only targeted tests. Before finalizing:
 
 ```bash
 pytest -q
 RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
 ```
 
-`pytest` is configured in `pyproject.toml` to run with pytest-xdist using 12 workers (`-n 12`). Run perf tests with `-n 0` because their wall-clock guardrails are calibrated for serial benchmark execution. If perf tests are too heavy for the environment, clearly note that and at least run the parallelized core test suite.
-
-- Always run non-performance tests (`pytest -q`) at the end before finalizing unless explicitly told not to.
-- Pytest output is configured to include per-test durations; use this to catch regressions in compile/runtime costs.
-- Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
+If perf tests are too heavy for the environment, clearly report that and still run full non-performance suite.
 
 ## Coding style
 
-- Always use absolute imports (e.g., `from trading_dsl_engine...`), not relative imports.
+- Use absolute imports (`from trading_dsl_engine...`).
+- Whenever a new operator is added (or operator semantics change), update `README.md` in the same PR with user-facing behavior, NaN semantics, shape expectations, and usage notes.
 - Keep implementations concise and generic; avoid repetitive boilerplate.
 - Prefer factories/templates/registries over hardcoded branching.
-- Prefer `make_nary_op` for stateless scalar/vector/matrix operators, including axis reducers, before adding custom operator classes.
 - Do not wrap imports in try/except blocks.
-- Make extension points obvious for future ops (including potential matrix/tensor emitters and optimizer/model workflow nodes).
 
-## Future roadmap hints
+## Roadmap compatibility
 
-Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+Planned direction includes typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Prioritize changes that accelerate `jax_new` parity without blocking this roadmap.
+
+## Practical notes for future agents
+
+- Start by locating existing coverage with `rg` under `tests/` before writing new tests; extend nearby test modules rather than scattering one-off files.
+- For backend reconciliation tasks, prefer this sequence: confirm Numba behavior in `tests/numba/` -> add/port parity test in `tests/jax_new/` -> implement in `src/trading_dsl_engine/jax_new/`.
+- When touching parser or lowering behavior, verify both string formulas and Python-composed `Expr` paths continue to lower identically.
+- Preserve canonical grouping APIs only; if you see legacy groupby forms in code/tests, migrate to canonical tuple-key form instead of adding compatibility branches.
+- Before finalizing, sanity-check docs for drift: if behavior expectations changed, update `README.md` + `AGENTS.md` in the same change.
+- Keep performance in mind while coding: avoid introducing Python loops in per-tick runtime paths even when tests pass.
+

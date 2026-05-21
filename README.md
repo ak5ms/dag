@@ -1,77 +1,84 @@
 # trading-dsl-engine
 
-A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
+A test-driven, high-performance DSL engine for streaming trading features on aligned minutely NumPy data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. A JAX + Equinox backend is installed as a standard dependency and is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
+The engine compiles formulas (string DSL or Python-composed expressions) into nested Numba `jitclass` state machines for low-latency live updates and scalable batch runs.
 
-## Core goals
+## Current project goal
 
-- **Streaming-first stateful computation**: each op follows `on_data(...)` + `emit(...)`.
-- **No interpreter hot loop**: runtime timestep loop executes in compiled Numba code.
-- **Composable formulas**: parse string expressions and support Python-level DSL macro composition.
-- **Extensible operators**: registry/plugin model for adding new ops without central branching.
-- **Scalable IO**: supports in-memory NumPy arrays and disk-backed memmaps.
+The operating goal is **TDD-first backend reconciliation**:
 
-## Project layout
+1. Write/adjust focused tests first.
+2. Implement minimal code changes.
+3. Re-run relevant tests and iterate until green.
+4. Reconcile feature/behavior gaps from Numba into `jax_new`.
+5. Deprecate legacy `jax` paths as parity lands in `jax_new`.
 
-- `src/trading_dsl_engine/base/`
-  - Shared parser (`parse_formula`), Python DSL constructors, registry metadata, and compile/lower pipeline.
-- `src/trading_dsl_engine/numba/`
-  - Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
-- `src/trading_dsl_engine/jax/`
-  - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
-- `tests/numba/`
-  - Parser, composition, Numba runtime correctness, shape, state persistence, and performance tests.
-- `tests/jax/`
-  - JAX backend correspondence tests against the Numba runtime.
+## Backend status
+
+- **Numba (`src/trading_dsl_engine/numba/`)**: reference runtime semantics.
+- **Legacy JAX (`src/trading_dsl_engine/jax/`)**: deprecated migration surface.
+- **JAX New (`src/trading_dsl_engine/jax_new/`)**: target backend for missing-ops/features reconciliation and future development.
+
+If a feature exists in Numba but not in `jax_new`, the expected direction is to add tests and implement parity in `jax_new`.
+
+## Design priorities
+
+- **Streaming-first semantics**: every op follows `on_data(...)` + `emit(...)`.
+- **Incremental updates**: no full-history recomputation in live ticks.
+- **Compiled hot paths**: avoid interpreter fallback in timestep loops.
+- **Extensible architecture**: registry/composition-driven growth.
+- **Parity-driven evolution**: converge `jax_new` behavior toward Numba.
+
+## Repository structure
+
+- `src/trading_dsl_engine/base/`: parser, DSL helpers, registry contracts, compile/lower pipeline.
+- `src/trading_dsl_engine/numba/`: reference backend implementation.
+- `src/trading_dsl_engine/jax/`: legacy backend being deprecated.
+- `src/trading_dsl_engine/jax_new/`: target backend under active reconciliation.
+- `tests/numba/`: correctness/performance baseline coverage.
+- `tests/jax/`: legacy backend tests.
+- `tests/jax_new/` (if present): preferred location for new parity tests.
 
 ## Typical usage
 
 ```python
 from trading_dsl_engine import compile_formula, build_engine, run_batch_from_mapping
 
-artifact = compile_formula("xs_rank(ewm(div(close, open), 21))")
-engine = build_engine("xs_rank(ewm(div(close, open), 21))")
+formula = "xs_rank(ewm(div(close, open), 21))"
+artifact = compile_formula(formula)
+engine = build_engine(formula)
 
-# live tick update
-out = engine.update_from_mapping({"open": open_t, "close": close_t})
+# Live tick update: 1D vectors shaped (n_instruments,)
+out_live = engine.update_from_mapping({"open": open_t, "close": close_t})
 
-# batch run (disk-backed output by default)
-out2d = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, chunk_size=4096)  # memmap shape (time, n_instruments) for vector outputs
-# opt into RAM materialization instead
-out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
+# Batch run: aligned 2D arrays shaped (time, n_instruments)
+out_batch = run_batch_from_mapping(
+    engine,
+    {"open": open_2d, "close": close_2d},
+    chunk_size=4096,
+)
 ```
 
-Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
+By default, batch output is disk-backed (memmap) to limit RAM pressure. Use `out_path=None` to opt into in-memory output.
 
-Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
+## DSL composition and canonical grouping
 
-## DSL composition
+Python-composed expressions and string formulas are both supported through the shared lowering pipeline.
 
-You can define reusable macro-like composed functions with an explicit registry namespace:
-
-```python
-from trading_dsl_engine import DSLFunctionRegistry, register_dsl_function, add, div
-
-my_registry = DSLFunctionRegistry()
-
-@register_dsl_function("hlc3", registry=my_registry)
-def hlc3(high, low, close):
-    return div(add(add(high, low), close), 3.0)
-```
-
-Then compile with `compile_formula(..., dsl_registry=my_registry)`. Built-in composed DSL functions include `diff(x, nlag=1, max_size=1)`, which expands to `sub(x, shift(x, nlag, max_size))`.
-
-Normal Python composition can use `var("close")`/`var("open")` identifiers and either prefix helpers or infix operator overloads: `xs_rank(ewm(var("close") / var("open"), 21))` is equivalent to `xs_rank(ewm(div(close, open), 21))`. Formula strings also support infix arithmetic/logical forms such as `close + open`, `close * 2`, `close % 5`, `close | open`, `close & open`, `close ^ open`, `close == open`, and `close != open`.
-
-The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile_seconds`) so compile-time CSE behavior and compile latency can be validated.
+- Compose via helpers such as `add`, `div`, `var`, and infix operators on `Expr` objects.
+- Canonical grouped form:
+  - `groupby((key1, key2, ...), lhs, op_using_self_)`
+  - Python sugar: `lhs.groupby((key1, key2, ...)).apply(op_expr_using_self_)`
+- Tuple keys can be arbitrary length and may include at most one `univ(...)` element.
+- Key NaNs are valid and route to a dedicated NaN-key group.
 
 ## Data contract
 
-- Inputs are aligned 2D arrays with shape `(time, n_instruments)`.
-- Optional `column_names` passed to `compile_formula(...)`/`build_engine(...)` maps universe ticker names to input column positions for static column grouping.
-- Live `update` expects 1D vectors with shape `(n_instruments,)`.
-- Some ops may emit matrix outputs (e.g., `outer`, `bspline`), with shape `(n_instruments, width)` where `width` can differ from `n_instruments`.
+- Batch inputs: aligned arrays of shape `(time, n_instruments)`.
+- Live updates: vectors of shape `(n_instruments,)`.
+- Some ops may emit matrix outputs where width differs from instrument count.
+- Optional `column_names` enables ticker-to-column mapping for universe-aware grouping.
 
 ## NaN semantics (current)
 
@@ -102,38 +109,25 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
-## JAX backend
-
-JAX and Equinox are required project dependencies. The backend mirrors the core runtime helpers under `trading_dsl_engine.jax`:
-
-```python
-from trading_dsl_engine.jax import build_jax_engine, run_batch_from_mapping
-
-engine = build_jax_engine("xs_rank(ewm(div(close, open), 21))")
-out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_path=None)
-```
-
-The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby((...)).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, canonical tuple-key groupby `groupby((...), lhs, op_using_self_)` (including optional `univ(...)` inside the key tuple), and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
-
-## Development quickstart
+## Development workflow
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
 PIP_CACHE_DIR=.pip-cache python -m pip install -e .
-pytest -q  # configured to use pytest-xdist with 12 workers
 ```
 
-The `.venv/` and `.pip-cache/` paths are gitignored so cloud/agent environments can reuse a repo-local virtualenv and wheel/download cache between iterations without committing environment artifacts.
-
-Performance tests (opt-in):
+Iterate with targeted tests, then run final validation:
 
 ```bash
+pytest -q
 RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
 ```
 
-## Notes for future work
+## Contributor expectations
 
-- Add graph-level IR + CSE for shared subtrees across multi-feature workflows.
-- Expand shape system for richer multi-output model/optimizer nodes.
-- Continue reducing memory movement in batch paths for large memmap workloads.
+- Follow TDD by default: tests first, then implementation, then targeted reruns.
+- For reconciliation work, start from failing parity tests and close gaps in `jax_new`.
+- Preserve streaming semantics and performance guardrails.
+- Keep architecture extensible (registries/factories/composition).
+- Update both `README.md` and `AGENTS.md` when project expectations shift.
