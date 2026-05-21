@@ -19,6 +19,8 @@ Priorities, in order:
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution.
+
+- JAX new backend batch lowering should avoid carrying stateless node state through `lax.scan`; prefer compact carry containing only stateful node states, and use vectorized row lowering for fully stateless formulas where possible.
 - Support arity > 1 cleanly.
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe on group sub-frames without interpreter fallback. `univ(...)` may also appear inside tuple keys such as `groupby((univ([0, 1]), ts), op)` to combine static column slicing with dynamic key routing.
 - Grouped execution must use a single canonical form: `groupby(key_tuple, lhs, op_using_self_)` (or Python sugar `lhs.groupby(key_tuple).apply(op(self_, *others))`). Delete all legacy groupby forms and alternate flow paths. `key_tuple` must support arbitrary-length composite keys and may contain at most one `univ(...)` element.

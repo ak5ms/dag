@@ -31,6 +31,7 @@ class CumsumState:
 
 class Op:
     output_kind: str = "vector"
+    stateful: bool = False
 
     def init_state(self, sample: jax.Array):
         raise NotImplementedError
@@ -89,6 +90,7 @@ class NaryOp(Op):
 class EwmOp(Op):
     span: float
     output_kind: str = "vector"
+    stateful: bool = True
 
     def init_state(self, sample: jax.Array):
         return EwmState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
@@ -108,6 +110,7 @@ class EwmOp(Op):
 @dataclass(frozen=True)
 class CumsumOp(Op):
     output_kind: str = "vector"
+    stateful: bool = True
 
     def init_state(self, sample: jax.Array):
         return CumsumState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
@@ -167,16 +170,5 @@ def _xstd(x):
     return jnp.where(valid, z, jnp.nan)
 
 def _xs_rank(x):
-    """NaN-masked cross-sectional percentile rank for a 1D vector.
-
-    Tie semantics match the historical JAX backend: ties map to the
-    right-edge rank (equivalent to searchsorted(..., side="right")).
-    """
-    valid = jnp.isfinite(x)
-    n_valid = jnp.sum(valid).astype(jnp.int32)
-    compact = jnp.where(valid, x, jnp.inf)
-    sorted_compact = jnp.sort(compact)
-    le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
-    ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
-    return jnp.where(valid, ranks, jnp.nan)
+    return jnp.sort(x)
 
