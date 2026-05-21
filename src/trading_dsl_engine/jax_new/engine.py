@@ -74,7 +74,7 @@ class JaxDagRuntime(eqx.Module):
         def step(states, rows):
             return self.tick(states, *rows)
 
-        out = jax.lax.scan(step, state0, xs=inputs, unroll=True)
+        out = jax.lax.scan(step, state0, xs=inputs, unroll=2)
         return out
 
 
@@ -89,6 +89,9 @@ def _format_output(value, output_kind: str):
 def jit_tick(runtime: JaxDagRuntime, states, *input_rows):
     return runtime.tick(states, *input_rows)
 
+@eqx.filter_jit
+def jit_batch(runtime: JaxDagRuntime, inputs, states=tuple()):
+    return runtime.run_batch(states=states, inputs=inputs)
 
 def _expr_key(node: Expr):
     if isinstance(node, Identifier):
