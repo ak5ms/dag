@@ -33,6 +33,7 @@ class DagProgram:
     outputs: tuple[int, ...]
     input_names: tuple[str, ...]
     stateful_node_ids: tuple[int, ...]
+    stateful_pos_by_node: tuple[int, ...]
 
 
 class JaxDagRuntime(eqx.Module):
@@ -57,8 +58,7 @@ class JaxDagRuntime(eqx.Module):
         outputs = tuple(_format_output(state_value(new_states[i]), self.program.nodes[i].op.output_kind) for i in self.program.outputs)
         return tuple(new_states), outputs[0] if len(outputs) == 1 else jnp.stack(outputs, axis=0)
 
-    def _tick_with_compact_carry(self, carry_states, *input_rows):
-        carry_idx = {nid: i for i, nid in enumerate(self.program.stateful_node_ids)}
+    def _tick_with_compact_carry(self, carry_states, full_states, *input_rows):
         new_states: list[Any] = []
         for idx, node in enumerate(self.program.nodes):
             op = node.op
@@ -66,13 +66,14 @@ class JaxDagRuntime(eqx.Module):
                 new_states.append(EmptyState(value=input_rows[op.input_index]))
                 continue
             if isinstance(op, LiteralOp):
-                new_states.append(op.init_state(input_rows[0]))
+                new_states.append(full_states[idx])
                 continue
             child_states = tuple(new_states[cid] for cid in node.child_ids)
-            if op.stateful:
-                prev_state = carry_states[carry_idx[idx]]
+            state_pos = self.program.stateful_pos_by_node[idx]
+            if state_pos >= 0:
+                prev_state = carry_states[state_pos]
             else:
-                prev_state = node.op.init_state(input_rows[0])
+                prev_state = full_states[idx]
             new_states.append(op.step(prev_state, *child_states))
         outputs = tuple(_format_output(state_value(new_states[i]), self.program.nodes[i].op.output_kind) for i in self.program.outputs)
         new_carry = tuple(new_states[nid] for nid in self.program.stateful_node_ids)
@@ -99,7 +100,7 @@ class JaxDagRuntime(eqx.Module):
             return state0, ys
 
         carry0 = tuple(state0[nid] for nid in self.program.stateful_node_ids)
-        out = jax.lax.scan(lambda c, rows: self._tick_with_compact_carry(c, *rows), carry0, xs=inputs, unroll=1)
+        out = jax.lax.scan(lambda c, rows: self._tick_with_compact_carry(c, state0, *rows), carry0, xs=inputs, unroll=1)
         carry_out, ys = out
         state_out = list(state0)
         for i, nid in enumerate(self.program.stateful_node_ids):
@@ -175,5 +176,7 @@ def compile_formula(formula: str | Expr) -> JaxDagRuntime:
     input_names: list[str] = []
     out = _compile_node(expr, memo, nodes, input_names)
     stateful_node_ids = tuple(i for i, node in enumerate(nodes) if node.op.stateful)
-    program = DagProgram(nodes=tuple(nodes), outputs=(out,), input_names=tuple(input_names), stateful_node_ids=stateful_node_ids)
+    stateful_pos = {nid: i for i, nid in enumerate(stateful_node_ids)}
+    stateful_pos_by_node = tuple(stateful_pos.get(i, -1) for i in range(len(nodes)))
+    program = DagProgram(nodes=tuple(nodes), outputs=(out,), input_names=tuple(input_names), stateful_node_ids=stateful_node_ids, stateful_pos_by_node=stateful_pos_by_node)
     return JaxDagRuntime(program=program)
