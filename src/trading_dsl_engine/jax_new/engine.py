@@ -13,10 +13,13 @@ from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, parse
 from trading_dsl_engine.jax_new.ops import (
     EwmOp,
     EmptyState,
+    FfillOp,
     InputOp,
     LiteralOp,
     Op,
     OP_FACTORIES,
+    RollingQuantileOp,
+    ShiftOp,
     state_value,
 )
 
@@ -82,6 +85,15 @@ def _build_op(expr: Call) -> tuple[Op, int | None]:
     fn = expr.fn
     if fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
+    if fn == "shift" and len(expr.args) in (2, 3):
+        max_size_expr = expr.args[2] if len(expr.args) == 3 else expr.args[1]
+        if not isinstance(max_size_expr, Number):
+            raise ValueError("shift requires literal max_size in jax_new")
+        return ShiftOp(max_size=max(1, int(max_size_expr.value))), None
+    if fn == "rolling_quantile" and len(expr.args) == 3 and isinstance(expr.args[1], Number):
+        return RollingQuantileOp(window=max(1, int(expr.args[1].value))), None
+    if fn == "ffill" and len(expr.args) == 2:
+        return FfillOp(), None
     builder = OP_FACTORIES.get((fn, len(expr.args)))
     if builder is None:
         raise ValueError(f"Unsupported function {expr.fn}/{len(expr.args)} in jax_new")

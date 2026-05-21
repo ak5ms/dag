@@ -36,6 +36,14 @@ Priorities, in order:
 - JAX + Equinox backend: `src/trading_dsl_engine/jax/`
 - Numba behavior/performance regression tests: `tests/numba/`
 - JAX correspondence regression tests: `tests/jax/`
+- `jax_new` migration/parity tests: `tests/jax_new/`
+
+### JAX migration policy
+
+- Keep `src/trading_dsl_engine/jax_new/` implementations distinct from `src/trading_dsl_engine/jax/`.
+- Do not route `jax_new` operator execution/compilation through the legacy `jax` engine as a fallback path.
+- When adding operator support in `jax_new`, port semantics directly into `jax_new` and keep parity tests in `tests/jax_new/`.
+- Goal: `jax_new` deprecates `jax` once feature parity and performance targets are met.
 
 ## Performance guardrails
 
