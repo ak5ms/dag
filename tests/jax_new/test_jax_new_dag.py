@@ -33,3 +33,27 @@ def test_jax_new_supports_unary_binary_where_and_cumsum():
     assert out1.shape == (3, 1)
     assert out2.shape == (3, 1)
     assert jnp.isfinite(out2[0, 0])
+
+def test_jax_new_stateless_batch_uses_no_scan_carry():
+    runtime = compile_formula("xs_rank(close)")
+    state0 = runtime.init_state(4)
+    close = jnp.arange(20.0).reshape(5, 4)
+    state1, out = runtime.run_batch(state0, (close,))
+    assert out.shape == (5, 4, 1)
+    assert jnp.all(out[:, :, 0] == jnp.sort(close, axis=1))
+    jaxpr = jax.make_jaxpr(runtime.run_batch)(state0, (close,))
+    txt = str(jaxpr)
+    assert "scan[" not in txt
+
+
+def test_jax_new_mixed_formula_scan_carries_only_stateful_nodes():
+    runtime = compile_formula("ewm(xs_rank(add(close, open)), 21)")
+    state0 = runtime.init_state(4)
+    close = jnp.arange(20.0).reshape(5, 4)
+    open_ = jnp.arange(20.0, 40.0).reshape(5, 4)
+    _, out = runtime.run_batch(state0, (close, open_))
+    assert out.shape == (5, 4, 1)
+    jaxpr = jax.make_jaxpr(runtime.run_batch)(state0, (close, open_))
+    txt = str(jaxpr)
+    assert "scan[" in txt
+    assert "num_carry=2" in txt

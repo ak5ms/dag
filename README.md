@@ -115,6 +115,9 @@ out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_p
 
 The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby((...)).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, canonical tuple-key groupby `groupby((...), lhs, op_using_self_)` (including optional `univ(...)` inside the key tuple), and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
 
+`trading_dsl_engine.jax_new` now applies two batch-lowering optimizations for scan-heavy formulas: (1) fully stateless formulas bypass `lax.scan` and execute with a row-vectorized path that reuses single-row evaluation logic, and (2) mixed formulas carry only stateful node state through scan (compact carry), while stateless intermediates are recomputed or vectorized outside carry paths to reduce loop-state tuple overhead.
+
+
 ## Development quickstart
 
 ```bash
