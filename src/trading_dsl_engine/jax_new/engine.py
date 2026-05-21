@@ -79,10 +79,10 @@ class JaxDagRuntime(eqx.Module):
 
 
 def _format_output(value, output_kind: str):
-    if output_kind == "vector":
-        return value[:, None]
-    if output_kind == "scalar":
-        return value.reshape(1, 1) if value.ndim == 0 else value
+    # if output_kind == "vector":
+    #     return value[:, None]
+    # if output_kind == "scalar":
+    #     return value.reshape(1, 1) if value.ndim == 0 else value
     return value
 
 @eqx.filter_jit

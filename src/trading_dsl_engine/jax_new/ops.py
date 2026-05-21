@@ -167,11 +167,6 @@ def _xstd(x):
     return jnp.where(valid, z, jnp.nan)
 
 def _xs_rank(x):
-    """NaN-masked cross-sectional percentile rank for a 1D vector.
-
-    Tie semantics match the historical JAX backend: ties map to the
-    right-edge rank (equivalent to searchsorted(..., side="right")).
-    """
     valid = jnp.isfinite(x)
     n_valid = jnp.sum(valid).astype(jnp.int32)
     compact = jnp.where(valid, x, jnp.inf)
