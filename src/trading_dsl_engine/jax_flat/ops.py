@@ -13,16 +13,26 @@ class Op:
     output_kind: str = "vector"
     is_stateful: bool = False
 
-    def state_spec(self, sample: jax.Array) -> tuple[tuple[str, jax.Array], ...]:
-        return ()
+    def init_state(self, sample: jax.Array):
+        return None
 
-    def lower_stream_step(
-        self,
-        child_values: tuple[jax.Array, ...],
-        state_fields: tuple[jax.Array, ...],
-    ) -> tuple[tuple[jax.Array, ...], jax.Array]:
-        del child_values, state_fields
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state, child_values
         raise NotImplementedError
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class EwmState:
+    value: jax.Array
+    initialized: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class CumsumState:
+    value: jax.Array
+    initialized: jax.Array
 
 
 @dataclass(frozen=True)
@@ -41,9 +51,9 @@ class NaryOp(Op):
     fn: Callable[..., jax.Array]
     output_kind: str = "vector"
 
-    def lower_stream_step(self, child_values, state_fields):
-        del state_fields
-        return (), self.fn(*child_values)
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        return None, self.fn(*child_values)
 
 
 @dataclass(frozen=True)
@@ -52,22 +62,19 @@ class EwmOp(Op):
     output_kind: str = "vector"
     is_stateful: bool = True
 
-    def state_spec(self, sample: jax.Array):
-        return (
-            ("value", jnp.zeros_like(sample)),
-            ("initialized", jnp.zeros_like(sample, dtype=bool)),
-        )
+    def init_state(self, sample: jax.Array):
+        return EwmState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
 
-    def lower_stream_step(self, child_values, state_fields):
+    def tick(self, state: EwmState, *child_values: jax.Array):
         x = child_values[0]
-        value, initialized = state_fields
+        value, initialized = state.value, state.initialized
         alpha = 2.0 / (self.span + 1.0)
         valid = jnp.isfinite(x)
         init_or_valid = initialized | valid
         blended = alpha * x + (1.0 - alpha) * value
         out = jnp.where(initialized, blended, x)
         out = jnp.where(init_or_valid, jnp.where(valid, out, value), jnp.nan)
-        return (out, init_or_valid), out
+        return EwmState(value=out, initialized=init_or_valid), out
 
 
 @dataclass(frozen=True)
@@ -75,21 +82,18 @@ class CumsumOp(Op):
     output_kind: str = "vector"
     is_stateful: bool = True
 
-    def state_spec(self, sample: jax.Array):
-        return (
-            ("value", jnp.zeros_like(sample)),
-            ("initialized", jnp.zeros_like(sample, dtype=bool)),
-        )
+    def init_state(self, sample: jax.Array):
+        return CumsumState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
 
-    def lower_stream_step(self, child_values, state_fields):
+    def tick(self, state: CumsumState, *child_values: jax.Array):
         x = child_values[0]
-        value, initialized = state_fields
+        value, initialized = state.value, state.initialized
         valid = jnp.isfinite(x)
         init_or_valid = initialized | valid
         prev = jnp.where(initialized, value, 0.0)
         accum = prev + jnp.where(valid, x, 0.0)
         out = jnp.where(init_or_valid, jnp.where(valid, accum, value), jnp.nan)
-        return (out, init_or_valid), out
+        return CumsumState(value=out, initialized=init_or_valid), out
 
 
 def _nan_cmp(a, b, pred):

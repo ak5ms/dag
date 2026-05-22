@@ -19,8 +19,7 @@ class DagNode:
 
 @dataclass(frozen=True)
 class StateFieldRef:
-    start: int
-    size: int
+    index: int
 
 
 @dataclass(frozen=True)
@@ -42,13 +41,12 @@ class JaxFlatRuntime(eqx.Module):
 
     def init_state(self, n_instruments: int):
         sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
-        leaves = []
+        states = []
         for node in self.program.nodes:
             if not node.op.is_stateful:
                 continue
-            for _, init_leaf in node.op.state_spec(sample):
-                leaves.append(init_leaf)
-        return tuple(leaves)
+            states.append(node.op.init_state(sample))
+        return tuple(states)
 
     def tick_stream(self, state_leaves, *input_rows):
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
@@ -65,11 +63,10 @@ class JaxFlatRuntime(eqx.Module):
 
             child_values = tuple(values[cid] for cid in node.child_ids)
             field = self.program.state_layout.node_fields[idx]
-            state_fields = tuple(state_leaves[field.start + k] for k in range(field.size))
-            next_fields, value = op.lower_stream_step(child_values, state_fields)
-            if field.size:
-                for k in range(field.size):
-                    new_state[field.start + k] = next_fields[k]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.tick(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
             values[idx] = value
 
         outs = tuple(values[i] for i in self.program.outputs)
@@ -129,11 +126,10 @@ def _build_state_layout(nodes: tuple[DagNode, ...], sample: jax.Array) -> StateL
     offset = 0
     for node in nodes:
         if node.op.is_stateful:
-            size = len(node.op.state_spec(sample))
-            refs.append(StateFieldRef(start=offset, size=size))
-            offset += size
+            refs.append(StateFieldRef(index=offset))
+            offset += 1
         else:
-            refs.append(StateFieldRef(start=offset, size=0))
+            refs.append(StateFieldRef(index=-1))
     return StateLayout(node_fields=tuple(refs), total_leaves=offset)
 
 

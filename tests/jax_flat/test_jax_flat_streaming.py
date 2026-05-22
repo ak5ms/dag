@@ -7,7 +7,7 @@ from trading_dsl_engine.jax_flat.engine import compile_formula
 def test_jax_flat_streaming_state_layout_and_natural_rank_output():
     runtime = compile_formula("ewm(xs_sort(add(close, open)), 21)")
     state0 = runtime.init_state(4)
-    assert len(state0) == 2
+    assert len(state0) == 1
 
     open_row = jnp.array([10.0, 20.0, 30.0, 40.0])
     close_row = jnp.array([11.0, 19.0, 31.0, 39.0])
