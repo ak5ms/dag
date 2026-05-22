@@ -48,7 +48,7 @@ class JaxFlatRuntime(eqx.Module):
             states.append(node.op.init_state(sample))
         return tuple(states)
 
-    def tick_stream(self, state_leaves, *input_rows):
+    def tick(self, state_leaves, *input_rows):
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
         new_state = list(state_leaves)
 
@@ -72,9 +72,23 @@ class JaxFlatRuntime(eqx.Module):
         outs = tuple(values[i] for i in self.program.outputs)
         return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
-    def tick(self, state_leaves, *input_rows):
-        return self.tick_stream(state_leaves, *input_rows)
+    def run_batch(self, inputs, states=None):
+        if not inputs:
+            raise ValueError("run_batch requires at least one input array")
+        n_steps = inputs[0].shape[0]
+        for arr in inputs[1:]:
+            if arr.shape[0] != n_steps:
+                raise ValueError("All inputs must have identical timestep length")
+        if not states:
+            state0 = self.init_state(inputs[0].shape[1])
+        else:
+            state0 = states
 
+        def step(states, rows):
+            return self.tick(states, *rows)
+
+        out = jax.lax.scan(step, state0, xs=inputs)
+        return out
 
 def _expr_key(node: Expr):
     if isinstance(node, Identifier):
@@ -217,7 +231,7 @@ def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
 
 @eqx.filter_jit
 def jit_tick_stream(runtime: JaxFlatRuntime, state_leaves, *input_rows):
-    return runtime.tick_stream(state_leaves, *input_rows)
+    return runtime.tick(state_leaves, *input_rows)
 
 
 @eqx.filter_jit

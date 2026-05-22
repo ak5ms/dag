@@ -30,5 +30,5 @@ def test_jax_flat_rejects_noncanonical_groupby_arity():
 def test_jax_flat_accepts_canonical_groupby_node_shape_for_lowering_path():
     runtime = compile_formula("groupby((key,), x, cumsum(self_))")
     state = runtime.init_state(1)
-    _, out = runtime.tick_stream(state, jnp.array([1.0]), jnp.array([2.0]))
+    _, out = runtime.tick(state, jnp.array([1.0]), jnp.array([2.0]))
     assert out.shape == (1,)
