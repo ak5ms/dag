@@ -35,12 +35,6 @@ class CumsumState:
     initialized: jax.Array
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class GroupbyState:
-    by_key: dict[tuple[float | str, ...], Any]
-
-
 @dataclass(frozen=True)
 class InputOp(Op):
     input_index: int
@@ -102,103 +96,6 @@ class CumsumOp(Op):
         return CumsumState(value=out, initialized=init_or_valid), out
 
 
-def _normalize_key(raw_key: tuple[float, ...]) -> tuple[float | str, ...]:
-    return tuple("__nan__" if jnp.isnan(v) else v for v in raw_key)
-
-
-def _concat_rows(rows: list[Any]):
-    first = rows[0]
-    if isinstance(first, jax.Array):
-        return jnp.concatenate([jnp.asarray(r) for r in rows], axis=0)
-    if hasattr(first, "__dataclass_fields__"):
-        return jax.tree_util.tree_map(lambda *vals: jnp.concatenate([jnp.asarray(v) for v in vals], axis=0), *rows)
-    return rows
-
-
-@dataclass(frozen=True)
-class GroupbyOp(Op):
-    inner_op: Op
-    n_keys: int
-    universe_groups: tuple[tuple[int, ...], ...] = ()
-    output_kind: str = "vector"
-    is_stateful: bool = True
-
-    def init_state(self, sample: jax.Array):
-        return GroupbyState(by_key={})
-
-    def _group_by_col(self, width: int):
-        if not self.universe_groups:
-            return None
-        group_by_col = jnp.full((width,), -1, dtype=jnp.int32)
-        for gid, cols in enumerate(self.universe_groups):
-            for c in cols:
-                if 0 <= c < width:
-                    group_by_col[c] = gid
-        return group_by_col
-
-    def tick(self, state: GroupbyState, *child_values: jax.Array):
-        key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
-        args_np = tuple(jnp.asarray(v) for v in child_values[self.n_keys :])
-        n = int(args_np[0].shape[0])
-        group_by_col = self._group_by_col(n)
-
-        # Build stable Python hash keys once, then process in key-buckets.
-        keys: list[tuple[float | str, ...]] = []
-        for i in range(n):
-            raw_key = tuple(float(col[i]) for col in key_cols)
-            if group_by_col is not None:
-                raw_key = (float(group_by_col[i]),) + raw_key
-            keys.append(_normalize_key(raw_key))
-
-        by_key = dict(state.by_key)
-        out_buffer = None
-
-        unique_order: list[tuple[float | str, ...]] = []
-        slot_map: dict[tuple[float | str, ...], list[int]] = {}
-        for i, key in enumerate(keys):
-            if key not in slot_map:
-                slot_map[key] = []
-                unique_order.append(key)
-            slot_map[key].append(i)
-
-        for key in unique_order:
-            slots = jnp.asarray(slot_map[key], dtype=jnp.int32)
-            prev_state = by_key.get(key)
-            group_args = tuple(jnp.asarray(a[slots]) if getattr(a, "ndim", 0) > 0 else jnp.asarray(a) for a in args_np)
-            next_state = prev_state
-            group_rows: list[Any] = []
-            # Keep generic semantics identical to per-row ticking but reduce global overhead.
-            for r in range(group_args[0].shape[0]):
-                row_args = tuple(ga[r : r + 1] if getattr(ga, "ndim", 0) > 0 else ga for ga in group_args)
-                if next_state is None and self.inner_op.is_stateful:
-                    next_state = self.inner_op.init_state(row_args[0])
-                next_state, row_out = self.inner_op.tick(next_state, *row_args)
-                group_rows.append(row_out)
-            by_key[key] = next_state
-            group_out = _concat_rows(group_rows)
-
-            if out_buffer is None:
-                if isinstance(group_out, jax.Array):
-                    out_buffer = jnp.full((n,) + group_out.shape[1:], jnp.nan, dtype=group_out.dtype)
-                elif hasattr(group_out, "__dataclass_fields__"):
-                    out_buffer = jax.tree_util.tree_map(
-                        lambda leaf: jnp.full((n,) + leaf.shape[1:], jnp.nan, dtype=leaf.dtype),
-                        group_out,
-                    )
-                else:
-                    out_buffer = [None] * n
-
-            if isinstance(out_buffer, jax.Array):
-                out_buffer = out_buffer.at[slots].set(group_out)
-            elif hasattr(group_out, "__dataclass_fields__"):
-                out_buffer = jax.tree_util.tree_map(lambda dst, src: dst.at[slots].set(src), out_buffer, group_out)
-            else:
-                for pos, slot in enumerate(slots.tolist()):
-                    out_buffer[slot] = group_out[pos]
-
-        return GroupbyState(by_key=by_key), out_buffer
-
-
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
 
@@ -245,3 +142,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[[], Op]] = {
     ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l)),
     ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f)),
 }
+
+from trading_dsl_engine.jax_flat.ops_groupby import *
+
+__all__ = ["GroupByOp"]

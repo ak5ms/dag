@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
-from trading_dsl_engine.jax_flat.ops import CumsumOp, EwmOp, GroupbyOp, InputOp, LiteralOp, OP_FACTORIES, Op
+from trading_dsl_engine.jax_flat.ops import EwmOp, InputOp, LiteralOp, OP_FACTORIES, Op, GroupByOp
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,7 @@ def _build_op(expr: Call) -> tuple[Op, int | None]:
             raise ValueError("groupby rhs must be a call expression")
         inner_op, _ = _build_op(rhs)
         universe_groups = _resolve_universe_groups(universe_items[0]) if universe_items else ()
-        return GroupbyOp(inner_op=inner_op, n_keys=len(dynamic_items), universe_groups=universe_groups), None
+        return GroupByOp(inner_op=inner_op, n_keys=len(dynamic_items), universe_groups=universe_groups), None
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))

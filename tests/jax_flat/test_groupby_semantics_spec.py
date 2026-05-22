@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import pytest
 
 from trading_dsl_engine.jax_flat.engine import compile_formula
-from trading_dsl_engine.jax_flat.ops import GroupbyOp, Op
+from trading_dsl_engine.jax_flat.ops import GroupByOp, Op
 
 
 def test_groupby_contract_requires_canonical_three_arg_form():
@@ -32,12 +32,62 @@ def test_groupby_contract_accepts_arbitrary_tuple_key_length():
 
 
 def test_groupby_contract_allows_single_univ_in_tuple_key():
-    runtime = compile_formula("groupby((univ([0, 1]), ts), close, cumsum(self_))")
-    state = runtime.init_state(2)
-    state, out1 = runtime.tick(state, jnp.array([1.0, 1.0]), jnp.array([10.0, 20.0]))
-    state, out2 = runtime.tick(state, jnp.array([1.0, 2.0]), jnp.array([1.0, 2.0]))
-    assert jnp.allclose(out1, jnp.array([10.0, 30.0]), equal_nan=True)
-    assert jnp.allclose(out2, jnp.array([31.0, 2.0]), equal_nan=True)
+    formula = "groupby((univ([0, 1]), ts), close, cumsum(self_))"
+
+    close = jnp.array([
+        [10., 20.],
+        [1.,  2.],
+        [20., 30.],
+        [jnp.nan, jnp.nan],
+    ])
+    ts = jnp.array([
+        [1., 1.],
+        [1., 2.],
+        [2., 1.],
+        [2., 2.],
+    ])
+
+    runtime = compile_formula(formula)
+    state, out = runtime.run_batch((ts, close))
+
+    desired = jnp.array([
+         [10., 20.],
+         [11., 2. ],
+         [20., 50.],
+         [20., 2. ],
+    ])
+    assert jnp.allclose(out, desired)
+
+def test_groupby_nested_op():
+    formula = "groupby((univ([0, 1]), ts / 1 * 3), close, cumsum(cumsum(self_),))"
+
+    close = jnp.array([
+        [10., 20.],
+        [1.,  2. ],
+        [20., 30.],
+        [jnp.nan, jnp.nan],
+    ])
+    ts = jnp.array([
+        [1., 1.],
+        [1., 2.],
+        [2., 1.],
+        [2., 2.],
+    ])
+
+    runtime = compile_formula(formula)
+    state, out = runtime.run_batch((ts, close))
+    from trading_dsl_engine.numba.engine import build_engine, run_batch_from_mapping
+    eng = build_engine(formula)
+    out = run_batch_from_mapping(eng, data={"close": close, "ts": ts}, out_path=None)
+
+    desired = jnp.array([
+         [10., 20.],
+         [21., 2. ],
+         [20., 70.],
+         [20, 2.  ],
+    ])
+
+    assert jnp.allclose(out, desired)
 
 
 def test_groupby_contract_rejects_multiple_univ_in_tuple_key():
@@ -82,7 +132,7 @@ class _DummyObjOp(Op):
 
 
 def test_groupby_contract_supports_dataclass_outputs_in_grouped_apply_op():
-    op = GroupbyOp(inner_op=_DummyObjOp(), n_keys=1)
+    op = GroupByOp(inner_op=_DummyObjOp(), n_keys=1)
     state = op.init_state(jnp.array([0.0]))
     state, out = op.tick(state, jnp.array([1.0, jnp.nan, 1.0]), jnp.array([2.0, 3.0, 4.0]))
     assert jnp.allclose(out.a, jnp.array([2.0, 3.0, 5.0]))
