@@ -35,6 +35,12 @@ class CumsumState:
     initialized: jax.Array
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class GroupbyState:
+    by_key: dict[tuple[float | str, ...], Any]
+
+
 @dataclass(frozen=True)
 class InputOp(Op):
     input_index: int
@@ -96,50 +102,37 @@ class CumsumOp(Op):
         return CumsumState(value=out, initialized=init_or_valid), out
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class GroupbyScalarApplyState:
-    by_key: dict[tuple[float | str, ...], Any]
-
-
-def _normalize_key_tuple(raw_key: tuple[float, ...]) -> tuple[float | str, ...]:
+def _normalize_key(raw_key: tuple[float, ...]) -> tuple[float | str, ...]:
     return tuple("__nan__" if jnp.isnan(v) else v for v in raw_key)
 
 
-
-
-def _concat_group_outputs(rows: list[Any]):
-    if not rows:
-        return jnp.asarray([], dtype=jnp.float64)
+def _concat_rows(rows: list[Any]):
     first = rows[0]
     if isinstance(first, jax.Array):
         return jnp.concatenate([jnp.asarray(r) for r in rows], axis=0)
     if hasattr(first, "__dataclass_fields__"):
-        return jax.tree_util.tree_map(
-            lambda *vals: jnp.concatenate([jnp.asarray(v) for v in vals], axis=0),
-            *rows,
-        )
+        return jax.tree_util.tree_map(lambda *vals: jnp.concatenate([jnp.asarray(v) for v in vals], axis=0), *rows)
     return rows
 
 
 @dataclass(frozen=True)
-class GroupbyScalarApplyOp(Op):
+class GroupbyOp(Op):
     inner_op: Op
     n_keys: int
     output_kind: str = "vector"
     is_stateful: bool = True
 
     def init_state(self, sample: jax.Array):
-        return GroupbyScalarApplyState(by_key={})
+        return GroupbyState(by_key={})
 
-    def tick(self, state: GroupbyScalarApplyState, *child_values: jax.Array):
+    def tick(self, state: GroupbyState, *child_values: jax.Array):
         key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
         args = tuple(jnp.asarray(v) for v in child_values[self.n_keys :])
         by_key = dict(state.by_key)
-        n = int(args[0].shape[0])
         out_rows: list[Any] = []
+        n = int(args[0].shape[0])
         for i in range(n):
-            key = _normalize_key_tuple(tuple(float(col[i]) for col in key_cols))
+            key = _normalize_key(tuple(float(col[i]) for col in key_cols))
             prev_state = by_key.get(key)
             row_args = tuple(a[i : i + 1] if a.ndim > 0 else a for a in args)
             if prev_state is None and self.inner_op.is_stateful:
@@ -147,7 +140,7 @@ class GroupbyScalarApplyOp(Op):
             next_state, row_out = self.inner_op.tick(prev_state, *row_args)
             by_key[key] = next_state
             out_rows.append(row_out)
-        return GroupbyScalarApplyState(by_key=by_key), _concat_group_outputs(out_rows)
+        return GroupbyState(by_key=by_key), _concat_rows(out_rows)
 
 
 def _nan_cmp(a, b, pred):

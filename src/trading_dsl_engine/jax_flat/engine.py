@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
-from trading_dsl_engine.jax_flat.ops import CumsumOp, EwmOp, GroupbyScalarApplyOp, InputOp, LiteralOp, OP_FACTORIES, Op
+from trading_dsl_engine.jax_flat.ops import CumsumOp, EwmOp, GroupbyOp, InputOp, LiteralOp, OP_FACTORIES, Op
 
 
 @dataclass(frozen=True)
@@ -90,24 +90,18 @@ def _expr_key(node: Expr):
     raise ValueError(f"Unsupported expression: {node}")
 
 
-
-
 def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
     if not isinstance(key, KeyTuple):
         key = KeyTuple((key,))
-    universe_count = sum(1 for item in key.items if isinstance(item, Universe))
-    if universe_count > 1:
+    if sum(1 for item in key.items if isinstance(item, Universe)) > 1:
         raise ValueError("groupby key tuple may contain at most one univ(...) element")
     return key.items
 
 
 def _validate_groupby_canonical_form(expr: Call) -> None:
     if len(expr.args) != 3:
-        raise ValueError(
-            "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
-        )
+        raise ValueError("groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)")
     _canonical_groupby_key_items(expr.args[0])
-
 
 
 def _replace_self(node: Expr, lhs: Expr) -> Expr:
@@ -124,13 +118,13 @@ def _build_op(expr: Call) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         _validate_groupby_canonical_form(expr)
         key_items = _canonical_groupby_key_items(expr.args[0])
-        rhs = expr.args[2]
         if any(isinstance(item, Universe) for item in key_items):
             raise ValueError("groupby form is valid but not implemented in jax_flat runtime yet")
+        rhs = expr.args[2]
         if not isinstance(rhs, Call):
             raise ValueError("groupby rhs must be a call expression")
         inner_op, _ = _build_op(rhs)
-        return GroupbyScalarApplyOp(inner_op=inner_op, n_keys=len(key_items)), None
+        return GroupbyOp(inner_op=inner_op, n_keys=len(key_items)), None
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
