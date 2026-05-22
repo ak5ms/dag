@@ -5,7 +5,6 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
@@ -130,7 +129,7 @@ class GroupbyOp(Op):
     def _group_by_col(self, width: int):
         if not self.universe_groups:
             return None
-        group_by_col = np.full((width,), -1, dtype=np.int32)
+        group_by_col = jnp.full((width,), -1, dtype=jnp.int32)
         for gid, cols in enumerate(self.universe_groups):
             for c in cols:
                 if 0 <= c < width:
@@ -138,8 +137,8 @@ class GroupbyOp(Op):
         return group_by_col
 
     def tick(self, state: GroupbyState, *child_values: jax.Array):
-        key_cols = tuple(np.asarray(child_values[i]) for i in range(self.n_keys))
-        args_np = tuple(np.asarray(v) for v in child_values[self.n_keys :])
+        key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
+        args_np = tuple(jnp.asarray(v) for v in child_values[self.n_keys :])
         n = int(args_np[0].shape[0])
         group_by_col = self._group_by_col(n)
 
@@ -163,7 +162,7 @@ class GroupbyOp(Op):
             slot_map[key].append(i)
 
         for key in unique_order:
-            slots = np.asarray(slot_map[key], dtype=np.int32)
+            slots = jnp.asarray(slot_map[key], dtype=jnp.int32)
             prev_state = by_key.get(key)
             group_args = tuple(jnp.asarray(a[slots]) if getattr(a, "ndim", 0) > 0 else jnp.asarray(a) for a in args_np)
             next_state = prev_state

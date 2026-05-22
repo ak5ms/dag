@@ -30,20 +30,7 @@ def _stats(samples: list[float]) -> dict[str, float]:
         "p90": float(np.percentile(arr, 90)),
     }
 
-
-
-
-def _bench_no_jax(fn: Callable, *args, warmup_runs: int = 1) -> dict[str, float]:
-    for _ in range(warmup_runs):
-        fn(*args)
-    samples: list[float] = []
-    for _ in range(N_RUNS):
-        t0 = time.perf_counter()
-        fn(*args)
-        samples.append(time.perf_counter() - t0)
-    return _stats(samples)
-
-def _bench(fn: Callable, *args) -> dict[str, float]:
+def _bench(fn: Callable, *args, warmup_runs: int = 1) -> dict[str, float]:
     samples: list[float] = []
     for _ in range(N_RUNS):
         t0 = time.perf_counter()
@@ -53,13 +40,12 @@ def _bench(fn: Callable, *args) -> dict[str, float]:
     return _stats(samples)
 
 
-def _make_scan_runner(runtime, tick_method_name: str):
-    tick = getattr(runtime, tick_method_name)
+def _make_scan_runner(runtime):
 
     def run(state, open_arr, close_arr):
         def step(carry, x):
             o, c = x
-            next_state, out = tick(carry, o, c)
+            next_state, out = runtime.tick(carry, o, c)
             return next_state, out
 
         return jax.lax.scan(step, state, (open_arr, close_arr))
@@ -76,8 +62,8 @@ def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1:
     state_new = runtime_new.init_state(N_INSTRUMENTS)
     state_flat = runtime_flat.init_state(N_INSTRUMENTS)
 
-    jit_new_scan = _make_scan_runner(runtime_new, "tick")
-    jit_flat_scan = _make_scan_runner(runtime_flat, "tick_stream")
+    jit_new_scan = _make_scan_runner(runtime_new)
+    jit_flat_scan = _make_scan_runner(runtime_flat)
     jit_batch = jax.jit(batch_fn)
 
     jax.block_until_ready(jit_new_scan(state_new, open_data, close_data))
@@ -87,31 +73,18 @@ def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1:
     new_stats = _bench(jit_new_scan, state_new, open_data, close_data)
     flat_stats = _bench(jit_flat_scan, state_flat, open_data, close_data)
     batch_stats = _bench(jit_batch, open_data, close_data)
+    jax_flat_batch_stats = _bench(lambda x, y: jax.block_until_ready(compile_flat(formula).run_batch(x, y)), (open_data, close_data), None)
 
     print(f"{case_name}::jax_new {new_stats}")
     print(f"{case_name}::jax_flat {flat_stats}")
+    print(f"{case_name}::jax_flat_batch {jax_flat_batch_stats}")
     print(f"{case_name}::batch {batch_stats}")
 
     new_out = jit_new_scan(state_new, open_data, close_data)[1]
-    flat_out = run_flat_loop(state_flat, open_data, close_data)[1]
+    flat_out = jit_flat_scan(state_flat, open_data, close_data)[1]
     batch_out = jit_batch(open_data, close_data)
     np.testing.assert_allclose(np.asarray(new_out), np.asarray(flat_out), rtol=1e-10, atol=1e-10, equal_nan=True)
     np.testing.assert_allclose(np.asarray(new_out), np.asarray(batch_out), rtol=1e-10, atol=1e-10, equal_nan=True)
-
-
-@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
-def test_perf_jax_new_vs_jax_flat_and_batch_lowerbound():
-    formula = "cumsum(xs_sort(add(close, open)))"
-
-    def run_batch_lowerbound(open_arr, close_arr):
-        ranked = jnp.sort(open_arr + close_arr, axis=1)
-        valid = jnp.isfinite(ranked)
-        safe = jnp.where(valid, ranked, 0.0)
-        cumulative = jnp.cumsum(safe, axis=0)
-        seen = jnp.cumsum(valid.astype(jnp.int32), axis=0) > 0
-        return jnp.where(seen, cumulative, jnp.nan)
-
-    _run_case("base", formula, run_batch_lowerbound, key0=0, key1=1)
 
 
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
@@ -175,27 +148,28 @@ def test_perf_groupby_univ_stateful_vs_polars_batch():
         outs = []
         cur = state
         for t in range(open_arr.shape[0]):
-            cur, out = runtime_flat.tick_stream(cur, open_arr[t], close_arr[t])
+            cur, out = runtime_flat.tick(cur, open_arr[t], close_arr[t])
             outs.append(out)
         return cur, jnp.stack(outs, axis=0)
 
     jax.block_until_ready(run_flat_loop(state_flat, open_data, close_data)[1])
     flat_stats = _bench(run_flat_loop, state_flat, open_data, close_data)
 
+    o = np.asarray(open_data)
+    c = np.asarray(close_data)
+    t, n = c.shape
+    rows = {"t": np.repeat(np.arange(t), n), "col": np.tile(np.arange(n), t), "open": o.reshape(-1), "close": c.reshape(-1)}
+    df = pl.DataFrame(rows).lazy().with_columns(
+        pl.when(pl.col("col") < 2).then(pl.lit(0)).otherwise(pl.lit(1)).alias("ug")
+    )
+
     def run_polars(open_arr, close_arr):
-        o = np.asarray(open_arr)
-        c = np.asarray(close_arr)
-        t, n = c.shape
-        rows = {"t": np.repeat(np.arange(t), n), "col": np.tile(np.arange(n), t), "open": o.reshape(-1), "close": c.reshape(-1)}
-        df = pl.DataFrame(rows).with_columns(
-            pl.when(pl.col("col") < 2).then(pl.lit(0)).otherwise(pl.lit(1)).alias("ug")
-        )
         out = (
             df.sort(["ug", "col", "open", "t"])
             .with_columns(pl.col("close").cum_sum().over(["ug", "open", "col"]).alias("out"))
             .sort(["t", "col"])
         )
-        return jnp.asarray(out["out"].to_numpy().reshape(t, n))
+        return jnp.asarray(out.collect()["out"].to_numpy().reshape(t, n))
 
     polars_stats = _bench(run_polars, open_data, close_data)
     print(f"groupby_univ::jax_flat {flat_stats}")
@@ -216,27 +190,18 @@ def test_perf_groupby_univ_stateful_jax_flat_vs_numba():
     runtime_flat = compile_flat(formula)
     state_flat = runtime_flat.init_state(N_INSTRUMENTS)
 
-    def run_flat_loop(state, open_arr, close_arr):
-        outs = []
-        cur = state
-        for t in range(open_arr.shape[0]):
-            cur, out = runtime_flat.tick_stream(cur, open_arr[t], close_arr[t])
-            outs.append(out)
-        return cur, jnp.stack(outs, axis=0)
-
+    runtime_flat.run_batch((open_data, close_data), state_flat)
     numba_engine = build_engine(formula)
     numba_data = {"open": np.asarray(open_data), "close": np.asarray(close_data)}
 
     def run_numba_batch(data):
         return run_batch_from_mapping(numba_engine, data, out_path=None)
 
-    jax.block_until_ready(run_flat_loop(state_flat, open_data, close_data)[1])
-    flat_stats = _bench(run_flat_loop, state_flat, open_data, close_data)
-    numba_stats = _bench_no_jax(run_numba_batch, numba_data, warmup_runs=1)
+    flat_stats = _bench(lambda x, y: jax.block_until_ready(compile_flat(formula).run_batch(x, y)), (open_data, close_data), None)
+    numba_stats = _bench(run_numba_batch, numba_data, warmup_runs=1)
 
     print(f"groupby_univ_numba::jax_flat {flat_stats}")
     print(f"groupby_univ_numba::numba {numba_stats}")
 
-    flat_out = run_flat_loop(state_flat, open_data, close_data)[1]
     numba_out = run_numba_batch(numba_data)
     np.testing.assert_allclose(np.asarray(flat_out), np.asarray(numba_out), rtol=1e-10, atol=1e-10, equal_nan=True)

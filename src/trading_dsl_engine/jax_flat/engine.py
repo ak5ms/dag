@@ -48,6 +48,7 @@ class JaxFlatRuntime(eqx.Module):
             states.append(node.op.init_state(sample))
         return tuple(states)
 
+    @jax.jit
     def tick(self, state_leaves, *input_rows):
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
         new_state = list(state_leaves)
@@ -84,6 +85,7 @@ class JaxFlatRuntime(eqx.Module):
         else:
             state0 = states
 
+        @jax.jit
         def step(states, rows):
             return self.tick(states, *rows)
 
