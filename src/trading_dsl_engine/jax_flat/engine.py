@@ -7,8 +7,8 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, Number, parse_formula
-from trading_dsl_engine.jax_flat.ops import CumsumOp, EwmOp, InputOp, LiteralOp, OP_FACTORIES, Op
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
+from trading_dsl_engine.jax_flat.ops import CumsumOp, EwmOp, GroupbyScalarApplyOp, InputOp, LiteralOp, OP_FACTORIES, Op
 
 
 @dataclass(frozen=True)
@@ -83,10 +83,54 @@ def _expr_key(node: Expr):
         return ("num", float(node.value))
     if isinstance(node, Call):
         return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
+    if isinstance(node, KeyTuple):
+        return ("tuple", tuple(_expr_key(item) for item in node.items))
+    if isinstance(node, Universe):
+        return ("univ", node.groups)
     raise ValueError(f"Unsupported expression: {node}")
 
 
+
+
+def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
+    if not isinstance(key, KeyTuple):
+        key = KeyTuple((key,))
+    universe_count = sum(1 for item in key.items if isinstance(item, Universe))
+    if universe_count > 1:
+        raise ValueError("groupby key tuple may contain at most one univ(...) element")
+    return key.items
+
+
+def _validate_groupby_canonical_form(expr: Call) -> None:
+    if len(expr.args) != 3:
+        raise ValueError(
+            "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+        )
+    _canonical_groupby_key_items(expr.args[0])
+
+
+
+def _replace_self(node: Expr, lhs: Expr) -> Expr:
+    if isinstance(node, Identifier) and node.name == "self_":
+        return lhs
+    if isinstance(node, Call):
+        return Call(node.fn, tuple(_replace_self(a, lhs) for a in node.args))
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
+    return node
+
+
 def _build_op(expr: Call) -> tuple[Op, int | None]:
+    if expr.fn == "groupby":
+        _validate_groupby_canonical_form(expr)
+        key_items = _canonical_groupby_key_items(expr.args[0])
+        rhs = expr.args[2]
+        if any(isinstance(item, Universe) for item in key_items):
+            raise ValueError("groupby form is valid but not implemented in jax_flat runtime yet")
+        if not isinstance(rhs, Call):
+            raise ValueError("groupby rhs must be a call expression")
+        inner_op, _ = _build_op(rhs)
+        return GroupbyScalarApplyOp(inner_op=inner_op, n_keys=len(key_items)), None
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
@@ -111,7 +155,18 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         nodes.append(DagNode(op=LiteralOp(float(expr.value)), child_ids=()))
         memo[key] = idx
         return idx
-    child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+    if isinstance(expr, Call) and expr.fn == "groupby" and len(expr.args) == 3:
+        key_items = _canonical_groupby_key_items(expr.args[0])
+        rhs = expr.args[2]
+        if all(not isinstance(item, Universe) for item in key_items) and isinstance(rhs, Call):
+            rhs_args = tuple(_replace_self(a, expr.args[1]) for a in rhs.args)
+            child_ids = tuple(_compile_node(k, memo, nodes, input_names) for k in key_items) + tuple(
+                _compile_node(a, memo, nodes, input_names) for a in rhs_args
+            )
+        else:
+            child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+    else:
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
     op, drop_child_idx = _build_op(expr)
     if drop_child_idx is not None:
         child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)

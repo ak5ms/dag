@@ -96,6 +96,44 @@ class CumsumOp(Op):
         return CumsumState(value=out, initialized=init_or_valid), out
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class GroupbyScalarApplyState:
+    by_key: dict[tuple[float | str, ...], Any]
+
+
+def _normalize_key_tuple(raw_key: tuple[float, ...]) -> tuple[float | str, ...]:
+    return tuple("__nan__" if jnp.isnan(v) else v for v in raw_key)
+
+
+@dataclass(frozen=True)
+class GroupbyScalarApplyOp(Op):
+    inner_op: Op
+    n_keys: int
+    output_kind: str = "vector"
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        return GroupbyScalarApplyState(by_key={})
+
+    def tick(self, state: GroupbyScalarApplyState, *child_values: jax.Array):
+        key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
+        args = tuple(jnp.asarray(v) for v in child_values[self.n_keys :])
+        by_key = dict(state.by_key)
+        n = int(args[0].shape[0])
+        out_rows: list[jax.Array] = []
+        for i in range(n):
+            key = _normalize_key_tuple(tuple(float(col[i]) for col in key_cols))
+            prev_state = by_key.get(key)
+            row_args = tuple(a[i : i + 1] if a.ndim > 0 else a for a in args)
+            if prev_state is None and self.inner_op.is_stateful:
+                prev_state = self.inner_op.init_state(row_args[0])
+            next_state, row_out = self.inner_op.tick(prev_state, *row_args)
+            by_key[key] = next_state
+            out_rows.append(jnp.asarray(row_out))
+        return GroupbyScalarApplyState(by_key=by_key), jnp.concatenate(out_rows, axis=0)
+
+
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
 
