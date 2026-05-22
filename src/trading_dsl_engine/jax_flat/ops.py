@@ -106,6 +106,22 @@ def _normalize_key_tuple(raw_key: tuple[float, ...]) -> tuple[float | str, ...]:
     return tuple("__nan__" if jnp.isnan(v) else v for v in raw_key)
 
 
+
+
+def _concat_group_outputs(rows: list[Any]):
+    if not rows:
+        return jnp.asarray([], dtype=jnp.float64)
+    first = rows[0]
+    if isinstance(first, jax.Array):
+        return jnp.concatenate([jnp.asarray(r) for r in rows], axis=0)
+    if hasattr(first, "__dataclass_fields__"):
+        return jax.tree_util.tree_map(
+            lambda *vals: jnp.concatenate([jnp.asarray(v) for v in vals], axis=0),
+            *rows,
+        )
+    return rows
+
+
 @dataclass(frozen=True)
 class GroupbyScalarApplyOp(Op):
     inner_op: Op
@@ -121,7 +137,7 @@ class GroupbyScalarApplyOp(Op):
         args = tuple(jnp.asarray(v) for v in child_values[self.n_keys :])
         by_key = dict(state.by_key)
         n = int(args[0].shape[0])
-        out_rows: list[jax.Array] = []
+        out_rows: list[Any] = []
         for i in range(n):
             key = _normalize_key_tuple(tuple(float(col[i]) for col in key_cols))
             prev_state = by_key.get(key)
@@ -130,8 +146,8 @@ class GroupbyScalarApplyOp(Op):
                 prev_state = self.inner_op.init_state(row_args[0])
             next_state, row_out = self.inner_op.tick(prev_state, *row_args)
             by_key[key] = next_state
-            out_rows.append(jnp.asarray(row_out))
-        return GroupbyScalarApplyState(by_key=by_key), jnp.concatenate(out_rows, axis=0)
+            out_rows.append(row_out)
+        return GroupbyScalarApplyState(by_key=by_key), _concat_group_outputs(out_rows)
 
 
 def _nan_cmp(a, b, pred):
