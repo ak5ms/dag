@@ -76,9 +76,6 @@ def test_groupby_nested_op():
 
     runtime = compile_formula(formula)
     state, out = runtime.run_batch((ts, close))
-    from trading_dsl_engine.numba.engine import build_engine, run_batch_from_mapping
-    eng = build_engine(formula)
-    out = run_batch_from_mapping(eng, data={"close": close, "ts": ts}, out_path=None)
 
     desired = jnp.array([
          [10., 20.],
