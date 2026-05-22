@@ -134,6 +134,7 @@ OP_FACTORIES = {
     ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x)),
     ("xstd", 1): lambda: NaryOp(_xstd),
     ("xs_rank", 1): lambda: NaryOp(_xs_rank),
+    ("xs_sort", 1): lambda: NaryOp(_xs_sort),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar"),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix"),
     ("cumsum", 1): lambda: CumsumOp(),
@@ -175,3 +176,6 @@ def _xs_rank(x):
     ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
     return jnp.where(valid, ranks, jnp.nan)
 
+
+def _xs_sort(x):
+    return jnp.sort(x)

@@ -14,7 +14,7 @@ def test_jax_new_full_graph_cse_reuses_subexpression_node_once():
     open_row = jnp.array([10.0, 20.0, 30.0, 40.0])
     close_row = jnp.array([11.0, 19.0, 31.0, 39.0])
     _, out = runtime.tick(state0, open_row, close_row)
-    assert out.shape == (4, 1)
+    assert out.shape == (4,)
     jaxpr = jax.make_jaxpr(runtime.tick)(state0, open_row, close_row)
     txt = str(jaxpr)
     assert "sqrt" in txt
@@ -30,6 +30,6 @@ def test_jax_new_supports_unary_binary_where_and_cumsum():
     close_row = jnp.array([1.0, 1.0, 4.0])
     state1, out1 = runtime.tick(state0, open_row, close_row)
     _, out2 = runtime.tick(state1, open_row, close_row)
-    assert out1.shape == (3, 1)
-    assert out2.shape == (3, 1)
-    assert jnp.isfinite(out2[0, 0])
+    assert out1.shape == (3,)
+    assert out2.shape == (3,)
+    assert jnp.isfinite(out2[0])
