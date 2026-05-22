@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from trading_dsl_engine.base.dsl import *
 from trading_dsl_engine.jax_flat.engine import compile_formula
 from trading_dsl_engine.jax_flat.ops import GroupByOp, Op
 
@@ -32,7 +33,7 @@ def test_groupby_contract_accepts_arbitrary_tuple_key_length():
 
 
 def test_groupby_contract_allows_single_univ_in_tuple_key():
-    formula = "groupby((univ([0, 1]), ts), close, cumsum(self_))"
+    formula = groupby((univ([0], [1]), var("ts")), var("close"), (cumsum(self_)))
 
     close = jnp.array([
         [10., 20.],
@@ -54,17 +55,17 @@ def test_groupby_contract_allows_single_univ_in_tuple_key():
          [10., 20.],
          [11., 2. ],
          [20., 50.],
-         [20., 2. ],
+         [jnp.nan, jnp.nan ],
     ])
-    assert jnp.allclose(out, desired)
+    assert jnp.allclose(out, desired, equal_nan=True)
 
 def test_groupby_nested_op():
-    formula = "groupby((univ([0, 1]), ts / 1 * 3), close, cumsum(cumsum(self_),))"
+    formula = groupby((univ([0, 1]), var("ts")), var("close"), cumsum(cumsum(self_)))
 
     close = jnp.array([
         [10., 20.],
         [1.,  2. ],
-        [20., 30.],
+        [20., 50.],
         [jnp.nan, jnp.nan],
     ])
     ts = jnp.array([
@@ -80,11 +81,11 @@ def test_groupby_nested_op():
     desired = jnp.array([
          [10., 20.],
          [21., 2. ],
-         [20., 70.],
-         [20, 2.  ],
+         [20., 90.],
+         [jnp.nan, jnp.nan],
     ])
 
-    assert jnp.allclose(out, desired)
+    assert jnp.allclose(out, desired, equal_nan=True)
 
 
 def test_groupby_contract_rejects_multiple_univ_in_tuple_key():

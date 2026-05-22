@@ -110,21 +110,9 @@ def _scatter_group_output(out: Any, idx: jax.Array, group_value: Any):
 
 @dataclass(frozen=True)
 class GroupByOp(Op):
-    """Dynamic key x static universe groupby.
-
-    For each universe group, evaluate the inner op once per distinct dynamic-key
-    tuple present in that group.
-
-    The inner op receives the full group-shaped input with nonmatching columns
-    masked to NaN. Only matching output positions are scattered back.
-
-    This matches the numba backend contract: absent key/universe combinations
-    are skipped, not ticked with an all-NaN frame.
-    """
-
     inner_op: Op
     n_keys: int
-    universe_groups: tuple[tuple[int, ...], ...]
+    universe_groups: tuple[tuple[int, ...], ...] | None = None
     capacity: int = 4096
     output_kind: str = "vector"
     is_stateful: bool = True
@@ -135,7 +123,11 @@ class GroupByOp(Op):
         occupied = []
         inner_states = []
 
-        for group in self.universe_groups:
+        groups = self.universe_groups
+        if groups is None:
+            groups = (tuple(range(int(jnp.asarray(sample).shape[0]))),)
+
+        for group in groups:
             group_width = len(group)
             group_sample = jnp.zeros((group_width,), dtype=dtype)
             inner_state = self.inner_op.init_state(group_sample) if self.inner_op.is_stateful else None
@@ -236,16 +228,20 @@ class GroupByOp(Op):
 
         width = args[0].shape[0] if args and args[0].ndim > 0 else key_cols[0].shape[0]
 
-        first_idx = jnp.asarray(self.universe_groups[0], dtype=jnp.int64)
-        first_template = self._group_template(state.inner_state[0], first_idx, args)
+        groups = self.universe_groups
+        if groups is None:
+            group_indices = (jnp.arange(width, dtype=jnp.int64),)
+        else:
+            group_indices = tuple(jnp.asarray(group, dtype=jnp.int64) for group in groups)
+
+        first_template = self._group_template(state.inner_state[0], group_indices[0], args)
         out = _empty_output_like(first_template, width)
 
         new_keys = []
         new_occupied = []
         new_inner_states = []
 
-        for group_i, group in enumerate(self.universe_groups):
-            idx = jnp.asarray(group, dtype=jnp.int64)
+        for group_i, idx in enumerate(group_indices):
             key_matrix = self._key_matrix_for_group(idx, key_cols)
 
             keys_i, occupied_i, inner_state_i, group_out = self._tick_group(

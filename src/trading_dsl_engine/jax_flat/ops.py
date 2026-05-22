@@ -87,14 +87,11 @@ class CumsumOp(Op):
 
     def tick(self, state: CumsumState, *child_values: jax.Array):
         x = child_values[0]
-        value, initialized = state.value, state.initialized
         valid = jnp.isfinite(x)
-        init_or_valid = initialized | valid
-        prev = jnp.where(initialized, value, 0.0)
-        accum = prev + jnp.where(valid, x, 0.0)
-        out = jnp.where(init_or_valid, jnp.where(valid, accum, value), jnp.nan)
-        return CumsumState(value=out, initialized=init_or_valid), out
-
+        initialized = state.initialized | valid
+        value = state.value + jnp.where(valid, x, 0.0)
+        out = jnp.where(valid, value, jnp.nan)
+        return CumsumState(value=value, initialized=initialized), out
 
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
