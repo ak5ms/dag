@@ -156,9 +156,9 @@ def test_perf_groupby_univ_stateful_vs_polars_batch():
             pl.when(pl.col("col") < 2).then(pl.lit(0)).otherwise(pl.lit(1)).alias("ug")
         )
         out = (
-            df.sort(["ug", "col", "open", "t"])
+            df#.sort(["ug", "col", "open", "t"])
             .with_columns(pl.col("close").cum_sum().over(["ug", "open", "col"]).alias("out"))
-            .sort(["t", "col"])
+            #.sort(["t", "col"])
         )
         return jnp.asarray(out.collect()["out"].to_numpy().reshape(t, n))
 
