@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any
 
 import jax
@@ -9,6 +9,48 @@ import jax.numpy as jnp
 from trading_dsl_engine.jax_flat.ops import Op
 
 jax.config.update("jax_enable_x64", True)
+
+
+_AUTO_REGISTERED_DATACLASS_TYPES: set[type] = set()
+
+
+def _is_dataclass_instance(value: Any) -> bool:
+    return is_dataclass(value) and not isinstance(value, type)
+
+
+def _ensure_dataclass_pytree(value: Any) -> Any:
+    """Register plain dataclass instances as JAX pytrees on first use."""
+    if _is_dataclass_instance(value):
+        cls = type(value)
+        for field in fields(value):
+            _ensure_dataclass_pytree(getattr(value, field.name))
+
+        if cls not in _AUTO_REGISTERED_DATACLASS_TYPES:
+            leaves, _ = jax.tree_util.tree_flatten(value)
+            if len(leaves) == 1 and leaves[0] is value:
+                try:
+                    jax.tree_util.register_dataclass(cls)
+                except ValueError:
+                    pass
+            _AUTO_REGISTERED_DATACLASS_TYPES.add(cls)
+        return value
+
+    if isinstance(value, tuple):
+        for item in value:
+            _ensure_dataclass_pytree(item)
+    elif isinstance(value, list):
+        for item in value:
+            _ensure_dataclass_pytree(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _ensure_dataclass_pytree(item)
+    return value
+
+
+def _tree_has_group_axis(tree: Any, group_width: int) -> bool:
+    tree = _ensure_dataclass_pytree(tree)
+    leaves = jax.tree_util.tree_leaves(tree)
+    return any(jnp.asarray(leaf).ndim > 0 and jnp.asarray(leaf).shape[0] == group_width for leaf in leaves)
 
 
 @jax.tree_util.register_dataclass
@@ -20,6 +62,7 @@ class GroupByState:
 
 
 def _tree_broadcast_slots(tree: Any, capacity: int):
+    tree = _ensure_dataclass_pytree(tree)
     return jax.tree_util.tree_map(
         lambda leaf: jnp.broadcast_to(jnp.asarray(leaf), (capacity,) + jnp.asarray(leaf).shape),
         tree,
@@ -27,10 +70,13 @@ def _tree_broadcast_slots(tree: Any, capacity: int):
 
 
 def _tree_take_slot(tree: Any, slot: jax.Array):
+    tree = _ensure_dataclass_pytree(tree)
     return jax.tree_util.tree_map(lambda leaf: jnp.take(leaf, slot, axis=0), tree)
 
 
 def _tree_set_slot(tree: Any, slot: jax.Array, value: Any):
+    tree = _ensure_dataclass_pytree(tree)
+    value = _ensure_dataclass_pytree(value)
     return jax.tree_util.tree_map(lambda dst, src: dst.at[slot].set(src), tree, value)
 
 
@@ -39,6 +85,8 @@ def _key_matches(stored_keys: jax.Array, occupied: jax.Array, key: jax.Array) ->
     return occupied & jnp.all(equal_or_both_nan, axis=1)
 
 def _empty_output_like(template: Any, width: int):
+    template = _ensure_dataclass_pytree(template)
+
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
         suffix = leaf.shape[1:] if leaf.ndim > 0 else ()
@@ -76,6 +124,8 @@ def _same_key_vector(left: jax.Array, right: jax.Array) -> jax.Array:
 
 
 def _group_output_like(template: Any, group_width: int):
+    template = _ensure_dataclass_pytree(template)
+
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
         suffix = leaf.shape[1:] if leaf.ndim > 0 else ()
@@ -85,6 +135,8 @@ def _group_output_like(template: Any, group_width: int):
 
 
 def _align_group_output(value: Any, group_width: int):
+    value = _ensure_dataclass_pytree(value)
+
     def align_leaf(leaf):
         leaf = jnp.asarray(leaf)
         if leaf.ndim == 0:
@@ -97,6 +149,9 @@ def _align_group_output(value: Any, group_width: int):
 
 
 def _mask_group_output(old: Any, new: Any, mask: jax.Array):
+    old = _ensure_dataclass_pytree(old)
+    new = _ensure_dataclass_pytree(new)
+
     def mask_leaf(dst, src):
         mask_shape = mask.shape + (1,) * (jnp.asarray(src).ndim - 1)
         return jnp.where(jnp.reshape(mask, mask_shape), src, dst)
@@ -105,7 +160,26 @@ def _mask_group_output(old: Any, new: Any, mask: jax.Array):
 
 
 def _scatter_group_output(out: Any, idx: jax.Array, group_value: Any):
+    out = _ensure_dataclass_pytree(out)
+    group_value = _ensure_dataclass_pytree(group_value)
     return jax.tree_util.tree_map(lambda dst, src: dst.at[idx].set(src), out, group_value)
+
+
+def _slice_member_arg(value: jax.Array, idx: jax.Array, member_pos: jax.Array) -> jax.Array:
+    group_value = _slice_group_arg(value, idx)
+    if jnp.asarray(group_value).ndim == 0:
+        return group_value
+    return jnp.take(group_value, member_pos, axis=0)
+
+
+def _set_member_output(out: Any, member_pos: jax.Array, value: Any):
+    out = _ensure_dataclass_pytree(out)
+    value = _ensure_dataclass_pytree(value)
+
+    def set_leaf(dst, src):
+        return dst.at[member_pos].set(src)
+
+    return jax.tree_util.tree_map(set_leaf, out, value)
 
 
 @dataclass(frozen=True)
@@ -155,9 +229,9 @@ class GroupByOp(Op):
         sample_state = _tree_take_slot(group_state, jnp.asarray(0, dtype=jnp.int32)) if group_state is not None else None
         sample_args = tuple(_slice_group_arg(arg, idx) for arg in args)
         _, template = self.inner_op.tick(sample_state, *sample_args)
-        return template
+        return _ensure_dataclass_pytree(template)
 
-    def _tick_group(
+    def _tick_group_groupwise(
         self,
         keys: jax.Array,
         occupied: jax.Array,
@@ -221,6 +295,60 @@ class GroupByOp(Op):
             body,
             (keys, occupied, inner_state, group_out0),
         )
+
+    def _tick_group_elementwise(
+        self,
+        keys: jax.Array,
+        occupied: jax.Array,
+        inner_state: Any,
+        idx: jax.Array,
+        key_matrix: jax.Array,
+        args: tuple[jax.Array, ...],
+    ):
+        group_width = idx.shape[0]
+        template = self._group_template(inner_state, idx, args)
+        group_out0 = _group_output_like(template, group_width)
+
+        def body(member_pos, carry):
+            keys_c, occupied_c, inner_state_c, group_out_c = carry
+            key = key_matrix[member_pos]
+            matches = _key_matches(keys_c, occupied_c, key)
+            slot = _first_available_slot(matches, occupied_c)
+
+            selected_state = _tree_take_slot(inner_state_c, slot)
+            member_args = tuple(_slice_member_arg(arg, idx, member_pos) for arg in args)
+            updated_state, local_out = self.inner_op.tick(selected_state, *member_args)
+
+            inner_state_next = _tree_set_slot(inner_state_c, slot, updated_state) if updated_state is not None else inner_state_c
+            group_out_next = _set_member_output(group_out_c, member_pos, local_out)
+            keys_next = keys_c.at[slot].set(key)
+            occupied_next = occupied_c.at[slot].set(True)
+            return keys_next, occupied_next, inner_state_next, group_out_next
+
+        return jax.lax.fori_loop(
+            0,
+            group_width,
+            body,
+            (keys, occupied, inner_state, group_out0),
+        )
+
+    def _tick_group(
+        self,
+        keys: jax.Array,
+        occupied: jax.Array,
+        inner_state: Any,
+        idx: jax.Array,
+        key_matrix: jax.Array,
+        args: tuple[jax.Array, ...],
+    ):
+        # Formula-compiled groupby RHS graphs initialize state with a leading
+        # group axis, so cross-sectional ops must see every member in the key.
+        # Direct grouped-apply ops with scalar keyed state advance per member;
+        # repeated keys in one cross-section should therefore tick sequentially.
+        if inner_state is not None and not _tree_has_group_axis(_tree_take_slot(inner_state, jnp.asarray(0, dtype=jnp.int32)), idx.shape[0]):
+            return self._tick_group_elementwise(keys, occupied, inner_state, idx, key_matrix, args)
+        return self._tick_group_groupwise(keys, occupied, inner_state, idx, key_matrix, args)
+
 
     def tick(self, state: GroupByState, *child_values: jax.Array):
         key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
