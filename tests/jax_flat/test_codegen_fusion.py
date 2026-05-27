@@ -24,7 +24,7 @@ def test_xla_hlo_and_compiled_ir_include_fused_sort_path():
     open_row = jnp.linspace(1.0, 9.0, 9)
     close_row = jnp.linspace(2.0, 10.0, 9)
 
-    lowered = jax.jit(runtime.tick_stream).lower(state0, open_row, close_row)
+    lowered = jax.jit(runtime.tick).lower(state0, open_row, close_row)
     hlo_text = lowered.compiler_ir(dialect="hlo").as_hlo_text()
     compiled_ir_text = lowered.compile().as_text()
 
