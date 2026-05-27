@@ -162,22 +162,24 @@ def test_perf_groupby_univ_stateful_vs_polars_batch():
         )
         return jnp.asarray(out.collect()["out"].to_numpy().reshape(t, n))
 
+    runtime_flat = compile_flat(formula)
+    flat_out = run_flat_batch(formula=runtime_flat, data=jax_flat_data)
+    polars_out = run_polars(open_data, close_data)
+
     polars_stats = _bench(run_polars, df)
     print(f"groupby_univ::polars {polars_stats}")
-    runtime_flat = compile_flat(formula)
     flat_stats = _bench(run_flat_batch, runtime_flat, jax_flat_data, warmup_runs=1)
     print(f"groupby_univ::jax_flat {flat_stats}")
 
-    flat_out = run_flat_batch(formula=runtime_flat, data=jax_flat_data)
-    polars_out = run_polars(open_data, close_data)
     np.testing.assert_allclose(np.asarray(flat_out), np.asarray(polars_out), rtol=1e-10, atol=1e-10, equal_nan=True)
 
 
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_groupby_univ_stateful_jax_flat_vs_numba():
     formula = "groupby((univ([0, 1], [2, 3, 4, 5, 6, 7, 8]), open), close, cumsum(self_))"
-    t_rows = min(T_ROWS, 20000)
-    open_data = (jnp.column_stack([jnp.arange(0, t_rows)]*N_INSTRUMENTS) // int(t_rows / 500)).astype(jnp.float64)
+    t_rows = int(10E3) #min(T_ROWS, 5_000_000)
+    groups = 500
+    open_data = (jnp.column_stack([jnp.arange(0, t_rows)]*N_INSTRUMENTS) // int(t_rows / groups)).astype(jnp.float64)
     close_data = jax.random.normal(jax.random.PRNGKey(53), (t_rows, N_INSTRUMENTS), dtype=jnp.float64)
 
     numba_engine = build_engine(formula)
@@ -191,11 +193,44 @@ def test_perf_groupby_univ_stateful_jax_flat_vs_numba():
         return jax.block_until_ready(formula.run_batch(data))[-1]
 
     runtime_flat = compile_flat(formula)
-    flat_stats = _bench(run_flat_batch, runtime_flat, jax_flat_data, warmup_runs=1)
-    print(f"groupby_univ_numba::jax_flat {flat_stats}")
-    numba_stats = _bench(run_numba_batch, numba_data, warmup_runs=1)
-    print(f"groupby_univ_numba::numba {numba_stats}")
 
     flat_out = run_flat_batch(formula=runtime_flat, data=jax_flat_data)
     numba_out = run_numba_batch(numba_data)
+
+    flat_stats = _bench(run_flat_batch, runtime_flat, jax_flat_data, warmup_runs=1)
+    print(f"groupby_univ::jax_flat {flat_stats}")
+    numba_stats = _bench(run_numba_batch, numba_data, warmup_runs=1)
+    print(f"groupby_univ::numba {numba_stats}")
+
     np.testing.assert_allclose(np.asarray(flat_out), np.asarray(numba_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_groupby_univ_stateful_jax_vs_numba():
+    from trading_dsl_engine.jax.engine import build_jax_engine, run_batch_from_mapping as run_batch_from_mapping_jax
+    formula = "groupby((univ([0, 1], [2, 3, 4, 5, 6, 7, 8]), open), close, cumsum(self_))"
+    t_rows = int(10E3) #min(T_ROWS, 5_000_000)
+    groups = 500
+    open_data = (jnp.column_stack([jnp.arange(0, t_rows)]*N_INSTRUMENTS) // int(t_rows / groups)).astype(jnp.float64)
+    close_data = jax.random.normal(jax.random.PRNGKey(53), (t_rows, N_INSTRUMENTS), dtype=jnp.float64)
+
+    numba_engine = build_engine(formula)
+    numba_data = {"open": np.asarray(open_data), "close": np.asarray(close_data)}
+    jax_engine = build_jax_engine(formula)
+
+    def run_numba_batch(data):
+        return run_batch_from_mapping(numba_engine, data=data, out_path=None)
+
+    def run_flat_batch(data):
+        return jax.block_until_ready(run_batch_from_mapping_jax(jax_engine, data=data, out_path=None))
+
+    # runtime_flat = compile_flat(formula)
+
+    jax_out = run_flat_batch(numba_data)
+    numba_out = run_numba_batch(numba_data)
+
+    jax_stats = _bench(run_flat_batch, numba_data, warmup_runs=1)
+    print(f"groupby_univ::jax {jax_stats}")
+    numba_stats = _bench(run_numba_batch, numba_data, warmup_runs=1)
+    print(f"groupby_univ::numba {numba_stats}")
+
+    np.testing.assert_allclose(np.asarray(jax_out), np.asarray(numba_out), rtol=1e-10, atol=1e-10, equal_nan=True)
