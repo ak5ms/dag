@@ -96,8 +96,7 @@ class JaxFlatRuntime(eqx.Module):
             states.append(node.op.init_state(sample))
         return tuple(states)
 
-    @jax.jit
-    def tick(self, state_leaves, *input_rows):
+    def _tick_impl(self, state_leaves, *input_rows):
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
         new_state = list(state_leaves)
 
@@ -121,6 +120,10 @@ class JaxFlatRuntime(eqx.Module):
         outs = tuple(values[i] for i in self.program.outputs)
         return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
+    @jax.jit
+    def tick(self, state_leaves, *input_rows):
+        return self._tick_impl(state_leaves, *input_rows)
+
     def run_batch(self, inputs, states=None):
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
@@ -128,17 +131,89 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps:
                 raise ValueError("All inputs must have identical timestep length")
+        if _can_use_groupby_root_batch(self):
+            return _run_groupby_root_batch(self, inputs, states)
         if not states:
-            state0 = self.init_state(inputs[0].shape[1])
+            return _jit_batch_from_initial_state(self, inputs)
+        return _jit_batch(self, states, inputs)
+
+
+@eqx.filter_jit
+def _jit_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    state0 = runtime.init_state(inputs[0].shape[1])
+    return _scan_batch(runtime, state0, inputs)
+
+
+@eqx.filter_jit
+def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
+    return _scan_batch(runtime, state0, inputs)
+
+
+def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    def step(states, rows):
+        return runtime._tick_impl(states, *rows)
+
+    return jax.lax.scan(step, state0, xs=inputs, unroll=32)
+
+
+def _can_use_groupby_root_batch(runtime: JaxFlatRuntime) -> bool:
+    if len(runtime.program.outputs) != 1:
+        return False
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    if not isinstance(root_node.op, GroupByOp):
+        return False
+    if runtime.program.state_layout.node_fields[root_id].index < 0:
+        return False
+    for child_id in root_node.child_ids:
+        child_op = runtime.program.nodes[child_id].op
+        if not isinstance(child_op, InputOp):
+            return False
+    return True
+
+
+def _groupby_root_child_sequences(runtime: JaxFlatRuntime, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    return tuple(inputs[runtime.program.nodes[child_id].op.input_index] for child_id in root_node.child_ids)
+
+
+def _run_groupby_root_batch(runtime: JaxFlatRuntime, inputs, states=None):
+    chunk_size = 2560
+    n_steps = inputs[0].shape[0]
+    state = None if not states else states
+    outputs = []
+    start = 0
+    while start < n_steps:
+        end = min(start + chunk_size, n_steps)
+        chunk_inputs = tuple(arr[start:end] for arr in inputs)
+        if state is None:
+            state, out = _jit_groupby_root_batch_from_initial_state(runtime, chunk_inputs)
         else:
-            state0 = states
+            state, out = _jit_groupby_root_batch(runtime, state, chunk_inputs)
+        outputs.append(out)
+        start = end
+    return state, jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
 
-        @jax.jit
-        def step(states, rows):
-            return self.tick(states, *rows)
 
-        out = jax.lax.scan(step, state0, xs=inputs)
-        return out
+@eqx.filter_jit
+def _jit_groupby_root_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    group_state = root_node.op.init_state(inputs[0][0])
+    new_group_state, out = root_node.op.scan_batch(group_state, *_groupby_root_child_sequences(runtime, inputs))
+    return (new_group_state,), out
+
+
+@eqx.filter_jit
+def _jit_groupby_root_batch(runtime: JaxFlatRuntime, states, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    state_idx = runtime.program.state_layout.node_fields[root_id].index
+    new_group_state, out = root_node.op.scan_batch(states[state_idx], *_groupby_root_child_sequences(runtime, inputs))
+    new_states = list(states)
+    new_states[state_idx] = new_group_state
+    return tuple(new_states), out
 
 
 def _expr_key(node: Expr):
@@ -298,9 +373,17 @@ def _compile_groupby_node(expr: Call, memo: dict[tuple[Any, ...], int], nodes: l
         _compile_node(feed, memo, nodes, input_names) for feed in feed_exprs
     )
     idx = len(nodes)
+    groupby_kwargs = {}
+    if universe_groups is not None:
+        groupby_kwargs = {"capacity": 2048, "hash_capacity": 4096}
     nodes.append(
         DagNode(
-            op=GroupByOp(inner_op=inner_op, n_keys=len(dynamic_items), universe_groups=universe_groups),
+            op=GroupByOp(
+                inner_op=inner_op,
+                n_keys=len(dynamic_items),
+                universe_groups=universe_groups,
+                **groupby_kwargs,
+            ),
             child_ids=child_ids,
         )
     )
