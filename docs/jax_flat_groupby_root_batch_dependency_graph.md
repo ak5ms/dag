@@ -1,6 +1,6 @@
 # jax_flat groupby-root batch dependency graph
 
-This document maps the `jax_flat` groupby-root batch helpers in
+This document maps the `jax_flat` groupby-root batch path in
 `src/trading_dsl_engine/jax_flat/engine.py`. It is intended to render directly
 on GitHub via Mermaid.
 
@@ -13,53 +13,47 @@ Node labels include:
 - **LOC**: inclusive source lines from `def` through the end of the function
   body.
 
+Small single-use helpers under 10 LOC were inlined into the caller; the graph
+therefore only shows the remaining named functions in this path.
+
 ```mermaid
 flowchart TD
-    RBO["_run_batch_once\nuses: 1 | LOC: 12"] --> RGB["_run_groupby_root_batch\nuses: 1 | LOC: 8"]
+    RBO["_run_batch_once\nuses: 1 | LOC: 16"] --> CAN["_can_use_groupby_root_batch\nuses: 1 | LOC: 14"]
+    RBO --> JIT["_jit_groupby_root_batch\nuses: 1 | LOC: 60"]
 
-    RGB --> INIT["_jit_groupby_root_batch_from_initial_state\nuses: 1 | LOC: 6"]
-    RGB --> JIT["_jit_groupby_root_batch\nuses: 1 | LOC: 8"]
-    RGB --> CINIT["_jit_groupby_root_chunked_batch_from_initial_state\nuses: 1 | LOC: 5"]
-    RGB --> CJIT["_jit_groupby_root_chunked_batch\nuses: 1 | LOC: 2"]
-
-    INIT --> CHILD["_groupby_root_child_sequences\nuses: 3 | LOC: 4"]
-    JIT --> CHILD
-    CINIT --> LOOP["_run_groupby_root_chunk_loop\nuses: 2 | LOC: 52"]
-    CJIT --> LOOP
-
-    LOOP --> CHILD
-    LOOP --> SCAN["_scan_groupby_root_chunk\nuses: 3 | LOC: 3"]
-    LOOP --> SET["_set_time_chunk\nuses: 3 | LOC: 10"]
-    LOOP --> EMPTY["_empty_batch_like\nuses: 1 | LOC: 6"]
-
-    SCAN --> SLICE["_slice_time_chunk\nuses: 1 | LOC: 2"]
-    SCAN --> GSCAN["GroupByOp.scan_batch\nexternal op method"]
-    INIT --> GSCAN
-    JIT --> GSCAN
-    EMPTY --> SET
+    JIT --> GSCAN["GroupByOp.scan_batch\nexternal op method"]
+    JIT --> DSLICE["jax.lax.dynamic_slice_in_dim\ninlined chunk slicing"]
+    JIT --> DUPDATE["jax.lax.dynamic_update_slice\ninlined output assembly"]
+    JIT --> FORI["jax.lax.fori_loop\ncompiled chunk loop"]
 ```
 
 ## Function metrics
 
 | Function | Role | Uses | LOC | Defined at |
 | --- | --- | ---: | ---: | --- |
-| `_run_batch_once` | Dispatches eligible root `groupby` programs into the specialized root-batch path. | 1 | 12 | `src/trading_dsl_engine/jax_flat/engine.py:146` |
-| `_groupby_root_child_sequences` | Maps root-child input nodes to their batch input arrays. | 3 | 4 | `src/trading_dsl_engine/jax_flat/engine.py:220` |
-| `_run_groupby_root_batch` | Selects direct single-shot JIT for small batches or compiled chunked JIT for larger batches. | 1 | 8 | `src/trading_dsl_engine/jax_flat/engine.py:229` |
-| `_jit_groupby_root_batch_from_initial_state` | Single-shot JIT path that initializes root groupby state. | 1 | 6 | `src/trading_dsl_engine/jax_flat/engine.py:240` |
-| `_jit_groupby_root_batch` | Single-shot JIT path from caller-provided state. | 1 | 8 | `src/trading_dsl_engine/jax_flat/engine.py:249` |
-| `_slice_time_chunk` | Uses JAX dynamic slicing to extract a time chunk inside compiled execution. | 1 | 2 | `src/trading_dsl_engine/jax_flat/engine.py:259` |
-| `_set_time_chunk` | Uses JAX dynamic update slicing to write a chunk result into the batch output tree. | 3 | 10 | `src/trading_dsl_engine/jax_flat/engine.py:263` |
-| `_empty_batch_like` | Allocates an output tree matching a sample chunk output over the full time length. | 1 | 6 | `src/trading_dsl_engine/jax_flat/engine.py:275` |
-| `_scan_groupby_root_chunk` | Runs `GroupByOp.scan_batch` for one chunk. | 3 | 3 | `src/trading_dsl_engine/jax_flat/engine.py:283` |
-| `_run_groupby_root_chunk_loop` | Holds the compiled chunk loop, carries group state, and assembles chunk outputs. | 2 | 52 | `src/trading_dsl_engine/jax_flat/engine.py:288` |
-| `_jit_groupby_root_chunked_batch_from_initial_state` | JIT wrapper for the chunked path that initializes groupby state. | 1 | 5 | `src/trading_dsl_engine/jax_flat/engine.py:343` |
-| `_jit_groupby_root_chunked_batch` | JIT wrapper for the chunked path from caller-provided state. | 1 | 2 | `src/trading_dsl_engine/jax_flat/engine.py:351` |
+| `_run_batch_once` | Validates batch inputs, initializes root-groupby state when needed, and dispatches eligible root `groupby` programs into the specialized JIT batch path. | 1 | 16 | `src/trading_dsl_engine/jax_flat/engine.py:146` |
+| `_can_use_groupby_root_batch` | Checks whether the program shape supports the specialized root-groupby batch path. | 1 | 14 | `src/trading_dsl_engine/jax_flat/engine.py:208` |
+| `_jit_groupby_root_batch` | Runs root-groupby batch execution under JIT, including inlined chunk slicing, `GroupByOp.scan_batch`, state carry, and output assembly. | 1 | 60 | `src/trading_dsl_engine/jax_flat/engine.py:228` |
+
+## Inlined code
+
+The previous small single-use helpers have been inlined into
+`_jit_groupby_root_batch`:
+
+| Former helper | Inlined responsibility |
+| --- | --- |
+| `_groupby_root_child_sequences` | Resolving root child input arrays. |
+| `_run_groupby_root_batch` | Dispatching and state initialization now happen directly in `_run_batch_once`. |
+| `_jit_groupby_root_batch_from_initial_state` | Initial state setup now happens directly before calling `_jit_groupby_root_batch`. |
+| `_slice_time_chunk` | `jax.lax.dynamic_slice_in_dim` is called directly inside the chunk scanner. |
+| `_empty_batch_like` | Output tree allocation is local to `_jit_groupby_root_batch`. |
+| `_scan_groupby_root_chunk` | Chunk scanning is a local nested function inside `_jit_groupby_root_batch`. |
+| `_run_groupby_root_chunk_loop` | The compiled chunk loop is now the body of `_jit_groupby_root_batch`. |
+| `_jit_groupby_root_chunked_batch_from_initial_state` | Initial state setup now happens directly before calling `_jit_groupby_root_batch`. |
+| `_jit_groupby_root_chunked_batch` | The chunked JIT path is now `_jit_groupby_root_batch`. |
 
 ## Notes
 
-- The chunking policy remains outside the compiled region because it depends on
-  the static batch length and selects between the single-shot and chunked paths.
-- For the chunked path, all per-chunk scanning, state carry, and output assembly
-  happen inside the jitted function through `jax.lax.fori_loop` and
-  `jax.lax.dynamic_update_slice`.
+- The chunk loop remains under JAX JIT via `jax.lax.fori_loop`.
+- The root-groupby path keeps chunked processing for large inputs while using the
+  same compiled function for small and large batches.
