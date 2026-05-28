@@ -133,6 +133,7 @@ class Number(Expr):
 class Call(Expr):
     fn: str
     args: tuple[Expr, ...]
+    kwargs: tuple[tuple[str, Expr], ...] = ()
 
 
 UniverseItem = Union[str, int]
@@ -211,13 +212,18 @@ class _AstParser:
             op_name = self._cmpop_name(node.ops[0])
             return Call(op_name, (self._expr(node.left), self._expr(node.comparators[0])))
         if isinstance(node, ast.Call):
-            if node.keywords:
-                raise FormulaParseError("Keyword arguments are not supported")
             if not isinstance(node.func, ast.Name):
                 raise FormulaParseError("Only direct function names are supported")
             if node.func.id == "univ":
+                if node.keywords:
+                    raise FormulaParseError("univ keyword arguments are not supported")
                 return self._universe(node)
-            return Call(node.func.id, tuple(self._expr(arg) for arg in node.args))
+            kwargs: list[tuple[str, Expr]] = []
+            for kw in node.keywords:
+                if kw.arg is None:
+                    raise FormulaParseError("**kwargs are not supported")
+                kwargs.append((kw.arg, self._expr(kw.value)))
+            return Call(node.func.id, tuple(self._expr(arg) for arg in node.args), tuple(kwargs))
         raise FormulaParseError(f"Unsupported syntax: {ast.dump(node, include_attributes=False)}")
 
     def _universe(self, node: ast.Call) -> Universe:

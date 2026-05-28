@@ -55,8 +55,12 @@ def var(name: str) -> Identifier:
     return Identifier(name)
 
 
-def call(name: str, *args) -> Expr:
-    return Call(name, tuple(ensure_expr(a) for a in args))
+def call(name: str, *args, **kwargs) -> Expr:
+    return Call(
+        name,
+        tuple(ensure_expr(a) for a in args),
+        tuple((key, ensure_expr(value)) for key, value in kwargs.items()),
+    )
 
 
 GROUPBY_VALUE_PLACEHOLDER = "self_"

@@ -114,7 +114,12 @@ def _expr_key(node: Expr):
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(a) for a in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
     raise FormulaCompileError(f"Unsupported expression node: {node}")
 
 
@@ -154,7 +159,11 @@ def _replace_self_placeholder(node: Expr, lhs: Expr) -> Expr:
     if isinstance(node, Identifier) and node.name == "self_":
         return lhs
     if isinstance(node, Call):
-        return Call(node.fn, tuple(_replace_self_placeholder(arg, lhs) for arg in node.args))
+        return Call(
+            node.fn,
+            tuple(_replace_self_placeholder(arg, lhs) for arg in node.args),
+            tuple((key, _replace_self_placeholder(value, lhs)) for key, value in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self_placeholder(item, lhs) for item in node.items))
     return node
@@ -193,6 +202,10 @@ def compile_formula(
         elif isinstance(expr, Number):
             op = LiteralOp(float(expr.value))
         elif isinstance(expr, Call):
+            if expr.kwargs:
+                unsupported_kwargs = {name for name, _ in expr.kwargs} - {"capacity", "hash_capacity"}
+                if expr.fn != "groupby" or unsupported_kwargs:
+                    raise FormulaCompileError(f"Keyword arguments are not supported for {expr.fn}")
             macro = dsl_registry.get(expr.fn)
             if macro is not None:
                 op = build(macro(*expr.args), local_inputs)
