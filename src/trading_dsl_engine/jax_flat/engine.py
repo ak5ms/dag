@@ -9,7 +9,18 @@ import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
-from trading_dsl_engine.jax_flat.ops import EwmOp, InputOp, LiteralOp, OP_FACTORIES, Op, GroupByOp
+from trading_dsl_engine.jax_flat.ops import (
+    EwmOp,
+    GroupByOp,
+    InputOp,
+    LiteralOp,
+    NaryOp,
+    OP_FACTORIES,
+    Op,
+    RidgeOp,
+    _bspline,
+    _col,
+)
 
 
 @dataclass(frozen=True)
@@ -329,13 +340,42 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
     return node
 
 
-def _build_op(expr: Call) -> tuple[Op, int | None]:
+def _literal_int_arg(expr: Expr, fn: str, position: int) -> int:
+    if not isinstance(expr, Number):
+        raise ValueError(f"{fn} argument {position} must be a numeric literal")
+    return int(round(float(expr.value)))
+
+
+def _op_width(op: Op) -> int:
+    if op.output_width is None:
+        raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
+    return int(op.output_width)
+
+
+def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
+    if expr.fn == "bspline" and len(expr.args) == 2:
+        n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
+        if n_basis <= 0:
+            raise ValueError("bspline n_basis must be >= 1")
+        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+    if expr.fn == "col" and len(expr.args) == 2:
+        index = _literal_int_arg(expr.args[1], "col", 2)
+        if index < 0:
+            raise ValueError("col index must be >= 0")
+        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
+    if expr.fn == "Ridge" and len(expr.args) >= 4:
+        has_weights = len(expr.args) >= 5
+        feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]
+        if not feature_ops:
+            raise ValueError("Ridge expects at least one feature arg")
+        feature_widths = tuple(_op_width(op) for op in feature_ops)
+        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights), None
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
     if builder is None:
         raise ValueError(f"Unsupported function {expr.fn}/{len(expr.args)} in jax_flat")
@@ -400,7 +440,7 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             if node.fn == "groupby":
                 raise ValueError("nested groupby inside a groupby rhs is not supported in jax_flat")
             child_ids = tuple(build(a) for a in node.args)
-            op, drop_child_idx = _build_op(node)
+            op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
             if drop_child_idx is not None:
                 child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
             idx = len(nodes)
@@ -420,6 +460,7 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             state_layout=state_layout,
             n_inputs=len(feed_exprs),
             is_stateful=state_layout.total_leaves > 0,
+            output_kind=node_tuple[output_id].op.output_kind,
         ),
         tuple(feed_exprs),
     )
@@ -498,7 +539,7 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         raise ValueError(f"Unsupported node {expr}")
 
     child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
-    op, drop_child_idx = _build_op(expr)
+    op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
         child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
     idx = len(nodes)
