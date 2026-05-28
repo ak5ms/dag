@@ -223,22 +223,17 @@ def _groupby_root_child_sequences(runtime: JaxFlatRuntime, inputs):
     return tuple(inputs[runtime.program.nodes[child_id].op.input_index] for child_id in root_node.child_ids)
 
 
+_GROUPBY_ROOT_BATCH_CHUNK_SIZE = 2560
+
+
 def _run_groupby_root_batch(runtime: JaxFlatRuntime, inputs, states=None):
-    chunk_size = 2560
-    n_steps = inputs[0].shape[0]
-    state = None if not states else states
-    outputs = []
-    start = 0
-    while start < n_steps:
-        end = min(start + chunk_size, n_steps)
-        chunk_inputs = tuple(arr[start:end] for arr in inputs)
-        if state is None:
-            state, out = _jit_groupby_root_batch_from_initial_state(runtime, chunk_inputs)
-        else:
-            state, out = _jit_groupby_root_batch(runtime, state, chunk_inputs)
-        outputs.append(out)
-        start = end
-    return state, jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
+    if inputs[0].shape[0] <= _GROUPBY_ROOT_BATCH_CHUNK_SIZE:
+        if not states:
+            return _jit_groupby_root_batch_from_initial_state(runtime, inputs)
+        return _jit_groupby_root_batch(runtime, states, inputs)
+    if not states:
+        return _jit_groupby_root_chunked_batch_from_initial_state(runtime, inputs)
+    return _jit_groupby_root_chunked_batch(runtime, states, inputs)
 
 
 @eqx.filter_jit
@@ -259,6 +254,102 @@ def _jit_groupby_root_batch(runtime: JaxFlatRuntime, states, inputs):
     new_states = list(states)
     new_states[state_idx] = new_group_state
     return tuple(new_states), out
+
+
+def _slice_time_chunk(value: jax.Array, start, size: int):
+    return jax.lax.dynamic_slice_in_dim(value, start, size, axis=0)
+
+
+def _set_time_chunk(out, start, value):
+    return jax.tree_util.tree_map(
+        lambda dst, src: jax.lax.dynamic_update_slice(
+            dst,
+            src,
+            (start,) + (0,) * (jnp.asarray(dst).ndim - 1),
+        ),
+        out,
+        value,
+    )
+
+
+def _empty_batch_like(value, n_steps: int):
+    def alloc(leaf):
+        leaf = jnp.asarray(leaf)
+        return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
+
+    return jax.tree_util.tree_map(alloc, value)
+
+
+def _scan_groupby_root_chunk(root_node: DagNode, state, child_sequences, start, chunk_size: int):
+    chunk_inputs = tuple(_slice_time_chunk(arr, start, chunk_size) for arr in child_sequences)
+    return root_node.op.scan_batch(state, *chunk_inputs)
+
+
+def _run_groupby_root_chunk_loop(runtime: JaxFlatRuntime, states, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    state_idx = runtime.program.state_layout.node_fields[root_id].index
+    child_sequences = _groupby_root_child_sequences(runtime, inputs)
+    n_steps = inputs[0].shape[0]
+    chunk_size = _GROUPBY_ROOT_BATCH_CHUNK_SIZE
+    n_full_chunks = n_steps // chunk_size
+    remainder = n_steps - n_full_chunks * chunk_size
+
+    group_state, chunk0_out = _scan_groupby_root_chunk(
+        root_node,
+        states[state_idx],
+        child_sequences,
+        0,
+        chunk_size,
+    )
+    out0 = _set_time_chunk(_empty_batch_like(chunk0_out, n_steps), 0, chunk0_out)
+
+    def body(chunk_i, carry):
+        group_state_c, out_c = carry
+        start = chunk_i * chunk_size
+        group_state_n, chunk_out = _scan_groupby_root_chunk(
+            root_node,
+            group_state_c,
+            child_sequences,
+            start,
+            chunk_size,
+        )
+        return group_state_n, _set_time_chunk(out_c, start, chunk_out)
+
+    group_state, out = jax.lax.fori_loop(
+        1,
+        n_full_chunks,
+        body,
+        (group_state, out0),
+    )
+
+    if remainder:
+        start = n_full_chunks * chunk_size
+        group_state, tail_out = _scan_groupby_root_chunk(
+            root_node,
+            group_state,
+            child_sequences,
+            start,
+            remainder,
+        )
+        out = _set_time_chunk(out, start, tail_out)
+
+    new_states = list(states)
+    new_states[state_idx] = group_state
+    return tuple(new_states), out
+
+
+@eqx.filter_jit
+def _jit_groupby_root_chunked_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    group_state = root_node.op.init_state(inputs[0][0])
+    return _run_groupby_root_chunk_loop(runtime, (group_state,), inputs)
+
+
+@eqx.filter_jit
+def _jit_groupby_root_chunked_batch(runtime: JaxFlatRuntime, states, inputs):
+    return _run_groupby_root_chunk_loop(runtime, states, inputs)
 
 
 def _expr_key(node: Expr):

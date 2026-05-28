@@ -177,9 +177,9 @@ def test_perf_groupby_univ_stateful_vs_polars_batch():
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_groupby_univ_stateful_jax_flat_vs_numba():
     formula = "groupby((univ([0, 1], [2, 3, 4, 5, 6, 7, 8]), open), close, cumsum(self_))"
-    t_rows = int(10E3) #min(T_ROWS, 5_000_000)
+    t_rows = int(1E6)
     groups = 500
-    open_data = (jnp.column_stack([jnp.arange(0, t_rows)]*N_INSTRUMENTS) // int(t_rows / groups)).astype(jnp.float64)
+    open_data = (jnp.column_stack([jnp.arange(0, t_rows)] * N_INSTRUMENTS) // int(t_rows / groups)).astype(jnp.float64)
     close_data = jax.random.normal(jax.random.PRNGKey(53), (t_rows, N_INSTRUMENTS), dtype=jnp.float64)
 
     numba_engine = build_engine(formula)
