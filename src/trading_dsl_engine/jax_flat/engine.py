@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+import warnings
 
 import equinox as eqx
 import jax
@@ -125,6 +126,24 @@ class JaxFlatRuntime(eqx.Module):
         return self._tick_impl(state_leaves, *input_rows)
 
     def run_batch(self, inputs, states=None):
+        runtime = self
+        while True:
+            try:
+                return runtime._run_batch_once(inputs, states)
+            except Exception as exc:
+                if states or not _is_groupby_capacity_error(exc):
+                    raise
+                next_runtime = _double_groupby_capacities(runtime)
+                if next_runtime is runtime:
+                    raise
+                warnings.warn(
+                    "jax_flat groupby capacity/hash table exhausted; retrying run_batch with 2x group key capacity",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                runtime = next_runtime
+
+    def _run_batch_once(self, inputs, states=None):
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
         n_steps = inputs[0].shape[0]
@@ -136,6 +155,32 @@ class JaxFlatRuntime(eqx.Module):
         if not states:
             return _jit_batch_from_initial_state(self, inputs)
         return _jit_batch(self, states, inputs)
+
+
+def _is_groupby_capacity_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "jax_flat groupby capacity exceeded" in message
+        or "jax_flat groupby hash table exhausted" in message
+    )
+
+
+def _double_groupby_capacities(runtime: JaxFlatRuntime) -> JaxFlatRuntime:
+    changed = False
+    nodes = []
+    for node in runtime.program.nodes:
+        op = node.op
+        if isinstance(op, GroupByOp):
+            op = replace(
+                op,
+                capacity=op.capacity * 2,
+                hash_capacity=max(op.hash_capacity * 2, op.capacity * 4),
+            )
+            changed = True
+        nodes.append(DagNode(op=op, child_ids=node.child_ids))
+    if not changed:
+        return runtime
+    return JaxFlatRuntime(program=replace(runtime.program, nodes=tuple(nodes)))
 
 
 @eqx.filter_jit
@@ -222,7 +267,12 @@ def _expr_key(node: Expr):
     if isinstance(node, Number):
         return ("num", float(node.value))
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(a) for a in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
     if isinstance(node, Universe):
@@ -252,7 +302,16 @@ def _resolve_universe_groups(universe: Universe) -> tuple[tuple[int, ...], ...]:
 
 def _validate_groupby_canonical_form(expr: Call) -> None:
     if len(expr.args) != 3:
-        raise ValueError("groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)")
+        raise ValueError(
+            "groupby only supports canonical form: "
+            "groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+        )
+    unsupported_kwargs = {name for name, _ in expr.kwargs} - {"capacity", "hash_capacity"}
+    if unsupported_kwargs:
+        raise ValueError(f"Unsupported groupby keyword argument(s): {sorted(unsupported_kwargs)}")
+    for name, value in expr.kwargs:
+        if not isinstance(value, Number):
+            raise ValueError(f"groupby {name} must be a numeric literal")
     _canonical_groupby_key_items(expr.args[0])
 
 
@@ -260,7 +319,11 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
     if isinstance(node, Identifier) and node.name == "self_":
         return lhs
     if isinstance(node, Call):
-        return Call(node.fn, tuple(_replace_self(a, lhs) for a in node.args))
+        return Call(
+            node.fn,
+            tuple(_replace_self(a, lhs) for a in node.args),
+            tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
     return node
@@ -269,6 +332,8 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
 def _build_op(expr: Call) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
+    if expr.kwargs:
+        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
@@ -360,7 +425,29 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
     )
 
 
-def _compile_groupby_node(expr: Call, memo: dict[tuple[Any, ...], int], nodes: list[DagNode], input_names: list[str]) -> int:
+def _groupby_capacity_kwargs(expr: Call, has_universe_groups: bool) -> dict[str, int]:
+    capacity = 2048 if has_universe_groups else 4096
+    hash_capacity = None
+    for name, value in expr.kwargs:
+        literal = int(value.value)
+        if literal <= 0:
+            raise ValueError(f"groupby {name} must be positive")
+        if name == "capacity":
+            capacity = literal
+        elif name == "hash_capacity":
+            hash_capacity = literal
+    return {
+        "capacity": capacity,
+        "hash_capacity": max(hash_capacity if hash_capacity is not None else capacity * 2, capacity),
+    }
+
+
+def _compile_groupby_node(
+    expr: Call,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+) -> int:
     _validate_groupby_canonical_form(expr)
     key_items = _canonical_groupby_key_items(expr.args[0])
     universe_items = [item for item in key_items if isinstance(item, Universe)]
@@ -373,9 +460,7 @@ def _compile_groupby_node(expr: Call, memo: dict[tuple[Any, ...], int], nodes: l
         _compile_node(feed, memo, nodes, input_names) for feed in feed_exprs
     )
     idx = len(nodes)
-    groupby_kwargs = {}
-    if universe_groups is not None:
-        groupby_kwargs = {"capacity": 2048, "hash_capacity": 4096}
+    groupby_kwargs = _groupby_capacity_kwargs(expr, universe_groups is not None)
     nodes.append(
         DagNode(
             op=GroupByOp(

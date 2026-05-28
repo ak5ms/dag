@@ -73,7 +73,12 @@ def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Number):
         return ("num", node.value)
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(arg) for arg in node.args))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(arg) for arg in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
     if isinstance(node, Universe):
         return ("univ", node.groups)
     if isinstance(node, KeyTuple):
@@ -122,7 +127,11 @@ def _replace_self_placeholder(node: Expr, lhs: Expr) -> Expr:
     if isinstance(node, Identifier) and node.name == "self_":
         return lhs
     if isinstance(node, Call):
-        return Call(node.fn, tuple(_replace_self_placeholder(arg, lhs) for arg in node.args))
+        return Call(
+            node.fn,
+            tuple(_replace_self_placeholder(arg, lhs) for arg in node.args),
+            tuple((key, _replace_self_placeholder(value, lhs)) for key, value in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self_placeholder(item, lhs) for item in node.items))
     return node
@@ -205,6 +214,12 @@ def compile_formula(
             compiled = _make_literal_node(node.value)
         elif isinstance(node, Call):
             if node.fn == "groupby" and len(node.args) == 3:
+                unsupported_kwargs = {name for name, _ in node.kwargs} - {"capacity", "hash_capacity"}
+                if unsupported_kwargs:
+                    raise FormulaCompileError(f"Unsupported groupby keyword argument(s): {sorted(unsupported_kwargs)}")
+                for name, value in node.kwargs:
+                    if not isinstance(value, Number):
+                        raise FormulaCompileError(f"groupby {name} must be a numeric literal")
                 try:
                     spec = REGISTRY.get(node.fn)
                 except KeyError as exc:
@@ -242,6 +257,8 @@ def compile_formula(
                     "groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
                 )
             else:
+                if node.kwargs:
+                    raise FormulaCompileError(f"Keyword arguments are not supported for {node.fn}")
                 try:
                     spec = REGISTRY.get(node.fn)
                 except KeyError as exc:
