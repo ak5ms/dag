@@ -55,6 +55,32 @@ def _tree_has_group_axis(tree: Any, group_width: int) -> bool:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class GroupTableState:
+    keys: jax.Array
+    occupied: jax.Array
+    table_slots: jax.Array
+    count: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class GroupCacheState:
+    key: jax.Array
+    slot: jax.Array
+    valid: jax.Array
+    inner_state: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class GroupRuntimeState:
+    table: GroupTableState
+    cache: GroupCacheState
+    inner_state: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class GroupByState:
     keys: tuple[jax.Array, ...]
     occupied: tuple[jax.Array, ...]
@@ -65,6 +91,24 @@ class GroupByState:
     cache_valid: tuple[jax.Array, ...]
     cached_inner_state: tuple[Any, ...]
     inner_state: tuple[Any, ...]
+
+
+def _runtime_from_group_state(state: GroupByState, group_i: int) -> GroupRuntimeState:
+    return GroupRuntimeState(
+        table=GroupTableState(
+            state.keys[group_i],
+            state.occupied[group_i],
+            state.table_slots[group_i],
+            state.counts[group_i],
+        ),
+        cache=GroupCacheState(
+            state.cached_keys[group_i],
+            state.cached_slots[group_i],
+            state.cache_valid[group_i],
+            state.cached_inner_state[group_i],
+        ),
+        inner_state=state.inner_state[group_i],
+    )
 
 
 def _tree_broadcast_slots(tree: Any, capacity: int):
@@ -105,12 +149,13 @@ def _hash_key(key: jax.Array) -> jax.Array:
 
 
 def _lookup_or_insert_slot(
-    keys: jax.Array,
-    occupied: jax.Array,
-    table_slots: jax.Array,
-    count: jax.Array,
+    table: GroupTableState,
     key: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, GroupTableState]:
+    keys = table.keys
+    occupied = table.occupied
+    table_slots = table.table_slots
+    count = table.count
     capacity = keys.shape[0]
     table_capacity = table_slots.shape[0]
     start = jnp.asarray(_hash_key(key) % jnp.uint64(table_capacity), dtype=jnp.int32)
@@ -149,7 +194,7 @@ def _lookup_or_insert_slot(
     occupied_next = jax.lax.cond(has_match, lambda x: x, lambda x: x.at[slot].set(True), occupied)
     table_next = jax.lax.cond(has_match, lambda x: x, lambda x: x.at[insert_bucket].set(slot), table_slots)
     count_next = jnp.where(has_match, count, jnp.minimum(count + 1, jnp.asarray(capacity, dtype=jnp.int32)))
-    return slot, keys_next, occupied_next, table_next, count_next
+    return slot, GroupTableState(keys_next, occupied_next, table_next, count_next)
 
 
 def _empty_output_like(template: Any, width: int):
@@ -369,10 +414,7 @@ class GroupByOp(Op):
 
     def _tick_group_groupwise(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
+        table: GroupTableState,
         inner_state: Any,
         idx: jax.Array,
         key_matrix: jax.Array,
@@ -383,7 +425,7 @@ class GroupByOp(Op):
         group_out0 = _group_output_like(template, group_width)
 
         def body(member_pos, carry):
-            keys_c, occupied_c, table_slots_c, count_c, inner_state_c, group_out_c = carry
+            table_c, inner_state_c, group_out_c = carry
             key = key_matrix[member_pos]
 
             already_processed = jnp.asarray(False)
@@ -395,15 +437,9 @@ class GroupByOp(Op):
                 )
 
             def process(process_carry):
-                keys_p, occupied_p, table_slots_p, count_p, inner_state_p, group_out_p = process_carry
+                table_p, inner_state_p, group_out_p = process_carry
 
-                slot, keys_found, occupied_found, table_slots_found, count_found = _lookup_or_insert_slot(
-                    keys_p,
-                    occupied_p,
-                    table_slots_p,
-                    count_p,
-                    key,
-                )
+                slot, table_found = _lookup_or_insert_slot(table_p, key)
 
                 mask = jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix)
                 group_args = tuple(_mask_group_arg(arg, idx, mask) for arg in args)
@@ -420,28 +456,25 @@ class GroupByOp(Op):
                 aligned_out = _align_group_output(local_out, group_width)
                 group_out_next = _mask_group_output(group_out_p, aligned_out, mask)
 
-                return keys_found, occupied_found, table_slots_found, count_found, inner_state_next, group_out_next
+                return table_found, inner_state_next, group_out_next
 
             return jax.lax.cond(
                 already_processed,
                 lambda x: x,
                 process,
-                (keys_c, occupied_c, table_slots_c, count_c, inner_state_c, group_out_c),
+                (table_c, inner_state_c, group_out_c),
             )
 
         return jax.lax.fori_loop(
             0,
             group_width,
             body,
-            (keys, occupied, table_slots, count, inner_state, group_out0),
+            (table, inner_state, group_out0),
         )
 
     def _tick_group_elementwise(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
+        table: GroupTableState,
         inner_state: Any,
         idx: jax.Array,
         key_matrix: jax.Array,
@@ -452,15 +485,9 @@ class GroupByOp(Op):
         group_out0 = _group_output_like(template, group_width)
 
         def body(member_pos, carry):
-            keys_c, occupied_c, table_slots_c, count_c, inner_state_c, group_out_c = carry
+            table_c, inner_state_c, group_out_c = carry
             key = key_matrix[member_pos]
-            slot, keys_found, occupied_found, table_slots_found, count_found = _lookup_or_insert_slot(
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                key,
-            )
+            slot, table_found = _lookup_or_insert_slot(table_c, key)
 
             selected_state = _tree_take_slot(inner_state_c, slot)
             member_args = tuple(_slice_member_arg(arg, idx, member_pos) for arg in args)
@@ -468,26 +495,18 @@ class GroupByOp(Op):
 
             inner_state_next = _tree_set_slot(inner_state_c, slot, updated_state) if updated_state is not None else inner_state_c
             group_out_next = _set_member_output(group_out_c, member_pos, local_out)
-            return keys_found, occupied_found, table_slots_found, count_found, inner_state_next, group_out_next
+            return table_found, inner_state_next, group_out_next
 
         return jax.lax.fori_loop(
             0,
             group_width,
             body,
-            (keys, occupied, table_slots, count, inner_state, group_out0),
+            (table, inner_state, group_out0),
         )
 
     def _tick_group_cached_single_key(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
-        inner_state: Any,
-        cached_key: jax.Array,
-        cached_slot: jax.Array,
-        cache_valid: jax.Array,
-        cached_inner_state: Any,
+        runtime: GroupRuntimeState,
         idx: jax.Array,
         key_matrix: jax.Array,
         args: tuple[jax.Array, ...],
@@ -495,24 +514,23 @@ class GroupByOp(Op):
         key = key_matrix[0]
         group_width = idx.shape[0]
         group_args = tuple(_slice_group_arg(arg, idx) for arg in args)
-        cache_hit = cache_valid & _same_key_vector(cached_key, key)
+        cache_hit = runtime.cache.valid & _same_key_vector(runtime.cache.key, key)
 
         def hit(_):
-            return keys, occupied, table_slots, count, inner_state, cached_slot, cached_inner_state
+            return runtime.table, runtime.inner_state, runtime.cache.slot, runtime.cache.inner_state
 
         def miss(_):
-            flushed_state = _flush_cached_inner_state(inner_state, cached_inner_state, cached_slot, cache_valid)
-            slot, keys_next, occupied_next, table_slots_next, count_next = _lookup_or_insert_slot(
-                keys,
-                occupied,
-                table_slots,
-                count,
-                key,
+            flushed_state = _flush_cached_inner_state(
+                runtime.inner_state,
+                runtime.cache.inner_state,
+                runtime.cache.slot,
+                runtime.cache.valid,
             )
+            slot, table_next = _lookup_or_insert_slot(runtime.table, key)
             selected_state = _tree_take_slot(flushed_state, slot) if flushed_state is not None else None
-            return keys_next, occupied_next, table_slots_next, count_next, flushed_state, slot, selected_state
+            return table_next, flushed_state, slot, selected_state
 
-        keys_c, occupied_c, table_slots_c, count_c, inner_state_c, slot_c, selected_state = jax.lax.cond(
+        table_c, inner_state_c, slot_c, selected_state = jax.lax.cond(
             cache_hit,
             hit,
             miss,
@@ -522,68 +540,51 @@ class GroupByOp(Op):
         updated_state, local_out = self.inner_op.tick(selected_state, *group_args)
         cached_state_next = updated_state if updated_state is not None else selected_state
         return (
-            keys_c,
-            occupied_c,
-            table_slots_c,
-            count_c,
-            key,
-            slot_c,
-            jnp.asarray(True),
-            cached_state_next,
-            inner_state_c,
+            GroupRuntimeState(
+                table=table_c,
+                cache=GroupCacheState(key, slot_c, jnp.asarray(True), cached_state_next),
+                inner_state=inner_state_c,
+            ),
             _align_group_output(local_out, group_width),
         )
 
     def _tick_group_groupwise_uncached(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
-        inner_state: Any,
-        cached_key: jax.Array,
-        cached_slot: jax.Array,
-        cache_valid: jax.Array,
-        cached_inner_state: Any,
+        runtime: GroupRuntimeState,
         idx: jax.Array,
         key_matrix: jax.Array,
         args: tuple[jax.Array, ...],
     ):
-        flushed_state = _flush_cached_inner_state(inner_state, cached_inner_state, cached_slot, cache_valid)
-        keys_next, occupied_next, table_slots_next, count_next, inner_state_next, group_out = self._tick_group_groupwise(
-            keys,
-            occupied,
-            table_slots,
-            count,
+        flushed_state = _flush_cached_inner_state(
+            runtime.inner_state,
+            runtime.cache.inner_state,
+            runtime.cache.slot,
+            runtime.cache.valid,
+        )
+        table_next, inner_state_next, group_out = self._tick_group_groupwise(
+            runtime.table,
             flushed_state,
             idx,
             key_matrix,
             args,
         )
         return (
-            keys_next,
-            occupied_next,
-            table_slots_next,
-            count_next,
-            cached_key,
-            cached_slot,
-            jnp.asarray(False),
-            cached_inner_state,
-            inner_state_next,
+            GroupRuntimeState(
+                table=table_next,
+                cache=GroupCacheState(
+                    runtime.cache.key,
+                    runtime.cache.slot,
+                    jnp.asarray(False),
+                    runtime.cache.inner_state,
+                ),
+                inner_state=inner_state_next,
+            ),
             group_out,
         )
 
     def _tick_group(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
-        cached_key: jax.Array,
-        cached_slot: jax.Array,
-        cache_valid: jax.Array,
-        cached_inner_state: Any,
-        inner_state: Any,
+        runtime: GroupRuntimeState,
         idx: jax.Array,
         key_matrix: jax.Array,
         args: tuple[jax.Array, ...],
@@ -592,80 +593,42 @@ class GroupByOp(Op):
         # group axis, so cross-sectional ops must see every member in the key.
         # Direct grouped-apply ops with scalar keyed state advance per member;
         # repeated keys in one cross-section should therefore tick sequentially.
-        if inner_state is not None and not _tree_has_group_axis(_tree_take_slot(inner_state, jnp.asarray(0, dtype=jnp.int32)), idx.shape[0]):
-            keys_next, occupied_next, table_slots_next, count_next, inner_state_next, group_out = self._tick_group_elementwise(
-                keys,
-                occupied,
-                table_slots,
-                count,
-                inner_state,
+        if runtime.inner_state is not None and not _tree_has_group_axis(_tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32)), idx.shape[0]):
+            table_next, inner_state_next, group_out = self._tick_group_elementwise(
+                runtime.table,
+                runtime.inner_state,
                 idx,
                 key_matrix,
                 args,
             )
             return (
-                keys_next,
-                occupied_next,
-                table_slots_next,
-                count_next,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
-                inner_state_next,
+                GroupRuntimeState(table_next, runtime.cache, inner_state_next),
                 group_out,
             )
 
-        if inner_state is None:
-            keys_next, occupied_next, table_slots_next, count_next, inner_state_next, group_out = self._tick_group_groupwise(
-                keys,
-                occupied,
-                table_slots,
-                count,
-                inner_state,
+        if runtime.inner_state is None:
+            table_next, inner_state_next, group_out = self._tick_group_groupwise(
+                runtime.table,
+                runtime.inner_state,
                 idx,
                 key_matrix,
                 args,
             )
             return (
-                keys_next,
-                occupied_next,
-                table_slots_next,
-                count_next,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
-                inner_state_next,
+                GroupRuntimeState(table_next, runtime.cache, inner_state_next),
                 group_out,
             )
 
         return jax.lax.cond(
             _all_same_group_key(key_matrix),
             lambda _: self._tick_group_cached_single_key(
-                keys,
-                occupied,
-                table_slots,
-                count,
-                inner_state,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
+                runtime,
                 idx,
                 key_matrix,
                 args,
             ),
             lambda _: self._tick_group_groupwise_uncached(
-                keys,
-                occupied,
-                table_slots,
-                count,
-                inner_state,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
+                runtime,
                 idx,
                 key_matrix,
                 args,
@@ -685,15 +648,7 @@ class GroupByOp(Op):
 
     def _scan_group_rows(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
-        cached_key: jax.Array,
-        cached_slot: jax.Array,
-        cache_valid: jax.Array,
-        cached_inner_state: Any,
-        inner_state: Any,
+        runtime: GroupRuntimeState,
         idx: jax.Array,
         key_seq: jax.Array,
         args_seq: tuple[jax.Array, ...],
@@ -701,88 +656,25 @@ class GroupByOp(Op):
         n_steps = key_seq.shape[0]
         group_width = idx.shape[0]
         sample_args = tuple(_slice_group_arg(arg[0], idx) for arg in args_seq)
-        sample_state = _tree_take_slot(inner_state, jnp.asarray(0, dtype=jnp.int32)) if inner_state is not None else None
+        sample_state = _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32)) if runtime.inner_state is not None else None
         _, template = self.inner_op.tick(sample_state, *sample_args)
         out0 = _empty_batch_group_output_like(template, n_steps, group_width)
 
-        def step(carry, row_values):
-            (
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                cached_key_c,
-                cached_slot_c,
-                cache_valid_c,
-                cached_inner_state_c,
-                inner_state_c,
-            ) = carry
+        def step(runtime_c, row_values):
             key_matrix, row_args = row_values
-            (
-                keys_n,
-                occupied_n,
-                table_slots_n,
-                count_n,
-                cached_key_n,
-                cached_slot_n,
-                cache_valid_n,
-                cached_inner_state_n,
-                inner_state_n,
-                group_out,
-            ) = self._tick_group(
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                cached_key_c,
-                cached_slot_c,
-                cache_valid_c,
-                cached_inner_state_c,
-                inner_state_c,
-                idx,
-                key_matrix,
-                row_args,
-            )
-            return (
-                keys_n,
-                occupied_n,
-                table_slots_n,
-                count_n,
-                cached_key_n,
-                cached_slot_n,
-                cache_valid_n,
-                cached_inner_state_n,
-                inner_state_n,
-            ), group_out
+            runtime_n, group_out = self._tick_group(runtime_c, idx, key_matrix, row_args)
+            return runtime_n, group_out
 
         return jax.lax.scan(
             step,
-            (
-                keys,
-                occupied,
-                table_slots,
-                count,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
-                inner_state,
-            ),
+            runtime,
             (key_seq, tuple(args_seq)),
             unroll=32,
         )
 
     def _scan_group_runs(
         self,
-        keys: jax.Array,
-        occupied: jax.Array,
-        table_slots: jax.Array,
-        count: jax.Array,
-        cached_key: jax.Array,
-        cached_slot: jax.Array,
-        cache_valid: jax.Array,
-        cached_inner_state: Any,
-        inner_state: Any,
+        runtime: GroupRuntimeState,
         idx: jax.Array,
         key_seq: jax.Array,
         args_seq: tuple[jax.Array, ...],
@@ -791,7 +683,7 @@ class GroupByOp(Op):
         n_steps = key_seq.shape[0]
         group_width = idx.shape[0]
         sample_args = tuple(_slice_group_arg(arg[0], idx) for arg in args_seq)
-        sample_state = _tree_take_slot(inner_state, jnp.asarray(0, dtype=jnp.int32))
+        sample_state = _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32))
         _, template = self.inner_op.tick(sample_state, *sample_args)
         out0 = _empty_batch_group_output_like(template, n_steps, group_width)
 
@@ -805,39 +697,26 @@ class GroupByOp(Op):
             return jax.lax.while_loop(cond, body, start)
 
         def process_uniform_run(carry):
-            (
-                pos_c,
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                cached_key_c,
-                cached_slot_c,
-                cache_valid_c,
-                cached_inner_state_c,
-                inner_state_c,
-                out_c,
-            ) = carry
+            pos_c, runtime_c, out_c = carry
             key = key_seq[pos_c, 0]
             run_end = find_run_end(pos_c, key)
-            cache_hit = cache_valid_c & _same_key_vector(cached_key_c, key)
+            cache_hit = runtime_c.cache.valid & _same_key_vector(runtime_c.cache.key, key)
 
             def hit(_):
-                return keys_c, occupied_c, table_slots_c, count_c, inner_state_c, cached_slot_c, cached_inner_state_c
+                return runtime_c.table, runtime_c.inner_state, runtime_c.cache.slot, runtime_c.cache.inner_state
 
             def miss(_):
-                flushed_state = _flush_cached_inner_state(inner_state_c, cached_inner_state_c, cached_slot_c, cache_valid_c)
-                slot, keys_next, occupied_next, table_slots_next, count_next = _lookup_or_insert_slot(
-                    keys_c,
-                    occupied_c,
-                    table_slots_c,
-                    count_c,
-                    key,
+                flushed_state = _flush_cached_inner_state(
+                    runtime_c.inner_state,
+                    runtime_c.cache.inner_state,
+                    runtime_c.cache.slot,
+                    runtime_c.cache.valid,
                 )
+                slot, table_next = _lookup_or_insert_slot(runtime_c.table, key)
                 selected_state = _tree_take_slot(flushed_state, slot)
-                return keys_next, occupied_next, table_slots_next, count_next, flushed_state, slot, selected_state
+                return table_next, flushed_state, slot, selected_state
 
-            keys_s, occupied_s, table_slots_s, count_s, inner_state_s, slot_s, selected_state = jax.lax.cond(
+            table_s, inner_state_s, slot_s, selected_state = jax.lax.cond(
                 cache_hit,
                 hit,
                 miss,
@@ -859,69 +738,21 @@ class GroupByOp(Op):
             )
             return (
                 run_end,
-                keys_s,
-                occupied_s,
-                table_slots_s,
-                count_s,
-                key,
-                slot_s,
-                jnp.asarray(True),
-                cached_state_next,
-                inner_state_s,
+                GroupRuntimeState(
+                    table=table_s,
+                    cache=GroupCacheState(key, slot_s, jnp.asarray(True), cached_state_next),
+                    inner_state=inner_state_s,
+                ),
                 out_next,
             )
 
         def process_mixed_row(carry):
-            (
-                pos_c,
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                cached_key_c,
-                cached_slot_c,
-                cache_valid_c,
-                cached_inner_state_c,
-                inner_state_c,
-                out_c,
-            ) = carry
+            pos_c, runtime_c, out_c = carry
             row_args = tuple(arg[pos_c] for arg in args_seq)
-            (
-                keys_n,
-                occupied_n,
-                table_slots_n,
-                count_n,
-                cached_key_n,
-                cached_slot_n,
-                cache_valid_n,
-                cached_inner_state_n,
-                inner_state_n,
-                group_out,
-            ) = self._tick_group(
-                keys_c,
-                occupied_c,
-                table_slots_c,
-                count_c,
-                cached_key_c,
-                cached_slot_c,
-                cache_valid_c,
-                cached_inner_state_c,
-                inner_state_c,
-                idx,
-                key_seq[pos_c],
-                row_args,
-            )
+            runtime_n, group_out = self._tick_group(runtime_c, idx, key_seq[pos_c], row_args)
             return (
                 pos_c + 1,
-                keys_n,
-                occupied_n,
-                table_slots_n,
-                count_n,
-                cached_key_n,
-                cached_slot_n,
-                cache_valid_n,
-                cached_inner_state_n,
-                inner_state_n,
+                runtime_n,
                 _set_time_output(out_c, pos_c, group_out),
             )
 
@@ -943,15 +774,7 @@ class GroupByOp(Op):
             body,
             (
                 jnp.asarray(0, dtype=jnp.int32),
-                keys,
-                occupied,
-                table_slots,
-                count,
-                cached_key,
-                cached_slot,
-                cache_valid,
-                cached_inner_state,
-                inner_state,
+                runtime,
                 out0,
             ),
         )
@@ -980,11 +803,11 @@ class GroupByOp(Op):
         new_inner_states = []
 
         for group_i, idx in enumerate(group_indices):
+            runtime = _runtime_from_group_state(state, group_i)
             key_seq = self._batch_key_matrix_for_group(idx, key_cols)
             group_args_seq = args_seq
-            group_state = state.inner_state[group_i]
-            use_run_scan = group_state is not None and _tree_has_group_axis(
-                _tree_take_slot(group_state, jnp.asarray(0, dtype=jnp.int32)),
+            use_run_scan = runtime.inner_state is not None and _tree_has_group_axis(
+                _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32)),
                 idx.shape[0],
             )
 
@@ -992,82 +815,24 @@ class GroupByOp(Op):
                 all_uniform = jnp.all(jax.vmap(_all_same_group_key)(key_seq))
 
                 def run_scan(require_uniform):
-                    (
-                        _,
-                        keys_r,
-                        occupied_r,
-                        table_slots_r,
-                        count_r,
-                        cached_key_r,
-                        cached_slot_r,
-                        cache_valid_r,
-                        cached_inner_state_r,
-                        inner_state_r,
-                        group_out_r,
-                    ) = self._scan_group_runs(
-                        state.keys[group_i],
-                        state.occupied[group_i],
-                        state.table_slots[group_i],
-                        state.counts[group_i],
-                        state.cached_keys[group_i],
-                        state.cached_slots[group_i],
-                        state.cache_valid[group_i],
-                        state.cached_inner_state[group_i],
-                        group_state,
+                    _, runtime_r, group_out_r = self._scan_group_runs(
+                        runtime,
                         idx,
                         key_seq,
                         group_args_seq,
                         require_uniform=require_uniform,
                     )
-                    return (
-                        keys_r,
-                        occupied_r,
-                        table_slots_r,
-                        count_r,
-                        cached_key_r,
-                        cached_slot_r,
-                        cache_valid_r,
-                        cached_inner_state_r,
-                        inner_state_r,
-                    ), group_out_r
+                    return runtime_r, group_out_r
 
-                (
-                    keys_i,
-                    occupied_i,
-                    table_slots_i,
-                    count_i,
-                    cached_key_i,
-                    cached_slot_i,
-                    cache_valid_i,
-                    cached_inner_state_i,
-                    inner_state_i,
-                ), group_out = jax.lax.cond(
+                runtime_i, group_out = jax.lax.cond(
                     all_uniform,
                     lambda _: run_scan(True),
                     lambda _: run_scan(False),
                     operand=None,
                 )
             else:
-                (
-                    keys_i,
-                    occupied_i,
-                    table_slots_i,
-                    count_i,
-                    cached_key_i,
-                    cached_slot_i,
-                    cache_valid_i,
-                    cached_inner_state_i,
-                    inner_state_i,
-                ), group_out = self._scan_group_rows(
-                    state.keys[group_i],
-                    state.occupied[group_i],
-                    state.table_slots[group_i],
-                    state.counts[group_i],
-                    state.cached_keys[group_i],
-                    state.cached_slots[group_i],
-                    state.cache_valid[group_i],
-                    state.cached_inner_state[group_i],
-                    group_state,
+                runtime_i, group_out = self._scan_group_rows(
+                    runtime,
                     idx,
                     key_seq,
                     group_args_seq,
@@ -1077,15 +842,15 @@ class GroupByOp(Op):
                 out = _empty_batch_output_like(group_out, n_steps, width)
             out = _scatter_batch_group_output(out, idx, group_out)
 
-            new_keys.append(keys_i)
-            new_occupied.append(occupied_i)
-            new_table_slots.append(table_slots_i)
-            new_counts.append(count_i)
-            new_cached_keys.append(cached_key_i)
-            new_cached_slots.append(cached_slot_i)
-            new_cache_valid.append(cache_valid_i)
-            new_cached_inner_states.append(cached_inner_state_i)
-            new_inner_states.append(inner_state_i)
+            new_keys.append(runtime_i.table.keys)
+            new_occupied.append(runtime_i.table.occupied)
+            new_table_slots.append(runtime_i.table.table_slots)
+            new_counts.append(runtime_i.table.count)
+            new_cached_keys.append(runtime_i.cache.key)
+            new_cached_slots.append(runtime_i.cache.slot)
+            new_cache_valid.append(runtime_i.cache.valid)
+            new_cached_inner_states.append(runtime_i.cache.inner_state)
+            new_inner_states.append(runtime_i.inner_state)
 
         return (
             GroupByState(
@@ -1129,28 +894,8 @@ class GroupByOp(Op):
 
         for group_i, idx in enumerate(group_indices):
             key_matrix = self._key_matrix_for_group(idx, key_cols)
-
-            (
-                keys_i,
-                occupied_i,
-                table_slots_i,
-                count_i,
-                cached_key_i,
-                cached_slot_i,
-                cache_valid_i,
-                cached_inner_state_i,
-                inner_state_i,
-                group_out,
-            ) = self._tick_group(
-                state.keys[group_i],
-                state.occupied[group_i],
-                state.table_slots[group_i],
-                state.counts[group_i],
-                state.cached_keys[group_i],
-                state.cached_slots[group_i],
-                state.cache_valid[group_i],
-                state.cached_inner_state[group_i],
-                state.inner_state[group_i],
+            runtime_i, group_out = self._tick_group(
+                _runtime_from_group_state(state, group_i),
                 idx,
                 key_matrix,
                 args,
@@ -1160,15 +905,15 @@ class GroupByOp(Op):
                 out = _empty_output_like(group_out, width)
             out = _scatter_group_output(out, idx, group_out)
 
-            new_keys.append(keys_i)
-            new_occupied.append(occupied_i)
-            new_table_slots.append(table_slots_i)
-            new_counts.append(count_i)
-            new_cached_keys.append(cached_key_i)
-            new_cached_slots.append(cached_slot_i)
-            new_cache_valid.append(cache_valid_i)
-            new_cached_inner_states.append(cached_inner_state_i)
-            new_inner_states.append(inner_state_i)
+            new_keys.append(runtime_i.table.keys)
+            new_occupied.append(runtime_i.table.occupied)
+            new_table_slots.append(runtime_i.table.table_slots)
+            new_counts.append(runtime_i.table.count)
+            new_cached_keys.append(runtime_i.cache.key)
+            new_cached_slots.append(runtime_i.cache.slot)
+            new_cache_valid.append(runtime_i.cache.valid)
+            new_cached_inner_states.append(runtime_i.cache.inner_state)
+            new_inner_states.append(runtime_i.inner_state)
 
         return (
             GroupByState(
@@ -1184,4 +929,3 @@ class GroupByOp(Op):
             ),
             out,
         )
-
