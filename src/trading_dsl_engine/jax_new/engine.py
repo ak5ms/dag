@@ -99,10 +99,17 @@ def _expr_key(node: Expr):
     if isinstance(node, Number):
         return ("num", float(node.value))
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(a) for a in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
     raise ValueError(f"Unsupported expression: {node}")
 
 def _build_op(expr: Call) -> tuple[Op, int | None]:
+    if expr.kwargs:
+        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     fn = expr.fn
     if fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1

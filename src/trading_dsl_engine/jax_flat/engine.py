@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+import warnings
 
 import equinox as eqx
 import jax
@@ -96,8 +97,7 @@ class JaxFlatRuntime(eqx.Module):
             states.append(node.op.init_state(sample))
         return tuple(states)
 
-    @jax.jit
-    def tick(self, state_leaves, *input_rows):
+    def _tick_impl(self, state_leaves, *input_rows):
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
         new_state = list(state_leaves)
 
@@ -121,24 +121,144 @@ class JaxFlatRuntime(eqx.Module):
         outs = tuple(values[i] for i in self.program.outputs)
         return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
+    @jax.jit
+    def tick(self, state_leaves, *input_rows):
+        return self._tick_impl(state_leaves, *input_rows)
+
     def run_batch(self, inputs, states=None):
+        runtime = self
+        while True:
+            try:
+                return runtime._run_batch_once(inputs, states)
+            except Exception as exc:
+                if states or not _is_groupby_capacity_error(exc):
+                    raise
+                next_runtime = _double_groupby_capacities(runtime)
+                if next_runtime is runtime:
+                    raise
+                warnings.warn(
+                    "jax_flat groupby capacity/hash table exhausted; retrying run_batch with 2x group key capacity",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                runtime = next_runtime
+
+    def _run_batch_once(self, inputs, states=None):
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
         n_steps = inputs[0].shape[0]
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps:
                 raise ValueError("All inputs must have identical timestep length")
+        if _can_use_groupby_root_batch(self):
+            return _run_groupby_root_batch(self, inputs, states)
         if not states:
-            state0 = self.init_state(inputs[0].shape[1])
+            return _jit_batch_from_initial_state(self, inputs)
+        return _jit_batch(self, states, inputs)
+
+
+def _is_groupby_capacity_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "jax_flat groupby capacity exceeded" in message
+        or "jax_flat groupby hash table exhausted" in message
+    )
+
+
+def _double_groupby_capacities(runtime: JaxFlatRuntime) -> JaxFlatRuntime:
+    changed = False
+    nodes = []
+    for node in runtime.program.nodes:
+        op = node.op
+        if isinstance(op, GroupByOp):
+            op = replace(
+                op,
+                capacity=op.capacity * 2,
+                hash_capacity=max(op.hash_capacity * 2, op.capacity * 4),
+            )
+            changed = True
+        nodes.append(DagNode(op=op, child_ids=node.child_ids))
+    if not changed:
+        return runtime
+    return JaxFlatRuntime(program=replace(runtime.program, nodes=tuple(nodes)))
+
+
+@eqx.filter_jit
+def _jit_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    state0 = runtime.init_state(inputs[0].shape[1])
+    return _scan_batch(runtime, state0, inputs)
+
+
+@eqx.filter_jit
+def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
+    return _scan_batch(runtime, state0, inputs)
+
+
+def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    def step(states, rows):
+        return runtime._tick_impl(states, *rows)
+
+    return jax.lax.scan(step, state0, xs=inputs, unroll=32)
+
+
+def _can_use_groupby_root_batch(runtime: JaxFlatRuntime) -> bool:
+    if len(runtime.program.outputs) != 1:
+        return False
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    if not isinstance(root_node.op, GroupByOp):
+        return False
+    if runtime.program.state_layout.node_fields[root_id].index < 0:
+        return False
+    for child_id in root_node.child_ids:
+        child_op = runtime.program.nodes[child_id].op
+        if not isinstance(child_op, InputOp):
+            return False
+    return True
+
+
+def _groupby_root_child_sequences(runtime: JaxFlatRuntime, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    return tuple(inputs[runtime.program.nodes[child_id].op.input_index] for child_id in root_node.child_ids)
+
+
+def _run_groupby_root_batch(runtime: JaxFlatRuntime, inputs, states=None):
+    chunk_size = 2560
+    n_steps = inputs[0].shape[0]
+    state = None if not states else states
+    outputs = []
+    start = 0
+    while start < n_steps:
+        end = min(start + chunk_size, n_steps)
+        chunk_inputs = tuple(arr[start:end] for arr in inputs)
+        if state is None:
+            state, out = _jit_groupby_root_batch_from_initial_state(runtime, chunk_inputs)
         else:
-            state0 = states
+            state, out = _jit_groupby_root_batch(runtime, state, chunk_inputs)
+        outputs.append(out)
+        start = end
+    return state, jax.tree_util.tree_map(lambda *parts: jnp.concatenate(parts, axis=0), *outputs)
 
-        @jax.jit
-        def step(states, rows):
-            return self.tick(states, *rows)
 
-        out = jax.lax.scan(step, state0, xs=inputs)
-        return out
+@eqx.filter_jit
+def _jit_groupby_root_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    group_state = root_node.op.init_state(inputs[0][0])
+    new_group_state, out = root_node.op.scan_batch(group_state, *_groupby_root_child_sequences(runtime, inputs))
+    return (new_group_state,), out
+
+
+@eqx.filter_jit
+def _jit_groupby_root_batch(runtime: JaxFlatRuntime, states, inputs):
+    root_id = runtime.program.outputs[0]
+    root_node = runtime.program.nodes[root_id]
+    state_idx = runtime.program.state_layout.node_fields[root_id].index
+    new_group_state, out = root_node.op.scan_batch(states[state_idx], *_groupby_root_child_sequences(runtime, inputs))
+    new_states = list(states)
+    new_states[state_idx] = new_group_state
+    return tuple(new_states), out
 
 
 def _expr_key(node: Expr):
@@ -147,7 +267,12 @@ def _expr_key(node: Expr):
     if isinstance(node, Number):
         return ("num", float(node.value))
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(a) for a in node.args))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(a) for a in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
     if isinstance(node, Universe):
@@ -177,7 +302,16 @@ def _resolve_universe_groups(universe: Universe) -> tuple[tuple[int, ...], ...]:
 
 def _validate_groupby_canonical_form(expr: Call) -> None:
     if len(expr.args) != 3:
-        raise ValueError("groupby only supports canonical form: groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)")
+        raise ValueError(
+            "groupby only supports canonical form: "
+            "groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+        )
+    unsupported_kwargs = {name for name, _ in expr.kwargs} - {"capacity", "hash_capacity"}
+    if unsupported_kwargs:
+        raise ValueError(f"Unsupported groupby keyword argument(s): {sorted(unsupported_kwargs)}")
+    for name, value in expr.kwargs:
+        if not isinstance(value, Number):
+            raise ValueError(f"groupby {name} must be a numeric literal")
     _canonical_groupby_key_items(expr.args[0])
 
 
@@ -185,7 +319,11 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
     if isinstance(node, Identifier) and node.name == "self_":
         return lhs
     if isinstance(node, Call):
-        return Call(node.fn, tuple(_replace_self(a, lhs) for a in node.args))
+        return Call(
+            node.fn,
+            tuple(_replace_self(a, lhs) for a in node.args),
+            tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
     return node
@@ -194,6 +332,8 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
 def _build_op(expr: Call) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
+    if expr.kwargs:
+        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
@@ -285,7 +425,29 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
     )
 
 
-def _compile_groupby_node(expr: Call, memo: dict[tuple[Any, ...], int], nodes: list[DagNode], input_names: list[str]) -> int:
+def _groupby_capacity_kwargs(expr: Call, has_universe_groups: bool) -> dict[str, int]:
+    capacity = 2048 if has_universe_groups else 4096
+    hash_capacity = None
+    for name, value in expr.kwargs:
+        literal = int(value.value)
+        if literal <= 0:
+            raise ValueError(f"groupby {name} must be positive")
+        if name == "capacity":
+            capacity = literal
+        elif name == "hash_capacity":
+            hash_capacity = literal
+    return {
+        "capacity": capacity,
+        "hash_capacity": max(hash_capacity if hash_capacity is not None else capacity * 2, capacity),
+    }
+
+
+def _compile_groupby_node(
+    expr: Call,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+) -> int:
     _validate_groupby_canonical_form(expr)
     key_items = _canonical_groupby_key_items(expr.args[0])
     universe_items = [item for item in key_items if isinstance(item, Universe)]
@@ -298,9 +460,15 @@ def _compile_groupby_node(expr: Call, memo: dict[tuple[Any, ...], int], nodes: l
         _compile_node(feed, memo, nodes, input_names) for feed in feed_exprs
     )
     idx = len(nodes)
+    groupby_kwargs = _groupby_capacity_kwargs(expr, universe_groups is not None)
     nodes.append(
         DagNode(
-            op=GroupByOp(inner_op=inner_op, n_keys=len(dynamic_items), universe_groups=universe_groups),
+            op=GroupByOp(
+                inner_op=inner_op,
+                n_keys=len(dynamic_items),
+                universe_groups=universe_groups,
+                **groupby_kwargs,
+            ),
             child_ids=child_ids,
         )
     )
