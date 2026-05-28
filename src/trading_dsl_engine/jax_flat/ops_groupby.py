@@ -148,6 +148,36 @@ def _hash_key(key: jax.Array) -> jax.Array:
     return jnp.bitwise_xor.reduce(mixed, initial=jnp.uint64(0x9e3779b97f4a7c15))
 
 
+def _raise_groupby_lookup_error(error_code: jax.Array) -> None:
+    messages = {
+        1: "jax_flat groupby capacity exceeded; increase GroupByOp.capacity",
+        2: (
+            "jax_flat groupby hash table exhausted before finding an empty bucket; "
+            "increase GroupByOp.hash_capacity"
+        ),
+    }
+    raise RuntimeError(messages[int(error_code)])
+
+
+def _check_lookup_insertable(
+    has_match: jax.Array,
+    has_insert_bucket: jax.Array,
+    count: jax.Array,
+    capacity: int,
+) -> None:
+    missing_key = ~has_match
+    slots_full = missing_key & (count >= jnp.asarray(capacity, dtype=jnp.int32))
+    hash_exhausted = missing_key & ~has_insert_bucket
+    error_code = jnp.where(slots_full, jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+    error_code = jnp.where(hash_exhausted & ~slots_full, jnp.asarray(2, dtype=jnp.int32), error_code)
+
+    def raise_error(code):
+        jax.debug.callback(_raise_groupby_lookup_error, code)
+        return code
+
+    jax.lax.cond(error_code != 0, raise_error, lambda code: code, error_code)
+
+
 def _lookup_or_insert_slot(
     table: GroupTableState,
     key: jax.Array,
@@ -188,6 +218,9 @@ def _lookup_or_insert_slot(
     )
 
     has_match = found_slot >= 0
+    has_insert_bucket = table_slots[insert_bucket] < 0
+    _check_lookup_insertable(has_match, has_insert_bucket, count, capacity)
+
     next_free = jnp.minimum(count, jnp.asarray(capacity - 1, dtype=jnp.int32))
     slot = jnp.where(has_match, found_slot, next_free)
     keys_next = jax.lax.cond(has_match, lambda x: x, lambda x: x.at[slot].set(key), keys)
