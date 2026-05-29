@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Any
+import mmap
+import os
+import tempfile
 import warnings
 
 import equinox as eqx
@@ -137,11 +140,11 @@ class JaxFlatRuntime(eqx.Module):
     def tick(self, state_leaves, *input_rows):
         return self._tick_impl(state_leaves, *input_rows)
 
-    def run_batch(self, inputs, states=None):
+    def run_batch(self, inputs, states=None, out_path: str | bool = False):
         runtime = self
         while True:
             try:
-                return runtime._run_batch_once(inputs, states)
+                return runtime._run_batch_once(inputs, states, out_path)
             except Exception as exc:
                 if states or not _is_groupby_capacity_error(exc):
                     raise
@@ -155,7 +158,7 @@ class JaxFlatRuntime(eqx.Module):
                 )
                 runtime = next_runtime
 
-    def _run_batch_once(self, inputs, states=None):
+    def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
         inputs = _normalize_batch_inputs(self, inputs)
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
@@ -164,8 +167,8 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-        if _has_memmap_input(inputs):
-            return _run_memmap_batch(self, inputs, states)
+        if _has_memmap_input(inputs) or out_path:
+            return _run_chunked_batch(self, inputs, states, out_path)
         if not states:
             return _jit_batch_from_initial_state(self, inputs)
         return _jit_batch(self, states, inputs)
@@ -196,14 +199,43 @@ def _has_memmap_input(inputs) -> bool:
     return any(isinstance(arr, np.memmap) for arr in inputs)
 
 
+def _fresh_memmap_path(prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
+    os.close(fd)
+    return path
+
+
 def _input_chunk(arr, start: int, stop: int):
     chunk = arr[start:stop]
     if isinstance(chunk, np.memmap) and chunk.dtype == np.float64:
         return chunk
-    return np.asarray(chunk, dtype=np.float64)
+    if isinstance(chunk, np.ndarray):
+        return np.asarray(chunk, dtype=np.float64)
+    return chunk
 
 
-def _run_memmap_batch(runtime: JaxFlatRuntime, inputs, states=None):
+def _output_array(out_path: str | bool, n_steps: int, chunk_out: np.ndarray):
+    shape = (n_steps,) + chunk_out.shape[1:]
+    if out_path is False or out_path is None:
+        return np.empty(shape, dtype=chunk_out.dtype)
+    if out_path is True:
+        out_path = _fresh_memmap_path("trading_dsl_engine_jax_flat_out_")
+    if isinstance(out_path, str):
+        return np.memmap(out_path, mode="w+", dtype=chunk_out.dtype, shape=shape)
+    raise ValueError("out_path must be False, True, or a filesystem path string")
+
+
+def _flush_memmap_output(out) -> None:
+    if not isinstance(out, np.memmap):
+        return
+    out.flush()
+    mapped = getattr(out, "_mmap", None)
+    madvise = getattr(mapped, "madvise", None)
+    if madvise is not None and hasattr(mmap, "MADV_DONTNEED"):
+        madvise(mmap.MADV_DONTNEED)
+
+
+def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: str | bool = False):
     n_steps = inputs[0].shape[0]
     n_instruments = inputs[0].shape[1]
     chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
@@ -216,8 +248,9 @@ def _run_memmap_batch(runtime: JaxFlatRuntime, inputs, states=None):
         states, chunk_out = _scan_batch_chunk(runtime, states, chunk_inputs)
         chunk_out_np = np.asarray(jax.block_until_ready(chunk_out))
         if out is None:
-            out = np.empty((n_steps,) + chunk_out_np.shape[1:], dtype=chunk_out_np.dtype)
+            out = _output_array(out_path, n_steps, chunk_out_np)
         out[start:stop] = chunk_out_np
+        _flush_memmap_output(out)
 
     return states, out
 

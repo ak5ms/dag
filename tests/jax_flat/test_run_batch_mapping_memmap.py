@@ -110,3 +110,50 @@ def test_run_batch_streams_memmap_mapping_inputs_in_chunks(tmp_path, monkeypatch
     assert peak[0] - baseline < input_bytes + out.nbytes * 2
     np.testing.assert_allclose(out[0], np.zeros(n_instruments, dtype=np.float64))
     np.testing.assert_allclose(out[-1], np.full(n_instruments, 2.0 * (n_steps - 1)))
+
+
+def test_run_batch_out_path_writes_memmap_incrementally(tmp_path, monkeypatch):
+    n_steps = 512
+    n_instruments = 8
+    chunk_size = 64
+    out_path = tmp_path / "out.memmap"
+    close = jnp.arange(n_steps * n_instruments, dtype=jnp.float64).reshape(n_steps, n_instruments)
+    open_ = jnp.ones((n_steps, n_instruments), dtype=jnp.float64)
+    runtime = jax_flat_engine.compile_formula("close + open")
+    monkeypatch.setattr(jax_flat_engine, "_BATCH_CHUNK_SIZE", chunk_size)
+
+    writes: list[tuple[int, int]] = []
+    original_memmap = jax_flat_engine.np.memmap
+
+    class TrackingMemmap(original_memmap):
+        def __setitem__(self, key, value):
+            if isinstance(key, slice):
+                writes.append((key.start, key.stop))
+            return super().__setitem__(key, value)
+
+    monkeypatch.setattr(jax_flat_engine.np, "memmap", TrackingMemmap)
+
+    _, out = runtime.run_batch({"open": open_, "close": close}, out_path=str(out_path))
+
+    assert isinstance(out, np.memmap)
+    assert out.filename == str(out_path)
+    assert writes == [(start, min(start + chunk_size, n_steps)) for start in range(0, n_steps, chunk_size)]
+    np.testing.assert_allclose(out[:], np.asarray(close + open_))
+
+
+def test_run_batch_out_path_true_allocates_tmp_memmap():
+    runtime = jax_flat_engine.compile_formula("close + open")
+    close = jnp.array([[1.0, 2.0]], dtype=jnp.float64)
+    open_ = jnp.array([[3.0, 4.0]], dtype=jnp.float64)
+
+    _, out = runtime.run_batch({"open": open_, "close": close}, out_path=True)
+
+    try:
+        assert isinstance(out, np.memmap)
+        assert os.path.exists(out.filename)
+        np.testing.assert_allclose(out[:], np.asarray(close + open_))
+    finally:
+        filename = out.filename
+        del out
+        if os.path.exists(filename):
+            os.remove(filename)
