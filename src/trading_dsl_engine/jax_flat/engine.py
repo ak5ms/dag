@@ -198,22 +198,99 @@ def _double_groupby_capacities(runtime: JaxFlatRuntime) -> JaxFlatRuntime:
     return JaxFlatRuntime(program=replace(runtime.program, nodes=tuple(nodes)))
 
 
-@eqx.filter_jit
+@jax.jit
 def _jit_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
     state0 = runtime.init_state(inputs[0].shape[1])
     return _scan_batch(runtime, state0, inputs)
 
 
-@eqx.filter_jit
+@jax.jit
 def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
     return _scan_batch(runtime, state0, inputs)
 
 
-def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
-    def step(states, rows):
-        return runtime._tick_impl(states, *rows)
+_BATCH_CHUNK_SIZE = 2560
 
-    return jax.lax.scan(step, state0, xs=inputs, unroll=32)
+
+@jax.jit
+def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    n_steps = inputs[0].shape[0]
+    chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    n_full_chunks = n_steps // chunk_size
+    remainder = n_steps - n_full_chunks * chunk_size
+
+    def scan_chunk(states, start, size: int):
+        chunk_inputs = tuple(
+            jax.lax.dynamic_slice_in_dim(arr, start, size, axis=0)
+            for arr in inputs
+        )
+        return _scan_batch_chunk(runtime, states, chunk_inputs)
+
+    def set_chunk(out, start, value):
+        return jax.tree_util.tree_map(
+            lambda dst, src: jax.lax.dynamic_update_slice(
+                dst,
+                src,
+                (start,) + (0,) * (jnp.asarray(dst).ndim - 1),
+            ),
+            out,
+            value,
+        )
+
+    states, chunk0_out = scan_chunk(state0, 0, chunk_size)
+
+    def alloc(leaf):
+        leaf = jnp.asarray(leaf)
+        return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
+
+    out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
+
+    def body(chunk_i, carry):
+        states_c, out_c = carry
+        start = chunk_i * chunk_size
+        states_n, chunk_out = scan_chunk(states_c, start, chunk_size)
+        return states_n, set_chunk(out_c, start, chunk_out)
+
+    states, out = jax.lax.fori_loop(
+        1,
+        n_full_chunks,
+        body,
+        (states, out0),
+    )
+
+    if remainder:
+        start = n_full_chunks * chunk_size
+        states, tail_out = scan_chunk(states, start, remainder)
+        out = set_chunk(out, start, tail_out)
+
+    return states, out
+
+
+@jax.jit
+def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
+    n_steps = inputs[0].shape[0]
+    values: list[Any] = [jnp.array(0.0)] * len(runtime.program.nodes)
+    new_state = list(state_leaves)
+
+    for idx, node in enumerate(runtime.program.nodes):
+        op = node.op
+        if isinstance(op, InputOp):
+            values[idx] = inputs[op.input_index]
+            continue
+        if isinstance(op, LiteralOp):
+            values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+            continue
+
+        child_values = tuple(values[cid] for cid in node.child_ids)
+        field = runtime.program.state_layout.node_fields[idx]
+        node_state = None if field.index < 0 else state_leaves[field.index]
+        next_state, value = op.scan_batch(node_state, *child_values)
+        if field.index >= 0:
+            new_state[field.index] = next_state
+        values[idx] = value
+
+    outs = tuple(values[i] for i in runtime.program.outputs)
+    return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
 
 def _can_use_groupby_root_batch(runtime: JaxFlatRuntime) -> bool:
@@ -235,7 +312,7 @@ def _can_use_groupby_root_batch(runtime: JaxFlatRuntime) -> bool:
 _GROUPBY_ROOT_BATCH_CHUNK_SIZE = 2560
 
 
-@eqx.filter_jit
+@jax.jit
 def _jit_groupby_root_batch(runtime: JaxFlatRuntime, states, inputs):
     root_id = runtime.program.outputs[0]
     root_node = runtime.program.nodes[root_id]
@@ -590,12 +667,3 @@ def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
         )
     )
 
-
-@eqx.filter_jit
-def jit_tick_stream(runtime: JaxFlatRuntime, state_leaves, *input_rows):
-    return runtime.tick(state_leaves, *input_rows)
-
-
-@eqx.filter_jit
-def jit_tick(runtime: JaxFlatRuntime, state_leaves, *input_rows):
-    return runtime.tick(state_leaves, *input_rows)

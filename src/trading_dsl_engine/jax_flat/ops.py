@@ -21,6 +21,12 @@ class Op:
         del state, child_values
         raise NotImplementedError
 
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        def step(carry, values):
+            return self.tick(carry, *values)
+
+        return jax.lax.scan(step, state, xs=child_sequences, unroll=32)
+
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
@@ -79,6 +85,10 @@ class NaryOp(Op):
         del state
         return None, self.fn(*child_values)
 
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        return None, jax.vmap(self.fn)(*child_sequences)
+
 
 @dataclass(frozen=True)
 class EwmOp(Op):
@@ -118,6 +128,15 @@ class CumsumOp(Op):
         value = state.value + jnp.where(valid, x, 0.0)
         out = jnp.where(valid, value, jnp.nan)
         return CumsumState(value=value, initialized=initialized), out
+
+    def scan_batch(self, state: CumsumState, *child_sequences: jax.Array):
+        x = child_sequences[0]
+        valid = jnp.isfinite(x)
+        cumulative = state.value + jnp.cumsum(jnp.where(valid, x, 0.0), axis=0)
+        out = jnp.where(valid, cumulative, jnp.nan)
+        next_value = cumulative[-1]
+        next_initialized = state.initialized | jnp.any(valid, axis=0)
+        return CumsumState(value=next_value, initialized=next_initialized), out
 
 
 @dataclass(frozen=True)

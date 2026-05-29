@@ -35,6 +35,20 @@ def test_groupby_contract_supports_dataclass_outputs_in_grouped_apply_op():
     assert jnp.allclose(out.b, jnp.array([4.0, 6.0, 8.0]))
 
 
+def test_groupby_scan_batch_supports_dataclass_outputs_in_grouped_apply_op():
+    op = GroupByOp(inner_op=_DummyObjOp(), n_keys=1)
+    keys = jnp.array([[1.0, jnp.nan, 1.0], [1.0, jnp.nan, 1.0]])
+    values = jnp.array([[2.0, 3.0, 4.0], [6.0, 8.0, 10.0]])
+    state = op.init_state(values[0])
+
+    state_after_first, tick_out0 = op.tick(state, keys[0], values[0])
+    _, tick_out1 = op.tick(state_after_first, keys[1], values[1])
+    _, batch_out = op.scan_batch(state, keys, values)
+
+    assert jnp.allclose(batch_out.a, jnp.stack((tick_out0.a, tick_out1.a)), equal_nan=True)
+    assert jnp.allclose(batch_out.b, jnp.stack((tick_out0.b, tick_out1.b)), equal_nan=True)
+
+
 def test_groupby_contract_jitted_supports_dataclass_outputs_in_grouped_apply_op():
     op = GroupByOp(inner_op=_DummyObjOp(), n_keys=1)
     state = op.init_state(jnp.array([0.0]))
