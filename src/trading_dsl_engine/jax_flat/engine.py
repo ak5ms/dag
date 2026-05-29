@@ -291,38 +291,39 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
     return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
 
-def _groupby_batch_node_id(runtime: JaxFlatRuntime) -> int | None:
+def _groupby_batch_node_ids(runtime: JaxFlatRuntime) -> tuple[int, ...]:
     if len(runtime.program.outputs) != 1:
-        return None
+        return ()
 
     groupby_ids = tuple(
         idx
         for idx, node in enumerate(runtime.program.nodes)
         if isinstance(node.op, GroupByOp) and runtime.program.state_layout.node_fields[idx].index >= 0
     )
-    if len(groupby_ids) != 1:
-        return None
+    if not groupby_ids:
+        return ()
+    groupby_id_set = set(groupby_ids)
 
-    groupby_id = groupby_ids[0]
     for idx, node in enumerate(runtime.program.nodes):
-        if idx == groupby_id:
+        if idx in groupby_id_set:
             continue
         if node.op.is_stateful:
-            return None
+            return ()
 
-    # Keep this fast path conservative: groupby's own batch kernel receives only
-    # materialized input columns. Downstream stateless nodes may compose the
-    # grouped result into a larger formula without forcing a tick-by-tick scan of
+    # Keep this fast path conservative: each groupby's own batch kernel receives
+    # only materialized input columns. Downstream stateless nodes may compose the
+    # grouped results into a larger formula without forcing a tick-by-tick scan of
     # the whole program.
-    for child_id in runtime.program.nodes[groupby_id].child_ids:
-        child_op = runtime.program.nodes[child_id].op
-        if not isinstance(child_op, InputOp):
-            return None
-    return groupby_id
+    for groupby_id in groupby_ids:
+        for child_id in runtime.program.nodes[groupby_id].child_ids:
+            child_op = runtime.program.nodes[child_id].op
+            if not isinstance(child_op, InputOp):
+                return ()
+    return groupby_ids
 
 
 def _can_use_groupby_node_batch(runtime: JaxFlatRuntime) -> bool:
-    return _groupby_batch_node_id(runtime) is not None
+    return bool(_groupby_batch_node_ids(runtime))
 
 
 _GROUPBY_NODE_BATCH_CHUNK_SIZE = 2560
@@ -384,7 +385,7 @@ def _jit_groupby_node_batch(runtime: JaxFlatRuntime, states, inputs):
 
 @jax.jit
 def _scan_groupby_node_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
-    groupby_id = _groupby_batch_node_id(runtime)
+    groupby_ids = _groupby_batch_node_ids(runtime)
     values: list[Any] = [jnp.array(0.0)] * len(runtime.program.nodes)
     new_state = list(state_leaves)
     n_steps = inputs[0].shape[0]
@@ -400,9 +401,10 @@ def _scan_groupby_node_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs
 
         child_values = tuple(values[cid] for cid in node.child_ids)
         field = runtime.program.state_layout.node_fields[idx]
-        node_state = state_leaves[field.index] if idx == groupby_id else None
+        node_is_groupby_batch = idx in groupby_ids
+        node_state = state_leaves[field.index] if node_is_groupby_batch else None
         next_state, value = op.scan_batch(node_state, *child_values)
-        if idx == groupby_id:
+        if node_is_groupby_batch:
             new_state[field.index] = next_state
         values[idx] = value
 
