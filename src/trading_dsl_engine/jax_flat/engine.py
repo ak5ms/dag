@@ -8,6 +8,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.ops import (
     EwmOp,
@@ -21,14 +22,6 @@ from trading_dsl_engine.jax_flat.ops import (
     _bspline,
     _cat,
     _col,
-)
-from trading_dsl_engine.jax_flat.ops_dt import (
-    ToDtOp,
-    date_part_value,
-    datetime_round_value,
-    dayofyear_value,
-    time_part_value,
-    timeofday_value,
 )
 
 
@@ -377,68 +370,19 @@ def _op_width(op: Op) -> int:
         raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
     return int(op.output_width)
 
-
-
-def _static_string_value(expr: Expr, fn: str, name: str) -> str:
-    if not isinstance(expr, String):
-        raise ValueError(f"{fn} {name} must be a string literal")
-    return expr.value
-
-
-def _static_kwarg_map(expr: Call) -> dict[str, Expr]:
-    return {name: value for name, value in expr.kwargs}
-
-
-def _datetime_unit(expr: Call, child_ops: tuple[Op, ...], kwargs: dict[str, Expr]) -> str:
-    if "unit" in kwargs:
-        return _static_string_value(kwargs["unit"], expr.fn, "unit")
-    if child_ops and isinstance(child_ops[0], ToDtOp):
-        return child_ops[0].unit
-    return "ns"
-
-
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
-    kwargs = _static_kwarg_map(expr)
+    if expr.kwargs:
+        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
-    if expr.fn == "to_dt" and len(expr.args) == 1:
-        unsupported = set(kwargs) - {"unit"}
-        if unsupported:
-            raise ValueError(f"Unsupported to_dt keyword argument(s): {sorted(unsupported)}")
-        return ToDtOp(unit=_static_string_value(kwargs.get("unit", String("ns")), "to_dt", "unit")), None
-    if expr.fn == "round" and not kwargs:
+    if expr.fn == "round":
         if len(expr.args) == 1:
             return NaryOp(jnp.round), None
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
-    if expr.fn in {"dayofyear", "timeofday", "year", "month", "day", "dayofweek", "hour", "minute", "second"}:
-        if len(expr.args) != 1:
-            raise ValueError(f"{expr.fn} expects one timestamp argument")
-        unsupported = set(kwargs) - {"unit"}
-        if unsupported:
-            raise ValueError(f"Unsupported {expr.fn} keyword argument(s): {sorted(unsupported)}")
-        unit = _datetime_unit(expr, child_ops, kwargs)
-        if expr.fn == "dayofyear":
-            return NaryOp(lambda x, unit=unit: dayofyear_value(x, unit)), None
-        if expr.fn == "timeofday":
-            return NaryOp(lambda x, unit=unit: timeofday_value(x, unit)), None
-        if expr.fn in {"year", "month", "day", "dayofweek"}:
-            return NaryOp(lambda x, unit=unit, part=expr.fn: date_part_value(x, unit, part)), None
-        return NaryOp(lambda x, unit=unit, part=expr.fn: time_part_value(x, unit, part)), None
-    if kwargs and expr.fn in {"floor", "ceil", "round"}:
-        if len(expr.args) != 1:
-            raise ValueError(f"datetime {expr.fn} expects one timestamp argument")
-        unsupported = set(kwargs) - {"unit", "freq"}
-        if unsupported:
-            raise ValueError(f"Unsupported datetime {expr.fn} keyword argument(s): {sorted(unsupported)}")
-        unit = _datetime_unit(expr, child_ops, kwargs)
-        freq = _static_string_value(kwargs.get("freq", String("D")), expr.fn, "freq")
-        return NaryOp(lambda x, unit=unit, freq=freq, mode=expr.fn: datetime_round_value(x, unit, freq, mode)), None
-    if expr.kwargs:
-        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     if expr.fn == "bspline" and len(expr.args) == 2:
@@ -633,9 +577,28 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     memo[key] = idx
     return idx
 
+def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -> Expr:
+    if depth > 256:
+        raise ValueError("Exceeded max DSL expansion depth (256)")
+    if isinstance(node, Call):
+        expanded_args = tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args)
+        expanded_kwargs = tuple((key, _expand_dsl(value, dsl_registry, depth)) for key, value in node.kwargs)
+        expanded_node = Call(node.fn, expanded_args, expanded_kwargs)
+        macro = dsl_registry.get(expanded_node.fn)
+        if macro is None:
+            return expanded_node
+        result = macro(*expanded_node.args, **dict(expanded_node.kwargs))
+        if _expr_key(result) == _expr_key(expanded_node):
+            return expanded_node
+        return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+    return node
 
-def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
+
+def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []

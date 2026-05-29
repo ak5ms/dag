@@ -63,15 +63,16 @@ def test_datetime_calendar_and_rounding_ops_from_microsecond_timestamps():
 
     _, out = runtime.run_batch((ev_ts,))
 
-    hour_us = 3_600_000_000
+    hour_s = 3600.0
+    ev_seconds = np.asarray(ev_ts) * 1e-6
     expected = np.stack(
         [
             np.array([[60.0, 1.0], [61.0, 365.0]]),
             np.array([[86310.0, 1770.0], [120.0, 84660.0]]),
             np.array([[23.0, 0.0], [0.0, 23.0]]),
-            np.floor(np.asarray(ev_ts) / hour_us) * hour_us,
-            np.ceil(np.asarray(ev_ts) / hour_us) * hour_us,
-            np.floor(np.asarray(ev_ts) / hour_us + 0.5) * hour_us,
+            np.floor(ev_seconds / hour_s) * hour_s,
+            np.ceil(ev_seconds / hour_s) * hour_s,
+            np.floor(ev_seconds / hour_s + 0.5) * hour_s,
         ],
         axis=-1,
     )

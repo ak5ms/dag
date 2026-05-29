@@ -16,7 +16,7 @@ from trading_dsl_engine.numba.ops import (
     _make_universe_groupby_node,
     register_builtin_ops,
 )
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.registry import REGISTRY, CompiledNode
 
 
@@ -72,6 +72,8 @@ def _expr_key(node: Expr) -> tuple:
         return ("id", node.name)
     if isinstance(node, Number):
         return ("num", node.value)
+    if isinstance(node, String):
+        return ("str", node.value)
     if isinstance(node, Call):
         return (
             "call",
@@ -189,13 +191,14 @@ def compile_formula(
             py_fn = dsl_registry.get(node.fn)
             if py_fn is not None:
                 try:
-                    expanded = py_fn(*node.args)
+                    expanded = py_fn(*node.args, **dict(node.kwargs))
                 except Exception as exc:
                     raise FormulaCompileError(f"Failed expanding DSL function '{node.fn}': {exc}") from exc
-                compiled_expanded = build(expanded, depth + 1, local_inputs)
-                if use_cache:
-                    cache[key] = compiled_expanded
-                return compiled_expanded
+                if _expr_key(expanded) != key:
+                    compiled_expanded = build(expanded, depth + 1, local_inputs)
+                    if use_cache:
+                        cache[key] = compiled_expanded
+                    return compiled_expanded
 
         expanded_nodes += 1
         if isinstance(node, Identifier):
