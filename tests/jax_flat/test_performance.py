@@ -32,6 +32,9 @@ def _stats(samples: list[float]) -> dict[str, float]:
 
 def _bench(fn: Callable, *args, warmup_runs: int = 1) -> dict[str, float]:
     samples: list[float] = []
+    for _ in range(warmup_runs):
+        out = fn(*args)
+
     for _ in range(N_RUNS):
         t0 = time.perf_counter()
         out = fn(*args)
