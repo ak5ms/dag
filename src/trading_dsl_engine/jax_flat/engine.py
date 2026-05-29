@@ -8,7 +8,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.ops import (
     EwmOp,
     GroupByOp,
@@ -19,7 +19,13 @@ from trading_dsl_engine.jax_flat.ops import (
     Op,
     RidgeOp,
     _bspline,
+    _cat,
     _col,
+    _date_part,
+    _datetime_round,
+    _dayofyear,
+    _time_part,
+    _timeofday,
 )
 
 
@@ -292,6 +298,8 @@ def _expr_key(node: Expr):
         return ("id", node.name)
     if isinstance(node, Number):
         return ("num", float(node.value))
+    if isinstance(node, String):
+        return ("str", node.value)
     if isinstance(node, Call):
         return (
             "call",
@@ -367,9 +375,56 @@ def _op_width(op: Op) -> int:
     return int(op.output_width)
 
 
+
+def _static_string_value(expr: Expr, fn: str, name: str) -> str:
+    if not isinstance(expr, String):
+        raise ValueError(f"{fn} {name} must be a string literal")
+    return expr.value
+
+
+def _static_kwarg_map(expr: Call) -> dict[str, Expr]:
+    return {name: value for name, value in expr.kwargs}
+
+
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
+    kwargs = _static_kwarg_map(expr)
+    if expr.fn == "cat" and len(expr.args) >= 1:
+        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+    if expr.fn == "round" and not kwargs:
+        if len(expr.args) == 1:
+            return NaryOp(jnp.round), None
+        if len(expr.args) == 2 and isinstance(expr.args[1], Number):
+            decimals = int(round(float(expr.args[1].value)))
+            return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
+    if expr.fn in {"dayofyear", "timeofday", "year", "month", "day", "dayofweek", "hour", "minute", "second"}:
+        if len(expr.args) != 1:
+            raise ValueError(f"{expr.fn} expects one timestamp argument")
+        unsupported = set(kwargs) - {"unit", "offset"}
+        if unsupported:
+            raise ValueError(f"Unsupported {expr.fn} keyword argument(s): {sorted(unsupported)}")
+        unit = _static_string_value(kwargs.get("unit", String("ns")), expr.fn, "unit")
+        offset_expr = kwargs.get("offset")
+        offset = 0 if offset_expr is None else (
+            _static_string_value(offset_expr, expr.fn, "offset") if isinstance(offset_expr, String) else float(offset_expr.value)
+        )
+        if expr.fn == "dayofyear":
+            return NaryOp(lambda x, unit=unit, offset=offset: _dayofyear(x, unit, offset)), None
+        if expr.fn == "timeofday":
+            return NaryOp(lambda x, unit=unit, offset=offset: _timeofday(x, unit, offset)), None
+        if expr.fn in {"year", "month", "day", "dayofweek"}:
+            return NaryOp(lambda x, unit=unit, offset=offset, part=expr.fn: _date_part(x, unit, part, offset)), None
+        return NaryOp(lambda x, unit=unit, offset=offset, part=expr.fn: _time_part(x, unit, part, offset)), None
+    if kwargs and expr.fn in {"floor", "ceil", "round"}:
+        if len(expr.args) != 1:
+            raise ValueError(f"datetime {expr.fn} expects one timestamp argument")
+        unsupported = set(kwargs) - {"unit", "freq"}
+        if unsupported:
+            raise ValueError(f"Unsupported datetime {expr.fn} keyword argument(s): {sorted(unsupported)}")
+        unit = _static_string_value(kwargs.get("unit", String("ns")), expr.fn, "unit")
+        freq = _static_string_value(kwargs.get("freq", String("D")), expr.fn, "freq")
+        return NaryOp(lambda x, unit=unit, freq=freq, mode=expr.fn: _datetime_round(x, unit, freq, mode)), None
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
@@ -450,6 +505,8 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             nodes.append(DagNode(op=LiteralOp(float(node.value)), child_ids=()))
             memo[key] = idx
             return idx
+        if isinstance(node, String):
+            raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
 
         if isinstance(node, Call):
             if node.fn == "groupby":
@@ -548,6 +605,8 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         nodes.append(DagNode(op=LiteralOp(float(expr.value)), child_ids=()))
         memo[key] = idx
         return idx
+    if isinstance(expr, String):
+        raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
     if isinstance(expr, Call) and expr.fn == "groupby":
         return _compile_groupby_node(expr, memo, nodes, input_names)
     if not isinstance(expr, Call):

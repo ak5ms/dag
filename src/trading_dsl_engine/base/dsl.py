@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, UniverseItem
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, UniverseItem
 
 
 class DSLFunctionRegistry:
@@ -30,6 +30,8 @@ def ensure_expr(value) -> Expr:
         return KeyTuple(tuple(ensure_expr(item) for item in value))
     if isinstance(value, (int, float)):
         return Number(float(value))
+    if isinstance(value, str):
+        return String(value)
     raise TypeError(f"Expected Expr|int|float, got {type(value).__name__}")
 
 
@@ -98,8 +100,8 @@ def grouped(lhs, key) -> GroupedExpr:
 
 
 def op(name: str) -> Callable[..., Expr]:
-    def _op(*args) -> Expr:
-        return call(name, *args)
+    def _op(*args, **kwargs) -> Expr:
+        return call(name, *args, **kwargs)
 
     _op.__name__ = name
     return _op
@@ -155,6 +157,18 @@ xs_rank = op("xs_rank")
 outer = op("outer")
 bspline = op("bspline")
 col = op("col")
+
+cat = op("cat")
+round = op("round")
+dayofyear = op("dayofyear")
+timeofday = op("timeofday")
+year = op("year")
+month = op("month")
+day = op("day")
+dayofweek = op("dayofweek")
+hour = op("hour")
+minute = op("minute")
+second = op("second")
 groupby = op("groupby")
 
 
