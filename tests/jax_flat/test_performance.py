@@ -88,6 +88,39 @@ def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1:
 
 
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_nary_chain_jax_flat_scan_batch_vs_tick_scan():
+    formula = (
+        "xstd("
+        "add("
+        "xstd(add(abs(close), exp(fraction(abs(open))))), "
+        "xstd(sub(mul(close, open), div(close, add(abs(open), 1.0))))"
+        ")"
+        ")"
+    )
+    open_data = jax.random.normal(jax.random.PRNGKey(22), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
+    close_data = jax.random.normal(jax.random.PRNGKey(23), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
+    runtime = compile_flat(formula)
+    state = runtime.init_state(N_INSTRUMENTS)
+    jit_tick_scan = _make_scan_runner(runtime)
+
+    def scan_batch(open_arr, close_arr):
+        return runtime.run_batch((open_arr, close_arr))[1]
+
+    jax.block_until_ready(jit_tick_scan(state, open_data, close_data))
+    jax.block_until_ready(scan_batch(open_data, close_data))
+
+    tick_scan_stats = _bench(jit_tick_scan, state, open_data, close_data)
+    scan_batch_stats = _bench(scan_batch, open_data, close_data)
+
+    print(f"nary_chain::tick_scan {tick_scan_stats}")
+    print(f"nary_chain::scan_batch {scan_batch_stats}")
+
+    tick_out = jit_tick_scan(state, open_data, close_data)[1]
+    batch_out = scan_batch(open_data, close_data)
+    np.testing.assert_allclose(np.asarray(tick_out), np.asarray(batch_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_fusion_formula_jax_new_vs_jax_flat_and_batch_lowerbound():
     formula = (
         "mul(mul(mul(cumsum(xs_sort(add(close, open))), xs_sort(add(close, open))), "
