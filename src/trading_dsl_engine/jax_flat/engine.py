@@ -667,12 +667,3 @@ def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
         )
     )
 
-
-@jax.jit
-def jit_tick_stream(runtime: JaxFlatRuntime, state_leaves, *input_rows):
-    return runtime.tick(state_leaves, *input_rows)
-
-
-@jax.jit
-def jit_tick(runtime: JaxFlatRuntime, state_leaves, *input_rows):
-    return runtime.tick(state_leaves, *input_rows)
