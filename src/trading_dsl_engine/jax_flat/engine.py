@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Any
+import mmap
+import os
+import tempfile
 import warnings
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
 from trading_dsl_engine.jax_flat.ops import (
@@ -136,11 +140,11 @@ class JaxFlatRuntime(eqx.Module):
     def tick(self, state_leaves, *input_rows):
         return self._tick_impl(state_leaves, *input_rows)
 
-    def run_batch(self, inputs, states=None):
+    def run_batch(self, inputs, states=None, out_path: str | bool = False):
         runtime = self
         while True:
             try:
-                return runtime._run_batch_once(inputs, states)
+                return runtime._run_batch_once(inputs, states, out_path)
             except Exception as exc:
                 if states or not _is_groupby_capacity_error(exc):
                     raise
@@ -154,16 +158,101 @@ class JaxFlatRuntime(eqx.Module):
                 )
                 runtime = next_runtime
 
-    def _run_batch_once(self, inputs, states=None):
+    def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
+        inputs = _normalize_batch_inputs(self, inputs)
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
         n_steps = inputs[0].shape[0]
+        n_instruments = inputs[0].shape[1]
         for arr in inputs[1:]:
-            if arr.shape[0] != n_steps:
-                raise ValueError("All inputs must have identical timestep length")
+            if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
+                raise ValueError("All inputs must share aligned shape (time, n_instruments)")
+        if _has_memmap_input(inputs) or out_path:
+            return _run_chunked_batch(self, inputs, states, out_path)
         if not states:
             return _jit_batch_from_initial_state(self, inputs)
         return _jit_batch(self, states, inputs)
+
+
+def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
+    if isinstance(inputs, dict):
+        missing = [name for name in runtime.program.input_names if name not in inputs]
+        if missing:
+            raise ValueError(f"Missing jax_flat run_batch input(s): {missing}")
+        inputs = tuple(inputs[name] for name in runtime.program.input_names)
+    else:
+        inputs = tuple(inputs)
+
+    if len(inputs) != len(runtime.program.input_names):
+        raise ValueError(
+            "run_batch expected "
+            f"{len(runtime.program.input_names)} input array(s) "
+            f"({runtime.program.input_names}), got {len(inputs)}"
+        )
+    for name, arr in zip(runtime.program.input_names, inputs):
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
+    return inputs
+
+
+def _has_memmap_input(inputs) -> bool:
+    return any(isinstance(arr, np.memmap) for arr in inputs)
+
+
+def _fresh_memmap_path(prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
+    os.close(fd)
+    return path
+
+
+def _input_chunk(arr, start: int, stop: int):
+    chunk = arr[start:stop]
+    if isinstance(chunk, np.memmap) and chunk.dtype == np.float64:
+        return chunk
+    if isinstance(chunk, np.ndarray):
+        return np.asarray(chunk, dtype=np.float64)
+    return chunk
+
+
+def _output_array(out_path: str | bool, n_steps: int, chunk_out: np.ndarray):
+    shape = (n_steps,) + chunk_out.shape[1:]
+    if out_path is False or out_path is None:
+        return np.empty(shape, dtype=chunk_out.dtype)
+    if out_path is True:
+        out_path = _fresh_memmap_path("trading_dsl_engine_jax_flat_out_")
+    if isinstance(out_path, str):
+        return np.memmap(out_path, mode="w+", dtype=chunk_out.dtype, shape=shape)
+    raise ValueError("out_path must be False, True, or a filesystem path string")
+
+
+def _flush_memmap_output(out) -> None:
+    if not isinstance(out, np.memmap):
+        return
+    out.flush()
+    mapped = getattr(out, "_mmap", None)
+    madvise = getattr(mapped, "madvise", None)
+    if madvise is not None and hasattr(mmap, "MADV_DONTNEED"):
+        madvise(mmap.MADV_DONTNEED)
+
+
+def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: str | bool = False):
+    n_steps = inputs[0].shape[0]
+    n_instruments = inputs[0].shape[1]
+    chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    states = runtime.init_state(n_instruments) if not states else states
+    out = None
+
+    for start in range(0, n_steps, chunk_size):
+        stop = min(start + chunk_size, n_steps)
+        chunk_inputs = tuple(jnp.asarray(_input_chunk(arr, start, stop)) for arr in inputs)
+        states, chunk_out = _scan_batch_chunk(runtime, states, chunk_inputs)
+        chunk_out_np = np.asarray(jax.block_until_ready(chunk_out))
+        if out is None:
+            out = _output_array(out_path, n_steps, chunk_out_np)
+        out[start:stop] = chunk_out_np
+        _flush_memmap_output(out)
+
+    return states, out
 
 
 def _is_groupby_capacity_error(exc: Exception) -> bool:
@@ -578,4 +667,3 @@ def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
             state_layout=layout,
         )
     )
-

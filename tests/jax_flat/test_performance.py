@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 import time
 from typing import Callable
 
@@ -270,3 +273,117 @@ def test_perf_groupby_univ_stateful_jax_vs_numba():
     print(f"groupby_univ::numba {numba_stats}")
 
     np.testing.assert_allclose(np.asarray(jax_out), np.asarray(numba_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_jax_flat_memmap_input_output_streaming_vs_existing():
+    script = r"""
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from trading_dsl_engine.jax_flat import engine as jax_flat_engine
+
+
+def rss_bytes():
+    with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+        return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def sample_peak(stop, peak):
+    while not stop.is_set():
+        peak[0] = max(peak[0], rss_bytes())
+        time.sleep(0.002)
+
+
+def make_inputs(workdir, shape):
+    close_path = os.path.join(workdir, "close.memmap")
+    open_path = os.path.join(workdir, "open.memmap")
+    close = np.memmap(close_path, mode="w+", dtype=np.float64, shape=shape)
+    open_ = np.memmap(open_path, mode="w+", dtype=np.float64, shape=shape)
+    close[:] = 2.0
+    open_[:] = 3.0
+    close.flush()
+    open_.flush()
+    del close, open_
+    return close_path, open_path
+
+
+def run(mode):
+    shape = (16384, 512)
+    chunk_size = 512
+    with tempfile.TemporaryDirectory() as workdir:
+        close_path, open_path = make_inputs(workdir, shape)
+        jax_flat_engine._BATCH_CHUNK_SIZE = chunk_size
+        runtime = jax_flat_engine.compile_formula("close + open")
+        warm = jnp.ones((chunk_size, shape[1]), dtype=jnp.float64)
+        if mode == "streaming":
+            runtime.run_batch({"open": warm, "close": warm}, out_path=True)
+        else:
+            jax.block_until_ready(runtime.run_batch({"open": warm, "close": warm})[1])
+
+        baseline = rss_bytes()
+        peak = [baseline]
+        stop = threading.Event()
+        sampler = threading.Thread(target=sample_peak, args=(stop, peak), daemon=True)
+        sampler.start()
+        t0 = time.perf_counter()
+        try:
+            close = np.memmap(close_path, mode="r", dtype=np.float64, shape=shape)
+            open_ = np.memmap(open_path, mode="r", dtype=np.float64, shape=shape)
+            if mode == "streaming":
+                out_path = os.path.join(workdir, "out.memmap")
+                _, out = runtime.run_batch({"open": open_, "close": close}, out_path=out_path)
+                checksum = float(out[0, 0] + out[-1, -1])
+                out.flush()
+            else:
+                close_jax = jnp.asarray(close)
+                open_jax = jnp.asarray(open_)
+                _, out = runtime.run_batch({"open": open_jax, "close": close_jax})
+                jax.block_until_ready(out)
+                checksum = float(out[0, 0] + out[-1, -1])
+        finally:
+            elapsed = time.perf_counter() - t0
+            stop.set()
+            sampler.join(timeout=1.0)
+
+        return {
+            "mode": mode,
+            "elapsed_s": elapsed,
+            "peak_delta_bytes": peak[0] - baseline,
+            "checksum": checksum,
+        }
+
+
+print(json.dumps(run(sys.argv[1])))
+"""
+    env = os.environ.copy()
+    pythonpath = os.path.abspath("src")
+    env["PYTHONPATH"] = pythonpath + os.pathsep + env.get("PYTHONPATH", "")
+
+    def run_mode(mode: str) -> dict[str, float]:
+        proc = subprocess.run(
+            [sys.executable, "-c", script, mode],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    existing = run_mode("existing")
+    streaming = run_mode("streaming")
+
+    print(f"close_plus_open::existing_memmap_to_jax {existing}")
+    print(f"close_plus_open::streaming_memmap_in_out {streaming}")
+
+    assert existing["checksum"] == pytest.approx(10.0)
+    assert streaming["checksum"] == pytest.approx(10.0)
+    assert streaming["peak_delta_bytes"] < existing["peak_delta_bytes"]
