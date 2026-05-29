@@ -282,12 +282,19 @@ def _flush_cached_inner_state(
     )
 
 
+def _group_suffix_shape(leaf: jax.Array, group_width: int) -> tuple[int, ...]:
+    leaf = jnp.asarray(leaf)
+    if leaf.ndim == 0 or leaf.shape[0] == 1 or leaf.shape[0] == group_width:
+        return leaf.shape[1:]
+    return leaf.shape
+
+
 def _group_output_like(template: Any, group_width: int):
     template = _ensure_dataclass_pytree(template)
 
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
-        suffix = leaf.shape[1:] if leaf.ndim > 0 else ()
+        suffix = _group_suffix_shape(leaf, group_width)
         return jnp.full((group_width,) + suffix, jnp.nan, dtype=leaf.dtype)
 
     return jax.tree_util.tree_map(alloc, template)
@@ -300,9 +307,11 @@ def _align_group_output(value: Any, group_width: int):
         leaf = jnp.asarray(leaf)
         if leaf.ndim == 0:
             return jnp.broadcast_to(leaf, (group_width,))
+        if leaf.shape[0] == group_width:
+            return leaf
         if leaf.shape[0] == 1:
             return jnp.broadcast_to(leaf[0], (group_width,) + leaf.shape[1:])
-        return leaf
+        return jnp.broadcast_to(leaf, (group_width,) + leaf.shape)
 
     return jax.tree_util.tree_map(align_leaf, value)
 
@@ -340,7 +349,7 @@ def _empty_batch_group_output_like(template: Any, n_steps: int, group_width: int
 
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
-        suffix = leaf.shape[1:] if leaf.ndim > 0 else ()
+        suffix = _group_suffix_shape(leaf, group_width)
         return jnp.full((n_steps, group_width) + suffix, jnp.nan, dtype=leaf.dtype)
 
     return jax.tree_util.tree_map(alloc, template)
@@ -669,9 +678,13 @@ class GroupByOp(Op):
             operand=None,
         )
 
-    def _batch_key_matrix_for_group(self, idx: jax.Array, key_cols: tuple[jax.Array, ...]) -> jax.Array:
+    def _batch_key_matrix_for_group(
+        self,
+        idx: jax.Array,
+        key_cols: tuple[jax.Array, ...],
+        n_steps: int,
+    ) -> jax.Array:
         if self.n_keys == 0:
-            n_steps = key_cols[0].shape[0]
             return jnp.zeros((n_steps, idx.shape[0], 0), dtype=jnp.float64)
 
         return jnp.stack(
@@ -837,7 +850,7 @@ class GroupByOp(Op):
 
         for group_i, idx in enumerate(group_indices):
             runtime = _runtime_from_group_state(state, group_i)
-            key_seq = self._batch_key_matrix_for_group(idx, key_cols)
+            key_seq = self._batch_key_matrix_for_group(idx, key_cols, n_steps)
             group_args_seq = args_seq
             use_run_scan = runtime.inner_state is not None and _tree_has_group_axis(
                 _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32)),

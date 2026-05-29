@@ -142,6 +142,33 @@ def test_ridge_supports_omitted_weights_and_bspline_matrix_features():
     assert np.isnan(preds[1, 1])
 
 
+def test_groupby_univ_only_can_emit_ridge_beta_feature_vectors():
+    x1 = np.array(
+        [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9], [0.2, 0.3, 0.4]],
+        dtype=np.float64,
+    )
+    x2 = np.array(
+        [[1.0, 0.5, 1.5], [1.2, 0.7, 1.7], [1.4, 0.9, 1.9], [1.1, 0.6, 1.6]],
+        dtype=np.float64,
+    )
+    y = 0.5 + 2.0 * x1 - x2
+    w = np.ones_like(x1)
+
+    out = np.asarray(
+        _run(
+            "groupby((univ([0, 1], [2]), ), y, get_beta(Ridge(bspline(x1, 2), x2, y, w, 8, 0.1)))",
+            x1,
+            x2,
+            y,
+            w,
+        )
+    )
+
+    assert out.shape == (4, 3, 3)
+    np.testing.assert_allclose(out[:, 0, :], out[:, 1, :], rtol=1e-12, atol=1e-12, equal_nan=True)
+    assert np.isfinite(out[-1]).all()
+
+
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_bspline_ridge_jax_flat_t_rows():
     x = jax.random.uniform(jax.random.PRNGKey(120), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
@@ -156,3 +183,22 @@ def test_perf_bspline_ridge_jax_flat_t_rows():
 
     print(f"bspline_ridge::jax_flat T_ROWS={T_ROWS} elapsed={elapsed:.3f}s")
     assert out.shape == (T_ROWS, N_INSTRUMENTS)
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_groupby_univ_only_ridge_beta_jax_flat_t_rows():
+    x1 = jax.random.uniform(jax.random.PRNGKey(120), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
+    x2 = jax.random.uniform(jax.random.PRNGKey(120), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
+    y = 0.5 + 2.0 * x1 - 1 * x2 + 0.01 * jax.random.normal(jax.random.PRNGKey(121), x1.shape, dtype=jnp.float64)
+    w = jnp.ones_like(x1)
+    runtime = compile_formula(
+        "groupby((univ([0, 1], [2]), ), y, get_beta(Ridge(bspline(x1, 2), x2, y, w, 8, 0.1)))"
+    )
+
+    start = time.perf_counter()
+    _, out = runtime.run_batch((x1, x2, y, w))
+    jax.block_until_ready(out)
+    elapsed = time.perf_counter() - start
+
+    print(f"groupby_univ_ridge_beta::jax_flat T_ROWS={T_ROWS} elapsed={elapsed:.3f}s")
+    assert out.shape == (T_ROWS, N_INSTRUMENTS, 3)
