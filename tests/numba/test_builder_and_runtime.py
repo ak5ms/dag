@@ -982,6 +982,29 @@ def test_universe_groupby_output_can_feed_keyed_apply_with_self_placeholder():
     )
 
 
+
+def test_universe_dynamic_groupby_can_feed_binary_op():
+    formula = "close + groupby((univ([0, 1], [2]), open), close, cumsum(self_))"
+    open_ = np.array([
+        [1.0, 1.0, 2.0],
+        [1.0, 2.0, 2.0],
+        [2.0, 1.0, 2.0],
+    ])
+    close = np.array([
+        [10.0, 20.0, 30.0],
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ])
+
+    out = run_batch_from_mapping(build_engine(formula), {"open": open_, "close": close}, out_path=None)
+
+    expected_grouped = np.array([
+        [10.0, 20.0, 30.0],
+        [11.0, 2.0, 33.0],
+        [4.0, 25.0, 39.0],
+    ])
+    np.testing.assert_allclose(out, close + expected_grouped)
+
 def test_grouped_expr_operator_method_sugar_matches_three_arg_groupby():
     from trading_dsl_engine import cumsum, var
 

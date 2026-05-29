@@ -19,9 +19,11 @@ def test_parse_number_and_identifier():
     assert isinstance(expr.args[1], Number)
 
 
-def test_parse_error_keyword_args():
-    with pytest.raises(FormulaParseError):
-        parse_formula("ewm(close, span=21)")
+def test_parse_keyword_args():
+    expr = parse_formula("groupby((key,), x, cumsum(self_), capacity=21)")
+    assert isinstance(expr, Call)
+    assert expr.fn == "groupby"
+    assert expr.kwargs == (("capacity", Number(21.0)),)
 
 
 def test_parse_multiline_formula():

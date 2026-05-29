@@ -161,12 +161,6 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps:
                 raise ValueError("All inputs must have identical timestep length")
-        if _can_use_groupby_root_batch(self):
-            if not states:
-                root_id = self.program.outputs[0]
-                root_node = self.program.nodes[root_id]
-                states = (root_node.op.init_state(inputs[0][0]),)
-            return _jit_groupby_root_batch(self, states, inputs)
         if not states:
             return _jit_batch_from_initial_state(self, inputs)
         return _jit_batch(self, states, inputs)
@@ -291,88 +285,6 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
 
     outs = tuple(values[i] for i in runtime.program.outputs)
     return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
-
-
-def _can_use_groupby_root_batch(runtime: JaxFlatRuntime) -> bool:
-    if len(runtime.program.outputs) != 1:
-        return False
-    root_id = runtime.program.outputs[0]
-    root_node = runtime.program.nodes[root_id]
-    if not isinstance(root_node.op, GroupByOp):
-        return False
-    if runtime.program.state_layout.node_fields[root_id].index < 0:
-        return False
-    for child_id in root_node.child_ids:
-        child_op = runtime.program.nodes[child_id].op
-        if not isinstance(child_op, InputOp):
-            return False
-    return True
-
-
-_GROUPBY_ROOT_BATCH_CHUNK_SIZE = 2560
-
-
-@jax.jit
-def _jit_groupby_root_batch(runtime: JaxFlatRuntime, states, inputs):
-    root_id = runtime.program.outputs[0]
-    root_node = runtime.program.nodes[root_id]
-    state_idx = runtime.program.state_layout.node_fields[root_id].index
-    child_sequences = tuple(
-        inputs[runtime.program.nodes[child_id].op.input_index]
-        for child_id in root_node.child_ids
-    )
-    n_steps = inputs[0].shape[0]
-    chunk_size = min(n_steps, _GROUPBY_ROOT_BATCH_CHUNK_SIZE)
-    n_full_chunks = n_steps // chunk_size
-    remainder = n_steps - n_full_chunks * chunk_size
-
-    def scan_chunk(state, start, size: int):
-        chunk_inputs = tuple(
-            jax.lax.dynamic_slice_in_dim(arr, start, size, axis=0)
-            for arr in child_sequences
-        )
-        return root_node.op.scan_batch(state, *chunk_inputs)
-
-    def set_chunk(out, start, value):
-        return jax.tree_util.tree_map(
-            lambda dst, src: jax.lax.dynamic_update_slice(
-                dst,
-                src,
-                (start,) + (0,) * (jnp.asarray(dst).ndim - 1),
-            ),
-            out,
-            value,
-        )
-
-    group_state, chunk0_out = scan_chunk(states[state_idx], 0, chunk_size)
-
-    def alloc(leaf):
-        leaf = jnp.asarray(leaf)
-        return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
-
-    out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
-
-    def body(chunk_i, carry):
-        group_state_c, out_c = carry
-        start = chunk_i * chunk_size
-        group_state_n, chunk_out = scan_chunk(group_state_c, start, chunk_size)
-        return group_state_n, set_chunk(out_c, start, chunk_out)
-
-    group_state, out = jax.lax.fori_loop(
-        1,
-        n_full_chunks,
-        body,
-        (group_state, out0),
-    )
-
-    if remainder:
-        start = n_full_chunks * chunk_size
-        group_state, tail_out = scan_chunk(group_state, start, remainder)
-        out = set_chunk(out, start, tail_out)
-
-    new_states = list(states)
-    new_states[state_idx] = group_state
-    return tuple(new_states), out
 
 
 def _expr_key(node: Expr):

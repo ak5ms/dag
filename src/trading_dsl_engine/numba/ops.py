@@ -191,6 +191,82 @@ def make_nary_op(
         if cached is not None:
             return cached
 
+        if arity == 2 and reduce_axis == -2:
+            spec = [
+                ("child0", child_types[0]),
+                ("child1", child_types[1]),
+                ("initialized", boolean),
+                ("out", float64[:, :]),
+                ("scratch", float64[:]),
+            ]
+
+            @jitclass(spec)
+            class BinaryNaryOp:
+                def __init__(self, child0, child1):
+                    self.child0 = child0
+                    self.child1 = child1
+                    self.initialized = False
+                    self.out = np.empty((1, 1), dtype=np.float64)
+                    self.scratch = np.empty(2, dtype=np.float64)
+
+                def _ensure_out(self, rows: int64, cols: int64):
+                    if not self.initialized or self.out.shape[0] != rows or self.out.shape[1] != cols:
+                        self.out = np.empty((rows, cols), dtype=np.float64)
+                        self.initialized = True
+
+                def on_data(self, frame2d):
+                    self.child0.on_data(frame2d)
+                    self.child1.on_data(frame2d)
+                    v0 = self.child0.emit()
+                    v1 = self.child1.emit()
+                    rows = 1
+                    cols = 1
+                    if v0.shape[0] != 1:
+                        rows = v0.shape[0]
+                    if v1.shape[0] != 1:
+                        rows = v1.shape[0]
+                    if v0.shape[1] != 1:
+                        cols = v0.shape[1]
+                    if v1.shape[1] != 1:
+                        cols = v1.shape[1]
+
+                    self._ensure_out(rows, cols)
+                    for i in range(rows):
+                        for j in range(cols):
+                            i0 = i if v0.shape[0] > 1 else 0
+                            j0 = j if v0.shape[1] > 1 else 0
+                            i1 = i if v1.shape[0] > 1 else 0
+                            j1 = j if v1.shape[1] > 1 else 0
+                            self.scratch[0] = v0[i0, j0]
+                            self.scratch[1] = v1[i1, j1]
+                            self.out[i, j] = kernel_jit(self.scratch)
+
+                def emit(self):
+                    return self.out
+
+            out_type = validator([child.type_info for child in children])
+            child_ctors = tuple(child.ctor for child in children)
+            child_jit_ctors = tuple(child.jit_ctor for child in children)
+
+            def _ctor():
+                return BinaryNaryOp(child_ctors[0](), child_ctors[1]())
+
+            _jit_ctor = None
+            if all(ctor is not None for ctor in child_jit_ctors):
+                @njit
+                def _jit_ctor():
+                    return BinaryNaryOp(child_jit_ctors[0](), child_jit_ctors[1]())
+
+            node = CompiledNode(
+                out_type,
+                BinaryNaryOp.class_type.instance_type,
+                _ctor,
+                _jit_ctor,
+                all(child.stateless for child in children),
+            )
+            node_cache[child_types] = node
+            return node
+
         spec = [
             ("children", types.Tuple(child_types)),
             ("initialized", boolean),

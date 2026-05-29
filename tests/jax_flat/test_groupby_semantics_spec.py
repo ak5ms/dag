@@ -88,6 +88,89 @@ def test_groupby_nested_op():
     assert jnp.allclose(out, desired, equal_nan=True)
 
 
+
+def test_groupby_batch_supports_non_root_composition():
+    formula = "close + groupby((univ([0, 1], [2]), open), close, cumsum(self_))"
+    runtime = compile_formula(formula)
+    open_ = jnp.array([
+        [1.0, 1.0, 2.0],
+        [1.0, 2.0, 2.0],
+        [2.0, 1.0, 2.0],
+    ])
+    close = jnp.array([
+        [10.0, 20.0, 30.0],
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ])
+
+    state = runtime.init_state(3)
+
+    def step(carry, row):
+        open_row, close_row = row
+        return runtime.tick(carry, close_row, open_row)
+
+    _, tick_out = jax.lax.scan(step, state, (open_, close))
+    _, batch_out = runtime.run_batch((close, open_))
+
+    assert jnp.allclose(batch_out, tick_out, equal_nan=True)
+
+
+def test_groupby_batch_supports_multiple_non_root_groupbys():
+    formula = (
+        "close "
+        "+ groupby((univ([0, 1], [2]), open), close, cumsum(self_)) "
+        "+ groupby((univ([0, 1, 2]), open), close, cumsum(self_))"
+    )
+    runtime = compile_formula(formula)
+    open_ = jnp.array([
+        [1.0, 1.0, 2.0],
+        [1.0, 2.0, 2.0],
+        [2.0, 1.0, 2.0],
+    ])
+    close = jnp.array([
+        [10.0, 20.0, 30.0],
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ])
+
+    state = runtime.init_state(3)
+
+    def step(carry, row):
+        open_row, close_row = row
+        return runtime.tick(carry, close_row, open_row)
+
+    _, tick_out = jax.lax.scan(step, state, (open_, close))
+    _, batch_out = runtime.run_batch((close, open_))
+
+    assert jnp.allclose(batch_out, tick_out, equal_nan=True)
+
+
+def test_groupby_batch_supports_computed_key_and_other_stateful_nodes():
+    formula = "cumsum(close) + groupby((univ([0, 1], [2]), xstd(open)), xstd(close), cumsum(self_))"
+    runtime = compile_formula(formula)
+    open_ = jnp.array([
+        [1.0, 1.0, 2.0],
+        [1.0, 2.0, 2.0],
+        [2.0, 1.0, 2.0],
+    ])
+    close = jnp.array([
+        [10.0, 20.0, 30.0],
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ])
+
+    state = runtime.init_state(3)
+
+    def step(carry, row):
+        open_row, close_row = row
+        return runtime.tick(carry, close_row, open_row)
+
+    _, tick_out = jax.lax.scan(step, state, (open_, close))
+    _, batch_out = runtime.run_batch((close, open_))
+
+    assert jnp.allclose(batch_out, tick_out, equal_nan=True)
+
+
 def test_groupby_contract_rejects_multiple_univ_in_tuple_key():
     with pytest.raises(ValueError, match="at most one univ"):
         compile_formula("groupby((univ([0]), univ([1]), ts), close, mean(self_))")
