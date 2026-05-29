@@ -80,6 +80,33 @@ def test_bspline_matrix_can_feed_col_projection():
     np.testing.assert_allclose(col, basis[:, :, 3], rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
+def test_ridge_object_root_scan_batch_matches_projected_outputs_and_tick_scan():
+    x = jnp.asarray(
+        [[1.0, 2.0, jnp.nan], [2.0, 3.0, 4.0], [3.0, jnp.nan, 5.0], [4.0, 5.0, 6.0]],
+        dtype=jnp.float64,
+    )
+    y = jnp.asarray(
+        [[2.0, 4.0, 6.0], [4.0, 6.0, 8.0], [6.0, jnp.nan, 10.0], [8.0, 10.0, 12.0]],
+        dtype=jnp.float64,
+    )
+    runtime = compile_formula("Ridge(x, y, 2, 0.1)")
+    state0 = runtime.init_state(x.shape[1])
+
+    def tick_step(carry, rows):
+        return runtime._tick_impl(carry, *rows)
+
+    _, tick_out = jax.lax.scan(tick_step, state0, (x, y))
+    _, batch_out = runtime.run_batch((x, y))
+
+    projected_beta = _run("get_beta(Ridge(x, y, 2, 0.1))", x, y)
+    projected_preds = _run("get_preds(Ridge(x, y, 2, 0.1))", x, y)
+
+    np.testing.assert_allclose(np.asarray(batch_out.beta), np.asarray(tick_out.beta), rtol=1e-12, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(np.asarray(batch_out.preds), np.asarray(tick_out.preds), rtol=1e-12, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(np.asarray(batch_out.beta), np.asarray(projected_beta), rtol=1e-12, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(np.asarray(batch_out.preds), np.asarray(projected_preds), rtol=1e-12, atol=1e-12, equal_nan=True)
+
+
 def test_ridge_one_feature_matches_pairwise_nan_reference_and_preds_use_prior_beta():
     x = np.array(
         [[1.0, 2.0, np.nan], [2.0, np.nan, 4.0], [np.nan, 4.0, 5.0], [4.0, 5.0, 6.0]],
