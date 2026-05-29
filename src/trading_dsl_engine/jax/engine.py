@@ -24,7 +24,7 @@ def _fresh_memmap_path(prefix: str) -> str:
 
 from trading_dsl_engine.base.compiler import CompileStats, FormulaCompileError
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax.ops import (
     GroupByOp,
     InputOp,
@@ -109,6 +109,8 @@ def _expr_key(node: Expr):
         return ("id", node.name)
     if isinstance(node, Number):
         return ("num", float(node.value))
+    if isinstance(node, String):
+        return ("str", node.value)
     if isinstance(node, Universe):
         return ("univ", node.groups)
     if isinstance(node, KeyTuple):
@@ -202,13 +204,24 @@ def compile_formula(
         elif isinstance(expr, Number):
             op = LiteralOp(float(expr.value))
         elif isinstance(expr, Call):
-            if expr.kwargs:
+            macro = dsl_registry.get(expr.fn)
+            if macro is not None:
+                expanded = macro(*expr.args, **dict(expr.kwargs))
+                if _expr_key(expanded) != key:
+                    op = build(expanded, local_inputs)
+                else:
+                    op = None
+            else:
+                op = None
+            if op is not None:
+                pass
+            elif expr.kwargs:
                 unsupported_kwargs = {name for name, _ in expr.kwargs} - {"capacity", "hash_capacity"}
                 if expr.fn != "groupby" or unsupported_kwargs:
                     raise FormulaCompileError(f"Keyword arguments are not supported for {expr.fn}")
-            macro = dsl_registry.get(expr.fn)
-            if macro is not None:
-                op = build(macro(*expr.args), local_inputs)
+                op = None
+            if op is not None:
+                pass
             elif expr.fn == "groupby" and len(expr.args) == 3:
                 key_items = _canonical_groupby_key_items(expr.args[0])
                 universe_items = [item for item in key_items if isinstance(item, Universe)]

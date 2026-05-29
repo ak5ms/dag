@@ -130,6 +130,11 @@ class Number(Expr):
 
 
 @dataclass(frozen=True, eq=False)
+class String(Expr):
+    value: str
+
+
+@dataclass(frozen=True, eq=False)
 class Call(Expr):
     fn: str
     args: tuple[Expr, ...]
@@ -190,6 +195,8 @@ class _AstParser:
             return Identifier(node.id)
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return Number(float(node.value))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return String(node.value)
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.USub):
                 if isinstance(node.operand, ast.Constant):

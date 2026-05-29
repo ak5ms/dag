@@ -130,7 +130,7 @@ class CumsumOp(Op):
         return CumsumState(value=value, initialized=initialized), out
 
     def scan_batch(self, state: CumsumState, *child_sequences: jax.Array):
-        x = child_sequences[0]
+        x = _broadcast_sequence_to_state(child_sequences[0], state.value)
         valid = jnp.isfinite(x)
         cumulative = state.value + jnp.cumsum(jnp.where(valid, x, 0.0), axis=0)
         out = jnp.where(valid, cumulative, jnp.nan)
@@ -213,6 +213,33 @@ class RidgeOp(Op):
             t=state.t + 1,
         )
         return next_state, RidgeValue(beta=beta, preds=preds)
+
+
+
+def _as_tick_matrix(value, rows: int | None = None):
+    value = jnp.asarray(value)
+    if value.ndim == 0:
+        if rows is None:
+            return value[None]
+        return jnp.broadcast_to(value, (rows, 1))
+    if value.ndim == 1:
+        return value[:, None]
+    return value
+
+
+def _cat(*values):
+    arrays = tuple(jnp.asarray(value) for value in values)
+    rows = next((array.shape[0] for array in arrays if array.ndim >= 1), None)
+    return jnp.concatenate(tuple(_as_tick_matrix(array, rows) for array in arrays), axis=-1)
+
+
+def _broadcast_sequence_to_state(x, state_value):
+    x = jnp.asarray(x)
+    state_value = jnp.asarray(state_value)
+    if x.ndim == 1 and state_value.ndim == 1:
+        return jnp.broadcast_to(x[:, None], (x.shape[0], state_value.shape[0]))
+    return x
+
 
 
 def _scalar_value(x):
@@ -322,6 +349,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[[], Op]] = {
     ("ln", 1): lambda: NaryOp(jnp.log),
     ("ceil", 1): lambda: NaryOp(jnp.ceil),
     ("floor", 1): lambda: NaryOp(jnp.floor),
+    ("round", 1): lambda: NaryOp(jnp.round),
     ("exp", 1): lambda: NaryOp(jnp.exp),
     ("sign", 1): lambda: NaryOp(jnp.sign),
     ("arctan", 1): lambda: NaryOp(jnp.arctan),

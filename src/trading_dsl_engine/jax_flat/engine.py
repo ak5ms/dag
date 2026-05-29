@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, Universe, parse_formula
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.ops import (
     EwmOp,
     GroupByOp,
@@ -23,6 +24,7 @@ from trading_dsl_engine.jax_flat.ops import (
     Op,
     RidgeOp,
     _bspline,
+    _cat,
     _col,
 )
 
@@ -381,6 +383,8 @@ def _expr_key(node: Expr):
         return ("id", node.name)
     if isinstance(node, Number):
         return ("num", float(node.value))
+    if isinstance(node, String):
+        return ("str", node.value)
     if isinstance(node, Call):
         return (
             "call",
@@ -455,12 +459,19 @@ def _op_width(op: Op) -> int:
         raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
     return int(op.output_width)
 
-
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
+    if expr.fn == "cat" and len(expr.args) >= 1:
+        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+    if expr.fn == "round":
+        if len(expr.args) == 1:
+            return NaryOp(jnp.round), None
+        if len(expr.args) == 2 and isinstance(expr.args[1], Number):
+            decimals = int(round(float(expr.args[1].value)))
+            return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
         return EwmOp(span=float(expr.args[1].value)), 1
     if expr.fn == "bspline" and len(expr.args) == 2:
@@ -539,6 +550,8 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             nodes.append(DagNode(op=LiteralOp(float(node.value)), child_ids=()))
             memo[key] = idx
             return idx
+        if isinstance(node, String):
+            raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
 
         if isinstance(node, Call):
             if node.fn == "groupby":
@@ -637,6 +650,8 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         nodes.append(DagNode(op=LiteralOp(float(expr.value)), child_ids=()))
         memo[key] = idx
         return idx
+    if isinstance(expr, String):
+        raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
     if isinstance(expr, Call) and expr.fn == "groupby":
         return _compile_groupby_node(expr, memo, nodes, input_names)
     if not isinstance(expr, Call):
@@ -651,9 +666,28 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     memo[key] = idx
     return idx
 
+def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -> Expr:
+    if depth > 256:
+        raise ValueError("Exceeded max DSL expansion depth (256)")
+    if isinstance(node, Call):
+        expanded_args = tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args)
+        expanded_kwargs = tuple((key, _expand_dsl(value, dsl_registry, depth)) for key, value in node.kwargs)
+        expanded_node = Call(node.fn, expanded_args, expanded_kwargs)
+        macro = dsl_registry.get(expanded_node.fn)
+        if macro is None:
+            return expanded_node
+        result = macro(*expanded_node.args, **dict(expanded_node.kwargs))
+        if _expr_key(result) == _expr_key(expanded_node):
+            return expanded_node
+        return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+    return node
 
-def compile_formula(formula: str | Expr) -> JaxFlatRuntime:
+
+def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
