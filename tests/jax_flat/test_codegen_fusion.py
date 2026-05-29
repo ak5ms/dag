@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.jax_flat.engine import compile_formula
+from trading_dsl_engine.jax_flat.ops import EwmOp, GroupByOp, InputOp, NaryOp
 
 
 def _fusion_formula() -> str:
@@ -31,3 +32,33 @@ def test_xla_hlo_and_compiled_ir_include_fused_sort_path():
     assert "sort" in hlo_text.lower()
     assert "searchsorted" not in hlo_text.lower()
     assert "fusion" in compiled_ir_text.lower() or "sort" in compiled_ir_text.lower()
+
+
+def test_groupby_cse_keeps_stateful_inner_ops_scoped_to_groupby():
+    runtime = compile_formula(
+        "mul("
+        "mul(ewm(add(a, b), 3), ewm(add(a, b), 3)), "
+        "groupby((key,), field, mul(2, ewm(add(a, b), 3)))"
+        ")"
+    )
+
+    top_ewm_ids = [idx for idx, node in enumerate(runtime.program.nodes) if isinstance(node.op, EwmOp)]
+    groupby_nodes = [node for node in runtime.program.nodes if isinstance(node.op, GroupByOp)]
+
+    assert len(top_ewm_ids) == 1
+    assert len(groupby_nodes) == 1
+
+    groupby_node = groupby_nodes[0]
+    inner_nodes = groupby_node.op.inner_op.nodes
+    inner_ewm_ids = [idx for idx, node in enumerate(inner_nodes) if isinstance(node.op, EwmOp)]
+
+    assert len(inner_ewm_ids) == 1
+    assert top_ewm_ids[0] not in groupby_node.child_ids
+    assert all(isinstance(runtime.program.nodes[child_id].op, InputOp) for child_id in groupby_node.child_ids)
+
+    top_nary_nodes = [node for node in runtime.program.nodes if isinstance(node.op, NaryOp)]
+    inner_nary_nodes = [node for node in inner_nodes if isinstance(node.op, NaryOp)]
+    assert len(top_nary_nodes) == 3
+    assert len(inner_nary_nodes) == 2
+    assert runtime.program.state_layout.total_leaves == 2
+    assert groupby_node.op.inner_op.state_layout.total_leaves == 1
