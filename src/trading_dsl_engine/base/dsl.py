@@ -170,46 +170,46 @@ def _literal_string(value, name: str) -> str:
     raise TypeError(f"{name} must be a string, got {type(value).__name__}")
 
 
-def _unit_seconds(unit: str) -> float:
+def _unit_microseconds(unit: str) -> float:
     unit = _literal_string(unit, "Datetime unit")
-    unit_seconds = {
-        "ns": 1e-9,
-        "nanosecond": 1e-9,
-        "nanoseconds": 1e-9,
-        "us": 1e-6,
-        "microsecond": 1e-6,
-        "microseconds": 1e-6,
-        "ms": 1e-3,
-        "millisecond": 1e-3,
-        "milliseconds": 1e-3,
-        "s": 1.0,
-        "sec": 1.0,
-        "second": 1.0,
-        "seconds": 1.0,
-        "T": 60.0,
-        "min": 60.0,
-        "minute": 60.0,
-        "minutes": 60.0,
-        "H": 3600.0,
-        "h": 3600.0,
-        "hour": 3600.0,
-        "hours": 3600.0,
-        "D": 86400.0,
-        "d": 86400.0,
-        "day": 86400.0,
-        "days": 86400.0,
+    unit_microseconds = {
+        "ns": 0.001,
+        "nanosecond": 0.001,
+        "nanoseconds": 0.001,
+        "us": 1.0,
+        "microsecond": 1.0,
+        "microseconds": 1.0,
+        "ms": 1_000.0,
+        "millisecond": 1_000.0,
+        "milliseconds": 1_000.0,
+        "s": 1_000_000.0,
+        "sec": 1_000_000.0,
+        "second": 1_000_000.0,
+        "seconds": 1_000_000.0,
+        "T": 60_000_000.0,
+        "min": 60_000_000.0,
+        "minute": 60_000_000.0,
+        "minutes": 60_000_000.0,
+        "H": 3_600_000_000.0,
+        "h": 3_600_000_000.0,
+        "hour": 3_600_000_000.0,
+        "hours": 3_600_000_000.0,
+        "D": 86_400_000_000.0,
+        "d": 86_400_000_000.0,
+        "day": 86_400_000_000.0,
+        "days": 86_400_000_000.0,
     }
     try:
-        return unit_seconds[unit]
+        return unit_microseconds[unit]
     except KeyError as exc:
         raise ValueError(f"Unsupported datetime unit {unit!r}") from exc
 
 
-def _duration_seconds(value: str | int | float, default_unit: str = "s") -> float:
+def _duration_microseconds(value: str | int | float, default_unit: str = "us") -> float:
     if isinstance(value, Number):
-        return float(value.value) * _unit_seconds(default_unit)
+        return float(value.value) * _unit_microseconds(default_unit)
     if isinstance(value, (int, float)):
-        return float(value) * _unit_seconds(default_unit)
+        return float(value) * _unit_microseconds(default_unit)
     text = _literal_string(value, "Duration").strip()
     if not text:
         raise ValueError("Duration cannot be empty")
@@ -217,7 +217,7 @@ def _duration_seconds(value: str | int | float, default_unit: str = "s") -> floa
     while idx < len(text) and (text[idx].isdigit() or text[idx] in "+-."):
         idx += 1
     number = float(text[:idx]) if idx else 1.0
-    return number * _unit_seconds(text[idx:] or default_unit)
+    return number * _unit_microseconds(text[idx:] or default_unit)
 
 
 def _floor_expr(x: Expr) -> Expr:
@@ -233,7 +233,7 @@ def _round_expr(x: Expr, *args) -> Expr:
 
 
 def _epoch_days(x: Expr) -> Expr:
-    return _floor_expr(div(x, 86400.0))
+    return _floor_expr(div(x, 86_400_000_000.0))
 
 
 def _civil_parts(x: Expr) -> tuple[Expr, Expr, Expr, Expr]:
@@ -269,28 +269,28 @@ def _is_leap_year_expr(year_expr: Expr) -> Expr:
 
 
 @register_dsl_function("to_dt")
-def to_dt(x: Expr, unit: str = "ns") -> Expr:
-    return mul(x, _unit_seconds(unit))
+def to_dt(x: Expr, unit: str = "us") -> Expr:
+    return mul(x, _unit_microseconds(unit))
 
 
 @register_dsl_function("timeofday")
 def timeofday(x: Expr) -> Expr:
-    return mod(x, 86400.0)
+    return mod(x, 86_400_000_000.0)
 
 
 @register_dsl_function("hour")
 def hour(x: Expr) -> Expr:
-    return _floor_expr(div(timeofday(x), 3600.0))
+    return _floor_expr(div(timeofday(x), 3_600_000_000.0))
 
 
 @register_dsl_function("minute")
 def minute(x: Expr) -> Expr:
-    return mod(_floor_expr(div(timeofday(x), 60.0)), 60.0)
+    return mod(_floor_expr(div(timeofday(x), 60_000_000.0)), 60.0)
 
 
 @register_dsl_function("second")
 def second(x: Expr) -> Expr:
-    return mod(_floor_expr(timeofday(x)), 60.0)
+    return mod(_floor_expr(div(timeofday(x), 1_000_000.0)), 60.0)
 
 
 @register_dsl_function("year")
@@ -330,16 +330,16 @@ def dayofyear(x: Expr) -> Expr:
 def floor(x: Expr, freq: str | int | float | None = None) -> Expr:
     if freq is None:
         return _floor_expr(x)
-    seconds = _duration_seconds(freq)
-    return mul(_floor_expr(div(x, seconds)), seconds)
+    micros = _duration_microseconds(freq)
+    return mul(_floor_expr(div(x, micros)), micros)
 
 
 @register_dsl_function("ceil")
 def ceil(x: Expr, freq: str | int | float | None = None) -> Expr:
     if freq is None:
         return _ceil_expr(x)
-    seconds = _duration_seconds(freq)
-    return mul(_ceil_expr(div(x, seconds)), seconds)
+    micros = _duration_microseconds(freq)
+    return mul(_ceil_expr(div(x, micros)), micros)
 
 
 @register_dsl_function("round")
@@ -348,8 +348,8 @@ def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
         return _round_expr(x, *args)
     if args:
         raise TypeError("round cannot combine decimals with freq")
-    seconds = _duration_seconds(freq)
-    return mul(_floor_expr(add(div(x, seconds), 0.5)), seconds)
+    micros = _duration_microseconds(freq)
+    return mul(_floor_expr(add(div(x, micros), 0.5)), micros)
 
 
 def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> Expr:  # noqa: N802
