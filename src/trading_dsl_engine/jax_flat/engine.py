@@ -21,11 +21,14 @@ from trading_dsl_engine.jax_flat.ops import (
     _bspline,
     _cat,
     _col,
-    _date_part,
-    _datetime_round,
-    _dayofyear,
-    _time_part,
-    _timeofday,
+)
+from trading_dsl_engine.jax_flat.ops_dt import (
+    ToDtOp,
+    date_part_value,
+    datetime_round_value,
+    dayofyear_value,
+    time_part_value,
+    timeofday_value,
 )
 
 
@@ -386,12 +389,25 @@ def _static_kwarg_map(expr: Call) -> dict[str, Expr]:
     return {name: value for name, value in expr.kwargs}
 
 
+def _datetime_unit(expr: Call, child_ops: tuple[Op, ...], kwargs: dict[str, Expr]) -> str:
+    if "unit" in kwargs:
+        return _static_string_value(kwargs["unit"], expr.fn, "unit")
+    if child_ops and isinstance(child_ops[0], ToDtOp):
+        return child_ops[0].unit
+    return "ns"
+
+
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
     kwargs = _static_kwarg_map(expr)
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+    if expr.fn == "to_dt" and len(expr.args) == 1:
+        unsupported = set(kwargs) - {"unit"}
+        if unsupported:
+            raise ValueError(f"Unsupported to_dt keyword argument(s): {sorted(unsupported)}")
+        return ToDtOp(unit=_static_string_value(kwargs.get("unit", String("ns")), "to_dt", "unit")), None
     if expr.fn == "round" and not kwargs:
         if len(expr.args) == 1:
             return NaryOp(jnp.round), None
@@ -401,30 +417,26 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
     if expr.fn in {"dayofyear", "timeofday", "year", "month", "day", "dayofweek", "hour", "minute", "second"}:
         if len(expr.args) != 1:
             raise ValueError(f"{expr.fn} expects one timestamp argument")
-        unsupported = set(kwargs) - {"unit", "offset"}
+        unsupported = set(kwargs) - {"unit"}
         if unsupported:
             raise ValueError(f"Unsupported {expr.fn} keyword argument(s): {sorted(unsupported)}")
-        unit = _static_string_value(kwargs.get("unit", String("ns")), expr.fn, "unit")
-        offset_expr = kwargs.get("offset")
-        offset = 0 if offset_expr is None else (
-            _static_string_value(offset_expr, expr.fn, "offset") if isinstance(offset_expr, String) else float(offset_expr.value)
-        )
+        unit = _datetime_unit(expr, child_ops, kwargs)
         if expr.fn == "dayofyear":
-            return NaryOp(lambda x, unit=unit, offset=offset: _dayofyear(x, unit, offset)), None
+            return NaryOp(lambda x, unit=unit: dayofyear_value(x, unit)), None
         if expr.fn == "timeofday":
-            return NaryOp(lambda x, unit=unit, offset=offset: _timeofday(x, unit, offset)), None
+            return NaryOp(lambda x, unit=unit: timeofday_value(x, unit)), None
         if expr.fn in {"year", "month", "day", "dayofweek"}:
-            return NaryOp(lambda x, unit=unit, offset=offset, part=expr.fn: _date_part(x, unit, part, offset)), None
-        return NaryOp(lambda x, unit=unit, offset=offset, part=expr.fn: _time_part(x, unit, part, offset)), None
+            return NaryOp(lambda x, unit=unit, part=expr.fn: date_part_value(x, unit, part)), None
+        return NaryOp(lambda x, unit=unit, part=expr.fn: time_part_value(x, unit, part)), None
     if kwargs and expr.fn in {"floor", "ceil", "round"}:
         if len(expr.args) != 1:
             raise ValueError(f"datetime {expr.fn} expects one timestamp argument")
         unsupported = set(kwargs) - {"unit", "freq"}
         if unsupported:
             raise ValueError(f"Unsupported datetime {expr.fn} keyword argument(s): {sorted(unsupported)}")
-        unit = _static_string_value(kwargs.get("unit", String("ns")), expr.fn, "unit")
+        unit = _datetime_unit(expr, child_ops, kwargs)
         freq = _static_string_value(kwargs.get("freq", String("D")), expr.fn, "freq")
-        return NaryOp(lambda x, unit=unit, freq=freq, mode=expr.fn: _datetime_round(x, unit, freq, mode)), None
+        return NaryOp(lambda x, unit=unit, freq=freq, mode=expr.fn: datetime_round_value(x, unit, freq, mode)), None
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):

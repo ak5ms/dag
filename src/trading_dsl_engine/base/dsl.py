@@ -159,6 +159,7 @@ bspline = op("bspline")
 col = op("col")
 
 cat = op("cat")
+to_dt = op("to_dt")
 round = op("round")
 dayofyear = op("dayofyear")
 timeofday = op("timeofday")

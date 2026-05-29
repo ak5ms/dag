@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import jax.numpy as jnp
 import numpy as np
 
+from trading_dsl_engine.base.dsl import cat, ceil, dayofyear, floor, hour, round, timeofday, to_dt, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
 
@@ -41,15 +42,16 @@ def test_cat_stacks_multiple_alpha_vectors_on_last_axis():
 
 
 def test_datetime_calendar_and_rounding_ops_from_microsecond_timestamps():
+    ev_dt = to_dt(var("ev_ts"), unit="us")
     runtime = compile_formula(
-        "cat("
-        "dayofyear(ev_ts, unit='us'), "
-        "timeofday(ev_ts, unit='us', offset='5T'), "
-        "hour(ev_ts, unit='us', offset='5T'), "
-        "floor(ev_ts, unit='us', freq='H'), "
-        "ceil(ev_ts, unit='us', freq='H'), "
-        "round(ev_ts, unit='us', freq='H')"
-        ")"
+        cat(
+            dayofyear(ev_dt),
+            timeofday(ev_dt),
+            hour(ev_dt),
+            floor(ev_dt, freq="H"),
+            ceil(ev_dt, freq="H"),
+            round(ev_dt, freq="H"),
+        )
     )
     ev_ts = jnp.array(
         [
@@ -65,8 +67,8 @@ def test_datetime_calendar_and_rounding_ops_from_microsecond_timestamps():
     expected = np.stack(
         [
             np.array([[60.0, 1.0], [61.0, 365.0]]),
-            np.array([[210.0, 2070.0], [420.0, 84960.0]]),
-            np.array([[0.0, 0.0], [0.0, 23.0]]),
+            np.array([[86310.0, 1770.0], [120.0, 84660.0]]),
+            np.array([[23.0, 0.0], [0.0, 23.0]]),
             np.floor(np.asarray(ev_ts) / hour_us) * hour_us,
             np.ceil(np.asarray(ev_ts) / hour_us) * hour_us,
             np.floor(np.asarray(ev_ts) / hour_us + 0.5) * hour_us,
