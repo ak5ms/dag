@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.base.dsl import ewm, shift, var
-from trading_dsl_engine.jax import compile_formula
+from trading_dsl_engine.jax_flat.engine import compile_formula
 
 jax.config.update("jax_enable_x64", True)
 
@@ -31,7 +31,7 @@ def ts_zscore(x, hl):
     return (x - ewm(x, hl)) / (ewm(x**2, hl) ** 0.5)
 
 
-def build_momentum_program():
+def build_momentum_runtime():
     returns = var("returns")
     half_life = var("hl")
     # One-step lag avoids lookahead: today's return is multiplied by yesterday's signal.
@@ -39,16 +39,15 @@ def build_momentum_program():
     return compile_formula(signal)
 
 
-def test_jax_autodiff_optimizes_momentum_half_life():
+def test_jax_flat_autodiff_optimizes_momentum_half_life():
     returns = generate_autocorrelated_returns()
-    artifact = build_momentum_program()
-    program = artifact.compiled
+    runtime = build_momentum_runtime()
 
     def sharpe_for_raw_half_life(raw_half_life):
         half_life = jax.nn.softplus(raw_half_life) + 2.0
         half_life_frame = jnp.broadcast_to(half_life, returns.shape)
-        inputs = tuple({"returns": returns, "hl": half_life_frame}[name] for name in artifact.input_names)
-        weights = program.run_batch(inputs)
+        inputs_by_name = {"returns": returns, "hl": half_life_frame}
+        _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
         pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
         return pnl.mean() / (pnl.std() + 1e-12)
 
@@ -76,16 +75,12 @@ def test_jax_autodiff_optimizes_momentum_half_life():
 
 if __name__ == "__main__":
     returns = generate_autocorrelated_returns()
-    artifact = build_momentum_program()
-    program = artifact.compiled
+    runtime = build_momentum_runtime()
 
     def sharpe(raw_half_life):
         half_life = jax.nn.softplus(raw_half_life) + 2.0
-        inputs = tuple(
-            {"returns": returns, "hl": jnp.broadcast_to(half_life, returns.shape)}[name]
-            for name in artifact.input_names
-        )
-        weights = program.run_batch(inputs)
+        inputs_by_name = {"returns": returns, "hl": jnp.broadcast_to(half_life, returns.shape)}
+        _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
         pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
         return pnl.mean() / (pnl.std() + 1e-12)
 

@@ -241,7 +241,7 @@ class EwmOp(eqx.Module):
     def init_state(self, n_instruments: int):
         return (
             _children_init((self.child, self.span), n_instruments),
-            jnp.zeros((n_instruments, 1), dtype=jnp.float64),
+            jnp.full((n_instruments, 1), jnp.nan),
             jnp.zeros((n_instruments, 1), dtype=bool),
         )
 
@@ -250,10 +250,9 @@ class EwmOp(eqx.Module):
         new_child_states, (x, span) = _children_tick((self.child, self.span), child_states, frame2d)
         alpha = 2.0 / (_scalar_value(span) + 1.0)
         valid = jnp.isfinite(x)
-        updated = jnp.where(initialized, alpha * x + (1.0 - alpha) * previous, x)
-        new_previous = jnp.where(valid, updated, previous)
-        out = jnp.where(valid | initialized, new_previous, jnp.nan)
-        return (new_child_states, new_previous, initialized | valid), out
+        out = jnp.where(initialized & valid, alpha * x + (1.0 - alpha) * previous, jnp.where(valid, x, previous))
+        out = jnp.where(valid | initialized, out, jnp.nan)
+        return (new_child_states, out, initialized | valid), out
 
 
 class CumsumOp(eqx.Module):
@@ -287,26 +286,22 @@ class ShiftOp(eqx.Module):
     def init_state(self, n_instruments: int):
         return (
             _children_init((self.child, self.lag, self.max_size_source), n_instruments),
-            jnp.zeros((self.max_size + 1, n_instruments, 1), dtype=jnp.float64),
-            jnp.zeros((self.max_size + 1, n_instruments, 1), dtype=bool),
+            jnp.full((self.max_size + 1, n_instruments, 1), jnp.nan),
             jnp.array(0, dtype=jnp.int64),
             jnp.array(0, dtype=jnp.int64),
         )
 
     def tick(self, state, frame2d):
-        child_states, buffer, buffer_valid, pos, count = state
+        child_states, buffer, pos, count = state
         new_child_states, (x, lag, _) = _children_tick((self.child, self.lag, self.max_size_source), child_states, frame2d)
         cap = buffer.shape[0]
         lag_i = jnp.clip(jnp.asarray(_scalar_value(lag), dtype=jnp.int64), 0, cap - 1)
         read_pos = jnp.mod(pos - lag_i, cap)
-        read_valid = (count >= lag_i) & buffer_valid[read_pos]
-        shifted = jnp.where(read_valid, buffer[read_pos], jnp.nan)
+        shifted = jnp.where(count >= lag_i, buffer[read_pos], jnp.nan)
         new_buffer = buffer.at[pos].set(x)
-        new_buffer_valid = buffer_valid.at[pos].set(jnp.isfinite(x))
         return (
             new_child_states,
             new_buffer,
-            new_buffer_valid,
             jnp.mod(pos + 1, cap),
             jnp.minimum(count + 1, cap),
         ), shifted

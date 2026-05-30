@@ -44,6 +44,15 @@ class CumsumState:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class ShiftState:
+    buffer: jax.Array
+    valid: jax.Array
+    pos: jax.Array
+    count: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class RidgeState:
     xx: jax.Array
     xy: jax.Array
@@ -92,7 +101,7 @@ class NaryOp(Op):
 
 @dataclass(frozen=True)
 class EwmOp(Op):
-    span: float
+    span: float | None = None
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
@@ -102,14 +111,51 @@ class EwmOp(Op):
 
     def tick(self, state: EwmState, *child_values: jax.Array):
         x = child_values[0]
+        span = self.span if self.span is not None else _scalar_value(child_values[1])
         value, initialized = state.value, state.initialized
-        alpha = 2.0 / (self.span + 1.0)
+        alpha = 2.0 / (span + 1.0)
         valid = jnp.isfinite(x)
         init_or_valid = initialized | valid
         blended = alpha * x + (1.0 - alpha) * value
-        out = jnp.where(initialized, blended, x)
-        out = jnp.where(init_or_valid, jnp.where(valid, out, value), jnp.nan)
-        return EwmState(value=out, initialized=init_or_valid), out
+        next_value = jnp.where(valid, jnp.where(initialized, blended, x), value)
+        out = jnp.where(init_or_valid, next_value, jnp.nan)
+        return EwmState(value=next_value, initialized=init_or_valid), out
+
+
+@dataclass(frozen=True)
+class ShiftOp(Op):
+    max_size: int
+    output_kind: str = "vector"
+    output_width: int | None = 1
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        shape = (self.max_size + 1,) + jnp.asarray(sample).shape
+        return ShiftState(
+            buffer=jnp.zeros(shape, dtype=jnp.float64),
+            valid=jnp.zeros(shape, dtype=bool),
+            pos=jnp.asarray(0, dtype=jnp.int64),
+            count=jnp.asarray(0, dtype=jnp.int64),
+        )
+
+    def tick(self, state: ShiftState, *child_values: jax.Array):
+        x, lag = child_values[:2]
+        cap = state.buffer.shape[0]
+        lag_i = jnp.clip(jnp.asarray(_scalar_value(lag), dtype=jnp.int64), 0, cap - 1)
+        read_pos = jnp.mod(state.pos - lag_i, cap)
+        read_valid = (state.count >= lag_i) & state.valid[read_pos]
+        shifted = jnp.where(read_valid, state.buffer[read_pos], jnp.nan)
+        next_buffer = state.buffer.at[state.pos].set(x)
+        next_valid = state.valid.at[state.pos].set(jnp.isfinite(x))
+        return (
+            ShiftState(
+                buffer=next_buffer,
+                valid=next_valid,
+                pos=jnp.mod(state.pos + 1, cap),
+                count=jnp.minimum(state.count + 1, cap),
+            ),
+            shifted,
+        )
 
 
 @dataclass(frozen=True)

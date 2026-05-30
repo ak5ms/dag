@@ -23,6 +23,7 @@ from trading_dsl_engine.jax_flat.ops import (
     OP_FACTORIES,
     Op,
     RidgeOp,
+    ShiftOp,
     _bspline,
     _cat,
     _col,
@@ -472,8 +473,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
-    if expr.fn == "ewm" and len(expr.args) == 2 and isinstance(expr.args[1], Number):
-        return EwmOp(span=float(expr.args[1].value)), 1
+    if expr.fn == "ewm" and len(expr.args) == 2:
+        if isinstance(expr.args[1], Number):
+            return EwmOp(span=float(expr.args[1].value)), 1
+        return EwmOp(), None
+    if expr.fn == "shift" and len(expr.args) in (2, 3):
+        max_size_arg = expr.args[2] if len(expr.args) == 3 else expr.args[1]
+        max_size = max(1, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
+        return ShiftOp(max_size=max_size), 2 if len(expr.args) == 3 else None
     if expr.fn == "bspline" and len(expr.args) == 2:
         n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
         if n_basis <= 0:
