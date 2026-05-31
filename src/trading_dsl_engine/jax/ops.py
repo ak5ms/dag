@@ -704,7 +704,7 @@ def _build_shift(args, children):
     max_size_arg = args[2] if len(args) > 2 else args[1]
     max_size = int(_literal_arg(max_size_arg, "shift", 3 if len(args) > 2 else 2))
     max_size_source = children[2] if len(children) > 2 else children[1]
-    return ShiftOp(children[0], children[1], max_size_source, max(1, max_size), children[0].output_kind)
+    return ShiftOp(children[0], children[1], max_size_source, max(0, max_size), children[0].output_kind)
 
 
 def _build_rolling_quantile(args, children):
