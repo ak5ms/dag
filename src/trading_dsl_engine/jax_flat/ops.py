@@ -46,9 +46,7 @@ class CumsumState:
 @dataclass(frozen=True)
 class ShiftState:
     buffer: jax.Array
-    valid: jax.Array
     pos: jax.Array
-    count: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -130,29 +128,32 @@ class ShiftOp(Op):
     is_stateful: bool = True
 
     def init_state(self, sample: jax.Array):
-        shape = (self.max_size + 1,) + jnp.asarray(sample).shape
+        shape = (self.max_size,) + jnp.asarray(sample).shape
+
         return ShiftState(
-            buffer=jnp.zeros(shape, dtype=jnp.float64),
-            valid=jnp.zeros(shape, dtype=bool),
+            buffer=jnp.full(shape, jnp.nan, dtype=jnp.float64),
             pos=jnp.asarray(0, dtype=jnp.int64),
-            count=jnp.asarray(0, dtype=jnp.int64),
         )
 
     def tick(self, state: ShiftState, *child_values: jax.Array):
         x, lag = child_values[:2]
         cap = state.buffer.shape[0]
-        lag_i = jnp.clip(jnp.asarray(_scalar_value(lag), dtype=jnp.int64), 0, cap - 1)
+        lag_i = jnp.clip(
+            jnp.asarray(_scalar_value(lag), dtype=jnp.int64),
+            0,
+            cap,
+        )
         read_pos = jnp.mod(state.pos - lag_i, cap)
-        read_valid = (state.count >= lag_i) & state.valid[read_pos]
-        shifted = jnp.where(read_valid, state.buffer[read_pos], jnp.nan)
+        shifted = jnp.where(
+            lag_i == 0,
+            x,
+            state.buffer[read_pos],
+        )
         next_buffer = state.buffer.at[state.pos].set(x)
-        next_valid = state.valid.at[state.pos].set(jnp.isfinite(x))
         return (
             ShiftState(
                 buffer=next_buffer,
-                valid=next_valid,
                 pos=jnp.mod(state.pos + 1, cap),
-                count=jnp.minimum(state.count + 1, cap),
             ),
             shifted,
         )

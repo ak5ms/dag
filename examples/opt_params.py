@@ -1,12 +1,7 @@
-from dataclasses import dataclass
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import jax
 import jax.numpy as jnp
-from jax.example_libraries import optimizers
+import pandas as pd
 
 from trading_dsl_engine.base.dsl import ewm, shift, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
@@ -18,20 +13,18 @@ N_ROWS = 5_000
 N_ASSETS = 5
 
 
-def generate_autocorrelated_returns(seed=0, n_rows=N_ROWS, n_assets=N_ASSETS, rho=0.15):
-    """Generate stationary unit-variance Gaussian AR(1) returns."""
-    key = jax.random.PRNGKey(seed)
-    shocks = jax.random.normal(key, (n_rows, n_assets), dtype=jnp.float64)
-    shock_scale = jnp.sqrt(1.0 - rho**2)
+def generate_autocorrelated_returns(seed=0, n_rows=N_ROWS, n_assets=N_ASSETS, windows=(5, 10)):
 
-    def step(previous, shock):
-        value = rho * previous + shock_scale * shock
-        return value, value
+    noise = pd.DataFrame(jax.random.normal (jax.random.PRNGKey(seed), (n_rows+max(windows), n_assets)))
+    returns = noise.rolling(windows[0]).mean() - noise.rolling(windows[1]).mean()
+    returns = returns.dropna()
 
-    initial = shocks[0]
-    _, tail = jax.lax.scan(step, initial, shocks[1:])
-    return jnp.vstack([initial[None, :], tail])
-
+    import matplotlib.pyplot as plt
+    def acf(returns):
+        pd.DataFrame(returns).iloc[:,0].pipe(lambda x: pd.Series([x.corr(x.shift(i)) for i in range(20)])).plot();
+        plt.show()
+    acf(returns)
+    return jnp.array(returns)
 
 def ts_zscore(x, hl):
     """Composed DSL expression: no dedicated ts_zscore operator is required."""
@@ -46,77 +39,68 @@ def build_momentum_runtime():
     return compile_formula(signal)
 
 
-@dataclass(frozen=True)
-class OptimizationResult:
-    initial_half_life: jax.Array
-    optimized_half_life: jax.Array
-    initial_sharpe: jax.Array
-    optimized_sharpe: jax.Array
-    sharpe_path: jax.Array
+def test_jax_flat_autodiff_optimizes_momentum_half_life():
+    returns = generate_autocorrelated_returns()
+    runtime = build_momentum_runtime()
 
-
-def make_sharpe_objective(returns, runtime):
     def sharpe_for_raw_half_life(raw_half_life):
         half_life = jax.nn.softplus(raw_half_life) + 2.0
-        inputs_by_name = {"returns": returns, "hl": jnp.broadcast_to(half_life, returns.shape)}
+        half_life_frame = jnp.broadcast_to(half_life, returns.shape)
+        inputs_by_name = {"returns": returns, "hl": half_life_frame}
         _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
         pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
         return pnl.mean() / (pnl.std() + 1e-12)
 
-    return sharpe_for_raw_half_life
-
-
-def optimize_half_life(returns, steps=25, learning_rate=0.5):
-    runtime = build_momentum_runtime()
-    sharpe = make_sharpe_objective(returns, runtime)
-    opt_init, opt_update, get_params = optimizers.adam(step_size=learning_rate)
     initial_raw_half_life = jnp.array(2.0, dtype=jnp.float64)
-
-    def loss(raw_half_life):
-        return -sharpe(raw_half_life)
+    initial_sharpe, initial_grad = jax.value_and_grad(sharpe_for_raw_half_life)(initial_raw_half_life)
 
     @jax.jit
-    def run_optimizer(opt_state):
-        def step(state, step_index):
-            raw_half_life = get_params(state)
-            loss_value, grad = jax.value_and_grad(loss)(raw_half_life)
-            next_state = opt_update(step_index, grad, state)
-            return next_state, -loss_value
+    def optimize(raw_half_life):
+        def step(raw, _):
+            sharpe, grad = jax.value_and_grad(sharpe_for_raw_half_life)(raw)
+            return raw + 5.0 * grad, sharpe
 
-        return jax.lax.scan(step, opt_state, jnp.arange(steps))
+        return jax.lax.scan(step, raw_half_life, None, length=25)
 
-    initial_state = opt_init(initial_raw_half_life)
-    final_state, sharpe_path = run_optimizer(initial_state)
-    optimized_raw_half_life = get_params(final_state)
-    return OptimizationResult(
-        initial_half_life=jax.nn.softplus(initial_raw_half_life) + 2.0,
-        optimized_half_life=jax.nn.softplus(optimized_raw_half_life) + 2.0,
-        initial_sharpe=sharpe(initial_raw_half_life),
-        optimized_sharpe=sharpe(optimized_raw_half_life),
-        sharpe_path=sharpe_path,
-    )
+    optimized_raw_half_life, sharpe_path = optimize(initial_raw_half_life)
+    optimized_sharpe = sharpe_for_raw_half_life(optimized_raw_half_life)
+    optimized_half_life = jax.nn.softplus(optimized_raw_half_life) + 2.0
 
-
-def validate_optimization(result):
-    assert jnp.isfinite(result.initial_sharpe)
-    assert jnp.isfinite(result.optimized_sharpe)
-    assert jnp.all(jnp.isfinite(result.sharpe_path))
-    assert result.optimized_half_life > 2.0
-    assert result.optimized_sharpe > result.initial_sharpe + 1e-3
-
-
-def main():
-    result = optimize_half_life(generate_autocorrelated_returns())
-    validate_optimization(result)
-    print(
-        {
-            "initial_half_life": float(result.initial_half_life),
-            "optimized_half_life": float(result.optimized_half_life),
-            "initial_sharpe": float(result.initial_sharpe),
-            "optimized_sharpe": float(result.optimized_sharpe),
-        }
-    )
+    assert jnp.isfinite(initial_sharpe)
+    assert jnp.isfinite(initial_grad)
+    assert jnp.all(jnp.isfinite(sharpe_path))
+    assert optimized_half_life > 2.0
+    assert optimized_sharpe > initial_sharpe + 1e-3
 
 
 if __name__ == "__main__":
-    main()
+    returns = generate_autocorrelated_returns()
+    runtime = build_momentum_runtime()
+
+    def sharpe(raw_half_life):
+        half_life = jax.nn.softplus(raw_half_life) + 2.0
+        inputs_by_name = {"returns": returns, "hl": jnp.broadcast_to(half_life, returns.shape)}
+        _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
+        pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
+        sharpe = pnl.mean() / (pnl.std() + 1e-12)
+        print(sharpe)
+        return sharpe
+
+    raw = jnp.array(2.0, dtype=jnp.float64)
+    for _ in range(25):
+        # jax.hessian(sharpe)(raw)
+        raw = raw + 50.0 * jax.grad(sharpe)(raw)
+
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    sharpe_vmap = jax.vmap(jax.jit(sharpe))
+    s1 = sharpe_vmap(jnp.arange(0,100, dtype=jnp.float64))
+
+    s2 = []
+    for x in range(100):
+        sharpe(1.1*x) - sharpe(x)
+        s2.append(jax.grad(sharpe)(0.1*x) + 0.5*jax.hessian(sharpe)(0.1*x)**2)
+    s2 = jnp.stack(s2)
+    pd.Series(s2).plot(); plt.show()
+
+    print({"half_life": float(jax.nn.softplus(raw) + 2.0), "sharpe": float(sharpe(raw))})

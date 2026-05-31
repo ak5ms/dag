@@ -479,7 +479,7 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         return EwmOp(), None
     if expr.fn == "shift" and len(expr.args) in (2, 3):
         max_size_arg = expr.args[2] if len(expr.args) == 3 else expr.args[1]
-        max_size = max(1, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
+        max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
         return ShiftOp(max_size=max_size), 2 if len(expr.args) == 3 else None
     if expr.fn == "bspline" and len(expr.args) == 2:
         n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
