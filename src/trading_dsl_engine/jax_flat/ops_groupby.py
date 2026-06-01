@@ -241,16 +241,28 @@ def _empty_output_like(template: Any, width: int):
     return jax.tree_util.tree_map(alloc, template)
 
 
-def _slice_group_arg(value: jax.Array, idx: jax.Array) -> jax.Array:
+def _is_group_aligned_arg(value: jax.Array, source_width: int | None) -> bool:
+    value = jnp.asarray(value)
+    return value.ndim == 0 or source_width is None or value.shape[0] == source_width
+
+
+def _slice_group_arg(value: jax.Array, idx: jax.Array, source_width: int | None = None) -> jax.Array:
     value = jnp.asarray(value)
     if value.ndim == 0:
+        return value
+    if not _is_group_aligned_arg(value, source_width):
         return value
     return jnp.take(value, idx, axis=0)
 
 
-def _mask_group_arg(value: jax.Array, idx: jax.Array, mask: jax.Array) -> jax.Array:
-    group_value = _slice_group_arg(value, idx)
-    if jnp.asarray(group_value).ndim == 0:
+def _mask_group_arg(
+    value: jax.Array,
+    idx: jax.Array,
+    mask: jax.Array,
+    source_width: int | None = None,
+) -> jax.Array:
+    group_value = _slice_group_arg(value, idx, source_width)
+    if jnp.asarray(group_value).ndim == 0 or not _is_group_aligned_arg(value, source_width):
         return group_value
     mask_shape = mask.shape + (1,) * (group_value.ndim - 1)
     return jnp.where(jnp.reshape(mask, mask_shape), group_value, jnp.nan)
@@ -367,9 +379,14 @@ def _scatter_batch_group_output(out: Any, idx: jax.Array, group_values: Any):
     return jax.tree_util.tree_map(lambda dst, src: dst.at[:, idx].set(src), out, group_values)
 
 
-def _slice_member_arg(value: jax.Array, idx: jax.Array, member_pos: jax.Array) -> jax.Array:
-    group_value = _slice_group_arg(value, idx)
-    if jnp.asarray(group_value).ndim == 0:
+def _slice_member_arg(
+    value: jax.Array,
+    idx: jax.Array,
+    member_pos: jax.Array,
+    source_width: int | None = None,
+) -> jax.Array:
+    group_value = _slice_group_arg(value, idx, source_width)
+    if jnp.asarray(group_value).ndim == 0 or not _is_group_aligned_arg(value, source_width):
         return group_value
     return jnp.take(group_value, member_pos, axis=0)
 
@@ -394,6 +411,27 @@ class GroupByOp(Op):
     output_kind: str = "vector"
     is_stateful: bool = True
 
+    def _source_width(self, fallback_width: int) -> int:
+        if self.universe_groups is None:
+            return fallback_width
+        return max(max(group) for group in self.universe_groups) + 1
+
+    def _group_sample(self, sample: jax.Array, group_width: int, source_width: int) -> jax.Array:
+        sample = jnp.asarray(sample)
+        if sample.ndim > 0 and sample.shape[0] != source_width:
+            return jnp.zeros_like(sample)
+        return jnp.zeros((group_width,) + sample.shape[1:], dtype=sample.dtype)
+
+    def _row_arg_source_width(self, arg: jax.Array, idx: jax.Array) -> int:
+        arg = jnp.asarray(arg)
+        fallback_width = arg.shape[0] if arg.ndim > 0 else idx.shape[0]
+        return self._source_width(fallback_width)
+
+    def _sequence_arg_source_width(self, arg: jax.Array, idx: jax.Array) -> int:
+        arg = jnp.asarray(arg)
+        fallback_width = arg.shape[1] if arg.ndim > 1 else idx.shape[0]
+        return self._source_width(fallback_width)
+
     def init_state(self, sample: jax.Array):
         dtype = jnp.asarray(sample).dtype
         keys = []
@@ -407,13 +445,15 @@ class GroupByOp(Op):
         inner_states = []
         hash_capacity = max(self.hash_capacity, self.capacity)
 
+        sample_width = int(jnp.asarray(sample).shape[0]) if jnp.asarray(sample).ndim > 0 else 1
+        source_width = self._source_width(sample_width)
         groups = self.universe_groups
         if groups is None:
-            groups = (tuple(range(int(jnp.asarray(sample).shape[0]))),)
+            groups = (tuple(range(source_width)),)
 
         for group in groups:
             group_width = len(group)
-            group_sample = jnp.zeros((group_width,), dtype=dtype)
+            group_sample = self._group_sample(sample, group_width, source_width)
             inner_state = self.inner_op.init_state(group_sample) if self.inner_op.is_stateful else None
 
             keys.append(jnp.full((self.capacity, self.n_keys), jnp.nan, dtype=jnp.float64))
@@ -450,7 +490,7 @@ class GroupByOp(Op):
 
     def _group_template(self, group_state: Any, idx: jax.Array, args: tuple[jax.Array, ...]):
         sample_state = _tree_take_slot(group_state, jnp.asarray(0, dtype=jnp.int32)) if group_state is not None else None
-        sample_args = tuple(_slice_group_arg(arg, idx) for arg in args)
+        sample_args = tuple(_slice_group_arg(arg, idx, self._row_arg_source_width(arg, idx)) for arg in args)
         _, template = self.inner_op.tick(sample_state, *sample_args)
         return _ensure_dataclass_pytree(template)
 
@@ -484,7 +524,7 @@ class GroupByOp(Op):
                 slot, table_found = _lookup_or_insert_slot(table_p, key)
 
                 mask = jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix)
-                group_args = tuple(_mask_group_arg(arg, idx, mask) for arg in args)
+                group_args = tuple(_mask_group_arg(arg, idx, mask, self._row_arg_source_width(arg, idx)) for arg in args)
 
                 selected_state = _tree_take_slot(inner_state_p, slot) if inner_state_p is not None else None
                 updated_state, local_out = self.inner_op.tick(selected_state, *group_args)
@@ -532,7 +572,7 @@ class GroupByOp(Op):
             slot, table_found = _lookup_or_insert_slot(table_c, key)
 
             selected_state = _tree_take_slot(inner_state_c, slot)
-            member_args = tuple(_slice_member_arg(arg, idx, member_pos) for arg in args)
+            member_args = tuple(_slice_member_arg(arg, idx, member_pos, self._row_arg_source_width(arg, idx)) for arg in args)
             updated_state, local_out = self.inner_op.tick(selected_state, *member_args)
 
             inner_state_next = _tree_set_slot(inner_state_c, slot, updated_state) if updated_state is not None else inner_state_c
@@ -555,7 +595,7 @@ class GroupByOp(Op):
     ):
         key = key_matrix[0]
         group_width = idx.shape[0]
-        group_args = tuple(_slice_group_arg(arg, idx) for arg in args)
+        group_args = tuple(_slice_group_arg(arg, idx, self._row_arg_source_width(arg, idx)) for arg in args)
         cache_hit = runtime.cache.valid & _same_key_vector(runtime.cache.key, key)
 
         def hit(_):
@@ -701,7 +741,7 @@ class GroupByOp(Op):
     ):
         n_steps = key_seq.shape[0]
         group_width = idx.shape[0]
-        sample_args = tuple(_slice_group_arg(arg[0], idx) for arg in args_seq)
+        sample_args = tuple(_slice_group_arg(arg[0], idx, self._sequence_arg_source_width(arg, idx)) for arg in args_seq)
         sample_state = _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32)) if runtime.inner_state is not None else None
         _, template = self.inner_op.tick(sample_state, *sample_args)
         out0 = _empty_batch_group_output_like(template, n_steps, group_width)
@@ -728,7 +768,7 @@ class GroupByOp(Op):
     ):
         n_steps = key_seq.shape[0]
         group_width = idx.shape[0]
-        sample_args = tuple(_slice_group_arg(arg[0], idx) for arg in args_seq)
+        sample_args = tuple(_slice_group_arg(arg[0], idx, self._sequence_arg_source_width(arg, idx)) for arg in args_seq)
         sample_state = _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32))
         _, template = self.inner_op.tick(sample_state, *sample_args)
         out0 = _empty_batch_group_output_like(template, n_steps, group_width)
@@ -771,7 +811,7 @@ class GroupByOp(Op):
 
             def row_body(t, row_carry):
                 state_c, out_rows_c = row_carry
-                group_args = tuple(_slice_group_arg(arg[t], idx) for arg in args_seq)
+                group_args = tuple(_slice_group_arg(arg[t], idx, self._sequence_arg_source_width(arg, idx)) for arg in args_seq)
                 next_state, local_out = self.inner_op.tick(state_c, *group_args)
                 group_out = _align_group_output(local_out, group_width)
                 return next_state, _set_time_output(out_rows_c, t, group_out)
@@ -829,7 +869,8 @@ class GroupByOp(Op):
         key_cols = tuple(jnp.asarray(child_sequences[i]) for i in range(self.n_keys))
         args_seq = tuple(jnp.asarray(v) for v in child_sequences[self.n_keys:])
         n_steps = args_seq[0].shape[0] if args_seq else key_cols[0].shape[0]
-        width = args_seq[0].shape[1] if args_seq and args_seq[0].ndim > 1 else key_cols[0].shape[1]
+        fallback_width = args_seq[0].shape[1] if args_seq and args_seq[0].ndim > 1 else key_cols[0].shape[1]
+        width = self._source_width(fallback_width)
 
         groups = self.universe_groups
         if groups is None:
@@ -918,7 +959,8 @@ class GroupByOp(Op):
         key_cols = tuple(jnp.asarray(child_values[i]) for i in range(self.n_keys))
         args = tuple(jnp.asarray(v) for v in child_values[self.n_keys:])
 
-        width = args[0].shape[0] if args and args[0].ndim > 0 else key_cols[0].shape[0]
+        fallback_width = args[0].shape[0] if args and args[0].ndim > 0 else key_cols[0].shape[0]
+        width = self._source_width(fallback_width)
 
         groups = self.universe_groups
         if groups is None:
