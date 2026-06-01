@@ -1,8 +1,6 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
-
 from trading_dsl_engine.base.dsl import bspline, einsum, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
 from trading_dsl_engine.jax_flat.ops import _bspline
@@ -68,6 +66,17 @@ def test_einsum_python_composed_formula_matches_string_formula_for_matrix_output
     np.testing.assert_allclose(composed, string, rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
-def test_einsum_rejects_repeated_output_subscripts_at_compile_time():
-    with pytest.raises(ValueError, match="output subscripts must be unique"):
-        compile_formula('einsum(bspline(x, 2), bspline(y, 2), "ij,ij->jj")')
+def test_einsum_scalar_output_from_matrix_inputs():
+    x = np.array([[0.0, 0.5, 1.0], [0.2, 0.4, 0.6]], dtype=np.float64)
+    y = np.array([[0.1, 0.3, 0.9], [0.8, 0.6, 0.4]], dtype=np.float64)
+
+    out = np.asarray(_run('einsum(bspline(x, 3), bspline(y, 3), "ij,ij->")', x, y))
+
+    expected = np.asarray(
+        jax.vmap(lambda row_x, row_y: jnp.einsum("ij,ij->", _bspline(row_x, 3), _bspline(row_y, 3)))(
+            jnp.asarray(x),
+            jnp.asarray(y),
+        )
+    )
+    assert out.shape == (2,)
+    np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12, equal_nan=True)

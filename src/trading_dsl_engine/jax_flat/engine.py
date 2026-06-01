@@ -20,6 +20,7 @@ from trading_dsl_engine.jax_flat.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    ANY_ARITY,
     OP_FACTORIES,
     Op,
     RidgeOp,
@@ -27,7 +28,6 @@ from trading_dsl_engine.jax_flat.ops import (
     _bspline,
     _cat,
     _col,
-    _einsum,
 )
 
 
@@ -462,62 +462,6 @@ def _op_width(op: Op) -> int:
     return int(op.output_width)
 
 
-def _einsum_labels(term: str) -> tuple[str, ...]:
-    if "..." in term:
-        raise ValueError("jax_flat einsum does not support ellipsis subscripts")
-    labels = tuple(ch for ch in term if ch.strip())
-    if any(not ch.isalpha() for ch in labels):
-        raise ValueError(f"Invalid einsum subscript term {term!r}")
-    return labels
-
-
-def _op_rank(op: Op) -> int:
-    if op.output_kind == "scalar":
-        return 0
-    if op.output_kind == "vector":
-        return 1
-    if op.output_kind == "matrix":
-        return 2
-    raise ValueError(f"einsum does not support {op.output_kind} inputs in jax_flat")
-
-
-def _einsum_output_metadata(spec: str, child_ops: tuple[Op, ...]) -> tuple[str, int | None]:
-    compact = spec.replace(" ", "")
-    if "->" not in compact:
-        raise ValueError("jax_flat einsum requires explicit output subscripts with '->'")
-    if compact.count("->") != 1:
-        raise ValueError("jax_flat einsum requires exactly one '->' in its subscript spec")
-    lhs, rhs = compact.split("->", 1)
-    input_terms = tuple(lhs.split(",")) if lhs else ()
-    if len(input_terms) != len(child_ops):
-        raise ValueError(f"einsum subscript count {len(input_terms)} does not match {len(child_ops)} input(s)")
-
-    label_widths: dict[str, int | None] = {}
-    for term, op in zip(input_terms, child_ops):
-        labels = _einsum_labels(term)
-        rank = _op_rank(op)
-        if len(labels) != rank:
-            raise ValueError(f"einsum term {term!r} expects rank {len(labels)}, got {op.output_kind}")
-        if rank == 2:
-            width = op.output_width
-            existing = label_widths.get(labels[1])
-            if existing is not None and width is not None and existing != width:
-                raise ValueError(f"einsum label {labels[1]!r} has conflicting static widths")
-            label_widths[labels[1]] = width
-        for label in labels[: max(rank - 1, 0)]:
-            label_widths.setdefault(label, None)
-
-    output_labels = _einsum_labels(rhs)
-    if len(set(output_labels)) != len(output_labels):
-        raise ValueError("jax_flat einsum output subscripts must be unique")
-    if len(output_labels) == 0:
-        return "scalar", 1
-    if len(output_labels) == 1:
-        return "vector", 1
-    if len(output_labels) == 2:
-        return "matrix", label_widths.get(output_labels[1])
-    return "tensor", None
-
 
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
@@ -526,17 +470,10 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
-    if expr.fn == "einsum" and len(expr.args) >= 2 and isinstance(expr.args[-1], String):
-        spec = expr.args[-1].value
-        output_kind, output_width = _einsum_output_metadata(spec, child_ops)
-        return (
-            NaryOp(
-                lambda *values, spec=spec: _einsum(spec, *values),
-                output_kind=output_kind,
-                output_width=output_width,
-            ),
-            None,
-        )
+    variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
+    if variadic_builder is not None:
+        static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
+        return variadic_builder(*static_args), None
     if expr.fn == "round":
         if len(expr.args) == 1:
             return NaryOp(jnp.round), None
@@ -633,12 +570,11 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
         if isinstance(node, Call):
             if node.fn == "groupby":
                 raise ValueError("nested groupby inside a groupby rhs is not supported in jax_flat")
-            arg_exprs = (
-                node.args[:-1]
-                if node.fn == "einsum" and node.args and isinstance(node.args[-1], String)
-                else node.args
+            child_ids = tuple(
+                build(a)
+                for a in node.args
+                if not ((node.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
             )
-            child_ids = tuple(build(a) for a in arg_exprs)
             op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
             if drop_child_idx is not None:
                 child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
@@ -739,12 +675,11 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     if not isinstance(expr, Call):
         raise ValueError(f"Unsupported node {expr}")
 
-    arg_exprs = (
-        expr.args[:-1]
-        if expr.fn == "einsum" and expr.args and isinstance(expr.args[-1], String)
-        else expr.args
+    child_ids = tuple(
+        _compile_node(a, memo, nodes, input_names)
+        for a in expr.args
+        if not ((expr.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
     )
-    child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in arg_exprs)
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
         child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
