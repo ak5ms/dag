@@ -14,6 +14,7 @@ import numpy as np
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
+from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     BufferShiftOp,
     EwmOp,
@@ -415,6 +416,14 @@ def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
                 raise ValueError("buffer keyword form requires shift_expr, min, and max")
             return Call("buffer", (args[0], min_lag, max_lag))
         return Call(node.fn, args, kwargs)
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
     return node
@@ -432,6 +441,15 @@ def _expr_key(node: Expr):
             node.fn,
             tuple(_expr_key(a) for a in node.args),
             tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
+    if isinstance(node, StatelessJaxCall):
+        return (
+            "jax_stateless",
+            id(node.fn),
+            node.output_kind,
+            node.output_width,
+            node.name,
+            tuple(_expr_key(a) for a in node.args),
         )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
@@ -484,6 +502,14 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
             tuple(_replace_self(a, lhs) for a in node.args),
             tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
         )
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_replace_self(a, lhs) for a in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
     return node
@@ -500,6 +526,14 @@ def _op_width(op: Op) -> int:
         raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
     return int(op.output_width)
 
+
+
+def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:
+    if not child_ops:
+        raise ValueError("stateless JAX call expects at least one child")
+    output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+    output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
 
 
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
@@ -605,6 +639,18 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             return idx
         if isinstance(node, String):
             raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
+
+        if isinstance(node, StatelessJaxCall):
+            child_ids = tuple(build(a) for a in node.args)
+            idx = len(nodes)
+            nodes.append(
+                DagNode(
+                    op=_build_stateless_jax_op(node, tuple(nodes[cid].op for cid in child_ids)),
+                    child_ids=child_ids,
+                )
+            )
+            memo[key] = idx
+            return idx
 
         if isinstance(node, Call):
             if node.fn == "groupby":
@@ -738,6 +784,17 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         return idx
     if isinstance(expr, String):
         raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
+    if isinstance(expr, StatelessJaxCall):
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+        idx = len(nodes)
+        nodes.append(
+            DagNode(
+                op=_build_stateless_jax_op(expr, tuple(nodes[cid].op for cid in child_ids)),
+                child_ids=child_ids,
+            )
+        )
+        memo[key] = idx
+        return idx
     if isinstance(expr, Call) and expr.fn == "groupby":
         return _compile_groupby_node(expr, memo, nodes, input_names)
     if isinstance(expr, Call) and expr.fn == "buffer":
@@ -772,6 +829,14 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
         if _expr_key(result) == _expr_key(expanded_node):
             return expanded_node
         return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
     return node
