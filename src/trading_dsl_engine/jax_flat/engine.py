@@ -21,6 +21,7 @@ from trading_dsl_engine.jax_flat.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    ANY_ARITY,
     OP_FACTORIES,
     Op,
     RidgeOp,
@@ -499,6 +500,8 @@ def _op_width(op: Op) -> int:
         raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
     return int(op.output_width)
 
+
+
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
@@ -506,6 +509,10 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+    variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
+    if variadic_builder is not None:
+        static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
+        return variadic_builder(*static_args), None
     if expr.fn == "round":
         if len(expr.args) == 1:
             return NaryOp(jnp.round), None
@@ -602,7 +609,11 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
         if isinstance(node, Call):
             if node.fn == "groupby":
                 raise ValueError("nested groupby inside a groupby rhs is not supported in jax_flat")
-            child_ids = tuple(build(a) for a in node.args)
+            child_ids = tuple(
+                build(a)
+                for a in node.args
+                if not ((node.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
+            )
             op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
             if drop_child_idx is not None:
                 child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
@@ -734,7 +745,11 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     if not isinstance(expr, Call):
         raise ValueError(f"Unsupported node {expr}")
 
-    child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+    child_ids = tuple(
+        _compile_node(a, memo, nodes, input_names)
+        for a in expr.args
+        if not ((expr.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
+    )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
         child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)

@@ -405,6 +405,10 @@ def _cat(*values):
     return jnp.concatenate(tuple(_as_tick_matrix(array, rows) for array in arrays), axis=-1)
 
 
+def _einsum(subscripts, *child_values):
+    return jnp.einsum(subscripts, *child_values)
+
+
 def _broadcast_sequence_to_state(x, state_value):
     x = jnp.asarray(x)
     state_value = jnp.asarray(state_value)
@@ -525,7 +529,10 @@ def _col(matrix, index: int):
     return jnp.asarray(matrix)[:, index]
 
 
-OP_FACTORIES: dict[tuple[str, int], Callable[[], Op]] = {
+ANY_ARITY = -1
+
+
+OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("abs", 1): lambda: NaryOp(jnp.abs),
     ("ln", 1): lambda: NaryOp(jnp.log),
     ("ceil", 1): lambda: NaryOp(jnp.ceil),
@@ -563,6 +570,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[[], Op]] = {
     ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0))),
     ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l)),
     ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f)),
+    ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values)),
 }
 
 from trading_dsl_engine.jax_flat.ops_groupby import *
