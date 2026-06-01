@@ -169,6 +169,30 @@ def test_groupby_univ_only_can_emit_ridge_beta_feature_vectors():
     assert np.isfinite(out[-1]).all()
 
 
+def test_groupby_univ_only_preserves_feature_vector_lhs_width():
+    ev_ts = np.ones((5, 4), dtype=np.float64)
+    volume = np.arange(1, 21, dtype=np.float64).reshape(5, 4)
+    formula = (
+        "groupby((univ([0], [1], [2], [3]), ), "
+        "get_beta(Ridge(bspline((cumsum(fillna(ev_ts, 1) / fillna(ev_ts, 1) * 60000000) "
+        "+ 1451601660010000) % 86400000000 / 86400000000, 3), ln(volume + 1), 1, 21, 0.0)), "
+        "self_ + 0)"
+    )
+
+    grouped = np.asarray(_run(formula, ev_ts, volume))
+    beta = np.asarray(
+        _run(
+            "get_beta(Ridge(bspline((cumsum(fillna(ev_ts, 1) / fillna(ev_ts, 1) * 60000000) "
+            "+ 1451601660010000) % 86400000000 / 86400000000, 3), ln(volume + 1), 1, 21, 0.0))",
+            ev_ts,
+            volume,
+        )
+    )
+
+    assert grouped.shape == (5, 4, 3)
+    np.testing.assert_allclose(grouped, np.broadcast_to(beta[:, None, :], grouped.shape), rtol=1e-12, atol=1e-12)
+
+
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_bspline_ridge_jax_flat_t_rows():
     x = jax.random.uniform(jax.random.PRNGKey(120), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
