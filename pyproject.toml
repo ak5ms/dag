@@ -19,6 +19,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --durations=0 -n 12"
+addopts = "-ra --durations=0 -n 12 --import-mode=importlib"
 
 markers = ["perf: performance tests"]

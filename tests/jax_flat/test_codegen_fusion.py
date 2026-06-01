@@ -34,6 +34,22 @@ def test_xla_hlo_and_compiled_ir_include_fused_sort_path():
     assert "fusion" in compiled_ir_text.lower() or "sort" in compiled_ir_text.lower()
 
 
+def test_stateless_chain_has_no_state_leaves_and_xla_fuses_tick_ir():
+    runtime = compile_formula("bspline((close + open) / 3, 5)")
+    assert runtime.program.state_layout.total_leaves == 0
+    assert all(field.index < 0 for field in runtime.program.state_layout.node_fields)
+
+    state0 = runtime.init_state(4)
+    open_row = jnp.linspace(1.0, 4.0, 4)
+    close_row = jnp.linspace(2.0, 5.0, 4)
+    compiled_ir_text = jax.jit(runtime.tick).lower(state0, close_row, open_row).compile().as_text().lower()
+
+    assert "fusion" in compiled_ir_text
+    assert "get-tuple-element" not in compiled_ir_text
+    assert "divide" in compiled_ir_text
+    assert "exponential" in compiled_ir_text or " exp" in compiled_ir_text
+
+
 def test_groupby_cse_keeps_stateful_inner_ops_scoped_to_groupby():
     runtime = compile_formula(
         "mul("

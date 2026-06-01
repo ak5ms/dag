@@ -117,6 +117,22 @@ The JAX backend accepts the same string formulas and Python-composed `Expr` tree
 
 The experimental `trading_dsl_engine.jax_flat` backend additionally supports `buffer(shift(x, lag, max_size), min_lag, max_lag)` (or keyword form `buffer(shift(x, lag=..., max_lag=...), min=..., max=...)`). This JAX-flat-only operator emits a `(time, n_instruments, max_lag)` lag cube whose columns are lags `1..max_lag`, preserving shift ring ordering and masking lags below dynamic `min_lag`, above dynamic `lag`, or beyond available history.
 
+`jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis:
+
+```python
+import jax.numpy as jnp
+from trading_dsl_engine.base.dsl import buffer, shift, var
+from trading_dsl_engine.jax_flat import compile_formula, stateless
+
+rev = stateless(lambda x: jnp.flip(x, axis=-1), name="rev")
+close = var("close")
+upper_lag = var("upper_lag")
+min_lag = var("min_lag")
+runtime = compile_formula(
+    rev(buffer(shift(close, lag=upper_lag, max_lag=4), min=min_lag, max=4))
+)
+```
+
 ## Development quickstart
 
 ```bash
