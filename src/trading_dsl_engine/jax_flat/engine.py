@@ -15,6 +15,7 @@ import numpy as np
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.ops import (
+    BufferShiftOp,
     EwmOp,
     GroupByOp,
     InputOp,
@@ -187,11 +188,14 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
         inputs = tuple(inputs)
 
     if len(inputs) != len(runtime.program.input_names):
-        raise ValueError(
-            "run_batch expected "
-            f"{len(runtime.program.input_names)} input array(s) "
-            f"({runtime.program.input_names}), got {len(inputs)}"
-        )
+        if len(runtime.program.input_names) == 0 and len(inputs) == 1:
+            pass
+        else:
+            raise ValueError(
+                "run_batch expected "
+                f"{len(runtime.program.input_names)} input array(s) "
+                f"({runtime.program.input_names}), got {len(inputs)}"
+            )
     for name, arr in zip(runtime.program.input_names, inputs):
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
@@ -378,6 +382,41 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
     outs = tuple(values[i] for i in runtime.program.outputs)
     return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
 
+
+
+def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
+    if isinstance(node, Call):
+        args = tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args)
+        kwargs = tuple((key, _normalize_static_jax_flat_kwargs(value)) for key, value in node.kwargs)
+        if not kwargs:
+            return Call(node.fn, args)
+        kw = dict(kwargs)
+        if node.fn == "shift":
+            unsupported = set(kw) - {"lag", "nlag", "max_lag", "max_size"}
+            if unsupported:
+                raise ValueError(f"Unsupported shift keyword argument(s): {sorted(unsupported)}")
+            lag = kw.pop("lag") if "lag" in kw else kw.pop("nlag", None)
+            max_lag = kw.pop("max_lag") if "max_lag" in kw else kw.pop("max_size", None)
+            if len(args) > 1 or (len(args) == 1 and lag is None):
+                raise ValueError("shift keyword form expects shift(x, lag=..., max_lag=...)")
+            if len(args) != 1 or lag is None or max_lag is None:
+                raise ValueError("shift keyword form requires x, lag, and max_lag")
+            return Call("shift", (args[0], lag, max_lag))
+        if node.fn == "buffer":
+            unsupported = set(kw) - {"min", "max"}
+            if unsupported:
+                raise ValueError(f"Unsupported buffer keyword argument(s): {sorted(unsupported)}")
+            min_lag = kw.pop("min", None)
+            max_lag = kw.pop("max", None)
+            if len(args) > 1 or (len(args) == 1 and min_lag is None):
+                raise ValueError("buffer keyword form expects buffer(shift_expr, min=..., max=...)")
+            if len(args) != 1 or min_lag is None or max_lag is None:
+                raise ValueError("buffer keyword form requires shift_expr, min, and max")
+            return Call("buffer", (args[0], min_lag, max_lag))
+        return Call(node.fn, args, kwargs)
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
+    return node
 
 def _expr_key(node: Expr):
     if isinstance(node, Identifier):
@@ -641,6 +680,35 @@ def _compile_groupby_node(
     return idx
 
 
+def _compile_buffer_shift_node(
+    expr: Call,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+) -> int:
+    if len(expr.args) != 3:
+        raise ValueError("buffer expects args: shift_expr, min_lag, max_lag")
+    shift_expr = expr.args[0]
+    if not isinstance(shift_expr, Call) or shift_expr.fn != "shift" or len(shift_expr.args) not in (2, 3):
+        raise ValueError("buffer first arg must be a direct shift(...) expression")
+    max_size_arg = shift_expr.args[2] if len(shift_expr.args) == 3 else shift_expr.args[1]
+    max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(shift_expr.args) == 3 else 2))
+    max_lag = _literal_int_arg(expr.args[2], "buffer", 3)
+    if max_lag < 1:
+        raise ValueError("buffer max_lag must be >= 1")
+    if max_lag > max_size:
+        raise ValueError("buffer max_lag must be <= shift max_size")
+
+    child_ids = (
+        _compile_node(shift_expr.args[0], memo, nodes, input_names),
+        _compile_node(shift_expr.args[1], memo, nodes, input_names),
+        _compile_node(expr.args[1], memo, nodes, input_names),
+    )
+    idx = len(nodes)
+    nodes.append(DagNode(op=BufferShiftOp(max_size=max_size, max_lag=max_lag), child_ids=child_ids))
+    memo[_expr_key(expr)] = idx
+    return idx
+
 def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagNode], input_names: list[str]) -> int:
     key = _expr_key(expr)
     if key in memo:
@@ -661,6 +729,8 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
     if isinstance(expr, Call) and expr.fn == "groupby":
         return _compile_groupby_node(expr, memo, nodes, input_names)
+    if isinstance(expr, Call) and expr.fn == "buffer":
+        return _compile_buffer_shift_node(expr, memo, nodes, input_names)
     if not isinstance(expr, Call):
         raise ValueError(f"Unsupported node {expr}")
 
@@ -695,6 +765,7 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
 def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
+    expr = _normalize_static_jax_flat_kwargs(expr)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []

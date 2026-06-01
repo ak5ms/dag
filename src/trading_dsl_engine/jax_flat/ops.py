@@ -47,6 +47,7 @@ class CumsumState:
 class ShiftState:
     buffer: jax.Array
     pos: jax.Array
+    count: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -128,35 +129,159 @@ class ShiftOp(Op):
     is_stateful: bool = True
 
     def init_state(self, sample: jax.Array):
-        shape = (self.max_size,) + jnp.asarray(sample).shape
+        shape = (self.max_size + 1,) + jnp.asarray(sample).shape
 
         return ShiftState(
             buffer=jnp.full(shape, jnp.nan, dtype=jnp.float64),
-            pos=jnp.asarray(0, dtype=jnp.int64),
+            pos=jnp.asarray(0, dtype=jnp.int32),
+            count=jnp.asarray(0, dtype=jnp.int32),
         )
 
     def tick(self, state: ShiftState, *child_values: jax.Array):
         x, lag = child_values[:2]
         cap = state.buffer.shape[0]
-        lag_i = jnp.clip(
-            jnp.asarray(_scalar_value(lag), dtype=jnp.int64),
-            0,
-            cap,
-        )
+        lag_values = _lag_vector(lag, x.shape[0])
+        finite_lag = jnp.isfinite(lag_values)
+        lag_i = jnp.clip(jnp.rint(jnp.where(finite_lag, lag_values, 0.0)).astype(jnp.int32), 0, cap - 1)
         read_pos = jnp.mod(state.pos - lag_i, cap)
-        shifted = jnp.where(
-            lag_i == 0,
-            x,
-            state.buffer[read_pos],
-        )
+        shifted = state.buffer[read_pos, jnp.arange(x.shape[0], dtype=jnp.int32)]
+        shifted = jnp.where(lag_i == 0, x, shifted)
+        shifted = jnp.where(finite_lag & (state.count >= lag_i), shifted, jnp.nan)
         next_buffer = state.buffer.at[state.pos].set(x)
         return (
             ShiftState(
                 buffer=next_buffer,
                 pos=jnp.mod(state.pos + 1, cap),
+                count=jnp.minimum(state.count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(cap, dtype=jnp.int32)),
             ),
             shifted,
         )
+
+    def scan_batch(self, state: ShiftState, *child_sequences: jax.Array):
+        x, lag = child_sequences[:2]
+        cap = state.buffer.shape[0]
+        rows, cols = x.shape
+        history = jnp.concatenate((_chronological_buffer(state), x), axis=0)
+        lag_values = _lag_matrix(lag, rows, cols)
+        finite_lag = jnp.isfinite(lag_values)
+        lag_i = jnp.clip(jnp.rint(jnp.where(finite_lag, lag_values, 0.0)).astype(jnp.int32), 0, cap - 1)
+        time_idx = jnp.arange(rows, dtype=jnp.int32)[:, None]
+        col_idx = jnp.arange(cols, dtype=jnp.int32)[None, :]
+        shifted = history[cap + time_idx - lag_i, col_idx]
+        shifted = jnp.where(lag_i == 0, x, shifted)
+        available = state.count + time_idx >= lag_i
+        shifted = jnp.where(finite_lag & available, shifted, jnp.nan)
+        return _shift_next_state(state, x), shifted
+
+
+@dataclass(frozen=True)
+class BufferShiftOp(Op):
+    max_size: int
+    max_lag: int
+    output_kind: str = "matrix"
+    output_width: int | None = None
+    is_stateful: bool = True
+
+    def __post_init__(self):
+        object.__setattr__(self, "output_width", self.max_lag)
+
+    def init_state(self, sample: jax.Array):
+        shape = (self.max_size + 1,) + jnp.asarray(sample).shape
+        return ShiftState(
+            buffer=jnp.full(shape, jnp.nan, dtype=jnp.float64),
+            pos=jnp.asarray(0, dtype=jnp.int32),
+            count=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def tick(self, state: ShiftState, *child_values: jax.Array):
+        x, upper_lag, min_lag = child_values[:3]
+        cap = state.buffer.shape[0]
+        n = x.shape[0]
+        lag_cols = jnp.arange(1, self.max_lag + 1, dtype=jnp.int32)
+        read_pos = jnp.mod(state.pos - lag_cols, cap)
+        history = jnp.swapaxes(state.buffer[read_pos], 0, 1)
+
+        min_values = _lag_vector(min_lag, n)
+        upper_values = _lag_vector(upper_lag, n)
+        finite_bounds = jnp.isfinite(min_values) & jnp.isfinite(upper_values)
+        min_bound = jnp.rint(jnp.where(jnp.isfinite(min_values), min_values, 0.0))
+        upper_bound = jnp.rint(jnp.where(jnp.isfinite(upper_values), upper_values, -1.0))
+        lag_cols_f = lag_cols.astype(jnp.float64)
+        available = state.count >= lag_cols
+        in_window = (lag_cols_f[None, :] >= min_bound[:, None]) & (lag_cols_f[None, :] <= upper_bound[:, None])
+        valid = finite_bounds[:, None] & available[None, :] & in_window
+        out = jnp.where(valid, history, jnp.nan)
+
+        next_buffer = state.buffer.at[state.pos].set(x)
+        return (
+            ShiftState(
+                buffer=next_buffer,
+                pos=jnp.mod(state.pos + 1, cap),
+                count=jnp.minimum(state.count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(cap, dtype=jnp.int32)),
+            ),
+            out,
+        )
+
+    def scan_batch(self, state: ShiftState, *child_sequences: jax.Array):
+        x, upper_lag, min_lag = child_sequences[:3]
+        cap = state.buffer.shape[0]
+        rows, cols = x.shape
+        lag_cols = jnp.arange(1, self.max_lag + 1, dtype=jnp.int32)
+        history = jnp.concatenate((_chronological_buffer(state)[-self.max_lag :], x), axis=0)
+        if self.max_lag <= 32:
+            out = jnp.stack(
+                tuple(history[self.max_lag - lag : self.max_lag - lag + rows] for lag in range(1, self.max_lag + 1)),
+                axis=2,
+            )
+        else:
+            time_idx = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
+            col_idx = jnp.arange(cols, dtype=jnp.int32)[None, :, None]
+            lag_idx = lag_cols[None, None, :]
+            out = history[self.max_lag + time_idx - lag_idx, col_idx]
+
+        min_values = _lag_matrix(min_lag, rows, cols)
+        upper_values = _lag_matrix(upper_lag, rows, cols)
+        min_finite = jnp.isfinite(min_values)
+        upper_finite = jnp.isfinite(upper_values)
+        min_bound = jnp.rint(jnp.where(min_finite, min_values, 0.0))
+        upper_bound = jnp.rint(jnp.where(upper_finite, upper_values, -1.0))
+        lag_cols_f = lag_cols.astype(jnp.float64)
+        available = state.count + jnp.arange(rows, dtype=jnp.int32)[:, None] >= lag_cols[None, :]
+        in_window = (lag_cols_f[None, None, :] >= min_bound[:, :, None]) & (lag_cols_f[None, None, :] <= upper_bound[:, :, None])
+        valid = (min_finite & upper_finite)[:, :, None] & available[:, None, :] & in_window
+        return _shift_next_state(state, x), jnp.where(valid, out, jnp.nan)
+
+
+def _chronological_buffer(state: ShiftState):
+    cap = state.buffer.shape[0]
+    return state.buffer[jnp.mod(state.pos + jnp.arange(cap, dtype=jnp.int32), cap)]
+
+
+def _shift_next_state(state: ShiftState, x_seq: jax.Array):
+    cap = state.buffer.shape[0]
+    if x_seq.shape[0] >= cap:
+        buffer = x_seq[-cap:]
+    else:
+        history = jnp.concatenate((_chronological_buffer(state), x_seq), axis=0)
+        buffer = history[-cap:]
+    return ShiftState(
+        buffer=buffer,
+        pos=jnp.asarray(0, dtype=jnp.int32),
+        count=jnp.minimum(state.count + jnp.asarray(x_seq.shape[0], dtype=jnp.int32), jnp.asarray(cap, dtype=jnp.int32)),
+    )
+
+
+def _lag_matrix(lag, rows: int, cols: int):
+    lag = jnp.asarray(lag)
+    if lag.ndim == 0:
+        return jnp.broadcast_to(lag, (rows, cols))
+    if lag.ndim == 1:
+        if lag.shape[0] == rows:
+            return jnp.broadcast_to(lag[:, None], (rows, cols))
+        return jnp.broadcast_to(lag[None, :], (rows, cols))
+    if lag.shape[1] == 1:
+        return jnp.broadcast_to(lag, (rows, cols))
+    return lag
 
 
 @dataclass(frozen=True)
@@ -291,6 +416,15 @@ def _broadcast_sequence_to_state(x, state_value):
 
 def _scalar_value(x):
     return jnp.ravel(jnp.asarray(x))[0]
+
+
+def _lag_vector(x, rows: int):
+    x = jnp.asarray(x)
+    if x.ndim == 0:
+        return jnp.broadcast_to(x, (rows,))
+    if x.ndim == 1:
+        return x
+    return x[:, 0]
 
 
 def _as_feature_matrix(value):

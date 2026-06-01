@@ -94,6 +94,41 @@ def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1:
 
 
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_shift_and_buffer_jax_flat_3m_by_9_assets():
+    t_rows = 3_000_000
+    n_assets = 9
+    row_idx = jnp.arange(t_rows, dtype=jnp.float64)[:, None]
+    col_idx = jnp.arange(n_assets, dtype=jnp.float64)[None, :]
+    close_data = row_idx * 0.01 + col_idx
+    lag_data = jnp.mod(row_idx + col_idx, 4.0) + 1.0
+    min_lag_data = jnp.mod(row_idx + 2.0 * col_idx, 3.0) + 1.0
+
+    shift_runtime = compile_flat("shift(close, lag, 8)")
+    buffer_runtime = compile_flat("buffer(shift(close, lag, 8), min_lag, 4)")
+
+    def timed(name, runtime, data):
+        jax.block_until_ready(runtime.run_batch(data)[1])
+        t0 = time.perf_counter()
+        out = runtime.run_batch(data)[1]
+        jax.block_until_ready(out)
+        elapsed = time.perf_counter() - t0
+        print(f"{name}::jax_flat_3m_x_9 elapsed_s={elapsed:.6f} shape={tuple(out.shape)}")
+        return out, elapsed
+
+    shift_out, shift_elapsed = timed("shift", shift_runtime, {"close": close_data, "lag": lag_data})
+    buffer_out, buffer_elapsed = timed(
+        "buffer_shift",
+        buffer_runtime,
+        {"close": close_data, "lag": lag_data, "min_lag": min_lag_data},
+    )
+
+    assert shift_out.shape == (t_rows, n_assets)
+    assert buffer_out.shape == (t_rows, n_assets, 4)
+    assert shift_elapsed > 0.0
+    assert buffer_elapsed > 0.0
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_nary_chain_jax_flat_scan_batch_vs_tick_scan():
     formula = (
         "xstd("

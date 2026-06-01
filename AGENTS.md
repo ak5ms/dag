@@ -19,7 +19,7 @@ Priorities, in order:
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
 - Keep compiler composition nested (no interpreter fallback in execution hot path).
 - For grouped runtime implementations (especially JAX/JAX-flat), do not add per-operator custom hot-path branches (for example, special-casing `cumsum` inside `GroupbyOp`). Keep grouped execution generic/compositional and optimize shared mechanisms instead.
-- For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution.
+- For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution. JAX-flat-only lag-history operators such as `buffer(shift(...), min_lag, max_lag)` should expose ordered ring state through compositional JAX ops, not Numba kernels. When adding a JAX-flat operator, implement `scan_batch` alongside `init_state` and `tick` rather than relying on the default per-tick scan.
 - Support arity > 1 cleanly.
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe on group sub-frames without interpreter fallback. `univ(...)` may also appear inside tuple keys such as `groupby((univ([0, 1]), ts), op)` to combine static column slicing with dynamic key routing.
 - Grouped execution must use a single canonical form: `groupby(key_tuple, lhs, op_using_self_)` (or Python sugar `lhs.groupby(key_tuple).apply(op(self_, *others))`). Delete all legacy groupby forms and alternate flow paths. `key_tuple` must support arbitrary-length composite keys and may contain at most one `univ(...)` element.
@@ -59,7 +59,7 @@ When modifying ops, keep NaN handling explicit and tested:
 - Ridge/object-op behavior when feature/target/parameter inputs include NaNs.
 - Ridge pairwise sufficient-statistic behavior: `xx[j, k]` and `xy[j]` update only when their own finite row requirements are met, and their per-statistic clocks do not advance during outages.
 - Ridge variadic-feature behavior (`Ridge(x1, ..., xk, y, weights, hl, lambda)`) and downstream shape expectations.
-- Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline`).
+- Matrix-op shape behavior when emitted width differs from instrument count (e.g., basis expansions like `bspline` and JAX-flat lag-history cubes from `buffer`).
 - Grouped-state behavior for canonical keyed operators (`groupby(key_tuple, lhs, op_using_self_)`) including arbitrary-length tuple-key composition, per-instrument/per-key state transitions, and key consistency expectations.
 - Key NaNs in groupby are valid and must route into a dedicated NaN key group (do not raise).
 - Tuple-key universe behavior (`groupby((..., univ(...), ...), lhs, op_using_self_)`) including ticker-to-column mapping, per-universe sub-frame state isolation, dynamic-key masking within universes, and scatter/broadcast shape behavior.
