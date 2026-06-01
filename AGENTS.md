@@ -6,6 +6,8 @@ Guidance for AI/code agents working in this repo.
 
 This project is a performance-sensitive trading-feature DSL engine that compiles formulas into nested Numba `jitclass` state machines.
 
+When a user describes a symptom from an example, treat it as a request for the underlying general/architectural fix unless they explicitly ask for an example-only patch.
+
 Priorities, in order:
 1. Preserve correctness and streaming state semantics.
 2. Preserve or improve performance (avoid Python loops in hot path).
