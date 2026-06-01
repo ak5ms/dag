@@ -4,7 +4,9 @@ Guidance for AI/code agents working in this repo.
 
 ## Mission context
 
-This project is a performance-sensitive trading-feature DSL engine that compiles formulas into nested Numba `jitclass` state machines.
+This project is a performance-sensitive trading-feature DSL engine. Active development now targets the `jax_flat` runtime and the shared DSL/parser/lowering layer; the older Numba and non-flat JAX implementations are deprecated compatibility code.
+
+Unless a task explicitly says otherwise, make edits only for `jax_flat` and shared DSL functionality, and run only the targeted `tests/jax_flat/` or shared DSL tests needed for the behavior being changed. Do not update or run Numba/non-flat-JAX code paths by default.
 
 Priorities, in order:
 1. Preserve correctness and streaming state semantics.
@@ -32,11 +34,12 @@ Priorities, in order:
 - Shared DSL macro composition + registry isolation: `src/trading_dsl_engine/base/dsl.py`
 - Shared operator plugin specs: `src/trading_dsl_engine/base/registry.py`
 - Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
-- Numba op kernels/factories: `src/trading_dsl_engine/numba/ops.py`
-- Numba runtime execution and batch/live helpers: `src/trading_dsl_engine/numba/engine.py`
-- JAX + Equinox backend: `src/trading_dsl_engine/jax/`
-- Numba behavior/performance regression tests: `tests/numba/`
-- JAX correspondence regression tests: `tests/jax/`
+- Active JAX-flat op kernels/factories: `src/trading_dsl_engine/jax_flat/ops.py`
+- Active JAX-flat runtime execution and batch/live helpers: `src/trading_dsl_engine/jax_flat/engine.py`
+- Active JAX-flat behavior/performance regression tests: `tests/jax_flat/`
+- Deprecated Numba implementation: `src/trading_dsl_engine/numba/` (do not edit unless explicitly requested)
+- Deprecated non-flat JAX implementation: `src/trading_dsl_engine/jax/` (do not edit unless explicitly requested)
+- Deprecated Numba/non-flat-JAX tests: `tests/numba/`, `tests/jax/` (do not run unless explicitly requested)
 
 ## Performance guardrails
 
@@ -79,16 +82,16 @@ JAX, Equinox, pytest, and pytest-xdist are mandatory project dependencies in `py
 During iteration, run only the relevant targeted tests for the files/behavior being changed. Do not repeatedly run the full suite while iterating.
 If a long-running pytest command starts showing failures in streamed output, you may preemptively terminate that run early to iterate faster, then rerun targeted tests after fixes.
 
-Run these locally at the end before finalizing:
+Unless explicitly instructed otherwise, final validation should stay limited to targeted `jax_flat` and shared DSL tests for the changed behavior. Do not run the deprecated Numba/non-flat-JAX suites by default. If performance behavior changes in `jax_flat`, run the relevant active performance test(s), for example:
 
 ```bash
-pytest -q
-RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
+pytest -q tests/jax_flat/test_changed_behavior.py
+RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ```
 
-`pytest` is configured in `pyproject.toml` to run with pytest-xdist using 12 workers (`-n 12`). Run perf tests with `-n 0` because their wall-clock guardrails are calibrated for serial benchmark execution. If perf tests are too heavy for the environment, clearly note that and at least run the parallelized core test suite.
+`pytest` is configured in `pyproject.toml` to run with pytest-xdist using 12 workers (`-n 12`). Run perf tests with `-n 0` because their wall-clock guardrails are calibrated for serial benchmark execution. If perf tests are too heavy for the environment, clearly note that and run the targeted non-performance test(s) instead.
 
-- Always run non-performance tests (`pytest -q`) at the end before finalizing unless explicitly told not to.
+- Always run the targeted non-performance `jax_flat`/DSL tests at the end before finalizing unless explicitly told not to.
 - Pytest output is configured to include per-test durations; use this to catch regressions in compile/runtime costs.
 - Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
 

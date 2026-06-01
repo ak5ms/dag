@@ -110,12 +110,29 @@ class JaxFlatRuntime(eqx.Module):
     program: StreamingProgram = eqx.field(static=True)
 
     def init_state(self, n_instruments: int):
-        sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
+        vector_sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
+        values: list[Any] = [vector_sample] * len(self.program.nodes)
         states = []
-        for node in self.program.nodes:
-            if not node.op.is_stateful:
+        for idx, node in enumerate(self.program.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = vector_sample
                 continue
-            states.append(node.op.init_state(sample))
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            if op.is_stateful:
+                sample = child_values[0] if child_values else vector_sample
+                if jnp.asarray(sample).ndim == 0:
+                    sample = vector_sample
+                state = op.init_state(sample)
+                states.append(state)
+                _, value = op.tick(state, *child_values)
+            else:
+                _, value = op.tick(None, *child_values)
+            values[idx] = value
         return tuple(states)
 
     def _tick_impl(self, state_leaves, *input_rows):
@@ -185,7 +202,10 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
         missing = [name for name in runtime.program.input_names if name not in inputs]
         if missing:
             raise ValueError(f"Missing jax_flat run_batch input(s): {missing}")
-        inputs = tuple(inputs[name] for name in runtime.program.input_names)
+        if len(runtime.program.input_names) == 0:
+            inputs = tuple(inputs.values())
+        else:
+            inputs = tuple(inputs[name] for name in runtime.program.input_names)
     else:
         inputs = tuple(inputs)
 
@@ -560,7 +580,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
     if expr.fn == "shift" and len(expr.args) in (2, 3):
         max_size_arg = expr.args[2] if len(expr.args) == 3 else expr.args[1]
         max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
-        return ShiftOp(max_size=max_size), 2 if len(expr.args) == 3 else None
+        return (
+            ShiftOp(
+                max_size=max_size,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            2 if len(expr.args) == 3 else None,
+        )
     if expr.fn == "bspline" and len(expr.args) == 2:
         n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
         if n_basis <= 0:

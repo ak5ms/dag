@@ -1,9 +1,11 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from trading_dsl_engine.base.dsl import buffer, shift, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
+from trading_dsl_engine.jax_flat.ops import _bspline
 
 
 def test_buffer_shift_batch_returns_ordered_lag_cube_with_dynamic_bounds():
@@ -97,6 +99,32 @@ def test_buffer_shift_python_helper_lowers_to_same_jax_flat_ast():
         dtype=np.float64,
     )
     np.testing.assert_allclose(np.asarray(out), expected, equal_nan=True)
+
+
+def test_buffer_shift_handles_bspline_matrix_and_data_independent_clock_formula():
+    runtime = compile_formula(
+        "buffer("
+        "shift(bspline((cumsum(1 * 60000000) + 1451601660010000) % 86400000000 / 86400000000, 3), "
+        "lag=2, max_lag=2), "
+        "min=1, max=2)"
+    )
+    schema = jnp.zeros((4, 2), dtype=jnp.float64)
+
+    _, out = runtime.run_batch((schema,))
+
+    clock = np.cumsum(np.ones((4, 2), dtype=np.float64) * 60000000, axis=0) + 1451601660010000
+    phase = (clock % 86400000000) / 86400000000
+    features = np.asarray(jax.vmap(lambda row: _bspline(jnp.asarray(row), 3))(jnp.asarray(phase)))
+    expected = np.full((4, 2, 3, 2), np.nan, dtype=np.float64)
+    expected[1, :, :, 0] = features[0]
+    expected[2, :, :, 0] = features[1]
+    expected[2, :, :, 1] = features[0]
+    expected[3, :, :, 0] = features[2]
+    expected[3, :, :, 1] = features[1]
+
+    assert runtime.program.input_names == ()
+    assert out.shape == (4, 2, 3, 2)
+    np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
 def test_buffer_shift_validates_direct_shift_and_static_capacity():

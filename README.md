@@ -1,13 +1,13 @@
 # trading-dsl-engine
 
-A high-performance Python DSL engine for streaming trading features on aligned minutely NumPy data.
+A high-performance Python DSL engine for streaming trading features on aligned minutely array data.
 
-This repository compiles formulas (string DSL or Python-composed DSL calls) into nested Numba `jitclass` state machines that support both live incremental updates and batch execution. A JAX + Equinox backend is installed as a standard dependency and is available for formulas supported by `trading_dsl_engine.jax`, with live tick and batch scan hot paths wrapped in JAX JIT compilation.
+Current development targets the `trading_dsl_engine.jax_flat` runtime plus shared DSL/parser functionality. The older Numba and non-flat JAX implementations remain in the tree for compatibility, but they are deprecated: unless a task explicitly says otherwise, make code changes only in `jax_flat` and shared DSL modules, and run only the focused `tests/jax_flat/` and shared DSL tests needed for the behavior being changed.
 
 ## Core goals
 
 - **Streaming-first stateful computation**: each op follows `on_data(...)` + `emit(...)`.
-- **No interpreter hot loop**: runtime timestep loop executes in compiled Numba code.
+- **No interpreter hot loop**: `jax_flat` live tick and batch timestep paths execute through JAX JIT/`lax.scan`.
 - **Composable formulas**: parse string expressions and support Python-level DSL macro composition.
 - **Extensible operators**: registry/plugin model for adding new ops without central branching.
 - **Scalable IO**: supports in-memory NumPy arrays and disk-backed memmaps.
@@ -17,13 +17,17 @@ This repository compiles formulas (string DSL or Python-composed DSL calls) into
 - `src/trading_dsl_engine/base/`
   - Shared parser (`parse_formula`), Python DSL constructors, registry metadata, and compile/lower pipeline.
 - `src/trading_dsl_engine/numba/`
-  - Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
+  - Deprecated Numba built-in op implementations, jitclass state machines, and batch/live runtime helpers.
 - `src/trading_dsl_engine/jax/`
-  - Optional JAX + Equinox runtime that lowers supported DSL expressions to functional state transitions and executes live ticks/batch scans through JIT-compiled JAX functions.
+  - Deprecated non-flat JAX + Equinox runtime.
+- `src/trading_dsl_engine/jax_flat/`
+  - Active JAX-flat runtime that lowers supported DSL expressions to a flat operator DAG and executes live ticks/batch scans through JIT-compiled JAX functions.
 - `tests/numba/`
-  - Parser, composition, Numba runtime correctness, shape, state persistence, and performance tests.
+  - Deprecated Numba runtime tests; do not run or update unless explicitly requested.
 - `tests/jax/`
-  - JAX backend correspondence tests against the Numba runtime.
+  - Deprecated non-flat JAX backend tests.
+- `tests/jax_flat/`
+  - Active JAX-flat behavior, shape, state, and performance tests.
 
 ## Typical usage
 
@@ -115,7 +119,7 @@ out = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d}, out_p
 
 The JAX backend accepts the same string formulas and Python-composed `Expr` trees as the Numba backend, including infix math/comparison operators and grouped-expression sugar such as `lhs.groupby((...)).apply(...)`. It stores formula structure in per-operator Equinox modules and wraps both the single-tick state transition and the batch `lax.scan` path with `eqx.filter_jit`, keeping the per-timestep hot paths compiled. It covers the scalar/vector/matrix stateless operators, `ewm`, `cumsum`, `shift`, `rolling_quantile`, `xs_rank`, `outer`, `bspline`, `col`, `mean`, canonical tuple-key groupby `groupby((...), lhs, op_using_self_)` (including optional `univ(...)` inside the key tuple), and Ridge projections via `get_beta(Ridge(...))`/`get_preds(Ridge(...))`.
 
-The experimental `trading_dsl_engine.jax_flat` backend additionally supports `buffer(shift(x, lag, max_size), min_lag, max_lag)` (or keyword form `buffer(shift(x, lag=..., max_lag=...), min=..., max=...)`). This JAX-flat-only operator emits a `(time, n_instruments, max_lag)` lag cube whose columns are lags `1..max_lag`, preserving shift ring ordering and masking lags below dynamic `min_lag`, above dynamic `lag`, or beyond available history.
+The active `trading_dsl_engine.jax_flat` backend additionally supports `buffer(shift(x, lag, max_size), min_lag, max_lag)` (or keyword form `buffer(shift(x, lag=..., max_lag=...), min=..., max=...)`). This JAX-flat-only operator emits a lag cube whose last axis is lags `1..max_lag`, preserving shift ring ordering and masking lags below dynamic `min_lag`, above dynamic `lag`, or beyond available history. Vector inputs produce `(time, n_instruments, max_lag)` outputs; matrix/ndarray inputs such as `bspline(...)` preserve their feature axes and append the lag axis, e.g. `(time, n_instruments, n_basis, max_lag)`.
 
 `jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis:
 
@@ -144,10 +148,10 @@ pytest -q  # configured to use pytest-xdist with 12 workers
 
 The `.venv/` and `.pip-cache/` paths are gitignored so cloud/agent environments can reuse a repo-local virtualenv and wheel/download cache between iterations without committing environment artifacts.
 
-Performance tests (opt-in):
+By default, contributors and agents should run only targeted tests for active `jax_flat` and shared DSL functionality. Do not run the full suite, deprecated Numba tests, or deprecated non-flat JAX tests unless the task explicitly asks for them. Active performance tests (opt-in) live under `tests/jax_flat/`:
 
 ```bash
-RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
+RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ```
 
 ## Notes for future work
