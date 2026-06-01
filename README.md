@@ -66,6 +66,32 @@ Normal Python composition can use `var("close")`/`var("open")` identifiers and e
 
 The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile_seconds`) so compile-time CSE behavior and compile latency can be validated.
 
+
+### JAX-flat scalar objectives and autodiff
+
+The `trading_dsl_engine.jax_flat` runtime supports `run_batch(...)` when callers need the full `(time, ...)` output history. For scalar losses used with `jax.grad`/`jax.value_and_grad`, prefer `fold_batch(inputs, reducer_init, reducer)`: it runs the same streaming state transitions under one JIT-compiled `lax.scan`, but folds each emitted row into a caller-defined accumulator instead of assembling and transposing a full output array. This keeps large optimization examples from spending first-call gradient compile time on output materialization tape that the scalar objective never needs.
+
+```python
+import jax.numpy as jnp
+from trading_dsl_engine.jax_flat.engine import compile_formula
+
+runtime = compile_formula("shift(ewm(returns, hl), 1, 2)")
+
+def pnl_moments(acc, weights, input_rows):
+    returns_row, _hl_row = input_rows
+    count, total, total_sq = acc
+    pnl = (jnp.nan_to_num(weights) * returns_row).sum()
+    return count + 1.0, total + pnl, total_sq + pnl * pnl
+
+init = (jnp.array(0.0),) * 3
+_, (count, total, total_sq) = runtime.fold_batch(
+    {"returns": returns_2d, "hl": hl_2d},
+    init,
+    pnl_moments,
+)
+sharpe = (total / count) / (jnp.sqrt(total_sq / count - (total / count) ** 2) + 1e-12)
+```
+
 ## Data contract
 
 - Inputs are aligned 2D arrays with shape `(time, n_instruments)`.

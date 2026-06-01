@@ -39,17 +39,40 @@ def build_momentum_runtime():
     return compile_formula(signal)
 
 
-def test_jax_flat_autodiff_optimizes_momentum_half_life():
-    returns = generate_autocorrelated_returns()
-    runtime = build_momentum_runtime()
+def make_sharpe_objective(runtime, returns):
+    """Build a scalar objective without materializing the full weight history.
+
+    Using fold_batch keeps the optimizer's value/grad trace focused on the
+    streaming state transitions plus the scalar PnL moments. Calling run_batch
+    inside a scalar loss is still correct, but reverse-mode compilation also has
+    to build and transpose the full output-array assembly, which dominates first
+    grad calls at large row counts.
+    """
+
+    def pnl_moments(acc, weights, input_rows):
+        returns_row, _hl_row = input_rows
+        count, total, total_sq = acc
+        pnl = (jnp.nan_to_num(weights) * returns_row).sum()
+        return count + 1.0, total + pnl, total_sq + pnl * pnl
 
     def sharpe_for_raw_half_life(raw_half_life):
         half_life = jax.nn.softplus(raw_half_life) + 2.0
         half_life_frame = jnp.broadcast_to(half_life, returns.shape)
         inputs_by_name = {"returns": returns, "hl": half_life_frame}
-        _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
-        pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
-        return pnl.mean() / (pnl.std() + 1e-12)
+        ordered_inputs = tuple(inputs_by_name[name] for name in runtime.program.input_names)
+        init = (jnp.array(0.0, dtype=jnp.float64),) * 3
+        _, (count, total, total_sq) = runtime.fold_batch(ordered_inputs, init, pnl_moments)
+        mean = total / count
+        variance = jnp.maximum(total_sq / count - mean * mean, 0.0)
+        return mean / (jnp.sqrt(variance) + 1e-12)
+
+    return sharpe_for_raw_half_life
+
+
+def test_jax_flat_autodiff_optimizes_momentum_half_life():
+    returns = generate_autocorrelated_returns()
+    runtime = build_momentum_runtime()
+    sharpe_for_raw_half_life = make_sharpe_objective(runtime, returns)
 
     initial_raw_half_life = jnp.array(2.0, dtype=jnp.float64)
     initial_sharpe, initial_grad = jax.value_and_grad(sharpe_for_raw_half_life)(initial_raw_half_life)
@@ -77,14 +100,7 @@ if __name__ == "__main__":
     returns = generate_autocorrelated_returns()
     runtime = build_momentum_runtime()
 
-    def sharpe(raw_half_life):
-        half_life = jax.nn.softplus(raw_half_life) + 2.0
-        inputs_by_name = {"returns": returns, "hl": jnp.broadcast_to(half_life, returns.shape)}
-        _, weights = runtime.run_batch(tuple(inputs_by_name[name] for name in runtime.program.input_names))
-        pnl = (jnp.nan_to_num(weights) * returns).sum(axis=1)
-        sharpe = pnl.mean() / (pnl.std() + 1e-12)
-        print(sharpe)
-        return sharpe
+    sharpe = make_sharpe_objective(runtime, returns)
 
     raw = jnp.array(2.0, dtype=jnp.float64)
     for _ in range(25):

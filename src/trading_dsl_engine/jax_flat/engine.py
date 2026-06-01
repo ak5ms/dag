@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from functools import partial
+from typing import Any, Callable
 import mmap
 import os
 import tempfile
@@ -161,6 +162,30 @@ class JaxFlatRuntime(eqx.Module):
                 )
                 runtime = next_runtime
 
+    def fold_batch(self, inputs, reducer_init, reducer: Callable, states=None):
+        """Run the program over a batch while folding outputs into ``reducer_init``.
+
+        ``reducer`` is a pure JAX-compatible callable with signature
+        ``reducer(accumulator, output_row, input_rows) -> accumulator``. It is
+        traced as static Python code inside the same JIT-compiled scan as the
+        streaming DAG. Use this for scalar objectives (for example autodiff
+        losses) that do not need the full ``(time, ...)`` output array.
+        """
+
+        inputs = _normalize_batch_inputs(self, inputs)
+        if not inputs:
+            raise ValueError("fold_batch requires at least one input array")
+        n_steps = inputs[0].shape[0]
+        n_instruments = inputs[0].shape[1]
+        for arr in inputs[1:]:
+            if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
+                raise ValueError("All inputs must share aligned shape (time, n_instruments)")
+        if _has_memmap_input(inputs):
+            raise ValueError("fold_batch does not support memmap inputs; use run_batch for chunked IO")
+        if not states:
+            return _jit_fold_batch_from_initial_state(self, inputs, reducer_init, reducer)
+        return _jit_fold_batch(self, states, inputs, reducer_init, reducer)
+
     def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
         inputs = _normalize_batch_inputs(self, inputs)
         if not inputs:
@@ -187,6 +212,8 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
         inputs = tuple(inputs)
 
     if len(inputs) != len(runtime.program.input_names):
+        if not runtime.program.input_names and len(inputs) == 1:
+            return inputs
         raise ValueError(
             "run_batch expected "
             f"{len(runtime.program.input_names)} input array(s) "
@@ -293,6 +320,27 @@ def _jit_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
 @jax.jit
 def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
     return _scan_batch(runtime, state0, inputs)
+
+
+@partial(jax.jit, static_argnums=(3,))
+def _jit_fold_batch_from_initial_state(runtime: JaxFlatRuntime, inputs, reducer_init, reducer):
+    state0 = runtime.init_state(inputs[0].shape[1])
+    return _scan_batch_fold(runtime, state0, inputs, reducer_init, reducer)
+
+
+@partial(jax.jit, static_argnums=(4,))
+def _jit_fold_batch(runtime: JaxFlatRuntime, state0, inputs, reducer_init, reducer):
+    return _scan_batch_fold(runtime, state0, inputs, reducer_init, reducer)
+
+
+def _scan_batch_fold(runtime: JaxFlatRuntime, state0, inputs, reducer_init, reducer):
+    def step(carry, input_rows):
+        states, acc = carry
+        next_states, out = runtime._tick_impl(states, *input_rows)
+        return (next_states, reducer(acc, out, input_rows)), None
+
+    (states, acc), _ = jax.lax.scan(step, (state0, reducer_init), inputs)
+    return states, acc
 
 
 _BATCH_CHUNK_SIZE = 2560
