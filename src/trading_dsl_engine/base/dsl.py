@@ -157,6 +157,7 @@ xs_rank = op("xs_rank")
 outer = op("outer")
 bspline = op("bspline")
 col = op("col")
+einsum = op("einsum")
 
 cat = op("cat")
 groupby = op("groupby")

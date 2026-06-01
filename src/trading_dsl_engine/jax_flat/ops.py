@@ -280,6 +280,10 @@ def _cat(*values):
     return jnp.concatenate(tuple(_as_tick_matrix(array, rows) for array in arrays), axis=-1)
 
 
+def _einsum(spec: str, *values):
+    return jnp.einsum(spec, *values)
+
+
 def _broadcast_sequence_to_state(x, state_value):
     x = jnp.asarray(x)
     state_value = jnp.asarray(state_value)
