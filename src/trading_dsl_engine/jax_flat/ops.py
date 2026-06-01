@@ -160,7 +160,7 @@ class ShiftOp(Op):
     def scan_batch(self, state: ShiftState, *child_sequences: jax.Array):
         x, lag = child_sequences[:2]
         cap = state.buffer.shape[0]
-        rows, cols = x.shape
+        rows, cols = x.shape[:2]
         history = jnp.concatenate((_chronological_buffer(state), x), axis=0)
         lag_values = _lag_matrix(lag, rows, cols)
         finite_lag = jnp.isfinite(lag_values)
@@ -199,7 +199,7 @@ class BufferShiftOp(Op):
         n = x.shape[0]
         lag_cols = jnp.arange(1, self.max_lag + 1, dtype=jnp.int32)
         read_pos = jnp.mod(state.pos - lag_cols, cap)
-        history = jnp.swapaxes(state.buffer[read_pos], 0, 1)
+        history = jnp.moveaxis(jnp.swapaxes(state.buffer[read_pos], 0, 1), 1, -1)
 
         min_values = _lag_vector(min_lag, n)
         upper_values = _lag_vector(upper_lag, n)
@@ -210,6 +210,7 @@ class BufferShiftOp(Op):
         available = state.count >= lag_cols
         in_window = (lag_cols_f[None, :] >= min_bound[:, None]) & (lag_cols_f[None, :] <= upper_bound[:, None])
         valid = finite_bounds[:, None] & available[None, :] & in_window
+        valid = _tick_lag_mask(valid, x.ndim)
         out = jnp.where(valid, history, jnp.nan)
 
         next_buffer = state.buffer.at[state.pos].set(x)
@@ -225,19 +226,19 @@ class BufferShiftOp(Op):
     def scan_batch(self, state: ShiftState, *child_sequences: jax.Array):
         x, upper_lag, min_lag = child_sequences[:3]
         cap = state.buffer.shape[0]
-        rows, cols = x.shape
+        rows, cols = x.shape[:2]
         lag_cols = jnp.arange(1, self.max_lag + 1, dtype=jnp.int32)
         history = jnp.concatenate((_chronological_buffer(state)[-self.max_lag :], x), axis=0)
         if self.max_lag <= 32:
             out = jnp.stack(
                 tuple(history[self.max_lag - lag : self.max_lag - lag + rows] for lag in range(1, self.max_lag + 1)),
-                axis=2,
+                axis=-1,
             )
         else:
             time_idx = jnp.arange(rows, dtype=jnp.int32)[:, None, None]
             col_idx = jnp.arange(cols, dtype=jnp.int32)[None, :, None]
             lag_idx = lag_cols[None, None, :]
-            out = history[self.max_lag + time_idx - lag_idx, col_idx]
+            out = jnp.moveaxis(history[self.max_lag + time_idx - lag_idx, col_idx], 2, -1)
 
         min_values = _lag_matrix(min_lag, rows, cols)
         upper_values = _lag_matrix(upper_lag, rows, cols)
@@ -249,6 +250,7 @@ class BufferShiftOp(Op):
         available = state.count + jnp.arange(rows, dtype=jnp.int32)[:, None] >= lag_cols[None, :]
         in_window = (lag_cols_f[None, None, :] >= min_bound[:, :, None]) & (lag_cols_f[None, None, :] <= upper_bound[:, :, None])
         valid = (min_finite & upper_finite)[:, :, None] & available[:, None, :] & in_window
+        valid = _batch_lag_mask(valid, x.ndim)
         return _shift_next_state(state, x), jnp.where(valid, out, jnp.nan)
 
 
@@ -269,6 +271,18 @@ def _shift_next_state(state: ShiftState, x_seq: jax.Array):
         pos=jnp.asarray(0, dtype=jnp.int32),
         count=jnp.minimum(state.count + jnp.asarray(x_seq.shape[0], dtype=jnp.int32), jnp.asarray(cap, dtype=jnp.int32)),
     )
+
+
+def _tick_lag_mask(mask: jax.Array, value_ndim: int):
+    if value_ndim <= 1:
+        return mask
+    return jnp.reshape(mask, (mask.shape[0],) + (1,) * (value_ndim - 1) + (mask.shape[1],))
+
+
+def _batch_lag_mask(mask: jax.Array, value_ndim: int):
+    if value_ndim <= 2:
+        return mask
+    return jnp.reshape(mask, mask.shape[:2] + (1,) * (value_ndim - 2) + (mask.shape[2],))
 
 
 def _lag_matrix(lag, rows: int, cols: int):
