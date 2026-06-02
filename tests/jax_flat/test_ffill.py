@@ -43,22 +43,6 @@ def test_ffill_batch_matches_reference_and_streaming_ticks():
     np.testing.assert_allclose(np.vstack(rows), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
-def test_ffill_without_limit_fills_indefinitely():
-    runtime = compile_formula("ffill(close)")
-    close = np.array([[1.0], [np.nan], [np.nan], [np.nan], [5.0], [np.nan]], dtype=np.float64)
-
-    _, out = runtime.run_batch((jnp.asarray(close),))
-    expected = np.array([[1.0], [1.0], [1.0], [1.0], [5.0], [5.0]], dtype=np.float64)
-    np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
-
-    state = runtime.init_state(close.shape[1])
-    rows = []
-    for row in close:
-        state, out_row = runtime.tick(state, jnp.asarray(row))
-        rows.append(np.asarray(out_row))
-    np.testing.assert_allclose(np.vstack(rows), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
-
-
 def test_ffill_dynamic_nan_limit_suppresses_output_without_updating_state():
     runtime = compile_formula("ffill(close, limit)")
     close = np.array(

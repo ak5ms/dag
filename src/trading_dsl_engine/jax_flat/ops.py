@@ -335,8 +335,6 @@ class CumsumOp(Op):
 
 @dataclass(frozen=True)
 class FFillOp(Op):
-    limit: int | None = None
-    dynamic_limit: bool = False
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
@@ -350,22 +348,15 @@ class FFillOp(Op):
         )
 
     def tick(self, state: FFillState, *child_values: jax.Array):
-        x = child_values[0]
-        if self.dynamic_limit:
-            return _ffill_dynamic_step(state, x, child_values[1])
-        if self.limit is None:
-            return _ffill_unlimited_step(state, x)
-        return _ffill_limited_step(state, x, self.limit)
+        x, limit = child_values[:2]
+        return _ffill_step(state, x, limit)
 
     def scan_batch(self, state: FFillState, *child_sequences: jax.Array):
         x = _broadcast_sequence_to_state(child_sequences[0], state.last)
-        if not self.dynamic_limit:
-            return _ffill_static_scan(state, x, self.limit)
-
         limit = child_sequences[1]
 
         def step(carry, values):
-            return _ffill_dynamic_step(carry, *values)
+            return _ffill_step(carry, *values)
 
         return jax.lax.scan(step, state, (x, limit), unroll=32)
 
@@ -446,59 +437,35 @@ class RidgeOp(Op):
         return next_state, RidgeValue(beta=beta, preds=preds)
 
 
-def _ffill_unlimited_step(state: FFillState, x: jax.Array):
+def _ffill_step(state: FFillState, x: jax.Array, limit: jax.Array):
     x = jnp.asarray(x)
-    valid = jnp.isfinite(x)
-    seen = state.seen | valid
-    last = jnp.where(valid, x, state.last)
-    return FFillState(last=last, streak=state.streak, seen=seen), jnp.where(seen, last, jnp.nan)
-
-
-def _ffill_limited_step(state: FFillState, x: jax.Array, limit: int):
-    x = jnp.asarray(x)
-    valid = jnp.isfinite(x)
-    seen = state.seen | valid
-    can_fill = (~valid) & seen & (state.streak < limit)
-    last = jnp.where(valid, x, state.last)
-    streak = jnp.where(valid, 0, jnp.where(can_fill, state.streak + 1, state.streak))
-    out = jnp.where(valid, x, jnp.where(can_fill, state.last, jnp.nan))
-    return FFillState(last=last, streak=streak, seen=seen), out
-
-
-def _ffill_dynamic_step(state: FFillState, x: jax.Array, limit: jax.Array):
     limit_value = _scalar_value(limit)
-    limit_i = jnp.rint(limit_value).astype(jnp.int64)
-    active = jnp.isfinite(limit_value) & (limit_i >= 0)
-    next_state, out = _ffill_limited_step(state, x, limit_i)
-    return (
-        FFillState(
-            last=jnp.where(active, next_state.last, state.last),
-            streak=jnp.where(active, next_state.streak, state.streak),
-            seen=jnp.where(active, next_state.seen, state.seen),
-        ),
-        jnp.where(active, out, jnp.nan),
+    finite_limit = jnp.isfinite(limit_value)
+    limit_i = jnp.maximum(
+        jnp.rint(jnp.where(finite_limit, limit_value, 0.0)).astype(jnp.int64),
+        jnp.asarray(0, dtype=jnp.int64),
     )
-
-
-def _ffill_static_scan(state: FFillState, x: jax.Array, limit: int | None):
-    valid_x = jnp.isfinite(x)
-    values = jnp.concatenate((state.last[None], x), axis=0)
-    valid = jnp.concatenate((state.seen[None], valid_x), axis=0)
-    time_shape = (values.shape[0],) + (1,) * (values.ndim - 1)
-    time = jnp.arange(values.shape[0], dtype=jnp.int64).reshape(time_shape)
-    last_idx = jnp.maximum.accumulate(jnp.where(valid, time, 0), axis=0)
-    seen = jnp.maximum.accumulate(valid, axis=0)
-    filled = jnp.take_along_axis(values, last_idx, axis=0)
-
-    if limit is None:
-        out = jnp.where(seen[1:], filled[1:], jnp.nan)
-        return FFillState(last=filled[-1], streak=state.streak, seen=seen[-1]), out
-
-    distance = jnp.where(last_idx == 0, state.streak[None] + time, time - last_idx)
-    allowed = seen & (distance <= limit)
-    out = jnp.where(allowed[1:], filled[1:], jnp.nan)
-    next_streak = jnp.where(valid[-1], 0, jnp.minimum(distance[-1], jnp.asarray(limit, dtype=jnp.int64)))
-    return FFillState(last=filled[-1], streak=next_streak, seen=seen[-1]), out
+    valid = jnp.isfinite(x)
+    next_last_candidate = jnp.where(valid, x, state.last)
+    next_seen_candidate = state.seen | valid
+    can_fill = (~valid) & next_seen_candidate & (state.streak < limit_i)
+    out_candidate = jnp.where(valid, x, jnp.where(can_fill, state.last, jnp.nan))
+    next_streak_candidate = jnp.where(
+        valid,
+        jnp.asarray(0, dtype=jnp.int64),
+        jnp.where(can_fill, state.streak + jnp.asarray(1, dtype=jnp.int64), state.streak),
+    )
+    next_state_candidate = FFillState(
+        last=next_last_candidate,
+        streak=next_streak_candidate,
+        seen=next_seen_candidate,
+    )
+    next_state = jax.tree_util.tree_map(
+        lambda old, new: jnp.where(finite_limit, new, old),
+        state,
+        next_state_candidate,
+    )
+    return next_state, jnp.where(finite_limit, out_candidate, jnp.nan)
 
 
 def _as_tick_matrix(value, rows: int | None = None):
