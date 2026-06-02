@@ -18,6 +18,7 @@ from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     BufferShiftOp,
     EwmOp,
+    FFillOp,
     GroupByOp,
     InputOp,
     LiteralOp,
@@ -577,6 +578,16 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         if isinstance(expr.args[1], Number):
             return EwmOp(span=float(expr.args[1].value)), 1
         return EwmOp(), None
+    if expr.fn == "ffill" and len(expr.args) == 2:
+        if isinstance(expr.args[1], Number) and float(expr.args[1].value) < 0.0:
+            raise ValueError("ffill limit must be >= 0")
+        return (
+            FFillOp(
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            None,
+        )
     if expr.fn == "shift" and len(expr.args) in (2, 3):
         max_size_arg = expr.args[2] if len(expr.args) == 3 else expr.args[1]
         max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
