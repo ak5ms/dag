@@ -218,7 +218,7 @@ class BufferShiftOp(Op):
         available = state.count >= lag_cols
         in_window = (lag_cols_f[None, :] >= min_bound[:, None]) & (lag_cols_f[None, :] <= upper_bound[:, None])
         valid = finite_bounds[:, None] & available[None, :] & in_window
-        valid = _tick_lag_mask(valid, x.ndim)
+        valid = self._tick_lag_mask(valid, x.ndim)
         out = jnp.where(valid, history, jnp.nan)
 
         next_buffer = state.buffer.at[state.pos].set(x)
@@ -258,8 +258,20 @@ class BufferShiftOp(Op):
         available = state.count + jnp.arange(rows, dtype=jnp.int32)[:, None] >= lag_cols[None, :]
         in_window = (lag_cols_f[None, None, :] >= min_bound[:, :, None]) & (lag_cols_f[None, None, :] <= upper_bound[:, :, None])
         valid = (min_finite & upper_finite)[:, :, None] & available[:, None, :] & in_window
-        valid = _batch_lag_mask(valid, x.ndim)
+        valid = self._batch_lag_mask(valid, x.ndim)
         return _shift_next_state(state, x), jnp.where(valid, out, jnp.nan)
+
+    @staticmethod
+    def _tick_lag_mask(mask: jax.Array, value_ndim: int):
+        if value_ndim <= 1:
+            return mask
+        return jnp.reshape(mask, (mask.shape[0],) + (1,) * (value_ndim - 1) + (mask.shape[1],))
+
+    @staticmethod
+    def _batch_lag_mask(mask: jax.Array, value_ndim: int):
+        if value_ndim <= 2:
+            return mask
+        return jnp.reshape(mask, mask.shape[:2] + (1,) * (value_ndim - 2) + (mask.shape[2],))
 
 
 def _chronological_buffer(state: ShiftState):
@@ -279,18 +291,6 @@ def _shift_next_state(state: ShiftState, x_seq: jax.Array):
         pos=jnp.asarray(0, dtype=jnp.int32),
         count=jnp.minimum(state.count + jnp.asarray(x_seq.shape[0], dtype=jnp.int32), jnp.asarray(cap, dtype=jnp.int32)),
     )
-
-
-def _tick_lag_mask(mask: jax.Array, value_ndim: int):
-    if value_ndim <= 1:
-        return mask
-    return jnp.reshape(mask, (mask.shape[0],) + (1,) * (value_ndim - 1) + (mask.shape[1],))
-
-
-def _batch_lag_mask(mask: jax.Array, value_ndim: int):
-    if value_ndim <= 2:
-        return mask
-    return jnp.reshape(mask, mask.shape[:2] + (1,) * (value_ndim - 2) + (mask.shape[2],))
 
 
 def _lag_matrix(lag, rows: int, cols: int):
@@ -352,22 +352,77 @@ class FFillOp(Op):
     def tick(self, state: FFillState, *child_values: jax.Array):
         x = child_values[0]
         if self.dynamic_limit:
-            return _ffill_dynamic_step(state, x, child_values[1])
+            return self._dynamic_step(state, x, child_values[1])
         if self.limit is None:
-            return _ffill_unlimited_step(state, x)
-        return _ffill_limited_step(state, x, self.limit)
+            return self._unlimited_step(state, x)
+        return self._limited_step(state, x, self.limit)
 
     def scan_batch(self, state: FFillState, *child_sequences: jax.Array):
         x = _broadcast_sequence_to_state(child_sequences[0], state.last)
         if not self.dynamic_limit:
-            return _ffill_static_scan(state, x, self.limit)
+            return self._static_scan(state, x, self.limit)
 
         limit = child_sequences[1]
 
         def step(carry, values):
-            return _ffill_dynamic_step(carry, *values)
+            return self._dynamic_step(carry, *values)
 
         return jax.lax.scan(step, state, (x, limit), unroll=32)
+
+    @staticmethod
+    def _unlimited_step(state: FFillState, x: jax.Array):
+        x = jnp.asarray(x)
+        valid = jnp.isfinite(x)
+        seen = state.seen | valid
+        last = jnp.where(valid, x, state.last)
+        return FFillState(last=last, streak=state.streak, seen=seen), jnp.where(seen, last, jnp.nan)
+
+    @staticmethod
+    def _limited_step(state: FFillState, x: jax.Array, limit: int):
+        x = jnp.asarray(x)
+        valid = jnp.isfinite(x)
+        seen = state.seen | valid
+        can_fill = (~valid) & seen & (state.streak < limit)
+        last = jnp.where(valid, x, state.last)
+        streak = jnp.where(valid, 0, jnp.where(can_fill, state.streak + 1, state.streak))
+        out = jnp.where(valid, x, jnp.where(can_fill, state.last, jnp.nan))
+        return FFillState(last=last, streak=streak, seen=seen), out
+
+    @classmethod
+    def _dynamic_step(cls, state: FFillState, x: jax.Array, limit: jax.Array):
+        limit_value = _scalar_value(limit)
+        limit_i = jnp.rint(limit_value).astype(jnp.int64)
+        active = jnp.isfinite(limit_value) & (limit_i >= 0)
+        next_state, out = cls._limited_step(state, x, limit_i)
+        return (
+            FFillState(
+                last=jnp.where(active, next_state.last, state.last),
+                streak=jnp.where(active, next_state.streak, state.streak),
+                seen=jnp.where(active, next_state.seen, state.seen),
+            ),
+            jnp.where(active, out, jnp.nan),
+        )
+
+    @staticmethod
+    def _static_scan(state: FFillState, x: jax.Array, limit: int | None):
+        valid_x = jnp.isfinite(x)
+        values = jnp.concatenate((state.last[None], x), axis=0)
+        valid = jnp.concatenate((state.seen[None], valid_x), axis=0)
+        time_shape = (values.shape[0],) + (1,) * (values.ndim - 1)
+        time = jnp.arange(values.shape[0], dtype=jnp.int64).reshape(time_shape)
+        last_idx = jnp.maximum.accumulate(jnp.where(valid, time, 0), axis=0)
+        seen = jnp.maximum.accumulate(valid, axis=0)
+        filled = jnp.take_along_axis(values, last_idx, axis=0)
+
+        if limit is None:
+            out = jnp.where(seen[1:], filled[1:], jnp.nan)
+            return FFillState(last=filled[-1], streak=state.streak, seen=seen[-1]), out
+
+        distance = jnp.where(last_idx == 0, state.streak[None] + time, time - last_idx)
+        allowed = seen & (distance <= limit)
+        out = jnp.where(allowed[1:], filled[1:], jnp.nan)
+        next_streak = jnp.where(valid[-1], 0, jnp.minimum(distance[-1], jnp.asarray(limit, dtype=jnp.int64)))
+        return FFillState(last=filled[-1], streak=next_streak, seen=seen[-1]), out
 
 
 @dataclass(frozen=True)
@@ -402,14 +457,14 @@ class RidgeOp(Op):
             y, hl, lam = child_values[-3:]
             weights = jnp.asarray(1.0, dtype=jnp.float64)
 
-        features = tuple(_as_feature_matrix(value) for value in feature_values)
+        features = tuple(self._as_feature_matrix(value) for value in feature_values)
         xmat = jnp.concatenate(features, axis=1)
         y = jnp.asarray(y)
         y_vec = y[:, 0] if y.ndim == 2 else y
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
         preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
 
-        xx_new, xy_new, xx_valid, xy_valid = _ridge_moments(xmat, y_vec, weights)
+        xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
         hl_value = _scalar_value(hl)
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
         rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
@@ -445,60 +500,49 @@ class RidgeOp(Op):
         )
         return next_state, RidgeValue(beta=beta, preds=preds)
 
+    @staticmethod
+    def _as_feature_matrix(value):
+        value = jnp.asarray(value)
+        if value.ndim == 1:
+            return value[:, None]
+        return value
 
-def _ffill_unlimited_step(state: FFillState, x: jax.Array):
-    x = jnp.asarray(x)
-    valid = jnp.isfinite(x)
-    seen = state.seen | valid
-    last = jnp.where(valid, x, state.last)
-    return FFillState(last=last, streak=state.streak, seen=seen), jnp.where(seen, last, jnp.nan)
+    @classmethod
+    def _moments(cls, xmat, y, weights):
+        valid_x = jnp.isfinite(xmat)
+        valid_y = jnp.isfinite(y)
+        x0 = jnp.where(valid_x, xmat, 0.0)
+        y0 = jnp.where(valid_y, y, 0.0)
+        weights = jnp.asarray(weights)
+        if weights.ndim == 0:
+            w = jnp.full((xmat.shape[0],), weights)
+            return cls._vector_weight_moments(x0, y0, w, valid_x, valid_y, jnp.isfinite(w))
+        if weights.ndim == 1:
+            w = weights
+            return cls._vector_weight_moments(x0, y0, jnp.where(jnp.isfinite(w), w, 0.0), valid_x, valid_y, jnp.isfinite(w))
+        if weights.shape[0] == 1 and weights.shape[1] == 1:
+            w = jnp.full((xmat.shape[0],), weights[0, 0])
+            return cls._vector_weight_moments(x0, y0, w, valid_x, valid_y, jnp.isfinite(w))
+        if weights.shape[1] == 1:
+            w = weights[:, 0]
+            return cls._vector_weight_moments(x0, y0, jnp.where(jnp.isfinite(w), w, 0.0), valid_x, valid_y, jnp.isfinite(w))
+        valid_w = jnp.isfinite(weights)
+        w0 = jnp.where(valid_w, weights, 0.0)
+        xx_new = x0.T @ w0 @ x0
+        xy_new = x0.T @ (w0 @ y0)
+        xx_valid = (valid_x.astype(jnp.int64).T @ (valid_w.astype(jnp.int64) @ valid_x.astype(jnp.int64))) > 0
+        xy_valid = (valid_x.astype(jnp.int64).T @ (valid_w.astype(jnp.int64) @ valid_y.astype(jnp.int64))) > 0
+        return xx_new, xy_new, xx_valid, xy_valid
 
+    @staticmethod
+    def _vector_weight_moments(x0, y0, w, valid_x, valid_y, valid_w):
+        xw = x0 * w[:, None]
+        xx_new = x0.T @ xw
+        xx_counts = valid_x.astype(jnp.int64).T @ (valid_x & valid_w[:, None]).astype(jnp.int64)
+        xy_new = x0.T @ (w * y0)
+        xy_counts = valid_x.astype(jnp.int64).T @ (valid_y & valid_w).astype(jnp.int64)
+        return xx_new, xy_new, xx_counts > 0, xy_counts > 0
 
-def _ffill_limited_step(state: FFillState, x: jax.Array, limit: int):
-    x = jnp.asarray(x)
-    valid = jnp.isfinite(x)
-    seen = state.seen | valid
-    can_fill = (~valid) & seen & (state.streak < limit)
-    last = jnp.where(valid, x, state.last)
-    streak = jnp.where(valid, 0, jnp.where(can_fill, state.streak + 1, state.streak))
-    out = jnp.where(valid, x, jnp.where(can_fill, state.last, jnp.nan))
-    return FFillState(last=last, streak=streak, seen=seen), out
-
-
-def _ffill_dynamic_step(state: FFillState, x: jax.Array, limit: jax.Array):
-    limit_value = _scalar_value(limit)
-    limit_i = jnp.rint(limit_value).astype(jnp.int64)
-    active = jnp.isfinite(limit_value) & (limit_i >= 0)
-    next_state, out = _ffill_limited_step(state, x, limit_i)
-    return (
-        FFillState(
-            last=jnp.where(active, next_state.last, state.last),
-            streak=jnp.where(active, next_state.streak, state.streak),
-            seen=jnp.where(active, next_state.seen, state.seen),
-        ),
-        jnp.where(active, out, jnp.nan),
-    )
-
-
-def _ffill_static_scan(state: FFillState, x: jax.Array, limit: int | None):
-    valid_x = jnp.isfinite(x)
-    values = jnp.concatenate((state.last[None], x), axis=0)
-    valid = jnp.concatenate((state.seen[None], valid_x), axis=0)
-    time_shape = (values.shape[0],) + (1,) * (values.ndim - 1)
-    time = jnp.arange(values.shape[0], dtype=jnp.int64).reshape(time_shape)
-    last_idx = jnp.maximum.accumulate(jnp.where(valid, time, 0), axis=0)
-    seen = jnp.maximum.accumulate(valid, axis=0)
-    filled = jnp.take_along_axis(values, last_idx, axis=0)
-
-    if limit is None:
-        out = jnp.where(seen[1:], filled[1:], jnp.nan)
-        return FFillState(last=filled[-1], streak=state.streak, seen=seen[-1]), out
-
-    distance = jnp.where(last_idx == 0, state.streak[None] + time, time - last_idx)
-    allowed = seen & (distance <= limit)
-    out = jnp.where(allowed[1:], filled[1:], jnp.nan)
-    next_streak = jnp.where(valid[-1], 0, jnp.minimum(distance[-1], jnp.asarray(limit, dtype=jnp.int64)))
-    return FFillState(last=filled[-1], streak=next_streak, seen=seen[-1]), out
 
 def _as_tick_matrix(value, rows: int | None = None):
     value = jnp.asarray(value)
@@ -543,13 +587,6 @@ def _lag_vector(x, rows: int):
     return x[:, 0]
 
 
-def _as_feature_matrix(value):
-    value = jnp.asarray(value)
-    if value.ndim == 1:
-        return value[:, None]
-    return value
-
-
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
 
@@ -591,42 +628,6 @@ def _bspline(x, n_basis: int):
     total = jnp.sum(values, axis=1, keepdims=True)
     values = jnp.where(total <= 1e-18, 1.0 / n_basis, values / total)
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
-
-
-def _ridge_moments(xmat, y, weights):
-    valid_x = jnp.isfinite(xmat)
-    valid_y = jnp.isfinite(y)
-    x0 = jnp.where(valid_x, xmat, 0.0)
-    y0 = jnp.where(valid_y, y, 0.0)
-    weights = jnp.asarray(weights)
-    if weights.ndim == 0:
-        w = jnp.full((xmat.shape[0],), weights)
-        return _ridge_vector_weight_moments(x0, y0, w, valid_x, valid_y, jnp.isfinite(w))
-    if weights.ndim == 1:
-        w = weights
-        return _ridge_vector_weight_moments(x0, y0, jnp.where(jnp.isfinite(w), w, 0.0), valid_x, valid_y, jnp.isfinite(w))
-    if weights.shape[0] == 1 and weights.shape[1] == 1:
-        w = jnp.full((xmat.shape[0],), weights[0, 0])
-        return _ridge_vector_weight_moments(x0, y0, w, valid_x, valid_y, jnp.isfinite(w))
-    if weights.shape[1] == 1:
-        w = weights[:, 0]
-        return _ridge_vector_weight_moments(x0, y0, jnp.where(jnp.isfinite(w), w, 0.0), valid_x, valid_y, jnp.isfinite(w))
-    valid_w = jnp.isfinite(weights)
-    w0 = jnp.where(valid_w, weights, 0.0)
-    xx_new = x0.T @ w0 @ x0
-    xy_new = x0.T @ (w0 @ y0)
-    xx_valid = (valid_x.astype(jnp.int64).T @ (valid_w.astype(jnp.int64) @ valid_x.astype(jnp.int64))) > 0
-    xy_valid = (valid_x.astype(jnp.int64).T @ (valid_w.astype(jnp.int64) @ valid_y.astype(jnp.int64))) > 0
-    return xx_new, xy_new, xx_valid, xy_valid
-
-
-def _ridge_vector_weight_moments(x0, y0, w, valid_x, valid_y, valid_w):
-    xw = x0 * w[:, None]
-    xx_new = x0.T @ xw
-    xx_counts = valid_x.astype(jnp.int64).T @ (valid_x & valid_w[:, None]).astype(jnp.int64)
-    xy_new = x0.T @ (w * y0)
-    xy_counts = valid_x.astype(jnp.int64).T @ (valid_y & valid_w).astype(jnp.int64)
-    return xx_new, xy_new, xx_counts > 0, xy_counts > 0
 
 
 def _get_beta(value: RidgeValue):
