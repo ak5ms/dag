@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 import mmap
 import os
+import time
 import tempfile
 import warnings
 
@@ -109,6 +110,8 @@ class InnerGraphOp(Op):
 
 class JaxFlatRuntime(eqx.Module):
     program: StreamingProgram = eqx.field(static=True)
+    runtimes: list[float] = eqx.field(default_factory=list, static=True)
+    block: bool = True # False disables waiting (for runtime measurement)
 
     def init_state(self, n_instruments: int):
         vector_sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
@@ -165,10 +168,19 @@ class JaxFlatRuntime(eqx.Module):
         return self._tick_impl(state_leaves, *input_rows)
 
     def run_batch(self, inputs, states=None, out_path: str | bool = False):
+
         runtime = self
+
         while True:
+            start = time.perf_counter()
             try:
-                return runtime._run_batch_once(inputs, states, out_path)
+                result = runtime._run_batch_once(inputs, states, out_path)
+                if runtime.block:
+                    jax.block_until_ready(result)
+                end = time.perf_counter()
+                runtime.runtimes.append(end - start)
+                return result
+
             except Exception as exc:
                 if states or not _is_groupby_capacity_error(exc):
                     raise
