@@ -301,6 +301,23 @@ def _group_suffix_shape(leaf: jax.Array, group_width: int) -> tuple[int, ...]:
     return leaf.shape
 
 
+
+def _same_group_key_matrix(key_matrix: jax.Array) -> jax.Array:
+    """Pairwise key equality for one group row, treating NaN keys as equal.
+
+    Groupwise execution consumes one representative per distinct key and masks
+    all group members with that key. Precomputing the pairwise matrix once keeps
+    the per-representative loop generic for ndarray/object outputs while avoiding
+    repeated key scans in the hot path.
+    """
+    return jax.vmap(lambda key: jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix))(key_matrix)
+
+
+def _first_occurrence_mask(same_keys: jax.Array) -> jax.Array:
+    positions = jnp.arange(same_keys.shape[0], dtype=jnp.int32)
+    earlier = positions[None, :] < positions[:, None]
+    return ~jnp.any(same_keys & earlier, axis=1)
+
 def _group_output_like(template: Any, group_width: int):
     template = _ensure_dataclass_pytree(template)
 
@@ -505,25 +522,20 @@ class GroupByOp(Op):
         group_width = idx.shape[0]
         template = self._group_template(inner_state, idx, args)
         group_out0 = _group_output_like(template, group_width)
+        same_keys = _same_group_key_matrix(key_matrix)
+        first_occurrence = _first_occurrence_mask(same_keys)
 
         def body(member_pos, carry):
             table_c, inner_state_c, group_out_c = carry
             key = key_matrix[member_pos]
-
-            already_processed = jnp.asarray(False)
-            for prev_pos in range(group_width):
-                already_processed = jnp.where(
-                    prev_pos < member_pos,
-                    already_processed | _same_key_vector(key_matrix[prev_pos], key),
-                    already_processed,
-                )
+            already_processed = ~first_occurrence[member_pos]
 
             def process(process_carry):
                 table_p, inner_state_p, group_out_p = process_carry
 
                 slot, table_found = _lookup_or_insert_slot(table_p, key)
 
-                mask = jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix)
+                mask = same_keys[member_pos]
                 group_args = tuple(_mask_group_arg(arg, idx, mask, self._row_arg_source_width(arg, idx)) for arg in args)
 
                 selected_state = _tree_take_slot(inner_state_p, slot) if inner_state_p is not None else None

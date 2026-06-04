@@ -35,6 +35,8 @@ from trading_dsl_engine.jax_flat.ops import (
 )
 
 
+
+
 @dataclass(frozen=True)
 class DagNode:
     op: Any
@@ -575,14 +577,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
-        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
     if variadic_builder is not None:
         static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
         return variadic_builder(*static_args), None
     if expr.fn == "round":
         if len(expr.args) == 1:
-            return NaryOp(jnp.round), None
+            return NaryOp(jnp.round, cpp_name="round"), None
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
@@ -626,12 +628,12 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
-        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis, cpp_name="bspline", cpp_int_param=n_basis), 1
     if expr.fn == "col" and len(expr.args) == 2:
         index = _literal_int_arg(expr.args[1], "col", 2)
         if index < 0:
             raise ValueError("col index must be >= 0")
-        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
+        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1, cpp_name="col", cpp_int_param=index), 1
     if expr.fn == "Ridge" and len(expr.args) >= 4:
         has_weights = len(expr.args) >= 5
         feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]
@@ -901,6 +903,7 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
     return node
+
 
 
 def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:

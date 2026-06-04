@@ -137,6 +137,21 @@ runtime = compile_formula(
 )
 ```
 
+
+## Native C++ tick prototype
+
+`trading_dsl_engine.jax_flat.compile_formula_cpp(...)` lazily imports `trading_dsl_engine.jax_flat.engine_cpp` and exposes an experimental native tick-path runtime for flat formulas where C++ can currently preserve the same streaming semantics as JAX-flat. It compiles the existing shared parser/lowering output into a C++ flattened node table backed by `jax_flat/engine.cpp` + `jax_flat/ops.cpp`; `init_state(n_instruments)` preallocates per-node scratch buffers and state slots, while `tick_into(state, out, *rows)` reuses both the state and caller-owned output row to avoid hot-path Python/JAX allocations. The convenience `tick(...)` method allocates only its returned row.
+
+The native batch helper intentionally stays a repeated tick loop over the same `eval_row` transition rather than a separate vectorized semantic path. It binds contiguous row pointers once, calls the same non-batch evaluator for each row, and uses `__restrict`/flat contiguous buffers so C++ compilers can optimize the row loop without changing streaming state behavior. The benchmark script compiles and warms both C++ and JAX-flat runtimes before timing, so printed results exclude extension import, formula compilation, and JAX first-use compilation.
+
+Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights, `get_beta`, `get_preds`, and dynamic-key `groupby(..., cumsum(self_))` without `univ(...)`. Unsupported nodes still raise `NotImplementedError`, so full DSL coverage remains available through the default JAX-flat runtime.
+
+Use the warmed comparison helper for quick local measurements:
+
+```bash
+python scripts/benchmark_cpp_flat.py --rows 100000 --cols 9 --runs 5
+```
+
 ## Development quickstart
 
 ```bash

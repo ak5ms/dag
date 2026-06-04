@@ -36,6 +36,7 @@ Priorities, in order:
 - Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
 - Active JAX-flat op kernels/factories: `src/trading_dsl_engine/jax_flat/ops.py`
 - Active JAX-flat runtime execution and batch/live helpers: `src/trading_dsl_engine/jax_flat/engine.py`
+- Experimental native C++ JAX-flat tick core: Python lowering/wrapper lives in `src/trading_dsl_engine/jax_flat/engine_cpp.py`; native extension code is split between `src/trading_dsl_engine/jax_flat/engine.cpp` and `src/trading_dsl_engine/jax_flat/ops.cpp` (keep this optional, flattened, and allocation-conscious; batch helpers must reuse the same non-batch row transition, and unsupported formulas should fail clearly rather than silently falling back).
 - Active JAX-flat behavior/performance regression tests: `tests/jax_flat/`
 - Deprecated Numba implementation: `src/trading_dsl_engine/numba/` (do not edit unless explicitly requested)
 - Deprecated non-flat JAX implementation: `src/trading_dsl_engine/jax/` (do not edit unless explicitly requested)
