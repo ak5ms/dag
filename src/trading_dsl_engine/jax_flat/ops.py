@@ -44,6 +44,14 @@ class CumsumState:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class SegmentedCumsumState:
+    value: jax.Array
+    key: jax.Array
+    initialized: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class ShiftState:
     buffer: jax.Array
     pos: jax.Array
@@ -334,6 +342,48 @@ class CumsumOp(Op):
 
 
 @dataclass(frozen=True)
+class SegmentedCumsumOp(Op):
+    output_kind: str = "vector"
+    output_width: int | None = 1
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        sample = jnp.asarray(sample)
+        return SegmentedCumsumState(
+            value=jnp.zeros_like(sample),
+            key=jnp.full_like(sample, jnp.nan, dtype=jnp.float64),
+            initialized=jnp.zeros_like(sample, dtype=bool),
+        )
+
+    def tick(self, state: SegmentedCumsumState, *child_values: jax.Array):
+        x, key = child_values[:2]
+        key_values = _lag_vector(key, x.shape[0])
+        same_key = state.initialized & _same_key_array(key_values, state.key)
+        valid = jnp.isfinite(x)
+        value = jnp.where(same_key, state.value, 0.0) + jnp.where(valid, x, 0.0)
+        initialized = state.initialized | jnp.isfinite(key_values) | jnp.isnan(key_values)
+        out = jnp.where(valid, value, jnp.nan)
+        return SegmentedCumsumState(value=value, key=key_values, initialized=initialized), out
+
+    def scan_batch(self, state: SegmentedCumsumState, *child_sequences: jax.Array):
+        x = _broadcast_sequence_to_state(child_sequences[0], state.value)
+        key = _lag_matrix(child_sequences[1], x.shape[0], x.shape[1])
+
+        def step(carry, values):
+            state_c = SegmentedCumsumState(*carry)
+            next_state, out = self.tick(state_c, *values)
+            return (next_state.value, next_state.key, next_state.initialized), out
+
+        carry, out = jax.lax.scan(
+            step,
+            (state.value, state.key, state.initialized),
+            (x, key),
+            unroll=32,
+        )
+        return SegmentedCumsumState(*carry), out
+
+
+@dataclass(frozen=True)
 class FFillOp(Op):
     limit: int | None = None
     dynamic_limit: bool = False
@@ -587,6 +637,10 @@ def _lag_vector(x, rows: int):
     return x[:, 0]
 
 
+def _same_key_array(left, right):
+    return (left == right) | (jnp.isnan(left) & jnp.isnan(right))
+
+
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
 
@@ -617,6 +671,11 @@ def _xs_sort(x):
     return jnp.sort(x)
 
 
+def _normalize_basis_values(values):
+    total = jnp.sum(values, axis=-1, keepdims=True)
+    return jnp.where(total <= 1e-18, 1.0 / values.shape[-1], values / total)
+
+
 def _bspline(x, n_basis: int):
     x = jnp.asarray(x)
     clipped = jnp.clip(x, 0.0, 1.0)
@@ -624,10 +683,91 @@ def _bspline(x, n_basis: int):
     sigma = 1.0 / n_basis
     dist = jnp.abs(clipped[:, None] - centers[None, :])
     circ_dist = jnp.minimum(dist, 1.0 - dist)
-    values = jnp.exp(-0.5 * (circ_dist / sigma) ** 2)
-    total = jnp.sum(values, axis=1, keepdims=True)
-    values = jnp.where(total <= 1e-18, 1.0 / n_basis, values / total)
+    values = _normalize_basis_values(jnp.exp(-0.5 * (circ_dist / sigma) ** 2))
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
+
+
+def _rbf_basis(x, n_basis: int):
+    x = jnp.asarray(x)
+    clipped = jnp.clip(x, 0.0, 1.0)
+    centers = jnp.linspace(0.0, 1.0, n_basis, dtype=jnp.float64)
+    sigma = 1.0 / max(n_basis - 1, 1)
+    dist = clipped[:, None] - centers[None, :]
+    values = _normalize_basis_values(jnp.exp(-0.5 * (dist / sigma) ** 2))
+    return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
+
+
+def _session_vectors(*values):
+    arrays = tuple(jnp.asarray(value) for value in values)
+    rows = next((array.shape[0] for array in arrays if array.ndim > 0), 1)
+    return tuple(_lag_vector(array, rows) for array in arrays)
+
+
+def _session_phase(ev_ts, session_start, session_end):
+    ev_ts, session_start, session_end = _session_vectors(ev_ts, session_start, session_end)
+    session_len = session_end - session_start
+    finite = jnp.isfinite(ev_ts) & jnp.isfinite(session_start) & jnp.isfinite(session_end)
+    valid_session = finite & (session_len > 0.0)
+    phase = (ev_ts - session_start) / jnp.where(session_len > 0.0, session_len, jnp.nan)
+    in_session = valid_session & (ev_ts >= session_start) & (ev_ts < session_end)
+    return phase, in_session, valid_session
+
+
+def _session_rbf_basis(ev_ts, session_start, session_end, n_basis: int, is_tradable=None):
+    phase, in_session, _ = _session_phase(ev_ts, session_start, session_end)
+    out = _rbf_basis(phase, n_basis)
+    valid = in_session
+    if is_tradable is not None:
+        (tradable,) = _session_vectors(is_tradable)
+        valid = valid & (tradable != 0.0) & jnp.isfinite(tradable)
+    return jnp.where(valid[:, None], out, jnp.nan)
+
+
+def _basis_suffix_table(n_basis: int, n_steps: int):
+    grid = jnp.arange(n_steps, dtype=jnp.float64) / n_steps
+    values = _rbf_basis(grid, n_basis)
+    suffix = jnp.flip(jnp.cumsum(jnp.flip(values, axis=0), axis=0), axis=0)
+    return jnp.concatenate((suffix, jnp.zeros((1, n_basis), dtype=values.dtype)), axis=0)
+
+
+def _future_session_rbf_basis_sum(
+    ev_ts,
+    session_start,
+    session_end,
+    n_basis: int,
+    n_steps: int,
+    next_session_start=None,
+    next_session_end=None,
+):
+    ev_ts, session_start, session_end = _session_vectors(ev_ts, session_start, session_end)
+    if next_session_start is not None and next_session_end is not None:
+        next_session_start, next_session_end = _session_vectors(next_session_start, next_session_end)
+        current_len = session_end - session_start
+        current_valid = jnp.isfinite(session_start) & jnp.isfinite(session_end) & (current_len > 0.0)
+        next_len = next_session_end - next_session_start
+        next_valid = jnp.isfinite(next_session_start) & jnp.isfinite(next_session_end) & (next_len > 0.0)
+        use_next = (~current_valid | (ev_ts >= session_end)) & next_valid
+        session_start = jnp.where(use_next, next_session_start, session_start)
+        session_end = jnp.where(use_next, next_session_end, session_end)
+
+    session_len = session_end - session_start
+    finite = jnp.isfinite(ev_ts) & jnp.isfinite(session_start) & jnp.isfinite(session_end)
+    valid_session = finite & (session_len > 0.0)
+    phase = (ev_ts - session_start) / jnp.where(session_len > 0.0, session_len, jnp.nan)
+    clipped = jnp.clip(phase, 0.0, 1.0)
+    inside_idx = jnp.floor(clipped * n_steps).astype(jnp.int32) + 1
+    idx = jnp.where(ev_ts < session_start, 0, jnp.where(ev_ts >= session_end, n_steps, inside_idx))
+    idx = jnp.clip(idx, 0, n_steps)
+    out = _basis_suffix_table(n_basis, n_steps)[idx]
+    return jnp.where(valid_session[:, None], out, jnp.nan)
+
+
+def _future_rbf_basis_sum(x, n_basis: int, n_steps: int):
+    x = jnp.asarray(x)
+    clipped = jnp.clip(x, 0.0, 1.0)
+    idx = jnp.clip(jnp.floor(clipped * n_steps).astype(jnp.int32) + 1, 0, n_steps)
+    out = _basis_suffix_table(n_basis, n_steps)[idx]
+    return jnp.where(jnp.isnan(x)[:, None], jnp.nan, out)
 
 
 def _get_beta(value: RidgeValue):
@@ -663,6 +803,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar"),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None),
     ("cumsum", 1): lambda: CumsumOp(),
+    ("segmented_cumsum", 2): lambda: SegmentedCumsumOp(),
     ("get_beta", 1): lambda: NaryOp(_get_beta),
     ("get_preds", 1): lambda: NaryOp(_get_preds),
     ("add", 2): lambda: NaryOp(lambda l, r: l + r),

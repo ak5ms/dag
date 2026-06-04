@@ -30,6 +30,10 @@ from trading_dsl_engine.jax_flat.ops import (
     RidgeOp,
     ShiftOp,
     _bspline,
+    _rbf_basis,
+    _session_rbf_basis,
+    _future_rbf_basis_sum,
+    _future_session_rbf_basis_sum,
     _cat,
     _col,
 )
@@ -569,7 +573,7 @@ def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -
     return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
 
 
-def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
+def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
     if expr.kwargs:
@@ -627,6 +631,77 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
         return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+    if expr.fn == "rbf_basis" and len(expr.args) == 2:
+        n_basis = _literal_int_arg(expr.args[1], "rbf_basis", 2)
+        if n_basis <= 0:
+            raise ValueError("rbf_basis n_basis must be >= 1")
+        return NaryOp(lambda x, n_basis=n_basis: _rbf_basis(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+    if expr.fn == "session_rbf_basis" and len(expr.args) in (4, 5):
+        n_basis = _literal_int_arg(expr.args[-1], "session_rbf_basis", len(expr.args))
+        if n_basis <= 0:
+            raise ValueError("session_rbf_basis n_basis must be >= 1")
+        if len(expr.args) == 4:
+            return (
+                NaryOp(
+                    lambda ev_ts, start, end, n_basis=n_basis: _session_rbf_basis(ev_ts, start, end, n_basis),
+                    output_kind="matrix",
+                    output_width=n_basis,
+                ),
+                3,
+            )
+        return (
+            NaryOp(
+                lambda ev_ts, start, end, is_tradable, n_basis=n_basis: _session_rbf_basis(
+                    ev_ts, start, end, n_basis, is_tradable
+                ),
+                output_kind="matrix",
+                output_width=n_basis,
+            ),
+            4,
+        )
+    if expr.fn == "future_rbf_basis_sum" and len(expr.args) == 3:
+        n_basis = _literal_int_arg(expr.args[1], "future_rbf_basis_sum", 2)
+        n_steps = _literal_int_arg(expr.args[2], "future_rbf_basis_sum", 3)
+        if n_basis <= 0:
+            raise ValueError("future_rbf_basis_sum n_basis must be >= 1")
+        if n_steps <= 0:
+            raise ValueError("future_rbf_basis_sum n_steps must be >= 1")
+        return (
+            NaryOp(
+                lambda x, n_basis=n_basis, n_steps=n_steps: _future_rbf_basis_sum(x, n_basis, n_steps),
+                output_kind="matrix",
+                output_width=n_basis,
+            ),
+            (1, 2),
+        )
+    if expr.fn == "future_session_rbf_basis_sum" and len(expr.args) in (5, 7):
+        n_basis = _literal_int_arg(expr.args[-2], "future_session_rbf_basis_sum", len(expr.args) - 1)
+        n_steps = _literal_int_arg(expr.args[-1], "future_session_rbf_basis_sum", len(expr.args))
+        if n_basis <= 0:
+            raise ValueError("future_session_rbf_basis_sum n_basis must be >= 1")
+        if n_steps <= 0:
+            raise ValueError("future_session_rbf_basis_sum n_steps must be >= 1")
+        if len(expr.args) == 5:
+            return (
+                NaryOp(
+                    lambda ev_ts, start, end, n_basis=n_basis, n_steps=n_steps: _future_session_rbf_basis_sum(
+                        ev_ts, start, end, n_basis, n_steps
+                    ),
+                    output_kind="matrix",
+                    output_width=n_basis,
+                ),
+                (3, 4),
+            )
+        return (
+            NaryOp(
+                lambda ev_ts, start, end, next_start, next_end, n_basis=n_basis, n_steps=n_steps: (
+                    _future_session_rbf_basis_sum(ev_ts, start, end, n_basis, n_steps, next_start, next_end)
+                ),
+                output_kind="matrix",
+                output_width=n_basis,
+            ),
+            (5, 6),
+        )
     if expr.fn == "col" and len(expr.args) == 2:
         index = _literal_int_arg(expr.args[1], "col", 2)
         if index < 0:
@@ -723,7 +798,8 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             )
             op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
             if drop_child_idx is not None:
-                child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
+                drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+                child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
             idx = len(nodes)
             nodes.append(DagNode(op=op, child_ids=child_ids))
             memo[key] = idx
@@ -870,7 +946,8 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
-        child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
+        drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+        child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
     idx = len(nodes)
     nodes.append(DagNode(op=op, child_ids=child_ids))
     memo[key] = idx
