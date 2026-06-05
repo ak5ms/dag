@@ -17,6 +17,8 @@ from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistr
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
+    BasisMeanOp,
+    InstrumentBasisMeanOp,
     BufferShiftOp,
     EwmOp,
     FFillOp,
@@ -110,6 +112,31 @@ class InnerGraphOp(Op):
             values[idx] = value
 
         return tuple(new_state), values[self.output_id]
+
+    def scan_batch(self, state_leaves, *input_sequences: jax.Array):
+        n_steps = input_sequences[0].shape[0]
+        values: list[Any] = [jnp.array(0.0)] * len(self.nodes)
+        new_state = list(()) if state_leaves is None else list(state_leaves)
+
+        for idx, node in enumerate(self.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = input_sequences[op.input_index]
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            field = self.state_layout.node_fields[idx]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.scan_batch(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
+            values[idx] = value
+
+        next_states = tuple(new_state) if state_leaves is not None else None
+        return next_states, values[self.output_id]
 
 
 class JaxFlatRuntime(eqx.Module):
@@ -338,7 +365,7 @@ def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
     return _scan_batch(runtime, state0, inputs)
 
 
-_BATCH_CHUNK_SIZE = 2560
+_BATCH_CHUNK_SIZE = int(os.environ.get("TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE", "65536"))
 
 
 @jax.jit
@@ -707,6 +734,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if index < 0:
             raise ValueError("col index must be >= 0")
         return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
+    if expr.fn == "BasisMean" and len(expr.args) in (3, 4):
+        has_weights = len(expr.args) == 4
+        feature_op = child_ops[0]
+        return BasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
+    if expr.fn == "InstrumentBasisMean" and len(expr.args) in (3, 4):
+        has_weights = len(expr.args) == 4
+        feature_op = child_ops[0]
+        return InstrumentBasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
     if expr.fn == "Ridge" and len(expr.args) >= 4:
         has_weights = len(expr.args) >= 5
         feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]

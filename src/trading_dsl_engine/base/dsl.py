@@ -359,6 +359,26 @@ def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
     return mul(_floor_expr(add(div(x, micros), 0.5)), micros)
 
 
+def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noqa: N802
+    if y is None or hl is None:
+        if weights is not None:
+            raise TypeError("InstrumentBasisMean positional form cannot combine positional y/hl with keyword weights")
+        return call("InstrumentBasisMean", features)
+    if weights is None:
+        return call("InstrumentBasisMean", features, y, 1.0, hl)
+    return call("InstrumentBasisMean", features, y, weights, hl)
+
+
+def BasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noqa: N802
+    if y is None or hl is None:
+        if weights is not None:
+            raise TypeError("BasisMean positional form cannot combine positional y/hl with keyword weights")
+        return call("BasisMean", features)
+    if weights is None:
+        return call("BasisMean", features, y, 1.0, hl)
+    return call("BasisMean", features, y, weights, hl)
+
+
 def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> Expr:  # noqa: N802
     ridge_lambda = lambda_ if lambda_ is not None else lam
     if y is None or hl is None or ridge_lambda is None:

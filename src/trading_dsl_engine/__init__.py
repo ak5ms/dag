@@ -2,6 +2,8 @@ from trading_dsl_engine.base.compiler import CompileStats, CompiledFormulaArtifa
 from trading_dsl_engine.base.dsl import (
     DEFAULT_DSL_REGISTRY,
     DSLFunctionRegistry,
+    BasisMean,
+    InstrumentBasisMean,
     Ridge,
     abs,
     add,
@@ -131,6 +133,8 @@ __all__ = [
     "grouped",
     "groupby",
     "rolling_quantile",
+    "BasisMean",
+    "InstrumentBasisMean",
     "Ridge",
     "get_beta",
     "get_preds",
