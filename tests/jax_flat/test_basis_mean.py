@@ -1,12 +1,12 @@
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import InstrumentBasisMean, get_beta, rbf_basis, var
+from trading_dsl_engine.base.dsl import InstrumentBasisMean, get_beta, session_rbf_basis, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
 
 def test_instrument_basis_mean_batch_matches_tick_and_tracks_per_instrument_betas():
-    x = jnp.array(
+    ev_ts = jnp.array(
         [
             [0.0, 0.5],
             [0.25, 0.75],
@@ -15,6 +15,8 @@ def test_instrument_basis_mean_batch_matches_tick_and_tracks_per_instrument_beta
         ],
         dtype=jnp.float64,
     )
+    start = jnp.zeros_like(ev_ts)
+    end = jnp.ones_like(ev_ts)
     y = jnp.array(
         [
             [10.0, 20.0],
@@ -24,14 +26,16 @@ def test_instrument_basis_mean_batch_matches_tick_and_tracks_per_instrument_beta
         ],
         dtype=jnp.float64,
     )
-    runtime = compile_formula(get_beta(InstrumentBasisMean(rbf_basis(var("x"), 3), var("y"), 1.0, 100.0)))
+    runtime = compile_formula(
+        get_beta(InstrumentBasisMean(session_rbf_basis(var("ev_ts"), var("start"), var("end"), 3), var("y"), 1.0, 100.0))
+    )
 
-    state, batch_out = runtime.run_batch({"x": x, "y": y})
+    state, batch_out = runtime.run_batch({"ev_ts": ev_ts, "start": start, "end": end, "y": y})
 
     tick_state = runtime.init_state(2)
     tick_rows = []
-    for row in range(x.shape[0]):
-        tick_state, tick_out = runtime.tick(tick_state, x[row], y[row])
+    for row in range(ev_ts.shape[0]):
+        tick_state, tick_out = runtime.tick(tick_state, ev_ts[row], start[row], end[row], y[row])
         tick_rows.append(np.asarray(tick_out))
 
     np.testing.assert_allclose(np.asarray(batch_out), np.stack(tick_rows), rtol=1e-12, atol=1e-12)

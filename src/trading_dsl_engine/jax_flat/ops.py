@@ -82,7 +82,7 @@ class RidgeState:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class BasisMeanState:
+class InstrumentBasisMeanState:
     num: jax.Array
     den: jax.Array
     has_value: jax.Array
@@ -99,7 +99,7 @@ class RidgeValue:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class BasisMeanValue:
+class InstrumentBasisMeanValue:
     beta: jax.Array
     preds: jax.Array
 
@@ -493,76 +493,6 @@ class FFillOp(Op):
 
 
 @dataclass(frozen=True)
-class BasisMeanOp(Op):
-    feature_width: int
-    has_weights: bool
-    output_kind: str = "object"
-    output_width: int | None = None
-    is_stateful: bool = True
-
-    def init_state(self, sample: jax.Array):
-        n = jnp.asarray(sample).shape[0]
-        return BasisMeanState(
-            num=jnp.zeros((self.feature_width,), dtype=jnp.float64),
-            den=jnp.zeros((self.feature_width,), dtype=jnp.float64),
-            has_value=jnp.zeros((self.feature_width,), dtype=bool),
-            beta=jnp.zeros((self.feature_width,), dtype=jnp.float64),
-            preds=jnp.full((n,), jnp.nan, dtype=jnp.float64),
-        )
-
-    def tick(self, state: BasisMeanState, *child_values: jax.Array):
-        if self.has_weights:
-            features, y, weights, hl = child_values[:4]
-        else:
-            features, y, hl = child_values[:3]
-            weights = jnp.asarray(1.0, dtype=jnp.float64)
-        xmat = RidgeOp._as_feature_matrix(features)
-        y = jnp.asarray(y)
-        y_vec = y[:, 0] if y.ndim == 2 else y
-        weights = jnp.asarray(weights)
-        if weights.ndim == 0:
-            w = jnp.full((xmat.shape[0],), weights)
-        elif weights.ndim == 2 and weights.shape[1] == 1:
-            w = weights[:, 0]
-        else:
-            w = weights
-        valid = jnp.isfinite(xmat) & jnp.isfinite(y_vec)[:, None] & jnp.isfinite(w)[:, None]
-        x0 = jnp.where(valid, xmat, 0.0)
-        yw = jnp.where(jnp.isfinite(y_vec) & jnp.isfinite(w), y_vec * w, 0.0)
-        w0 = jnp.where(jnp.isfinite(w), w, 0.0)
-        num_new = jnp.sum(x0 * yw[:, None], axis=0)
-        den_new = jnp.sum(x0 * w0[:, None], axis=0)
-        valid_feature = jnp.sum(valid, axis=0) > 0
-        hl_value = _scalar_value(hl)
-        rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
-        alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
-        num_update = jnp.where(state.has_value, state.num * (1.0 - alpha) + num_new * alpha, num_new)
-        den_update = jnp.where(state.has_value, state.den * (1.0 - alpha) + den_new * alpha, den_new)
-        num = jnp.where(valid_feature, num_update, state.num)
-        den = jnp.where(valid_feature, den_update, state.den)
-        has_value = state.has_value | valid_feature
-        beta_candidate = num / jnp.where(den != 0.0, den, jnp.nan)
-        beta = jnp.where(jnp.isfinite(beta_candidate), beta_candidate, state.beta)
-        row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
-        preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
-        return BasisMeanState(num=num, den=den, has_value=has_value, beta=beta, preds=preds), BasisMeanValue(beta=beta, preds=preds)
-
-    def scan_batch(self, state: BasisMeanState, *child_sequences: jax.Array):
-        def step(carry, values):
-            state_c = BasisMeanState(*carry)
-            next_state, out = self.tick(state_c, *values)
-            return (next_state.num, next_state.den, next_state.has_value, next_state.beta, next_state.preds), out
-
-        carry, out = jax.lax.scan(
-            step,
-            (state.num, state.den, state.has_value, state.beta, state.preds),
-            child_sequences,
-            unroll=32,
-        )
-        return BasisMeanState(*carry), out
-
-
-@dataclass(frozen=True)
 class InstrumentBasisMeanOp(Op):
     feature_width: int
     has_weights: bool
@@ -573,7 +503,7 @@ class InstrumentBasisMeanOp(Op):
     def init_state(self, sample: jax.Array):
         n = jnp.asarray(sample).shape[0]
         shape = (n, self.feature_width)
-        return BasisMeanState(
+        return InstrumentBasisMeanState(
             num=jnp.zeros(shape, dtype=jnp.float64),
             den=jnp.zeros(shape, dtype=jnp.float64),
             has_value=jnp.zeros(shape, dtype=bool),
@@ -581,7 +511,7 @@ class InstrumentBasisMeanOp(Op):
             preds=jnp.full((n,), jnp.nan, dtype=jnp.float64),
         )
 
-    def tick(self, state: BasisMeanState, *child_values: jax.Array):
+    def tick(self, state: InstrumentBasisMeanState, *child_values: jax.Array):
         if self.has_weights:
             features, y, weights, hl = child_values[:4]
         else:
@@ -615,11 +545,11 @@ class InstrumentBasisMeanOp(Op):
         beta_candidate = num / jnp.where(den != 0.0, den, jnp.nan)
         beta = jnp.where(jnp.isfinite(beta_candidate), beta_candidate, state.beta)
         preds = jnp.where(valid_row & jnp.all(jnp.isfinite(xmat), axis=1), jnp.sum(xmat * state.beta, axis=1), jnp.nan)
-        return BasisMeanState(num=num, den=den, has_value=has_value, beta=beta, preds=preds), BasisMeanValue(beta=beta, preds=preds)
+        return InstrumentBasisMeanState(num=num, den=den, has_value=has_value, beta=beta, preds=preds), InstrumentBasisMeanValue(beta=beta, preds=preds)
 
-    def scan_batch(self, state: BasisMeanState, *child_sequences: jax.Array):
+    def scan_batch(self, state: InstrumentBasisMeanState, *child_sequences: jax.Array):
         def step(carry, values):
-            state_c = BasisMeanState(*carry)
+            state_c = InstrumentBasisMeanState(*carry)
             next_state, out = self.tick(state_c, *values)
             return (next_state.num, next_state.den, next_state.has_value, next_state.beta, next_state.preds), out
 
@@ -629,7 +559,7 @@ class InstrumentBasisMeanOp(Op):
             child_sequences,
             unroll=32,
         )
-        return BasisMeanState(*carry), out
+        return InstrumentBasisMeanState(*carry), out
 
 
 @dataclass(frozen=True)
@@ -1004,14 +934,6 @@ def _future_session_rbf_basis_sum(
     idx = jnp.clip(idx, 0, n_steps)
     out = _basis_suffix_table(n_basis, n_steps)[idx]
     return jnp.where(valid_session[:, None], out, jnp.nan)
-
-
-def _future_rbf_basis_sum(x, n_basis: int, n_steps: int):
-    x = jnp.asarray(x)
-    clipped = jnp.clip(x, 0.0, 1.0)
-    idx = jnp.clip(jnp.floor(clipped * n_steps).astype(jnp.int32) + 1, 0, n_steps)
-    out = _basis_suffix_table(n_basis, n_steps)[idx]
-    return jnp.where(jnp.isnan(x)[:, None], jnp.nan, out)
 
 
 def _get_beta(value: RidgeValue):

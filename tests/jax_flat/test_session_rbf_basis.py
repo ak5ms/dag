@@ -1,16 +1,9 @@
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import (
-    einsum,
-    future_rbf_basis_sum,
-    future_session_rbf_basis_sum,
-    rbf_basis,
-    session_rbf_basis,
-    var,
-)
+from trading_dsl_engine.base.dsl import einsum, future_session_rbf_basis_sum, session_rbf_basis, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
-from trading_dsl_engine.jax_flat.ops import _future_rbf_basis_sum, _rbf_basis
+from trading_dsl_engine.jax_flat.ops import _basis_suffix_table, _rbf_basis
 
 
 def test_session_rbf_basis_uses_epoch_session_clock_and_masks_non_tradable_rows():
@@ -39,8 +32,7 @@ def test_future_session_rbf_basis_sum_uses_current_session_without_phase_precomp
     formula = future_session_rbf_basis_sum(var("ev_ts"), var("start"), var("end"), 3, 8)
     _, out = compile_formula(formula).run_batch({"ev_ts": ev_ts, "start": start, "end": end})
 
-    phases = jnp.array([0.0, 0.25, 0.99, 1.0], dtype=jnp.float64)
-    expected = np.asarray(_future_rbf_basis_sum(phases, 3, 8))
+    expected = np.asarray(_basis_suffix_table(3, 8))[[1, 3, 8, 8]]
     np.testing.assert_allclose(np.asarray(out[0]), expected, rtol=1e-12, atol=1e-12)
 
 
@@ -65,9 +57,7 @@ def test_future_session_rbf_basis_sum_can_roll_to_next_session_after_close():
     )
 
     # 250 is before next session -> full next-session mass. 350 is 25% into next session.
-    full_session = np.asarray(_rbf_basis(jnp.arange(8, dtype=jnp.float64) / 8.0, 3)).sum(axis=0)
-    partial_session = np.asarray(_future_rbf_basis_sum(jnp.array([0.25], dtype=jnp.float64), 3, 8))[0]
-    expected = np.stack([full_session, partial_session])
+    expected = np.asarray(_basis_suffix_table(3, 8))[[0, 3]]
     np.testing.assert_allclose(np.asarray(out[0]), expected, rtol=1e-12, atol=1e-12)
 
 
@@ -85,24 +75,25 @@ def test_future_session_rbf_basis_sum_uses_next_session_when_current_bounds_are_
         {"ev_ts": ev_ts, "start": start, "end": end, "next_start": next_start, "next_end": next_end}
     )
 
-    expected = np.asarray(_rbf_basis(jnp.arange(8, dtype=jnp.float64) / 8.0, 3)).sum(axis=0)
+    expected = np.asarray(_basis_suffix_table(3, 8))[0]
     np.testing.assert_allclose(np.asarray(out[0, 0]), expected, rtol=1e-12, atol=1e-12)
 
 
-def test_session_basis_projection_matches_phase_based_projection_inside_session():
+def test_session_basis_projection_matches_explicit_session_phase_projection_inside_session():
     ev_ts = jnp.array([[125.0, 175.0]], dtype=jnp.float64)
     start = jnp.full_like(ev_ts, 100.0)
     end = jnp.full_like(ev_ts, 200.0)
-    phase = (ev_ts - start) / (end - start)
 
-    session_formula = einsum(
+    formula = einsum(
         session_rbf_basis(var("ev_ts"), var("start"), var("end"), 3),
         future_session_rbf_basis_sum(var("ev_ts"), var("start"), var("end"), 3, 8),
         "nf,nf->n",
     )
-    phase_formula = einsum(rbf_basis(var("phase"), 3), future_rbf_basis_sum(var("phase"), 3, 8), "nf,nf->n")
 
-    _, session_out = compile_formula(session_formula).run_batch({"ev_ts": ev_ts, "start": start, "end": end})
-    _, phase_out = compile_formula(phase_formula).run_batch({"phase": phase})
+    _, out = compile_formula(formula).run_batch({"ev_ts": ev_ts, "start": start, "end": end})
 
-    np.testing.assert_allclose(np.asarray(session_out), np.asarray(phase_out), rtol=1e-12, atol=1e-12)
+    phase = np.asarray(((ev_ts - start) / (end - start))[0])
+    basis = np.asarray(_rbf_basis(jnp.asarray(phase), 3))
+    suffix = np.asarray(_basis_suffix_table(3, 8))[[3, 7]]
+    expected = np.einsum("nf,nf->n", basis, suffix)
+    np.testing.assert_allclose(np.asarray(out[0]), expected, rtol=1e-12, atol=1e-12)

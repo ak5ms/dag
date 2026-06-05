@@ -17,7 +17,6 @@ from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistr
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
-    BasisMeanOp,
     InstrumentBasisMeanOp,
     BufferShiftOp,
     EwmOp,
@@ -32,9 +31,7 @@ from trading_dsl_engine.jax_flat.ops import (
     RidgeOp,
     ShiftOp,
     _bspline,
-    _rbf_basis,
     _session_rbf_basis,
-    _future_rbf_basis_sum,
     _future_session_rbf_basis_sum,
     _cat,
     _col,
@@ -658,11 +655,6 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
         return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
-    if expr.fn == "rbf_basis" and len(expr.args) == 2:
-        n_basis = _literal_int_arg(expr.args[1], "rbf_basis", 2)
-        if n_basis <= 0:
-            raise ValueError("rbf_basis n_basis must be >= 1")
-        return NaryOp(lambda x, n_basis=n_basis: _rbf_basis(x, n_basis), output_kind="matrix", output_width=n_basis), 1
     if expr.fn == "session_rbf_basis" and len(expr.args) in (4, 5):
         n_basis = _literal_int_arg(expr.args[-1], "session_rbf_basis", len(expr.args))
         if n_basis <= 0:
@@ -685,21 +677,6 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
                 output_width=n_basis,
             ),
             4,
-        )
-    if expr.fn == "future_rbf_basis_sum" and len(expr.args) == 3:
-        n_basis = _literal_int_arg(expr.args[1], "future_rbf_basis_sum", 2)
-        n_steps = _literal_int_arg(expr.args[2], "future_rbf_basis_sum", 3)
-        if n_basis <= 0:
-            raise ValueError("future_rbf_basis_sum n_basis must be >= 1")
-        if n_steps <= 0:
-            raise ValueError("future_rbf_basis_sum n_steps must be >= 1")
-        return (
-            NaryOp(
-                lambda x, n_basis=n_basis, n_steps=n_steps: _future_rbf_basis_sum(x, n_basis, n_steps),
-                output_kind="matrix",
-                output_width=n_basis,
-            ),
-            (1, 2),
         )
     if expr.fn == "future_session_rbf_basis_sum" and len(expr.args) in (5, 7):
         n_basis = _literal_int_arg(expr.args[-2], "future_session_rbf_basis_sum", len(expr.args) - 1)
@@ -734,10 +711,6 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if index < 0:
             raise ValueError("col index must be >= 0")
         return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
-    if expr.fn == "BasisMean" and len(expr.args) in (3, 4):
-        has_weights = len(expr.args) == 4
-        feature_op = child_ops[0]
-        return BasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
     if expr.fn == "InstrumentBasisMean" and len(expr.args) in (3, 4):
         has_weights = len(expr.args) == 4
         feature_op = child_ops[0]
