@@ -547,20 +547,6 @@ class InstrumentBasisMeanOp(Op):
         preds = jnp.where(valid_row & jnp.all(jnp.isfinite(xmat), axis=1), jnp.sum(xmat * state.beta, axis=1), jnp.nan)
         return InstrumentBasisMeanState(num=num, den=den, has_value=has_value, beta=beta, preds=preds), InstrumentBasisMeanValue(beta=beta, preds=preds)
 
-    def scan_batch(self, state: InstrumentBasisMeanState, *child_sequences: jax.Array):
-        def step(carry, values):
-            state_c = InstrumentBasisMeanState(*carry)
-            next_state, out = self.tick(state_c, *values)
-            return (next_state.num, next_state.den, next_state.has_value, next_state.beta, next_state.preds), out
-
-        carry, out = jax.lax.scan(
-            step,
-            (state.num, state.den, state.has_value, state.beta, state.preds),
-            child_sequences,
-            unroll=32,
-        )
-        return InstrumentBasisMeanState(*carry), out
-
 
 @dataclass(frozen=True)
 class RidgeOp(Op):
