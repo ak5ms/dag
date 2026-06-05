@@ -31,8 +31,8 @@ from trading_dsl_engine.jax_flat.ops import (
     RidgeOp,
     ShiftOp,
     _bspline,
-    _session_rbf_basis,
-    _future_session_rbf_basis_sum,
+    _RBF_basis,
+    _future_RBF_basis_sum,
     _cat,
     _col,
 )
@@ -655,14 +655,16 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
         return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
-    if expr.fn == "session_rbf_basis" and len(expr.args) in (4, 5):
-        n_basis = _literal_int_arg(expr.args[-1], "session_rbf_basis", len(expr.args))
+    if expr.fn == "RBF_basis" and len(expr.args) in (2, 4, 5):
+        n_basis = _literal_int_arg(expr.args[-1], "RBF_basis", len(expr.args))
         if n_basis <= 0:
-            raise ValueError("session_rbf_basis n_basis must be >= 1")
+            raise ValueError("RBF_basis n_basis must be >= 1")
+        if len(expr.args) == 2:
+            return NaryOp(lambda x, n_basis=n_basis: _RBF_basis(x, n_basis), output_kind="matrix", output_width=n_basis), 1
         if len(expr.args) == 4:
             return (
                 NaryOp(
-                    lambda ev_ts, start, end, n_basis=n_basis: _session_rbf_basis(ev_ts, start, end, n_basis),
+                    lambda ev_ts, start, end, n_basis=n_basis: _RBF_basis(ev_ts, start, end, n_basis),
                     output_kind="matrix",
                     output_width=n_basis,
                 ),
@@ -670,7 +672,7 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
             )
         return (
             NaryOp(
-                lambda ev_ts, start, end, is_tradable, n_basis=n_basis: _session_rbf_basis(
+                lambda ev_ts, start, end, is_tradable, n_basis=n_basis: _RBF_basis(
                     ev_ts, start, end, n_basis, is_tradable
                 ),
                 output_kind="matrix",
@@ -678,17 +680,26 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
             ),
             4,
         )
-    if expr.fn == "future_session_rbf_basis_sum" and len(expr.args) in (5, 7):
-        n_basis = _literal_int_arg(expr.args[-2], "future_session_rbf_basis_sum", len(expr.args) - 1)
-        n_steps = _literal_int_arg(expr.args[-1], "future_session_rbf_basis_sum", len(expr.args))
+    if expr.fn == "future_RBF_basis_sum" and len(expr.args) in (3, 5, 7):
+        n_basis = _literal_int_arg(expr.args[-2], "future_RBF_basis_sum", len(expr.args) - 1)
+        n_steps = _literal_int_arg(expr.args[-1], "future_RBF_basis_sum", len(expr.args))
         if n_basis <= 0:
-            raise ValueError("future_session_rbf_basis_sum n_basis must be >= 1")
+            raise ValueError("future_RBF_basis_sum n_basis must be >= 1")
         if n_steps <= 0:
-            raise ValueError("future_session_rbf_basis_sum n_steps must be >= 1")
+            raise ValueError("future_RBF_basis_sum n_steps must be >= 1")
+        if len(expr.args) == 3:
+            return (
+                NaryOp(
+                    lambda x, n_basis=n_basis, n_steps=n_steps: _future_RBF_basis_sum(x, n_basis, n_steps),
+                    output_kind="matrix",
+                    output_width=n_basis,
+                ),
+                (1, 2),
+            )
         if len(expr.args) == 5:
             return (
                 NaryOp(
-                    lambda ev_ts, start, end, n_basis=n_basis, n_steps=n_steps: _future_session_rbf_basis_sum(
+                    lambda ev_ts, start, end, n_basis=n_basis, n_steps=n_steps: _future_RBF_basis_sum(
                         ev_ts, start, end, n_basis, n_steps
                     ),
                     output_kind="matrix",
@@ -699,7 +710,7 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         return (
             NaryOp(
                 lambda ev_ts, start, end, next_start, next_end, n_basis=n_basis, n_steps=n_steps: (
-                    _future_session_rbf_basis_sum(ev_ts, start, end, n_basis, n_steps, next_start, next_end)
+                    _future_RBF_basis_sum(ev_ts, start, end, n_basis, n_steps, next_start, next_end)
                 ),
                 output_kind="matrix",
                 output_width=n_basis,

@@ -861,7 +861,7 @@ def _bspline(x, n_basis: int):
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
 
 
-def _rbf_basis(x, n_basis: int):
+def _normalized_RBF_basis(x, n_basis: int):
     x = jnp.asarray(x)
     clipped = jnp.clip(x, 0.0, 1.0)
     centers = jnp.linspace(0.0, 1.0, n_basis, dtype=jnp.float64)
@@ -887,9 +887,9 @@ def _session_phase(ev_ts, session_start, session_end):
     return phase, in_session, valid_session
 
 
-def _session_rbf_basis(ev_ts, session_start, session_end, n_basis: int, is_tradable=None):
+def _session_RBF_basis(ev_ts, session_start, session_end, n_basis: int, is_tradable=None):
     phase, in_session, _ = _session_phase(ev_ts, session_start, session_end)
-    out = _rbf_basis(phase, n_basis)
+    out = _normalized_RBF_basis(phase, n_basis)
     valid = in_session
     if is_tradable is not None:
         (tradable,) = _session_vectors(is_tradable)
@@ -899,12 +899,12 @@ def _session_rbf_basis(ev_ts, session_start, session_end, n_basis: int, is_trada
 
 def _basis_suffix_table(n_basis: int, n_steps: int):
     grid = jnp.arange(n_steps, dtype=jnp.float64) / n_steps
-    values = _rbf_basis(grid, n_basis)
+    values = _normalized_RBF_basis(grid, n_basis)
     suffix = jnp.flip(jnp.cumsum(jnp.flip(values, axis=0), axis=0), axis=0)
     return jnp.concatenate((suffix, jnp.zeros((1, n_basis), dtype=values.dtype)), axis=0)
 
 
-def _future_session_rbf_basis_sum(
+def _future_session_RBF_basis_sum(
     ev_ts,
     session_start,
     session_end,
@@ -935,6 +935,42 @@ def _future_session_rbf_basis_sum(
     out = _basis_suffix_table(n_basis, n_steps)[idx]
     return jnp.where(valid_session[:, None], out, jnp.nan)
 
+
+
+def _future_phase_RBF_basis_sum(x, n_basis: int, n_steps: int):
+    x = jnp.asarray(x)
+    clipped = jnp.clip(x, 0.0, 1.0)
+    idx = jnp.clip(jnp.floor(clipped * n_steps).astype(jnp.int32) + 1, 0, n_steps)
+    out = _basis_suffix_table(n_basis, n_steps)[idx]
+    return jnp.where(jnp.isnan(x)[:, None], jnp.nan, out)
+
+
+def _RBF_basis(*args):
+    if len(args) == 2:
+        x, n_basis = args
+        return _normalized_RBF_basis(x, n_basis)
+    if len(args) == 4:
+        ev_ts, session_start, session_end, n_basis = args
+        return _session_RBF_basis(ev_ts, session_start, session_end, n_basis)
+    if len(args) == 5:
+        ev_ts, session_start, session_end, n_basis, is_tradable = args
+        return _session_RBF_basis(ev_ts, session_start, session_end, n_basis, is_tradable)
+    raise TypeError("_RBF_basis expects phase+n_basis or session bounds plus n_basis")
+
+
+def _future_RBF_basis_sum(*args):
+    if len(args) == 3:
+        x, n_basis, n_steps = args
+        return _future_phase_RBF_basis_sum(x, n_basis, n_steps)
+    if len(args) == 5:
+        ev_ts, session_start, session_end, n_basis, n_steps = args
+        return _future_session_RBF_basis_sum(ev_ts, session_start, session_end, n_basis, n_steps)
+    if len(args) == 7:
+        ev_ts, session_start, session_end, n_basis, n_steps, next_session_start, next_session_end = args
+        return _future_session_RBF_basis_sum(
+            ev_ts, session_start, session_end, n_basis, n_steps, next_session_start, next_session_end
+        )
+    raise TypeError("_future_RBF_basis_sum expects phase or session arguments")
 
 def _get_beta(value: RidgeValue):
     return value.beta

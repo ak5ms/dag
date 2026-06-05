@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import InstrumentBasisMean, get_beta, session_rbf_basis, var
+from trading_dsl_engine.base.dsl import InstrumentBasisMean, get_beta, RBF_basis, var
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
 
@@ -27,7 +27,7 @@ def test_instrument_basis_mean_batch_matches_tick_and_tracks_per_instrument_beta
         dtype=jnp.float64,
     )
     runtime = compile_formula(
-        get_beta(InstrumentBasisMean(session_rbf_basis(var("ev_ts"), var("start"), var("end"), 3), var("y"), 1.0, 100.0))
+        get_beta(InstrumentBasisMean(RBF_basis(var("ev_ts"), var("start"), var("end"), 3), var("y"), 1.0, 100.0))
     )
 
     state, batch_out = runtime.run_batch({"ev_ts": ev_ts, "start": start, "end": end, "y": y})

@@ -90,10 +90,10 @@ def _formula(root: str):
     session_end = var("session_end")
     volume = var("volume")
 
-    features = session_rbf_basis(ts, session_start, session_end, N_BASIS)
+    features = RBF_basis(ts, session_start, session_end, N_BASIS)
     fit_y = volume_for_fit(volume, ts, session_start, session_end)
     beta = get_beta(InstrumentBasisMean(features, fit_y, 1.0, 21 * H))
-    forecast = nonnegative(einsum(beta, future_session_rbf_basis_sum(ts, session_start, session_end, N_BASIS, H), "nf,nf->n"))
+    forecast = nonnegative(einsum(beta, future_RBF_basis_sum(ts, session_start, session_end, N_BASIS, H), "nf,nf->n"))
     seen = segmented_cumsum(volume_for_seen(volume, ts, session_start, session_end, var("is_tradable0")), session_start)
     pov = pct_seen(seen, forecast, ts, session_start)
 
