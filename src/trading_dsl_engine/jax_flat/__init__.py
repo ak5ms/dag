@@ -1,4 +1,20 @@
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall, StatelessJaxFunction, stateless
 from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
 
-__all__ = ["JaxFlatRuntime", "compile_formula", "StatelessJaxCall", "StatelessJaxFunction", "stateless"]
+
+def __getattr__(name: str):
+    if name == "CppFlatRuntime":
+        from trading_dsl_engine.jax_flat.engine_cpp import CppFlatRuntime
+
+        return CppFlatRuntime
+    raise AttributeError(name)
+
+
+__all__ = [
+    "JaxFlatRuntime",
+    "CppFlatRuntime",
+    "compile_formula",
+    "StatelessJaxCall",
+    "StatelessJaxFunction",
+    "stateless",
+]

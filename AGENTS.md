@@ -28,6 +28,7 @@ Priorities, in order:
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Keep op-specific private helper functions on the relevant operator class as `@staticmethod`; these static methods may be reused from another class when that is the cleanest shared implementation.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
+- When adding new active `jax_flat` operators, implement both the pure JAX-flat operator and corresponding native C++ lowering/runtime support unless the task explicitly scopes C++ out; document and test any intentional C++ fallback.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
 ## Where to change what
@@ -38,7 +39,8 @@ Priorities, in order:
 - Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
 - Active JAX-flat op kernels/factories: `src/trading_dsl_engine/jax_flat/ops.py`
 - Active JAX-flat runtime execution and batch/live helpers: `src/trading_dsl_engine/jax_flat/engine.py`
-- Active JAX-flat behavior/performance regression tests: `tests/jax_flat/`
+- Experimental native C++ JAX-flat tick core: Python lowering/wrapper lives in `src/trading_dsl_engine/jax_flat/engine_cpp.py`; native extension code is split between `src/trading_dsl_engine/jax_flat/engine.cpp` and `src/trading_dsl_engine/jax_flat/ops.cpp` (keep this optional, flattened, and allocation-conscious; `compile_formula(..., cpp=True)` enables automatic native acceleration for supported grouped hot paths, `cpp=False` forces pure JAX-flat, batch helpers must reuse the same non-batch row transition, unsupported automatic accelerator formulas should warn with the unsupported node before falling back to JAX-flat, and `TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=1` must force the pure JAX path for behavior checks).
+- Active JAX-flat behavior/performance regression tests: `tests/jax_flat/`; the groupby cartesian benchmark CLI lives at `tests/jax_flat/test_benchmark_groupby_matrix.py` and is a perf test when configured above 200 rows.
 - Deprecated Numba implementation: `src/trading_dsl_engine/numba/` (do not edit unless explicitly requested)
 - Deprecated non-flat JAX implementation: `src/trading_dsl_engine/jax/` (do not edit unless explicitly requested)
 - Deprecated Numba/non-flat-JAX tests: `tests/numba/`, `tests/jax/` (do not run unless explicitly requested)
@@ -101,6 +103,7 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 
 - Always use absolute imports (e.g., `from trading_dsl_engine...`), not relative imports.
 - Keep implementations concise and generic; avoid repetitive boilerplate.
+- Native C++ should read like a carefully reviewed systems component: prefer named state structs, Eigen-backed math/state buffers, small factory helpers, and clear ownership boundaries over monolithic slots, nested container soup, or broad if/else initialization blocks.
 - Prefer factories/templates/registries over hardcoded branching.
 - Prefer `make_nary_op` for stateless scalar/vector/matrix operators, including axis reducers, before adding custom operator classes.
 - Do not wrap imports in try/except blocks.
