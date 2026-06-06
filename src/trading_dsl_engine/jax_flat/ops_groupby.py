@@ -281,6 +281,15 @@ def _slice_group_arg(value: jax.Array, idx: jax.Array, source_width: int | None 
     return jnp.take(value, idx, axis=0)
 
 
+def _slice_sequence_group_arg(value: jax.Array, idx: jax.Array, source_width: int | None = None) -> jax.Array:
+    value = jnp.asarray(value)
+    if value.ndim <= 1:
+        return value
+    if source_width is not None and value.shape[1] != source_width:
+        return value
+    return jnp.take(value, idx, axis=1)
+
+
 def _mask_group_arg(
     value: jax.Array,
     idx: jax.Array,
@@ -414,6 +423,22 @@ def _set_time_output(out: Any, t: jax.Array, value: Any):
     out = _ensure_dataclass_pytree(out)
     value = _ensure_dataclass_pytree(value)
     return jax.tree_util.tree_map(lambda dst, src: dst.at[t].set(src), out, value)
+
+
+def _align_batch_group_output(value: Any, group_width: int):
+    value = _ensure_dataclass_pytree(value)
+
+    def align_leaf(leaf):
+        leaf = jnp.asarray(leaf)
+        if leaf.ndim == 1:
+            return jnp.broadcast_to(leaf[:, None], (leaf.shape[0], group_width))
+        if leaf.shape[1] == group_width:
+            return leaf
+        if leaf.shape[1] == 1:
+            return jnp.broadcast_to(leaf[:, 0], (leaf.shape[0], group_width) + leaf.shape[2:])
+        return jnp.broadcast_to(leaf[:, None], (leaf.shape[0], group_width) + leaf.shape[1:])
+
+    return jax.tree_util.tree_map(align_leaf, value)
 
 
 def _scatter_batch_group_output(out: Any, idx: jax.Array, group_values: Any):
@@ -980,6 +1005,32 @@ class GroupByOp(Op):
             ),
         )
 
+    def _scan_static_universe_group(
+        self,
+        state: GroupByState,
+        group_i: int,
+        idx: jax.Array,
+        args_seq: tuple[jax.Array, ...],
+    ):
+        runtime = _runtime_from_group_state(state, group_i)
+        selected_state = (
+            _tree_take_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32))
+            if runtime.inner_state is not None
+            else None
+        )
+        group_args_seq = tuple(
+            _slice_sequence_group_arg(arg, idx, self._sequence_arg_source_width(arg, idx))
+            for arg in args_seq
+        )
+        updated_state, group_out = self.inner_op.scan_batch(selected_state, *group_args_seq)
+        group_out = _align_batch_group_output(group_out, idx.shape[0])
+        inner_state_next = (
+            _tree_set_slot(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32), updated_state)
+            if runtime.inner_state is not None and updated_state is not None
+            else runtime.inner_state
+        )
+        return GroupRuntimeState(runtime.table, runtime.cache, inner_state_next), group_out
+
     def scan_batch(self, state: GroupByState, *child_sequences: jax.Array):
         key_cols = tuple(jnp.asarray(child_sequences[i]) for i in range(self.n_keys))
         args_seq = tuple(jnp.asarray(v) for v in child_sequences[self.n_keys:])
@@ -1005,6 +1056,23 @@ class GroupByOp(Op):
         new_inner_states = []
 
         for group_i, idx in enumerate(group_indices):
+            if self.n_keys == 0 and _runtime_from_group_state(state, group_i).inner_state is not None:
+                runtime_i, group_out = self._scan_static_universe_group(state, group_i, idx, args_seq)
+                if out is None:
+                    out = _empty_batch_output_like(group_out, n_steps, width)
+                out = _scatter_batch_group_output(out, idx, group_out)
+
+                new_keys.append(runtime_i.table.keys)
+                new_occupied.append(runtime_i.table.occupied)
+                new_table_slots.append(runtime_i.table.table_slots)
+                new_counts.append(runtime_i.table.count)
+                new_cached_keys.append(runtime_i.cache.key)
+                new_cached_slots.append(runtime_i.cache.slot)
+                new_cache_valid.append(runtime_i.cache.valid)
+                new_cached_inner_states.append(runtime_i.cache.inner_state)
+                new_inner_states.append(runtime_i.inner_state)
+                continue
+
             runtime = _runtime_from_group_state(state, group_i)
             key_seq = self._batch_key_matrix_for_group(idx, key_cols, n_steps)
             group_args_seq = args_seq

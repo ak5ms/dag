@@ -63,11 +63,14 @@ enum class OpCode : int {
     Where,
     Cat,
     Bspline,
+    RbfBasis,
+    FutureRbfBasisSum,
     Col,
     Cumsum,
     Ewm,
     FFill,
     Shift,
+    InstrumentBasisMean,
     Ridge,
     GetBeta,
     GetPreds,
@@ -112,11 +115,14 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "where") return OpCode::Where;
     if (name == "cat") return OpCode::Cat;
     if (name == "bspline") return OpCode::Bspline;
+    if (name == "rbf_basis") return OpCode::RbfBasis;
+    if (name == "future_rbf_basis_sum") return OpCode::FutureRbfBasisSum;
     if (name == "col") return OpCode::Col;
     if (name == "cumsum") return OpCode::Cumsum;
     if (name == "ewm") return OpCode::Ewm;
     if (name == "ffill") return OpCode::FFill;
     if (name == "shift") return OpCode::Shift;
+    if (name == "instrument_basis_mean") return OpCode::InstrumentBasisMean;
     if (name == "ridge") return OpCode::Ridge;
     if (name == "get_beta") return OpCode::GetBeta;
     if (name == "get_preds") return OpCode::GetPreds;
@@ -196,6 +202,23 @@ struct RidgeState {
           k(feature_count) {}
 };
 
+struct InstrumentBasisMeanState {
+    RowMatrix num;
+    RowMatrix den;
+    ByteVec has_value;
+    RowMatrix beta;
+    Vec preds;
+    int k = 0;
+
+    InstrumentBasisMeanState(int feature_width = 0, int instruments = 0)
+        : num(RowMatrix::Zero(instruments, feature_width)),
+          den(RowMatrix::Zero(instruments, feature_width)),
+          has_value(ByteVec::Zero(instruments * feature_width)),
+          beta(RowMatrix::Zero(instruments, feature_width)),
+          preds(Vec::Constant(instruments, NaN)),
+          k(feature_width) {}
+};
+
 struct GroupState {
     int n_keys = 0;
     int capacity = 0;
@@ -257,6 +280,7 @@ private:
     std::vector<ValueState> value_states_;
     std::vector<ShiftState> shift_states_;
     std::vector<RidgeState> ridge_states_;
+    std::vector<InstrumentBasisMeanState> instrument_basis_mean_states_;
     std::vector<GroupState> group_states_;
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
@@ -355,10 +379,11 @@ private:
     static ValueState& value_state(State& state, const NodeSpec& spec) { return state.value_states_.at(static_cast<size_t>(spec.state_index)); }
     static ShiftState& shift_state(State& state, const NodeSpec& spec) { return state.shift_states_.at(static_cast<size_t>(spec.state_index)); }
     static RidgeState& ridge_state(State& state, const NodeSpec& spec) { return state.ridge_states_.at(static_cast<size_t>(spec.state_index)); }
+    static InstrumentBasisMeanState& instrument_basis_mean_state(State& state, const NodeSpec& spec) { return state.instrument_basis_mean_states_.at(static_cast<size_t>(spec.state_index)); }
     static GroupState& group_state(State& state, const NodeSpec& spec) { return state.group_states_.at(static_cast<size_t>(spec.state_index)); }
 
     void assign_native_state_indices() {
-        std::array<int, 4> next{0, 0, 0, 0};
+        std::array<int, 5> next{0, 0, 0, 0, 0};
         for (NodeSpec& spec : nodes_) {
             if (spec.state_index < 0) continue;
             spec.state_index = next[static_cast<size_t>(state_bucket(spec.opcode))]++;
@@ -369,7 +394,8 @@ private:
         switch (opcode) {
             case OpCode::Shift: return 1;
             case OpCode::Ridge: return 2;
-            case OpCode::Group: return 3;
+            case OpCode::InstrumentBasisMean: return 3;
+            case OpCode::Group: return 4;
             default: return 0;
         }
     }
@@ -381,6 +407,127 @@ private:
         const int r = v.rows(n) == 1 ? 0 : row;
         const int c = width == 1 ? 0 : col;
         return v.data[static_cast<size_t>(r * width + c)];
+    }
+
+    static void normalized_rbf_row(double x, int k, double* out) {
+        if (!finite(x)) {
+            for (int b = 0; b < k; ++b) out[b] = NaN;
+            return;
+        }
+        const double clipped = std::min(std::max(x, 0.0), 1.0);
+        const double denom = static_cast<double>(std::max(k - 1, 1));
+        const double sigma = 1.0 / denom;
+        double total = 0.0;
+        for (int b = 0; b < k; ++b) {
+            const double center = k == 1 ? 0.0 : static_cast<double>(b) / static_cast<double>(k - 1);
+            const double z = (clipped - center) / sigma;
+            const double val = std::exp(-0.5 * z * z);
+            out[b] = val;
+            total += val;
+        }
+        if (total <= 1e-18) {
+            for (int b = 0; b < k; ++b) out[b] = 1.0 / static_cast<double>(k);
+        } else {
+            for (int b = 0; b < k; ++b) out[b] /= total;
+        }
+    }
+
+    static void fill_rbf_basis(State& state, const NodeSpec& spec, NodeValue& dst_v) {
+        const int n = state.n_instruments_;
+        const int k = spec.width;
+        const auto& ev = child(state, spec, 0);
+        const auto& start = child(state, spec, 1);
+        const auto& end = child(state, spec, 2);
+        std::vector<double> row(static_cast<size_t>(k));
+        for (int i = 0; i < n; ++i) {
+            const double ts = at(ev, n, i);
+            const double s = at(start, n, i);
+            const double e = at(end, n, i);
+            const double len = e - s;
+            const bool in_session = finite(ts) && finite(s) && finite(e) && len > 0.0 && ts >= s && ts < e;
+            if (!in_session) {
+                for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = NaN;
+                continue;
+            }
+            normalized_rbf_row((ts - s) / len, k, row.data());
+            for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = row[static_cast<size_t>(b)];
+        }
+    }
+
+    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v) {
+        const int n = state.n_instruments_;
+        const int k = spec.width;
+        const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
+        const auto& ev = child(state, spec, 0);
+        const auto& start = child(state, spec, 1);
+        const auto& end = child(state, spec, 2);
+        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
+        std::vector<double> vals(static_cast<size_t>(k));
+        for (int g = steps - 1; g >= 0; --g) {
+            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
+            for (int b = 0; b < k; ++b) {
+                suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            const double ts = at(ev, n, i);
+            const double s = at(start, n, i);
+            const double e = at(end, n, i);
+            const double len = e - s;
+            const bool valid_session = finite(ts) && finite(s) && finite(e) && len > 0.0;
+            if (!valid_session) {
+                for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = NaN;
+                continue;
+            }
+            const double phase = (ts - s) / len;
+            const double clipped = std::min(std::max(phase, 0.0), 1.0);
+            int idx = static_cast<int>(std::floor(clipped * static_cast<double>(steps))) + 1;
+            if (ts < s) idx = 0;
+            else if (ts >= e) idx = steps;
+            idx = std::min(std::max(idx, 0), steps);
+            for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = suffix[static_cast<size_t>(idx * k + b)];
+        }
+    }
+
+    void eval_instrument_basis_mean(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
+        auto& s = instrument_basis_mean_state(state, spec);
+        const int n = state.n_instruments_;
+        const int k = s.k;
+        const auto& x = child(state, spec, 0);
+        const auto& yv = child(state, spec, 1);
+        const bool has_weights = spec.int_param != 0;
+        const auto& weights = child(state, spec, has_weights ? 2 : 1);
+        const auto& hlv = child(state, spec, has_weights ? 3 : 2);
+        const double hl = at(hlv, n, 0, 0);
+        const double rho = (!finite(hl) || hl <= 0.0) ? 0.0 : std::exp(std::log(0.5) / hl);
+        const double alpha = std::min(std::max(1.0 - rho, 0.0), 1.0);
+        for (int i = 0; i < n; ++i) {
+            const double y = at(yv, n, i, 0);
+            const double w = has_weights ? at(weights, n, i, 0) : 1.0;
+            const bool valid_row = finite(y) && finite(w);
+            bool finite_features = true;
+            double pred = 0.0;
+            for (int b = 0; b < k; ++b) {
+                const double xb = at(x, n, i, b);
+                finite_features = finite_features && finite(xb);
+                pred += xb * s.beta(i, b);
+            }
+            s.preds[i] = valid_row && finite_features ? pred : NaN;
+            dst_v.data[static_cast<size_t>(i)] = s.preds[i];
+            for (int b = 0; b < k; ++b) {
+                const double xb = at(x, n, i, b);
+                const bool valid = valid_row && finite(xb);
+                if (!valid) continue;
+                const double num_new = xb * y * w;
+                const double den_new = xb * w;
+                const size_t hv_idx = static_cast<size_t>(i * k + b);
+                s.num(i, b) = s.has_value[hv_idx] ? s.num(i, b) * (1.0 - alpha) + num_new * alpha : num_new;
+                s.den(i, b) = s.has_value[hv_idx] ? s.den(i, b) * (1.0 - alpha) + den_new * alpha : den_new;
+                s.has_value[hv_idx] = 1;
+                const double candidate = s.den(i, b) != 0.0 ? s.num(i, b) / s.den(i, b) : NaN;
+                if (finite(candidate)) s.beta(i, b) = candidate;
+            }
+        }
     }
 
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
@@ -514,6 +661,13 @@ private:
                         Eigen::Map<const RowMatrix> matrix(m.data.data(), n, m.width);
                         Eigen::Map<Vec> out(dst, n);
                         out.array() = x_vec.array() * matrix.rowwise().sum().array();
+                    } else if (sub == "ij,ij->i") {
+                        const auto& a = child(state, spec, 0);
+                        const auto& b = child(state, spec, 1);
+                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
+                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
+                        Eigen::Map<Vec> out(dst, n);
+                        out.array() = (left.array() * right.array()).rowwise().sum();
                     } else if (sub == "ij,ij->ij") {
                         const auto& a = child(state, spec, 0);
                         const auto& b = child(state, spec, 1);
@@ -610,6 +764,12 @@ private:
                     }
                     break;
                 }
+                case OpCode::RbfBasis:
+                    fill_rbf_basis(state, spec, dst_v);
+                    break;
+                case OpCode::FutureRbfBasisSum:
+                    fill_future_rbf_basis_sum(state, spec, dst_v);
+                    break;
                 case OpCode::Col: {
                     const auto& x = child(state, spec, 0);
                     const int col = spec.int_param;
@@ -669,12 +829,23 @@ private:
                     s.count = std::min(s.count + 1, s.cap);
                     break;
                 }
+                case OpCode::InstrumentBasisMean:
+                    eval_instrument_basis_mean(state, spec, dst_v);
+                    break;
                 case OpCode::Ridge:
                     eval_ridge(state, spec, dst_v);
                     break;
                 case OpCode::GetBeta: {
-                    const auto& s = state.ridge_states_[static_cast<size_t>(nodes_[static_cast<size_t>(spec.children[0])].state_index)];
-                    std::copy(s.beta.data(), s.beta.data() + s.beta.size(), dst);
+                    const auto& child_node = nodes_[static_cast<size_t>(spec.children[0])];
+                    if (child_node.opcode == OpCode::Ridge) {
+                        const auto& s = state.ridge_states_[static_cast<size_t>(child_node.state_index)];
+                        std::copy(s.beta.data(), s.beta.data() + s.beta.size(), dst);
+                    } else if (child_node.opcode == OpCode::InstrumentBasisMean) {
+                        const auto& s = state.instrument_basis_mean_states_[static_cast<size_t>(child_node.state_index)];
+                        std::copy(s.beta.data(), s.beta.data() + s.beta.size(), dst);
+                    } else {
+                        throw std::invalid_argument("C++ jax_flat get_beta expects Ridge or InstrumentBasisMean child");
+                    }
                     break;
                 }
                 case OpCode::GetPreds: {
@@ -1019,7 +1190,10 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
         NodeValue& value = values_[i];
         value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
         value.fixed_rows = (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->jk") && !spec.feature_widths.empty()) ? spec.feature_widths[0] : 1;
-        value.rows_kind = (spec.opcode == OpCode::GetBeta || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk")))) ? 1 : 0;
+        const bool instrument_beta = spec.opcode == OpCode::GetBeta
+            && !spec.children.empty()
+            && runtime->nodes_[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
+        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk")))) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
@@ -1035,6 +1209,11 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
             case OpCode::Ridge: {
                 const int feature_count = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
                 ridge_states_.emplace_back(feature_count, n_instruments);
+                break;
+            }
+            case OpCode::InstrumentBasisMean: {
+                const int feature_width = spec.feature_widths.empty() ? spec.width : spec.feature_widths.at(0);
+                instrument_basis_mean_states_.emplace_back(feature_width, n_instruments);
                 break;
             }
             case OpCode::Group: {
@@ -1089,4 +1268,3 @@ Runtime make_runtime(py::iterable specs, int output_id, int n_states) {
     return Runtime(std::move(nodes), output_id, n_states);
 }
 }  // namespace
-

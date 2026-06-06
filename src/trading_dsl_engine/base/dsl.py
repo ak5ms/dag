@@ -157,6 +157,8 @@ ewm = op("ewm")
 xs_rank = op("xs_rank")
 outer = op("outer")
 bspline = op("bspline")
+rbf_basis = op("rbf_basis")
+future_rbf_basis_sum = op("future_rbf_basis_sum")
 col = op("col")
 einsum = op("einsum")
 
@@ -352,6 +354,16 @@ def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
         raise TypeError("round cannot combine decimals with freq")
     micros = _duration_microseconds(freq)
     return mul(_floor_expr(add(div(x, micros), 0.5)), micros)
+
+
+def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noqa: N802
+    if y is None or hl is None:
+        if weights is not None:
+            raise TypeError("InstrumentBasisMean positional form cannot combine positional y/hl with keyword weights")
+        return call("InstrumentBasisMean", features)
+    if weights is None:
+        return call("InstrumentBasisMean", features, y, 1.0, hl)
+    return call("InstrumentBasisMean", features, y, weights, hl)
 
 
 def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> Expr:  # noqa: N802

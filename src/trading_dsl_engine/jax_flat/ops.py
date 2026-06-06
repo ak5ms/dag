@@ -42,6 +42,7 @@ class CumsumState:
     initialized: jax.Array
 
 
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class ShiftState:
@@ -74,7 +75,24 @@ class RidgeState:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class InstrumentBasisMeanState:
+    num: jax.Array
+    den: jax.Array
+    has_value: jax.Array
+    beta: jax.Array
+    preds: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class RidgeValue:
+    beta: jax.Array
+    preds: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class InstrumentBasisMeanValue:
     beta: jax.Array
     preds: jax.Array
 
@@ -337,6 +355,7 @@ class CumsumOp(Op):
         return CumsumState(value=next_value, initialized=next_initialized), out
 
 
+
 @dataclass(frozen=True)
 class FFillOp(Op):
     limit: int | None = None
@@ -430,6 +449,185 @@ class FFillOp(Op):
 
 
 @dataclass(frozen=True)
+class InstrumentBasisMeanOp(Op):
+    feature_width: int
+    has_weights: bool
+    output_kind: str = "object"
+    output_width: int | None = None
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        n = jnp.asarray(sample).shape[0]
+        shape = (n, self.feature_width)
+        return InstrumentBasisMeanState(
+            num=jnp.zeros(shape, dtype=jnp.float64),
+            den=jnp.zeros(shape, dtype=jnp.float64),
+            has_value=jnp.zeros(shape, dtype=bool),
+            beta=jnp.zeros(shape, dtype=jnp.float64),
+            preds=jnp.full((n,), jnp.nan, dtype=jnp.float64),
+        )
+
+    def tick(self, state: InstrumentBasisMeanState, *child_values: jax.Array):
+        if self.has_weights:
+            features, y, weights, hl = child_values[:4]
+        else:
+            features, y, hl = child_values[:3]
+            weights = jnp.asarray(1.0, dtype=jnp.float64)
+        xmat = RidgeOp._as_feature_matrix(features)
+        y = jnp.asarray(y)
+        y_vec = y[:, 0] if y.ndim == 2 else y
+        weights = jnp.asarray(weights)
+        if weights.ndim == 0:
+            w = jnp.full((xmat.shape[0],), weights)
+        elif weights.ndim == 2 and weights.shape[1] == 1:
+            w = weights[:, 0]
+        else:
+            w = weights
+        valid_row = jnp.isfinite(y_vec) & jnp.isfinite(w)
+        valid = jnp.isfinite(xmat) & valid_row[:, None]
+        x0 = jnp.where(valid, xmat, 0.0)
+        yw = jnp.where(valid_row, y_vec * w, 0.0)
+        w0 = jnp.where(jnp.isfinite(w), w, 0.0)
+        num_new = x0 * yw[:, None]
+        den_new = x0 * w0[:, None]
+        hl_value = _scalar_value(hl)
+        rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
+        alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
+        num_update = jnp.where(state.has_value, state.num * (1.0 - alpha) + num_new * alpha, num_new)
+        den_update = jnp.where(state.has_value, state.den * (1.0 - alpha) + den_new * alpha, den_new)
+        num = jnp.where(valid, num_update, state.num)
+        den = jnp.where(valid, den_update, state.den)
+        has_value = state.has_value | valid
+        beta_candidate = num / jnp.where(den != 0.0, den, jnp.nan)
+        beta = jnp.where(jnp.isfinite(beta_candidate), beta_candidate, state.beta)
+        preds = jnp.where(valid_row & jnp.all(jnp.isfinite(xmat), axis=1), jnp.sum(xmat * state.beta, axis=1), jnp.nan)
+        return InstrumentBasisMeanState(num=num, den=den, has_value=has_value, beta=beta, preds=preds), InstrumentBasisMeanValue(beta=beta, preds=preds)
+
+    def scan_batch(self, state: InstrumentBasisMeanState, *child_sequences: jax.Array):
+        def step(carry, values):
+            state_c = InstrumentBasisMeanState(*carry)
+            next_state, out = self.tick(state_c, *values)
+            return (next_state.num, next_state.den, next_state.has_value, next_state.beta, next_state.preds), out
+
+        carry, out = jax.lax.scan(
+            step,
+            (state.num, state.den, state.has_value, state.beta, state.preds),
+            child_sequences,
+            unroll=32,
+        )
+        return InstrumentBasisMeanState(*carry), out
+
+
+@dataclass(frozen=True)
+class RbfBasisOp(Op):
+    n_basis: int
+    output_kind: str = "matrix"
+    output_width: int | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "output_width", self.n_basis)
+
+    @staticmethod
+    def _as_vector(value, rows: int | None = None):
+        value = jnp.asarray(value)
+        if value.ndim == 0:
+            if rows is None:
+                return value[None]
+            return jnp.broadcast_to(value, (rows,))
+        if value.ndim == 1:
+            return value
+        return value[:, 0]
+
+    @staticmethod
+    def _session_vectors(*values):
+        arrays = tuple(jnp.asarray(value) for value in values)
+        rows = next((array.shape[0] for array in arrays if array.ndim > 0), 1)
+        return tuple(RbfBasisOp._as_vector(array, rows) for array in arrays)
+
+    @staticmethod
+    def _normalized_basis(x, n_basis: int):
+        x = jnp.asarray(x)
+        clipped = jnp.clip(x, 0.0, 1.0)
+        centers = jnp.linspace(0.0, 1.0, n_basis, dtype=jnp.float64)
+        sigma = 1.0 / max(n_basis - 1, 1)
+        dist = clipped[:, None] - centers[None, :]
+        values = jnp.exp(-0.5 * (dist / sigma) ** 2)
+        total = jnp.sum(values, axis=-1, keepdims=True)
+        values = jnp.where(total <= 1e-18, 1.0 / n_basis, values / total)
+        return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
+
+    @staticmethod
+    def _session_phase(ev_ts, session_start, session_end):
+        ev_ts, session_start, session_end = RbfBasisOp._session_vectors(ev_ts, session_start, session_end)
+        session_len = session_end - session_start
+        finite = jnp.isfinite(ev_ts) & jnp.isfinite(session_start) & jnp.isfinite(session_end)
+        valid_session = finite & (session_len > 0.0)
+        phase = (ev_ts - session_start) / jnp.where(session_len > 0.0, session_len, jnp.nan)
+        in_session = valid_session & (ev_ts >= session_start) & (ev_ts < session_end)
+        return phase, in_session, valid_session
+
+    @staticmethod
+    def _session_rbf_basis(ev_ts, session_start, session_end, n_basis: int):
+        phase, in_session, _ = RbfBasisOp._session_phase(ev_ts, session_start, session_end)
+        out = RbfBasisOp._normalized_basis(phase, n_basis)
+        return jnp.where(in_session[:, None], out, jnp.nan)
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        ev_ts, session_start, session_end = child_values[:3]
+        return None, self._session_rbf_basis(ev_ts, session_start, session_end, self.n_basis)
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        return None, jax.vmap(lambda ev_ts, start, end: self._session_rbf_basis(ev_ts, start, end, self.n_basis))(
+            *child_sequences[:3]
+        )
+
+
+@dataclass(frozen=True)
+class FutureRbfBasisSumOp(Op):
+    n_basis: int
+    n_steps: int
+    output_kind: str = "matrix"
+    output_width: int | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "output_width", self.n_basis)
+
+    @staticmethod
+    def _basis_suffix_table(n_basis: int, n_steps: int):
+        grid = jnp.arange(n_steps, dtype=jnp.float64) / n_steps
+        values = RbfBasisOp._normalized_basis(grid, n_basis)
+        suffix = jnp.flip(jnp.cumsum(jnp.flip(values, axis=0), axis=0), axis=0)
+        return jnp.concatenate((suffix, jnp.zeros((1, n_basis), dtype=values.dtype)), axis=0)
+
+    @staticmethod
+    def _future_rbf_basis_sum(ev_ts, session_start, session_end, n_basis: int, n_steps: int):
+        ev_ts, session_start, session_end = RbfBasisOp._session_vectors(ev_ts, session_start, session_end)
+        session_len = session_end - session_start
+        finite = jnp.isfinite(ev_ts) & jnp.isfinite(session_start) & jnp.isfinite(session_end)
+        valid_session = finite & (session_len > 0.0)
+        phase = (ev_ts - session_start) / jnp.where(session_len > 0.0, session_len, jnp.nan)
+        clipped = jnp.clip(phase, 0.0, 1.0)
+        inside_idx = jnp.floor(clipped * n_steps).astype(jnp.int32) + 1
+        idx = jnp.where(ev_ts < session_start, 0, jnp.where(ev_ts >= session_end, n_steps, inside_idx))
+        idx = jnp.clip(idx, 0, n_steps)
+        out = FutureRbfBasisSumOp._basis_suffix_table(n_basis, n_steps)[idx]
+        return jnp.where(valid_session[:, None], out, jnp.nan)
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        ev_ts, session_start, session_end = child_values[:3]
+        return None, self._future_rbf_basis_sum(ev_ts, session_start, session_end, self.n_basis, self.n_steps)
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        return None, jax.vmap(
+            lambda ev_ts, start, end: self._future_rbf_basis_sum(ev_ts, start, end, self.n_basis, self.n_steps)
+        )(*child_sequences[:3])
+
+
+@dataclass(frozen=True)
 class RidgeOp(Op):
     feature_widths: tuple[int, ...]
     has_weights: bool
@@ -503,6 +701,93 @@ class RidgeOp(Op):
             t=state.t + 1,
         )
         return next_state, RidgeValue(beta=beta, preds=preds)
+
+    def scan_batch(self, state: RidgeState, *child_sequences: jax.Array):
+        if self.has_weights:
+            feature_sequences = child_sequences[: len(self.feature_widths)]
+            y_seq, weights_seq, hl_seq, lam_seq = child_sequences[-4:]
+        else:
+            feature_sequences = child_sequences[: len(self.feature_widths)]
+            y_seq, hl_seq, lam_seq = child_sequences[-3:]
+            weights_seq = jnp.broadcast_to(jnp.asarray(1.0, dtype=jnp.float64), (y_seq.shape[0],))
+
+        def row_xmat(*feature_rows):
+            features = tuple(self._as_feature_matrix(value) for value in feature_rows)
+            return jnp.concatenate(features, axis=1)
+
+        xmat_seq = jax.vmap(row_xmat)(*feature_sequences)
+        y_arr = jnp.asarray(y_seq)
+        y_vec_seq = y_arr[:, :, 0] if y_arr.ndim == 3 else y_arr
+
+        def moment_step(carry, values):
+            xx_c, xy_c, has_xx_c, has_xy_c, last_xx_c, last_xy_c, t_c = carry
+            xmat, y_vec, weights, hl, lam = values
+            del lam
+            xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
+            hl_value = _scalar_value(hl)
+            rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
+            alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
+
+            a_xx = alpha ** (t_c - last_xx_c)
+            a_xy = alpha ** (t_c - last_xy_c)
+            updated_xx = jnp.where(has_xx_c, xx_c * (1.0 - a_xx) + xx_new * a_xx, xx_new)
+            updated_xy = jnp.where(has_xy_c, xy_c * (1.0 - a_xy) + xy_new * a_xy, xy_new)
+            xx = jnp.where(xx_valid, updated_xx, xx_c)
+            xy = jnp.where(xy_valid, updated_xy, xy_c)
+            has_xx = has_xx_c | xx_valid
+            has_xy = has_xy_c | xy_valid
+            last_xx = jnp.where(xx_valid, t_c, last_xx_c)
+            last_xy = jnp.where(xy_valid, t_c, last_xy_c)
+
+            xx = 0.5 * (xx + xx.T)
+            last_xx = jnp.maximum(last_xx, last_xx.T)
+            has_xx = has_xx | has_xx.T
+            next_carry = (xx, xy, has_xx, has_xy, last_xx, last_xy, t_c + 1)
+            return next_carry, (xx, xy)
+
+        init = (state.xx, state.xy, state.has_xx, state.has_xy, state.last_xx, state.last_xy, state.t)
+        carry, (xx_seq, xy_seq) = jax.lax.scan(
+            moment_step,
+            init,
+            (xmat_seq, y_vec_seq, weights_seq, hl_seq, lam_seq),
+            unroll=32,
+        )
+
+        lam_values = jax.vmap(
+            lambda lam: jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
+        )(lam_seq)
+        diag_seq = jax.vmap(lambda xx: jnp.diag(jnp.diag(xx)))(xx_seq)
+        systems = xx_seq + lam_values[:, None, None] * diag_seq
+        beta_candidates = jax.vmap(jnp.linalg.solve)(systems, xy_seq)
+        finite_beta = jnp.all(jnp.isfinite(beta_candidates), axis=1)
+
+        def beta_step(beta_prev, values):
+            beta_candidate, finite, xmat, y_vec = values
+            row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
+            preds = jnp.where(row_valid, xmat @ beta_prev, jnp.nan)
+            beta = jnp.where(finite, beta_candidate, beta_prev)
+            return beta, (beta, preds)
+
+        beta, (beta_seq, preds_seq) = jax.lax.scan(
+            beta_step,
+            state.beta,
+            (beta_candidates, finite_beta, xmat_seq, y_vec_seq),
+            unroll=32,
+        )
+        xx, xy, has_xx, has_xy, last_xx, last_xy, t = carry
+        next_state = RidgeState(
+            xx=xx,
+            xy=xy,
+            has_xx=has_xx,
+            has_xy=has_xy,
+            last_xx=last_xx,
+            last_xy=last_xy,
+            beta=beta,
+            preds=preds_seq[-1],
+            t=t,
+        )
+        return next_state, RidgeValue(beta=beta_seq, preds=preds_seq)
+
 
     @staticmethod
     def _as_feature_matrix(value):
@@ -591,6 +876,7 @@ def _lag_vector(x, rows: int):
     return x[:, 0]
 
 
+
 def _nan_cmp(a, b, pred):
     return jnp.where(jnp.isnan(a) | jnp.isnan(b), jnp.nan, jnp.where(pred, 1.0, 0.0))
 
@@ -629,7 +915,7 @@ def _bspline(x, n_basis: int):
     dist = jnp.abs(clipped[:, None] - centers[None, :])
     circ_dist = jnp.minimum(dist, 1.0 - dist)
     values = jnp.exp(-0.5 * (circ_dist / sigma) ** 2)
-    total = jnp.sum(values, axis=1, keepdims=True)
+    total = jnp.sum(values, axis=-1, keepdims=True)
     values = jnp.where(total <= 1e-18, 1.0 / n_basis, values / total)
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
 

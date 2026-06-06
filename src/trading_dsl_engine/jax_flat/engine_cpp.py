@@ -18,11 +18,14 @@ from trading_dsl_engine.jax_flat.ops import (
     CumsumOp,
     EwmOp,
     FFillOp,
+    FutureRbfBasisSumOp,
     GroupByOp,
     InputOp,
+    InstrumentBasisMeanOp,
     LiteralOp,
     NaryOp,
     Op,
+    RbfBasisOp,
     RidgeOp,
     ShiftOp,
 )
@@ -187,10 +190,13 @@ def _cpp_node_specs(program: StreamingProgram):
             if op.cpp_name == "einsum" and op.output_width is None:
                 cpp_width = 0
             if op.cpp_name == "get_beta":
-                ridge_child = program.nodes[node.child_ids[0]].op
-                if not isinstance(ridge_child, RidgeOp):
-                    raise NotImplementedError("C++ jax_flat get_beta expects direct Ridge child")
-                cpp_width = sum(ridge_child.feature_widths)
+                beta_child = program.nodes[node.child_ids[0]].op
+                if isinstance(beta_child, RidgeOp):
+                    cpp_width = sum(beta_child.feature_widths)
+                elif isinstance(beta_child, InstrumentBasisMeanOp):
+                    cpp_width = beta_child.feature_width
+                else:
+                    raise NotImplementedError("C++ jax_flat get_beta expects direct Ridge or InstrumentBasisMean child")
             feature_widths = ()
             if op.cpp_name == "einsum":
                 feature_widths = tuple(program.nodes[cid].op.output_width or 1 for cid in node.child_ids)
@@ -213,6 +219,27 @@ def _cpp_node_specs(program: StreamingProgram):
         if isinstance(op, ShiftOp):
             specs.append(spec_tuple("shift", node.child_ids, state_index=state_index, int_param=op.max_size, width=width))
             supported.append("shift")
+            continue
+        if isinstance(op, RbfBasisOp):
+            specs.append(spec_tuple("rbf_basis", node.child_ids, int_param=op.n_basis, width=op.n_basis))
+            supported.append("rbf_basis")
+            continue
+        if isinstance(op, FutureRbfBasisSumOp):
+            specs.append(spec_tuple("future_rbf_basis_sum", node.child_ids, int_param=op.n_basis, param=op.n_steps, width=op.n_basis))
+            supported.append("future_rbf_basis_sum")
+            continue
+        if isinstance(op, InstrumentBasisMeanOp):
+            specs.append(
+                spec_tuple(
+                    "instrument_basis_mean",
+                    node.child_ids,
+                    state_index=state_index,
+                    int_param=1 if op.has_weights else 0,
+                    width=1,
+                    feature_widths=(op.feature_width,),
+                )
+            )
+            supported.append("instrument_basis_mean")
             continue
         if isinstance(op, RidgeOp):
             k = sum(op.feature_widths)

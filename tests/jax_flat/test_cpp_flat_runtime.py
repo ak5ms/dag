@@ -78,6 +78,33 @@ def test_cpp_flat_ridge_projections_match_jax_flat():
     _assert_cpp_matches_jax("get_beta(Ridge(cat(close, open), open, 1.0, 8.0, 0.01))", data)
 
 
+
+def test_cpp_flat_rbf_and_instrument_basis_mean_match_jax_flat():
+    rows = 18
+    cols = 4
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    ev_ts = row + 0.25 * col
+    session_start = np.zeros((rows, cols), dtype=np.float64)
+    session_end = np.full((rows, cols), 12.0, dtype=np.float64)
+    volume = 10.0 + 0.5 * row + col
+    ev_ts[1, 2] = -1.0
+    ev_ts[14:, :] = 13.0
+    volume[5, 1] = np.nan
+    data = {
+        "ev_ts": ev_ts,
+        "session_start": session_start,
+        "session_end": session_end,
+        "volume": volume,
+    }
+    for formula in (
+        "rbf_basis(ev_ts, session_start, session_end, 4)",
+        "future_rbf_basis_sum(ev_ts, session_start, session_end, 4, 8)",
+        "get_preds(InstrumentBasisMean(rbf_basis(ev_ts, session_start, session_end, 3), volume, 1.0, 4.0))",
+        'einsum(get_beta(InstrumentBasisMean(rbf_basis(ev_ts, session_start, session_end, 3), volume, 1.0, 4.0)), future_rbf_basis_sum(ev_ts, session_start, session_end, 3, 8), "ij,ij->i")',
+    ):
+        _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)
+
 def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     rows = 18
     cols = 5
