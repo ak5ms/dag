@@ -130,6 +130,32 @@ def _tree_set_slot(tree: Any, slot: jax.Array, value: Any):
     return jax.tree_util.tree_map(lambda dst, src: dst.at[slot].set(src), tree, value)
 
 
+def _tree_take_slot_member(tree: Any, slot: jax.Array, member_pos: jax.Array):
+    tree = _ensure_dataclass_pytree(tree)
+
+    def take_leaf(leaf):
+        leaf = jnp.asarray(leaf)
+        slot_leaf = jnp.take(leaf, slot, axis=0)
+        if slot_leaf.ndim == 0:
+            return slot_leaf
+        return jnp.take(slot_leaf, member_pos, axis=0)
+
+    return jax.tree_util.tree_map(take_leaf, tree)
+
+
+def _tree_set_slot_member(tree: Any, slot: jax.Array, member_pos: jax.Array, value: Any):
+    tree = _ensure_dataclass_pytree(tree)
+    value = _ensure_dataclass_pytree(value)
+
+    def set_leaf(dst, src):
+        dst = jnp.asarray(dst)
+        if dst.ndim <= 1:
+            return dst.at[slot].set(src)
+        return dst.at[slot, member_pos].set(src)
+
+    return jax.tree_util.tree_map(set_leaf, tree, value)
+
+
 def _hash_mix(value: jax.Array) -> jax.Array:
     value = value ^ (value >> jnp.uint64(33))
     value = value * jnp.uint64(0xff51afd7ed558ccd)
@@ -300,6 +326,23 @@ def _group_suffix_shape(leaf: jax.Array, group_width: int) -> tuple[int, ...]:
         return leaf.shape[1:]
     return leaf.shape
 
+
+
+def _same_group_key_matrix(key_matrix: jax.Array) -> jax.Array:
+    """Pairwise key equality for one group row, treating NaN keys as equal.
+
+    Groupwise execution consumes one representative per distinct key and masks
+    all group members with that key. Precomputing the pairwise matrix once keeps
+    the per-representative loop generic for ndarray/object outputs while avoiding
+    repeated key scans in the hot path.
+    """
+    return jax.vmap(lambda key: jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix))(key_matrix)
+
+
+def _first_occurrence_mask(same_keys: jax.Array) -> jax.Array:
+    positions = jnp.arange(same_keys.shape[0], dtype=jnp.int32)
+    earlier = positions[None, :] < positions[:, None]
+    return ~jnp.any(same_keys & earlier, axis=1)
 
 def _group_output_like(template: Any, group_width: int):
     template = _ensure_dataclass_pytree(template)
@@ -505,25 +548,20 @@ class GroupByOp(Op):
         group_width = idx.shape[0]
         template = self._group_template(inner_state, idx, args)
         group_out0 = _group_output_like(template, group_width)
+        same_keys = _same_group_key_matrix(key_matrix)
+        first_occurrence = _first_occurrence_mask(same_keys)
 
         def body(member_pos, carry):
             table_c, inner_state_c, group_out_c = carry
             key = key_matrix[member_pos]
-
-            already_processed = jnp.asarray(False)
-            for prev_pos in range(group_width):
-                already_processed = jnp.where(
-                    prev_pos < member_pos,
-                    already_processed | _same_key_vector(key_matrix[prev_pos], key),
-                    already_processed,
-                )
+            already_processed = ~first_occurrence[member_pos]
 
             def process(process_carry):
                 table_p, inner_state_p, group_out_p = process_carry
 
                 slot, table_found = _lookup_or_insert_slot(table_p, key)
 
-                mask = jax.vmap(lambda row_key: _same_key_vector(row_key, key))(key_matrix)
+                mask = same_keys[member_pos]
                 group_args = tuple(_mask_group_arg(arg, idx, mask, self._row_arg_source_width(arg, idx)) for arg in args)
 
                 selected_state = _tree_take_slot(inner_state_p, slot) if inner_state_p is not None else None
@@ -585,6 +623,76 @@ class GroupByOp(Op):
             body,
             (table, inner_state, group_out0),
         )
+
+    def _inner_graph_is_memberwise(self) -> bool:
+        nodes = getattr(self.inner_op, "nodes", None)
+        if nodes is None:
+            return False
+        allowed_cpp_names = {
+            "add", "sub", "mul", "div", "mod", "pow", "floordiv",
+            "eq", "ne", "lt", "gt", "and", "or", "xor", "fillna", "where",
+            "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
+            "isnan", "purify", "fraction",
+        }
+        allowed_stateful = {"CumsumOp", "EwmOp", "FFillOp"}
+        for node in nodes:
+            op = node.op
+            name = type(op).__name__
+            if name in {"InputOp", "LiteralOp"}:
+                continue
+            if name in allowed_stateful:
+                if op.output_width not in (None, 1):
+                    return False
+                continue
+            cpp_name = getattr(op, "cpp_name", None)
+            if cpp_name in allowed_cpp_names and op.output_width in (None, 1):
+                continue
+            return False
+        return True
+
+    def _tick_group_memberwise(
+        self,
+        runtime: GroupRuntimeState,
+        idx: jax.Array,
+        key_matrix: jax.Array,
+        args: tuple[jax.Array, ...],
+    ):
+        group_width = idx.shape[0]
+        sample_state = (
+            _tree_take_slot_member(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+            if runtime.inner_state is not None
+            else None
+        )
+        sample_args = tuple(_slice_member_arg(arg, idx, jnp.asarray(0, dtype=jnp.int32), self._row_arg_source_width(arg, idx)) for arg in args)
+        _, template = self.inner_op.tick(sample_state, *sample_args)
+        group_out0 = _group_output_like(template, group_width)
+
+        def body(member_pos, carry):
+            table_c, inner_state_c, group_out_c = carry
+            key = key_matrix[member_pos]
+            slot, table_next = _lookup_or_insert_slot(table_c, key)
+            member_args = tuple(_slice_member_arg(arg, idx, member_pos, self._row_arg_source_width(arg, idx)) for arg in args)
+            selected_state = (
+                _tree_take_slot_member(inner_state_c, slot, member_pos)
+                if inner_state_c is not None
+                else None
+            )
+            updated_state, local_out = self.inner_op.tick(selected_state, *member_args)
+            inner_state_next = (
+                _tree_set_slot_member(inner_state_c, slot, member_pos, updated_state)
+                if inner_state_c is not None and updated_state is not None
+                else inner_state_c
+            )
+            group_out_next = _set_member_output(group_out_c, member_pos, local_out)
+            return table_next, inner_state_next, group_out_next
+
+        table_next, inner_state_next, group_out = jax.lax.fori_loop(
+            0,
+            group_width,
+            body,
+            (runtime.table, runtime.inner_state, group_out0),
+        )
+        return GroupRuntimeState(table_next, runtime.cache, inner_state_next), group_out
 
     def _tick_group_cached_single_key(
         self,
@@ -671,6 +779,13 @@ class GroupByOp(Op):
         key_matrix: jax.Array,
         args: tuple[jax.Array, ...],
     ):
+        # The memberwise path is only profitable when each member owns keyed
+        # inner state.  Stateless RHS graphs are faster through the generic
+        # groupwise path because it evaluates one vectorized inner tick per
+        # distinct key instead of one scalar tick per member.
+        if runtime.inner_state is not None and self._inner_graph_is_memberwise():
+            return self._tick_group_memberwise(runtime, idx, key_matrix, args)
+
         # Formula-compiled groupby RHS graphs initialize state with a leading
         # group axis, so cross-sectional ops must see every member in the key.
         # Direct grouped-apply ops with scalar keyed state advance per member;
