@@ -90,6 +90,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - `groupby` now has one canonical form: `groupby((key1, key2, ..., maybe_univ, ...), lhs, op_using_self_)`.
 - The tuple key supports arbitrary length. It may contain at most one `univ(...)` element plus any number of dynamic key expressions.
 - The local op expression must consume the outer stream value via `self_`, e.g. `groupby((day, bucket), get_preds(Ridge(...)), cumsum(self_))`.
+- Elementwise grouped RHS graphs such as nested arithmetic, `cumsum`, `ewm`, and `ffill` use a memberwise JAX-flat update path that keeps per-key/per-column state independent without invoking the heavier groupwise mask path reserved for cross-sectional RHS graphs.
 - Python-composed formulas use the same canonical lowering via `lhs.groupby((...)).apply(op_expr_using_self_)`.
 - Legacy groupby forms are intentionally removed (no `groupby(key, op)` and no alternate universe-only syntax path).
 - Key NaNs are valid in groupby and are routed into a dedicated NaN-key group instead of raising.
@@ -137,11 +138,28 @@ runtime = compile_formula(
 )
 ```
 
+
+## Native C++ tick prototype
+
+`trading_dsl_engine.jax_flat.compile_formula(..., cpp=True)` enables the optional native accelerator by default for supported grouped hot paths, while `cpp=False` forces the pure JAX-flat path. `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` lazily imports `trading_dsl_engine.jax_flat.engine_cpp` and exposes an experimental native tick-path runtime for flat formulas where C++ can currently preserve the same streaming semantics as JAX-flat. It compiles the existing shared parser/lowering output into a C++ flattened node table backed by `jax_flat/engine.cpp` + `jax_flat/ops.cpp`; `init_state(n_instruments)` preallocates per-node scratch buffers and operator-specific native state, while `tick_into(state, out, *rows)` reuses both the state and caller-owned output row to avoid hot-path Python/JAX allocations. The native wrapper also mirrors the JAX-flat batch API with `run_batch(...)` and `run_batch_into(...)`; `tick(...)` remains a convenience method that allocates only its returned row.
+
+The native batch helper intentionally stays a repeated tick loop over the same `eval_row` transition rather than a separate vectorized semantic path. It binds contiguous row pointers once, calls the same non-batch evaluator for each row, and uses `__restrict`/flat contiguous buffers so C++ compilers can optimize the row loop without changing streaming state behavior. The benchmark script compiles and warms both C++ and JAX-flat runtimes before timing, so printed results exclude extension import, formula compilation, and JAX first-use compilation. When the optional extension is installed, `JaxFlatRuntime.run_batch(...)` may use the same native flat evaluator for fully supported in-memory dynamic-key groupby programs (including `univ(...)` column partitions) with no caller-supplied state; set `TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=1` to force the pure JAX path for behavior checks. Native groupby lowering uses a nested RHS node table rather than a per-operator grouped-cumsum branch, so additional scalar/vector-width-1 RHS operators can compose without adding a new grouped hot-path case. If a grouped formula is not yet native-supported, `run_batch` emits a one-time `RuntimeWarning` identifying the unsupported node and automatically falls back to the JAX-flat implementation.
+
+Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `outer`, an Eigen-backed `einsum` subset, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights solved via Eigen, `get_beta`, `get_preds`, and dynamic-key `groupby(...)` with optional `univ(...)` column partitions for nested scalar/vector-width-1 RHS graphs over `self_` (for example `cumsum(self_)`, `cumsum(cumsum(self_))`, or `add(cumsum(self_), 1)`). Explicit `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` still raises `NotImplementedError` for unsupported nodes, while automatic `compile_formula(..., cpp=True)` acceleration warns once and falls back to the default JAX-flat runtime.
+
+Use the warmed comparison helper for quick local measurements:
+
+```bash
+python scripts/benchmark_cpp_flat.py --rows 100000 --cols 9 --runs 5
+python tests/jax_flat/test_benchmark_groupby_matrix.py --rows 100000 --cols 9 --runs 1 --warmups 1 --assert
+```
+
 ## Development quickstart
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
+sudo apt-get install -y libeigen3-dev  # required to build the optional C++ jax_flat extension
 PIP_CACHE_DIR=.pip-cache python -m pip install -e .
 pytest -q  # configured to use pytest-xdist with 12 workers
 ```
