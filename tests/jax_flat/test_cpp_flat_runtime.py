@@ -177,5 +177,6 @@ def test_cpp_flat_outer_and_einsum_subset_match_jax_flat():
         'einsum(close, bspline(fillna(open, 0.25), 3), "i,ij->i")',
         'einsum(bspline(fillna(close, 0.25), 3), bspline(fillna(open, 0.5), 3), "ij,ij->ij")',
         'einsum(bspline(fillna(close, 0.25), 3), bspline(fillna(open, 0.5), 3), "ij,ij->")',
+        'einsum(bspline(fillna(close, 0.25), 2), bspline(fillna(open, 0.5), 3), "ij,ik->jk")',
     ):
         _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)

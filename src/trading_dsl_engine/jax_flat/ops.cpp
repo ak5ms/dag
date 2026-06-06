@@ -2,8 +2,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <Eigen/Dense>
+
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,10 @@ namespace py = pybind11;
 
 namespace {
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
+using Vec = Eigen::VectorXd;
+using RowMatrix = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using ByteVec = Eigen::Array<uint8_t, Eigen::Dynamic, 1>;
+using I64Vec = Eigen::Array<int64_t, Eigen::Dynamic, 1>;
 
 enum class OpCode : int {
     Input,
@@ -143,49 +148,120 @@ struct NodeValue {
     int size(int n) const { return rows(n) * width; }
 };
 
-enum class StateSlotKind : uint8_t { None, Value, Shift, Ridge, Group };
+struct ValueState {
+    Vec value;
+    ByteVec initialized;
+    I64Vec streak;
+    ByteVec seen;
 
-struct StateSlot {
-    StateSlotKind kind = StateSlotKind::None;
-    std::vector<double> value;
-    std::vector<uint8_t> initialized;
-    std::vector<int64_t> streak;
-    std::vector<uint8_t> seen;
-    std::vector<double> buffer;
+    explicit ValueState(int size = 0)
+        : value(Vec::Zero(size)),
+          initialized(ByteVec::Zero(size)),
+          streak(I64Vec::Zero(size)),
+          seen(ByteVec::Zero(size)) {}
+};
+
+struct ShiftState {
+    RowMatrix buffer;
     int pos = 0;
     int count = 0;
     int cap = 0;
 
-    // Ridge state.
-    std::vector<double> xx;
-    std::vector<double> xy;
-    std::vector<uint8_t> has_xx;
-    std::vector<uint8_t> has_xy;
-    std::vector<int64_t> last_xx;
-    std::vector<int64_t> last_xy;
-    std::vector<double> beta;
-    std::vector<double> preds;
+    ShiftState(int capacity = 0, int row_size = 0)
+        : buffer(RowMatrix::Constant(capacity, row_size, NaN)), cap(capacity) {}
+};
+
+struct RidgeState {
+    RowMatrix xx;
+    Vec xy;
+    ByteVec has_xx;
+    ByteVec has_xy;
+    I64Vec last_xx;
+    I64Vec last_xy;
+    Vec beta;
+    Vec preds;
     int64_t t = 0;
     int k = 0;
 
-    // Generic dynamic-key grouped scalar/vector-width-1 inner graph state.
+    RidgeState(int feature_count = 0, int instruments = 0)
+        : xx(RowMatrix::Zero(feature_count, feature_count)),
+          xy(Vec::Zero(feature_count)),
+          has_xx(ByteVec::Zero(feature_count * feature_count)),
+          has_xy(ByteVec::Zero(feature_count)),
+          last_xx(I64Vec::Zero(feature_count * feature_count)),
+          last_xy(I64Vec::Zero(feature_count)),
+          beta(Vec::Zero(feature_count)),
+          preds(Vec::Constant(instruments, NaN)),
+          k(feature_count) {}
+};
+
+struct GroupState {
     int n_keys = 0;
     int capacity = 0;
     int n_groups = 1;
     std::vector<int> group_offsets;
     std::vector<int> group_indices;
-    std::vector<double> keys;
-    std::vector<uint8_t> occupied;
-    std::vector<double> cached_group_key;
+    RowMatrix keys;
+    ByteVec occupied;
+    Vec cached_group_key;
     int cached_group_slot = -1;
     int cached_group_universe = -1;
     uint8_t cached_group_valid = 0;
-    std::vector<std::vector<double>> inner_values;
-    std::vector<std::vector<uint8_t>> inner_initialized;
-    std::vector<std::vector<int64_t>> inner_streak;
-    std::vector<std::vector<uint8_t>> inner_seen;
+    std::vector<Vec> inner_values;
+    std::vector<ByteVec> inner_initialized;
+    std::vector<I64Vec> inner_streak;
+    std::vector<ByteVec> inner_seen;
 
+    GroupState(int key_count = 0, int slot_count = 0, int inner_state_count = 0, int instruments = 0)
+        : n_keys(key_count),
+          capacity(slot_count),
+          keys(RowMatrix::Constant(slot_count, std::max(key_count, 1), NaN)),
+          occupied(ByteVec::Zero(slot_count)),
+          cached_group_key(Vec::Constant(std::max(key_count, 1), NaN)) {
+        inner_values.reserve(static_cast<size_t>(inner_state_count));
+        inner_initialized.reserve(static_cast<size_t>(inner_state_count));
+        inner_streak.reserve(static_cast<size_t>(inner_state_count));
+        inner_seen.reserve(static_cast<size_t>(inner_state_count));
+        for (int i = 0; i < inner_state_count; ++i) {
+            inner_values.emplace_back(Vec::Zero(slot_count * instruments));
+            inner_initialized.emplace_back(ByteVec::Zero(slot_count * instruments));
+            inner_streak.emplace_back(I64Vec::Zero(slot_count * instruments));
+            inner_seen.emplace_back(ByteVec::Zero(slot_count * instruments));
+        }
+    }
 };
+
+struct StateSlot {
+    ValueState value;
+    ShiftState shift;
+    RidgeState ridge;
+    GroupState group;
+
+    static StateSlot value_slot(int size) {
+        StateSlot slot;
+        slot.value = ValueState(size);
+        return slot;
+    }
+
+    static StateSlot shift_slot(int capacity, int row_size) {
+        StateSlot slot;
+        slot.shift = ShiftState(capacity, row_size);
+        return slot;
+    }
+
+    static StateSlot ridge_slot(int feature_count, int instruments) {
+        StateSlot slot;
+        slot.ridge = RidgeState(feature_count, instruments);
+        return slot;
+    }
+
+    static StateSlot group_slot(int key_count, int total_slots, int inner_state_count, int instruments) {
+        StateSlot slot;
+        slot.group = GroupState(key_count, total_slots, inner_state_count, instruments);
+        return slot;
+    }
+};
+
 
 inline bool finite(double x) { return std::isfinite(x); }
 inline bool same_double_key(double a, double b) { return (std::isnan(a) && std::isnan(b)) || a == b; }
@@ -422,39 +498,48 @@ private:
                 }
                 case OpCode::Outer: {
                     const auto& x = child(state, spec, 0);
-                    const int width = dst_v.width;
-                    for (int i = 0; i < n; ++i) {
-                        const double a = at(x, n, i, 0);
-                        for (int j = 0; j < width; ++j) dst[static_cast<size_t>(i * width + j)] = a * at(x, n, j, 0);
-                    }
+                    Eigen::Map<const Vec> x_vec(x.data.data(), n);
+                    Eigen::Map<RowMatrix> out(dst, n, dst_v.width);
+                    out.noalias() = x_vec * x_vec.transpose();
                     break;
                 }
                 case OpCode::Einsum: {
                     const std::string& sub = spec.str_param;
                     if (sub == "i,i->i" || sub == "i,i,i->i") {
-                        for (int i = 0; i < n; ++i) {
-                            double v = 1.0;
-                            for (int child_id : spec.children) v *= at(state.values_[static_cast<size_t>(child_id)], n, i, 0);
-                            dst[i] = v;
+                        Eigen::Map<Vec> out(dst, n);
+                        out.setOnes();
+                        for (int child_id : spec.children) {
+                            const auto& child_v = state.values_[static_cast<size_t>(child_id)];
+                            Eigen::Map<const Vec> child_vec(child_v.data.data(), n);
+                            out.array() *= child_vec.array();
                         }
                     } else if (sub == "i,ij->i") {
                         const auto& x = child(state, spec, 0);
                         const auto& m = child(state, spec, 1);
-                        for (int i = 0; i < n; ++i) {
-                            double row_sum = 0.0;
-                            for (int j = 0; j < m.width; ++j) row_sum += at(m, n, i, j);
-                            dst[i] = at(x, n, i, 0) * row_sum;
-                        }
+                        Eigen::Map<const Vec> x_vec(x.data.data(), n);
+                        Eigen::Map<const RowMatrix> matrix(m.data.data(), n, m.width);
+                        Eigen::Map<Vec> out(dst, n);
+                        out.array() = x_vec.array() * matrix.rowwise().sum().array();
                     } else if (sub == "ij,ij->ij") {
                         const auto& a = child(state, spec, 0);
                         const auto& b = child(state, spec, 1);
-                        for (int i = 0; i < n; ++i) for (int j = 0; j < dst_v.width; ++j) dst[static_cast<size_t>(i * dst_v.width + j)] = at(a, n, i, j) * at(b, n, i, j);
+                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
+                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
+                        Eigen::Map<RowMatrix> out(dst, n, dst_v.width);
+                        out.array() = left.array() * right.array();
+                    } else if (sub == "ij,ik->jk") {
+                        const auto& a = child(state, spec, 0);
+                        const auto& b = child(state, spec, 1);
+                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
+                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
+                        Eigen::Map<RowMatrix> out(dst, a.width, b.width);
+                        out.noalias() = left.transpose() * right;
                     } else if (sub == "ij,ij->") {
                         const auto& a = child(state, spec, 0);
                         const auto& b = child(state, spec, 1);
-                        double total = 0.0;
-                        for (int i = 0; i < n; ++i) for (int j = 0; j < a.width; ++j) total += at(a, n, i, j) * at(b, n, i, j);
-                        dst[0] = total;
+                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
+                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
+                        dst[0] = (left.array() * right.array()).sum();
                     } else {
                         throw std::invalid_argument("unsupported C++ jax_flat einsum pattern: " + sub);
                     }
@@ -538,39 +623,39 @@ private:
                     break;
                 }
                 case OpCode::Cumsum: {
-                    auto& s = slot(state, spec);
+                    auto& s = slot(state, spec).value;
                     const auto& x = child(state, spec, 0);
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        if (finite(v)) { s.value[static_cast<size_t>(i)] += v; s.initialized[static_cast<size_t>(i)] = 1; dst[i] = s.value[static_cast<size_t>(i)]; }
+                        if (finite(v)) { s.value[i] += v; s.initialized[i] = 1; dst[i] = s.value[i]; }
                         else dst[i] = NaN;
                     }
                     break;
                 }
                 case OpCode::Ewm: {
-                    auto& s = slot(state, spec);
+                    auto& s = slot(state, spec).value;
                     const auto& x = child(state, spec, 0);
                     const double alpha = 2.0 / (spec.param + 1.0);
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        if (finite(v)) { s.value[static_cast<size_t>(i)] = s.initialized[static_cast<size_t>(i)] ? alpha * v + (1.0 - alpha) * s.value[static_cast<size_t>(i)] : v; s.initialized[static_cast<size_t>(i)] = 1; }
-                        dst[i] = s.initialized[static_cast<size_t>(i)] ? s.value[static_cast<size_t>(i)] : NaN;
+                        if (finite(v)) { s.value[i] = s.initialized[i] ? alpha * v + (1.0 - alpha) * s.value[i] : v; s.initialized[i] = 1; }
+                        dst[i] = s.initialized[i] ? s.value[i] : NaN;
                     }
                     break;
                 }
                 case OpCode::FFill: {
-                    auto& s = slot(state, spec);
+                    auto& s = slot(state, spec).value;
                     const auto& x = child(state, spec, 0);
                     const int limit = spec.int_param;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        if (finite(v)) { s.value[static_cast<size_t>(i)] = v; s.seen[static_cast<size_t>(i)] = 1; s.streak[static_cast<size_t>(i)] = 0; dst[i] = v; }
-                        else { s.streak[static_cast<size_t>(i)] += 1; const bool allowed = s.seen[static_cast<size_t>(i)] && (limit < 0 || s.streak[static_cast<size_t>(i)] <= limit); dst[i] = allowed ? s.value[static_cast<size_t>(i)] : NaN; }
+                        if (finite(v)) { s.value[i] = v; s.seen[i] = 1; s.streak[i] = 0; dst[i] = v; }
+                        else { s.streak[i] += 1; const bool allowed = s.seen[i] && (limit < 0 || s.streak[i] <= limit); dst[i] = allowed ? s.value[i] : NaN; }
                     }
                     break;
                 }
                 case OpCode::Shift: {
-                    auto& s = slot(state, spec);
+                    auto& s = slot(state, spec).shift;
                     const auto& x = child(state, spec, 0);
                     const auto& lag = child(state, spec, 1);
                     const int width = dst_v.width;
@@ -581,11 +666,11 @@ private:
                         for (int c = 0; c < width; ++c) {
                             if (!finite(raw_lag)) dst[static_cast<size_t>(i * width + c)] = NaN;
                             else if (lag_i == 0) dst[static_cast<size_t>(i * width + c)] = at(x, n, i, c);
-                            else if (s.count >= lag_i) { int rp = (s.pos - lag_i) % s.cap; if (rp < 0) rp += s.cap; dst[static_cast<size_t>(i * width + c)] = s.buffer[static_cast<size_t>((rp * n + i) * width + c)]; }
+                            else if (s.count >= lag_i) { int rp = (s.pos - lag_i) % s.cap; if (rp < 0) rp += s.cap; dst[static_cast<size_t>(i * width + c)] = s.buffer(rp, i * width + c); }
                             else dst[static_cast<size_t>(i * width + c)] = NaN;
                         }
                     }
-                    std::copy(x.data.begin(), x.data.begin() + n * width, s.buffer.begin() + static_cast<size_t>(s.pos * n * width));
+                    std::copy(x.data.begin(), x.data.begin() + n * width, s.buffer.row(s.pos).data());
                     s.pos = (s.pos + 1) % s.cap;
                     s.count = std::min(s.count + 1, s.cap);
                     break;
@@ -594,8 +679,8 @@ private:
                     eval_ridge(state, spec, dst_v);
                     break;
                 case OpCode::GetBeta: {
-                    const auto& s = state.slots_[static_cast<size_t>(nodes_[static_cast<size_t>(spec.children[0])].state_index)];
-                    std::copy(s.beta.begin(), s.beta.end(), dst);
+                    const auto& s = state.slots_[static_cast<size_t>(nodes_[static_cast<size_t>(spec.children[0])].state_index)].ridge;
+                    std::copy(s.beta.data(), s.beta.data() + s.beta.size(), dst);
                     break;
                 }
                 case OpCode::GetPreds: {
@@ -647,7 +732,7 @@ private:
         }
     }
 
-    double eval_group_inner_node(StateSlot& s, const NodeSpec& node, int n, int row, int slot_i, std::vector<double>& values) const {
+    double eval_group_inner_node(GroupState& s, const NodeSpec& node, int n, int row, int slot_i, std::vector<double>& values) const {
         const auto child_value = [&](size_t i) { return values[static_cast<size_t>(node.children.at(i))]; };
         const size_t off = static_cast<size_t>(slot_i * n + row);
         switch (node.opcode) {
@@ -704,7 +789,7 @@ private:
     void eval_group_row(
         State& state,
         const NodeSpec& spec,
-        StateSlot& s,
+        GroupState& s,
         const NodeValue& lhs,
         int group_i,
         int row,
@@ -722,7 +807,7 @@ private:
     }
 
     void eval_group(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
-        StateSlot& s = slot(state, spec);
+        GroupState& s = slot(state, spec).group;
         const int lhs_child = s.n_keys;
         const auto& lhs = state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(lhs_child)])];
         std::fill(dst_v.data.begin(), dst_v.data.end(), NaN);
@@ -734,29 +819,29 @@ private:
         }
     }
 
-    bool row_matches_key(State& state, const NodeSpec& spec, int row, const std::vector<double>& key) const {
+    bool row_matches_key(State& state, const NodeSpec& spec, int row, const Vec& key) const {
         const int n = state.n_instruments_;
         for (int k = 0; k < static_cast<int>(key.size()); ++k) {
             const double incoming = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
-            if (!same_double_key(key[static_cast<size_t>(k)], incoming)) return false;
+            if (!same_double_key(key[k], incoming)) return false;
         }
         return true;
     }
 
-    bool row_matches_slot(State& state, const NodeSpec& spec, int row, const StateSlot& s, int slot_i) const {
+    bool row_matches_slot(State& state, const NodeSpec& spec, int row, const GroupState& s, int slot_i) const {
         const int n = state.n_instruments_;
         for (int k = 0; k < s.n_keys; ++k) {
-            const double stored = s.keys[static_cast<size_t>(slot_i * s.n_keys + k)];
+            const double stored = s.keys(slot_i, k);
             const double incoming = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
             if (!same_double_key(stored, incoming)) return false;
         }
         return true;
     }
 
-    void cache_group_slot(State& state, const NodeSpec& spec, int row, int group_i, StateSlot& s, int slot_i) const {
+    void cache_group_slot(State& state, const NodeSpec& spec, int row, int group_i, GroupState& s, int slot_i) const {
         const int n = state.n_instruments_;
         for (int k = 0; k < s.n_keys; ++k) {
-            s.cached_group_key[static_cast<size_t>(k)] = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
+            s.cached_group_key[k] = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
         }
         s.cached_group_slot = slot_i;
         s.cached_group_universe = group_i;
@@ -764,7 +849,7 @@ private:
     }
 
     int find_or_insert_group_slot(State& state, const NodeSpec& spec, int row, int group_i) const {
-        StateSlot& s = slot(state, spec);
+        GroupState& s = slot(state, spec).group;
         if (
             s.cached_group_valid && s.cached_group_slot >= 0 &&
             s.cached_group_universe == group_i &&
@@ -775,18 +860,18 @@ private:
         const int begin = group_i * s.capacity;
         const int end = begin + s.capacity;
         for (int slot_i = begin; slot_i < end; ++slot_i) {
-            if (!s.occupied[static_cast<size_t>(slot_i)]) continue;
+            if (!s.occupied[slot_i]) continue;
             if (row_matches_slot(state, spec, row, s, slot_i)) {
                 cache_group_slot(state, spec, row, group_i, s, slot_i);
                 return slot_i;
             }
         }
         for (int slot_i = begin; slot_i < end; ++slot_i) {
-            if (s.occupied[static_cast<size_t>(slot_i)]) continue;
-            s.occupied[static_cast<size_t>(slot_i)] = 1;
+            if (s.occupied[slot_i]) continue;
+            s.occupied[slot_i] = 1;
             const int n = state.n_instruments_;
             for (int k = 0; k < s.n_keys; ++k) {
-                s.keys[static_cast<size_t>(slot_i * s.n_keys + k)] = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
+                s.keys(slot_i, k) = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
             }
             cache_group_slot(state, spec, row, group_i, s, slot_i);
             return slot_i;
@@ -796,7 +881,7 @@ private:
 
     void eval_ridge(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
         const int n = state.n_instruments_;
-        StateSlot& s = slot(state, spec);
+        RidgeState& s = slot(state, spec).ridge;
         const int k = s.k;
         const bool has_weights = spec.children.size() == spec.feature_widths.size() + 4;
         const int y_child = static_cast<int>(spec.feature_widths.size());
@@ -808,12 +893,12 @@ private:
         const auto& hlv = state.values_[static_cast<size_t>(spec.children[hl_child])];
         const auto& lamv = state.values_[static_cast<size_t>(spec.children[lam_child])];
 
-        std::vector<double> xmat(static_cast<size_t>(n * k), NaN);
+        RowMatrix xmat = RowMatrix::Constant(n, k, NaN);
         for (int row = 0; row < n; ++row) {
             int off = 0;
             for (size_t f = 0; f < spec.feature_widths.size(); ++f) {
                 const auto& feat = state.values_[static_cast<size_t>(spec.children[f])];
-                for (int c = 0; c < spec.feature_widths[f]; ++c) xmat[static_cast<size_t>(row * k + off++)] = at(feat, n, row, c);
+                for (int c = 0; c < spec.feature_widths[f]; ++c) xmat(row, off++) = at(feat, n, row, c);
             }
         }
 
@@ -822,17 +907,17 @@ private:
             bool row_valid = finite(at(yv, n, row, 0));
             double pred = 0.0;
             for (int a = 0; a < k; ++a) {
-                const double x = xmat[static_cast<size_t>(row * k + a)];
+                const double x = xmat(row, a);
                 row_valid &= finite(x);
-                pred += (finite(x) ? x : 0.0) * s.beta[static_cast<size_t>(a)];
+                pred += (finite(x) ? x : 0.0) * s.beta[a];
             }
-            s.preds[static_cast<size_t>(row)] = row_valid ? pred : NaN;
+            s.preds[row] = row_valid ? pred : NaN;
         }
 
-        std::vector<double> xx_new(static_cast<size_t>(k * k), 0.0);
-        std::vector<double> xy_new(static_cast<size_t>(k), 0.0);
-        std::vector<uint8_t> xx_valid(static_cast<size_t>(k * k), 0);
-        std::vector<uint8_t> xy_valid(static_cast<size_t>(k), 0);
+        RowMatrix xx_new = RowMatrix::Zero(k, k);
+        Vec xy_new = Vec::Zero(k);
+        ByteVec xx_valid = ByteVec::Zero(k * k);
+        ByteVec xy_valid = ByteVec::Zero(k);
         for (int row = 0; row < n; ++row) {
             const double y = at(yv, n, row, 0);
             const double w_raw = has_weights ? at(wv, n, row, 0) : 1.0;
@@ -840,17 +925,17 @@ private:
             const double w = valid_w ? w_raw : 0.0;
             const bool valid_y = finite(y);
             for (int a = 0; a < k; ++a) {
-                const double xa = xmat[static_cast<size_t>(row * k + a)];
+                const double xa = xmat(row, a);
                 const bool valid_xa = finite(xa);
                 if (valid_xa && valid_y && valid_w) {
-                    xy_new[static_cast<size_t>(a)] += xa * w * y;
-                    xy_valid[static_cast<size_t>(a)] = 1;
+                    xy_new[a] += xa * w * y;
+                    xy_valid[a] = 1;
                 }
                 for (int b = 0; b < k; ++b) {
-                    const double xb = xmat[static_cast<size_t>(row * k + b)];
+                    const double xb = xmat(row, b);
                     if (valid_xa && finite(xb) && valid_w) {
                         const size_t idx = static_cast<size_t>(a * k + b);
-                        xx_new[idx] += xa * w * xb;
+                        xx_new(a, b) += xa * w * xb;
                         xx_valid[idx] = 1;
                     }
                 }
@@ -859,26 +944,24 @@ private:
 
         const double hl = at(hlv, n, 0, 0);
         for (int a = 0; a < k; ++a) {
-            if (xy_valid[static_cast<size_t>(a)]) update_ew_stat(s.xy[static_cast<size_t>(a)], s.has_xy[static_cast<size_t>(a)], s.last_xy[static_cast<size_t>(a)], xy_new[static_cast<size_t>(a)], s.t, hl);
+            if (xy_valid[a]) update_ew_stat(s.xy[a], s.has_xy[a], s.last_xy[a], xy_new[a], s.t, hl);
             for (int b = 0; b < k; ++b) {
                 const size_t idx = static_cast<size_t>(a * k + b);
-                if (xx_valid[idx]) update_ew_stat(s.xx[idx], s.has_xx[idx], s.last_xx[idx], xx_new[idx], s.t, hl);
+                if (xx_valid[idx]) update_ew_stat(s.xx(a, b), s.has_xx[idx], s.last_xx[idx], xx_new(a, b), s.t, hl);
             }
         }
         for (int a = 0; a < k; ++a) {
             for (int b = a + 1; b < k; ++b) {
-                const size_t ab = static_cast<size_t>(a * k + b);
-                const size_t ba = static_cast<size_t>(b * k + a);
-                const double avg = 0.5 * (s.xx[ab] + s.xx[ba]);
-                s.xx[ab] = avg;
-                s.xx[ba] = avg;
+                const double avg = 0.5 * (s.xx(a, b) + s.xx(b, a));
+                s.xx(a, b) = avg;
+                s.xx(b, a) = avg;
             }
         }
         const double lam_raw = at(lamv, n, 0, 0);
         const double lam = std::max(finite(lam_raw) ? lam_raw : 0.0, 0.0);
         solve_ridge(s, lam);
         ++s.t;
-        std::copy(s.preds.begin(), s.preds.end(), dst_v.data.begin());
+        std::copy(s.preds.data(), s.preds.data() + s.preds.size(), dst_v.data.begin());
     }
 
     static void update_ew_stat(double& current, uint8_t& has, int64_t& last, double fresh, int64_t t, double hl) {
@@ -890,41 +973,49 @@ private:
         last = t;
     }
 
-    static void solve_ridge(StateSlot& s, double lam) {
+    static void solve_ridge(RidgeState& s, double lam) {
         const int k = s.k;
-        // State sizes are known at init_state; the solver works over fixed-size
-        // owned state buffers and uses stack scalars for pivot bookkeeping. This
-        // keeps allocations outside the hot row evaluator except for the local
-        // linear-system copy needed to preserve sufficient statistics.
-        std::array<int, 2> pivot_stats{0, 0};
-        std::vector<double> a = s.xx;
-        std::vector<double> b = s.xy;
-        for (int i = 0; i < k; ++i) a[static_cast<size_t>(i * k + i)] += lam * s.xx[static_cast<size_t>(i * k + i)];
-        std::vector<double> x(static_cast<size_t>(k), 0.0);
-        for (int col = 0; col < k; ++col) {
-            int pivot = col;
-            double best = std::abs(a[static_cast<size_t>(col * k + col)]);
-            for (int r = col + 1; r < k; ++r) if (std::abs(a[static_cast<size_t>(r * k + col)]) > best) { best = std::abs(a[static_cast<size_t>(r * k + col)]); pivot = r; }
-            if (best <= 1e-18 || !finite(best)) return;
-            pivot_stats[0] += 1;
-            if (pivot != col) {
-                for (int c = col; c < k; ++c) std::swap(a[static_cast<size_t>(col * k + c)], a[static_cast<size_t>(pivot * k + c)]);
-                std::swap(b[static_cast<size_t>(col)], b[static_cast<size_t>(pivot)]);
-            }
-            const double diag = a[static_cast<size_t>(col * k + col)];
-            for (int c = col; c < k; ++c) a[static_cast<size_t>(col * k + c)] /= diag;
-            b[static_cast<size_t>(col)] /= diag;
-            for (int r = 0; r < k; ++r) {
-                if (r == col) continue;
-                const double factor = a[static_cast<size_t>(r * k + col)];
-                for (int c = col; c < k; ++c) a[static_cast<size_t>(r * k + c)] -= factor * a[static_cast<size_t>(col * k + c)];
-                b[static_cast<size_t>(r)] -= factor * b[static_cast<size_t>(col)];
-            }
-        }
-        if (std::all_of(b.begin(), b.end(), [](double v) { return finite(v); })) s.beta = b;
+        RowMatrix lhs = s.xx;
+        lhs.diagonal().array() += lam * s.xx.diagonal().array();
+        if (!lhs.allFinite() || !s.xy.allFinite()) return;
+
+        Eigen::ColPivHouseholderQR<RowMatrix> solver(lhs);
+        solver.setThreshold(1e-12);
+        if (solver.rank() < k) return;
+
+        Vec beta = solver.solve(s.xy);
+        if (beta.allFinite()) s.beta = std::move(beta);
     }
 
+
 };
+
+void configure_group_universe(GroupState& group, const NodeSpec& spec, int n_instruments, int groups, int capacity) {
+    group.n_groups = groups;
+    group.capacity = capacity;
+    if (spec.feature_widths.empty()) {
+        group.group_offsets = {0, n_instruments};
+        group.group_indices.resize(static_cast<size_t>(n_instruments));
+        std::iota(group.group_indices.begin(), group.group_indices.end(), 0);
+        return;
+    }
+
+    group.group_offsets.clear();
+    group.group_indices.clear();
+    group.group_offsets.push_back(0);
+    size_t pos = 1;
+    for (int group_i = 0; group_i < groups; ++group_i) {
+        if (pos >= spec.feature_widths.size()) throw std::invalid_argument("invalid C++ jax_flat group universe encoding");
+        const int len = spec.feature_widths[pos++];
+        for (int j = 0; j < len; ++j) {
+            if (pos >= spec.feature_widths.size()) throw std::invalid_argument("invalid C++ jax_flat group universe index encoding");
+            const int col = spec.feature_widths[pos++];
+            if (col < 0 || col >= n_instruments) throw std::invalid_argument("C++ jax_flat group universe column out of range");
+            group.group_indices.push_back(col);
+        }
+        group.group_offsets.push_back(static_cast<int>(group.group_indices.size()));
+    }
+}
 
 State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instruments) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
@@ -933,8 +1024,8 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
         const NodeSpec& spec = runtime->nodes_[i];
         NodeValue& value = values_[i];
         value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
-        value.fixed_rows = 1;
-        value.rows_kind = (spec.opcode == OpCode::GetBeta || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->"))) ? 1 : 0;
+        value.fixed_rows = (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->jk") && !spec.feature_widths.empty()) ? spec.feature_widths[0] : 1;
+        value.rows_kind = (spec.opcode == OpCode::GetBeta || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk")))) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
@@ -942,69 +1033,30 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
     slots_.resize(static_cast<size_t>(runtime->n_states_));
     for (const NodeSpec& spec : runtime->nodes_) {
         if (spec.state_index < 0) continue;
-        StateSlot& s = slots_[static_cast<size_t>(spec.state_index)];
-        const int size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
-        if (spec.opcode == OpCode::Shift) {
-            s.kind = StateSlotKind::Shift;
-            s.cap = spec.int_param + 1;
-            s.buffer.assign(static_cast<size_t>(s.cap * size), NaN);
-        } else if (spec.opcode == OpCode::Ridge) {
-            s.kind = StateSlotKind::Ridge;
-            s.k = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
-            s.value.assign(static_cast<size_t>(s.k), 0.0);
-            s.xx.assign(static_cast<size_t>(s.k * s.k), 0.0);
-            s.xy.assign(static_cast<size_t>(s.k), 0.0);
-            s.has_xx.assign(static_cast<size_t>(s.k * s.k), 0);
-            s.has_xy.assign(static_cast<size_t>(s.k), 0);
-            s.last_xx.assign(static_cast<size_t>(s.k * s.k), 0);
-            s.last_xy.assign(static_cast<size_t>(s.k), 0);
-            s.beta.assign(static_cast<size_t>(s.k), 0.0);
-            s.preds.assign(static_cast<size_t>(n_instruments), NaN);
-        } else if (spec.opcode == OpCode::Group) {
-            s.kind = StateSlotKind::Group;
-            s.n_keys = spec.int_param;
-            s.capacity = static_cast<int>(spec.param);
-            if (spec.feature_widths.empty()) {
-                s.n_groups = 1;
-                s.group_offsets = {0, n_instruments};
-                s.group_indices.resize(static_cast<size_t>(n_instruments));
-                std::iota(s.group_indices.begin(), s.group_indices.end(), 0);
-            } else {
-                s.n_groups = spec.feature_widths.at(0);
-                s.group_offsets.clear();
-                s.group_indices.clear();
-                s.group_offsets.push_back(0);
-                size_t pos = 1;
-                for (int group_i = 0; group_i < s.n_groups; ++group_i) {
-                    if (pos >= spec.feature_widths.size()) throw std::invalid_argument("invalid C++ jax_flat group universe encoding");
-                    const int len = spec.feature_widths[pos++];
-                    for (int j = 0; j < len; ++j) {
-                        if (pos >= spec.feature_widths.size()) throw std::invalid_argument("invalid C++ jax_flat group universe index encoding");
-                        const int col = spec.feature_widths[pos++];
-                        if (col < 0 || col >= n_instruments) throw std::invalid_argument("C++ jax_flat group universe column out of range");
-                        s.group_indices.push_back(col);
-                    }
-                    s.group_offsets.push_back(static_cast<int>(s.group_indices.size()));
-                }
+        const int node_size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
+        StateSlot& slot = slots_[static_cast<size_t>(spec.state_index)];
+
+        switch (spec.opcode) {
+            case OpCode::Shift:
+                slot = StateSlot::shift_slot(spec.int_param + 1, node_size);
+                break;
+            case OpCode::Ridge: {
+                const int feature_count = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
+                slot = StateSlot::ridge_slot(feature_count, n_instruments);
+                break;
             }
-            const int total_slots = s.capacity * s.n_groups;
-            s.keys.assign(static_cast<size_t>(total_slots * std::max(s.n_keys, 1)), NaN);
-            s.occupied.assign(static_cast<size_t>(total_slots), 0);
-            s.cached_group_key.assign(static_cast<size_t>(std::max(s.n_keys, 1)), NaN);
-            s.cached_group_slot = -1;
-            s.cached_group_universe = -1;
-            s.cached_group_valid = 0;
-            const int states = count_inner_states(spec.inner_nodes);
-            s.inner_values.assign(static_cast<size_t>(states), std::vector<double>(static_cast<size_t>(total_slots * n_instruments), 0.0));
-            s.inner_initialized.assign(static_cast<size_t>(states), std::vector<uint8_t>(static_cast<size_t>(total_slots * n_instruments), 0));
-            s.inner_streak.assign(static_cast<size_t>(states), std::vector<int64_t>(static_cast<size_t>(total_slots * n_instruments), 0));
-            s.inner_seen.assign(static_cast<size_t>(states), std::vector<uint8_t>(static_cast<size_t>(total_slots * n_instruments), 0));
-        } else {
-            s.kind = StateSlotKind::Value;
-            s.value.assign(static_cast<size_t>(size), 0.0);
-            s.initialized.assign(static_cast<size_t>(size), 0);
-            s.streak.assign(static_cast<size_t>(size), 0);
-            s.seen.assign(static_cast<size_t>(size), 0);
+            case OpCode::Group: {
+                const int groups = spec.feature_widths.empty() ? 1 : spec.feature_widths.at(0);
+                const int capacity = static_cast<int>(spec.param);
+                const int total_slots = capacity * groups;
+                const int inner_states = count_inner_states(spec.inner_nodes);
+                slot = StateSlot::group_slot(spec.int_param, total_slots, inner_states, n_instruments);
+                configure_group_universe(slot.group, spec, n_instruments, groups, capacity);
+                break;
+            }
+            default:
+                slot = StateSlot::value_slot(node_size);
+                break;
         }
     }
 }

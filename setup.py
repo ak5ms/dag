@@ -11,6 +11,7 @@ ext_modules = [
         "trading_dsl_engine.jax_flat._cpp_flat",
         ["src/trading_dsl_engine/jax_flat/engine.cpp"],
         depends=["src/trading_dsl_engine/jax_flat/ops.cpp"],
+        include_dirs=["/usr/include/eigen3"],
         cxx_std=23,
         extra_compile_args=["-O3", "-std=c++2b"],
     )

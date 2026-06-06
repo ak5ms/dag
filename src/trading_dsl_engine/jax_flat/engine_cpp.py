@@ -88,6 +88,17 @@ def _reshape_cpp_batch_output(program: StreamingProgram, raw, n_steps: int, n_in
     arr = np.asarray(raw)
     if root.output_kind == "matrix":
         width = int(root.output_width) if root.output_width is not None else n_instruments
+        if isinstance(root, NaryOp) and root.cpp_name == "einsum":
+            subscripts = root.cpp_str_param
+            output = subscripts.split("->", 1)[1] if "->" in subscripts else ""
+            if "i" not in output and len(output) == 2:
+                input_terms = subscripts.split("->", 1)[0].split(",")
+                row_width = next(
+                    (program.nodes[cid].op.output_width for term, cid in zip(input_terms, program.nodes[program.outputs[0]].child_ids) if len(term) == 2 and term[1] == output[0]),
+                    None,
+                )
+                if row_width is not None:
+                    return arr.reshape((n_steps, int(row_width), width))
         return arr.reshape((n_steps, n_instruments, width))
     if root.output_kind == "scalar" and arr.ndim == 2 and arr.shape[1] == 1:
         return arr[:, 0]
@@ -174,7 +185,10 @@ def _cpp_node_specs(program: StreamingProgram):
                 if not isinstance(ridge_child, RidgeOp):
                     raise NotImplementedError("C++ jax_flat get_beta expects direct Ridge child")
                 cpp_width = sum(ridge_child.feature_widths)
-            specs.append(spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width, str_param=getattr(op, "cpp_str_param", "")))
+            feature_widths = ()
+            if op.cpp_name == "einsum":
+                feature_widths = tuple(program.nodes[cid].op.output_width or 1 for cid in node.child_ids)
+            specs.append(spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width, feature_widths=feature_widths, str_param=getattr(op, "cpp_str_param", "")))
             supported.append(op.cpp_name)
             continue
         if isinstance(op, CumsumOp):
