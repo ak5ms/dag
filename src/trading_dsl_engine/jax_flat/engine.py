@@ -35,6 +35,8 @@ from trading_dsl_engine.jax_flat.ops import (
 )
 
 
+
+
 @dataclass(frozen=True)
 class DagNode:
     op: Any
@@ -203,12 +205,54 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
+        if (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
+            accelerated = _try_cpp_accelerated_batch(self, inputs, states)
+            if accelerated is not None:
+                return accelerated
         if _has_memmap_input(inputs) or out_path:
             return _run_chunked_batch(self, inputs, states, out_path)
         if not states:
             return _jit_batch_from_initial_state(self, inputs)
         return _jit_batch(self, states, inputs)
 
+
+
+def _is_cpp_flat_state(states) -> bool:
+    return type(states).__name__ == "CppFlatState"
+
+
+def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
+    """Optionally run C++ flat batch for fully supported programs.
+
+    This is a runtime accelerator, not a semantic fallback: unsupported programs,
+    callers with explicit state, memmaps, or disabled native acceleration continue
+    through the normal JAX path. The C++ module is imported lazily so the standard
+    JAX-flat import path does not require a built extension.
+    """
+    if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
+        return None
+    if not any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
+        return None
+    try:
+        from trading_dsl_engine.jax_flat import _cpp_flat
+        from trading_dsl_engine.jax_flat.engine_cpp import _cpp_node_specs, _reshape_cpp_batch_output
+    except Exception:
+        return None
+    try:
+        node_specs, _ = _cpp_node_specs(runtime.program)
+    except NotImplementedError:
+        return None
+
+    n_steps, n_instruments = inputs[0].shape
+    key = (node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves, n_instruments)
+    core = _CPP_ACCELERATOR_CACHE.get(key)
+    if core is None:
+        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves)
+        _CPP_ACCELERATOR_CACHE[key] = core
+    state = states if _is_cpp_flat_state(states) else core.init_state(n_instruments)
+    np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+    raw = core.run_batch(state, *np_inputs)
+    return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
 
 def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
     if isinstance(inputs, dict):
@@ -335,6 +379,7 @@ def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
 
 
 _BATCH_CHUNK_SIZE = 2560
+_CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
 @jax.jit
@@ -575,14 +620,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
-        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops)), None
+        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
     if variadic_builder is not None:
         static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
         return variadic_builder(*static_args), None
     if expr.fn == "round":
         if len(expr.args) == 1:
-            return NaryOp(jnp.round), None
+            return NaryOp(jnp.round, cpp_name="round"), None
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
@@ -626,12 +671,12 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
-        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis, cpp_name="bspline", cpp_int_param=n_basis), 1
     if expr.fn == "col" and len(expr.args) == 2:
         index = _literal_int_arg(expr.args[1], "col", 2)
         if index < 0:
             raise ValueError("col index must be >= 0")
-        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
+        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1, cpp_name="col", cpp_int_param=index), 1
     if expr.fn == "Ridge" and len(expr.args) >= 4:
         has_weights = len(expr.args) >= 5
         feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]
@@ -901,6 +946,7 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
     return node
+
 
 
 def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:
