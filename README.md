@@ -141,6 +141,29 @@ runtime = compile_formula(
 ```
 
 
+## Formula units, semantic types, and ranges
+
+`trading_dsl_engine.jax_flat.compile_formula(...)` accepts optional static field metadata so users can inspect the physical/trading units and value range implied by a formula without changing the compiled streaming hot path. The helper API is intentionally lightweight: describe only new input fields, then let arithmetic propagate the metadata through the expression graph.
+
+```python
+from trading_dsl_engine.jax_flat import compile_formula, field, metadata
+
+schema = metadata(
+    {
+        "close": field(units={"dollar": 1}, range="real", types=("price",)),
+        "volume": field(units={"shares": 1}, range="nonnegative", types=("volume",)),
+    },
+    type_relations=(("price", "currency"),),
+)
+
+runtime = compile_formula("close * volume ** 3", metadata=schema, cpp=False)
+runtime.get_units().as_dict()  # {"dollar": 1.0, "shares": 3.0}
+runtime.get_range().as_tuple()  # (-inf, inf) for real price times nonnegative volume**3
+runtime.get_type_relations().closure(("price",))  # {"price", "currency"}
+```
+
+Unit metadata is represented as a sparse exponent vector over domain labels such as `dollar` or `shares`; compatible addition/subtraction is checked at compile time, while multiplication/division/power compose exponents. The semantic type graph is a small transitive Boolean relation matrix, so users can express Venn-style implications such as “every price is a currency-denominated value, but not every currency value is a price.” Range metadata uses interval arithmetic rules for common scalar/vector operators and exposes `ValueRange.to_immrax_interval()` when the optional `metadata` extra (`unxt` + `immrax`) is installed. Unit metadata similarly exposes `UnitInfo.to_unxt_quantity()` for downstream `unxt` interop when unit labels are registered/recognized by that environment.
+
 ## Native C++ tick prototype
 
 `trading_dsl_engine.jax_flat.compile_formula(..., cpp=True)` enables the optional native accelerator by default for supported grouped hot paths, while `cpp=False` forces the pure JAX-flat path. `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` lazily imports `trading_dsl_engine.jax_flat.engine_cpp` and exposes an experimental native tick-path runtime for flat formulas where C++ can currently preserve the same streaming semantics as JAX-flat. It compiles the existing shared parser/lowering output into a C++ flattened node table backed by `jax_flat/engine.cpp` + `jax_flat/ops.cpp`; `init_state(n_instruments)` preallocates per-node scratch buffers and operator-specific native state, while `tick_into(state, out, *rows)` reuses both the state and caller-owned output row to avoid hot-path Python/JAX allocations. The native wrapper also mirrors the JAX-flat batch API with `run_batch(...)` and `run_batch_into(...)`; `tick(...)` remains a convenience method that allocates only its returned row.

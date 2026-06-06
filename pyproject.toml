@@ -18,6 +18,12 @@ dependencies = [
     "pybind11>=2.12",
 ]
 
+[project.optional-dependencies]
+metadata = [
+    "unxt",
+    "immrax",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --durations=0 -n 12 --import-mode=importlib"
