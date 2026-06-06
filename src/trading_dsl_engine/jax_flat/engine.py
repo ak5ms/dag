@@ -17,6 +17,9 @@ from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistr
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
+    InstrumentBasisMeanOp,
+    RbfBasisOp,
+    FutureRbfBasisSumOp,
     BufferShiftOp,
     EwmOp,
     FFillOp,
@@ -106,6 +109,31 @@ class InnerGraphOp(Op):
             values[idx] = value
 
         return tuple(new_state), values[self.output_id]
+
+    def scan_batch(self, state_leaves, *input_sequences: jax.Array):
+        n_steps = input_sequences[0].shape[0]
+        values: list[Any] = [jnp.array(0.0)] * len(self.nodes)
+        new_state = list(()) if state_leaves is None else list(state_leaves)
+
+        for idx, node in enumerate(self.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = input_sequences[op.input_index]
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            field = self.state_layout.node_fields[idx]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.scan_batch(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
+            values[idx] = value
+
+        next_states = tuple(new_state) if state_leaves is not None else None
+        return next_states, values[self.output_id]
 
 
 class JaxFlatRuntime(eqx.Module):
@@ -334,7 +362,7 @@ def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
     return _scan_batch(runtime, state0, inputs)
 
 
-_BATCH_CHUNK_SIZE = 2560
+_BATCH_CHUNK_SIZE = int(os.environ.get("TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE", "65536"))
 
 
 @jax.jit
@@ -569,7 +597,7 @@ def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -
     return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
 
 
-def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | None]:
+def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
     if expr.fn == "groupby":
         raise ValueError("groupby must be compiled with its RHS subgraph")
     if expr.kwargs:
@@ -627,11 +655,28 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         if n_basis <= 0:
             raise ValueError("bspline n_basis must be >= 1")
         return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis), 1
+    if expr.fn == "rbf_basis" and len(expr.args) == 4:
+        n_basis = _literal_int_arg(expr.args[3], "rbf_basis", 4)
+        if n_basis <= 0:
+            raise ValueError("rbf_basis n_basis must be >= 1")
+        return RbfBasisOp(n_basis=n_basis), 3
+    if expr.fn == "future_rbf_basis_sum" and len(expr.args) == 5:
+        n_basis = _literal_int_arg(expr.args[3], "future_rbf_basis_sum", 4)
+        n_steps = _literal_int_arg(expr.args[4], "future_rbf_basis_sum", 5)
+        if n_basis <= 0:
+            raise ValueError("future_rbf_basis_sum n_basis must be >= 1")
+        if n_steps <= 0:
+            raise ValueError("future_rbf_basis_sum n_steps must be >= 1")
+        return FutureRbfBasisSumOp(n_basis=n_basis, n_steps=n_steps), (3, 4)
     if expr.fn == "col" and len(expr.args) == 2:
         index = _literal_int_arg(expr.args[1], "col", 2)
         if index < 0:
             raise ValueError("col index must be >= 0")
         return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1), 1
+    if expr.fn == "InstrumentBasisMean" and len(expr.args) in (3, 4):
+        has_weights = len(expr.args) == 4
+        feature_op = child_ops[0]
+        return InstrumentBasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
     if expr.fn == "Ridge" and len(expr.args) >= 4:
         has_weights = len(expr.args) >= 5
         feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]
@@ -723,7 +768,8 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             )
             op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
             if drop_child_idx is not None:
-                child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
+                drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+                child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
             idx = len(nodes)
             nodes.append(DagNode(op=op, child_ids=child_ids))
             memo[key] = idx
@@ -870,7 +916,8 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
-        child_ids = tuple(cid for i, cid in enumerate(child_ids) if i != drop_child_idx)
+        drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+        child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
     idx = len(nodes)
     nodes.append(DagNode(op=op, child_ids=child_ids))
     memo[key] = idx

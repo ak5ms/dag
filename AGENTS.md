@@ -26,6 +26,8 @@ Priorities, in order:
 - Preserve column universe support for generic operators: `univ(...)` describes static column groups, `column_names` maps tickers to column positions, and grouped operators must run independently per universe on group sub-frames without interpreter fallback. `univ(...)` may also appear inside tuple keys such as `groupby((univ([0, 1]), ts), op)` to combine static column slicing with dynamic key routing.
 - Grouped execution must use a single canonical form: `groupby(key_tuple, lhs, op_using_self_)` (or Python sugar `lhs.groupby(key_tuple).apply(op(self_, *others))`). Delete all legacy groupby forms and alternate flow paths. `key_tuple` must support arbitrary-length composite keys and may contain at most one `univ(...)` element.
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
+- Keep op-specific private helper functions on the relevant operator class as `@staticmethod`; these static methods may be reused from another class when that is the cleanest shared implementation.
+- DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
 
 ## Where to change what
