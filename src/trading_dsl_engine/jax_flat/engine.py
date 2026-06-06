@@ -32,6 +32,7 @@ from trading_dsl_engine.jax_flat.ops import (
     _bspline,
     _cat,
     _col,
+    _einsum,
 )
 
 
@@ -113,6 +114,8 @@ class InnerGraphOp(Op):
 class JaxFlatRuntime(eqx.Module):
     program: StreamingProgram = eqx.field(static=True)
     runtimes: list[float] = eqx.field(default_factory=list, static=True)
+    cpp: bool = eqx.field(default=True, static=True)
+    cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     block: bool = True # False disables waiting (for runtime measurement)
 
     def init_state(self, n_instruments: int):
@@ -205,7 +208,7 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-        if (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
+        if self.cpp and (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
             accelerated = _try_cpp_accelerated_batch(self, inputs, states)
             if accelerated is not None:
                 return accelerated
@@ -231,16 +234,22 @@ def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
     """
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
+    # Avoid regressing the pure JAX vectorized path for simple formulas; the
+    # automatic accelerator currently targets grouped formulas where the native
+    # row transition materially improves steady-state runtime. Explicit
+    # compile_formula_cpp(...) remains available for non-group formulas.
     if not any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
         return None
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
         from trading_dsl_engine.jax_flat.engine_cpp import _cpp_node_specs, _reshape_cpp_batch_output
-    except Exception:
+    except Exception as exc:
+        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
         return None
     try:
         node_specs, _ = _cpp_node_specs(runtime.program)
-    except NotImplementedError:
+    except NotImplementedError as exc:
+        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
         return None
 
     n_steps, n_instruments = inputs[0].shape
@@ -253,6 +262,14 @@ def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
     np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
     raw = core.run_batch(state, *np_inputs)
     return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
+
+
+def _warn_cpp_fallback(runtime: JaxFlatRuntime, message: str) -> None:
+    if message in runtime.cpp_fallback_warnings:
+        return
+    runtime.cpp_fallback_warnings.append(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+
 
 def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
     if isinstance(inputs, dict):
@@ -621,6 +638,28 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | Non
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
+    if expr.fn == "einsum":
+        static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
+        if len(static_args) != 1:
+            raise ValueError("einsum expects one string subscript literal")
+        subscripts = str(static_args[0])
+        output = subscripts.split("->", 1)[1] if "->" in subscripts else ""
+        if output == "":
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="scalar", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
+        if output == "i":
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
+        if output in {"ij", "jk", "ik"}:
+            # Matrix width is inferred from the last output index when possible;
+            # dynamic widths (for outer-like i,j output) use None.
+            index_widths = {}
+            input_terms = subscripts.split("->", 1)[0].split(",")
+            for term, op in zip(input_terms, child_ops):
+                if len(term) == 2 and op.output_width is not None:
+                    index_widths[term[1]] = int(op.output_width)
+                elif term == "i":
+                    index_widths["i"] = 1
+            width = index_widths.get(output[-1])
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="matrix", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
     variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
     if variadic_builder is not None:
         static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
@@ -949,7 +988,7 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
 
 
 
-def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> JaxFlatRuntime:
+def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None, cpp: bool = True) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
@@ -964,5 +1003,6 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
             outputs=(out,),
             input_names=tuple(input_names),
             state_layout=layout,
-        )
+        ),
+        cpp=cpp,
     )

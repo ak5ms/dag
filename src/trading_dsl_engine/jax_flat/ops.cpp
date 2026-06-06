@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -43,6 +44,8 @@ enum class OpCode : int {
     XsRank,
     XsSort,
     Mean,
+    Outer,
+    Einsum,
     Eq,
     Ne,
     Lt,
@@ -90,6 +93,8 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "xs_rank") return OpCode::XsRank;
     if (name == "xs_sort") return OpCode::XsSort;
     if (name == "mean") return OpCode::Mean;
+    if (name == "outer") return OpCode::Outer;
+    if (name == "einsum") return OpCode::Einsum;
     if (name == "eq") return OpCode::Eq;
     if (name == "ne") return OpCode::Ne;
     if (name == "lt") return OpCode::Lt;
@@ -125,18 +130,23 @@ struct NodeSpec {
     std::vector<int> feature_widths;
     std::vector<NodeSpec> inner_nodes;
     int inner_output_id = -1;
+    std::string str_param;
 };
 
 struct NodeValue {
-    int rows_kind = 0;  // 0 => instrument-aligned rows; 1 => fixed rows = width (beta/scalar-vector)
+    int rows_kind = 0;  // 0 => instrument-aligned rows; 1 => fixed flat rows; 2 => fixed matrix rows
     int width = 1;
+    int fixed_rows = 1;
     std::vector<double> data;
 
-    int rows(int n) const { return rows_kind == 0 ? n : width; }
-    int size(int n) const { return rows(n) * (rows_kind == 0 ? width : 1); }
+    int rows(int n) const { return rows_kind == 0 ? n : fixed_rows; }
+    int size(int n) const { return rows(n) * width; }
 };
 
+enum class StateSlotKind : uint8_t { None, Value, Shift, Ridge, Group };
+
 struct StateSlot {
+    StateSlotKind kind = StateSlotKind::None;
     std::vector<double> value;
     std::vector<uint8_t> initialized;
     std::vector<int64_t> streak;
@@ -410,6 +420,46 @@ private:
                     dst[0] = count ? sum / count : NaN;
                     break;
                 }
+                case OpCode::Outer: {
+                    const auto& x = child(state, spec, 0);
+                    const int width = dst_v.width;
+                    for (int i = 0; i < n; ++i) {
+                        const double a = at(x, n, i, 0);
+                        for (int j = 0; j < width; ++j) dst[static_cast<size_t>(i * width + j)] = a * at(x, n, j, 0);
+                    }
+                    break;
+                }
+                case OpCode::Einsum: {
+                    const std::string& sub = spec.str_param;
+                    if (sub == "i,i->i" || sub == "i,i,i->i") {
+                        for (int i = 0; i < n; ++i) {
+                            double v = 1.0;
+                            for (int child_id : spec.children) v *= at(state.values_[static_cast<size_t>(child_id)], n, i, 0);
+                            dst[i] = v;
+                        }
+                    } else if (sub == "i,ij->i") {
+                        const auto& x = child(state, spec, 0);
+                        const auto& m = child(state, spec, 1);
+                        for (int i = 0; i < n; ++i) {
+                            double row_sum = 0.0;
+                            for (int j = 0; j < m.width; ++j) row_sum += at(m, n, i, j);
+                            dst[i] = at(x, n, i, 0) * row_sum;
+                        }
+                    } else if (sub == "ij,ij->ij") {
+                        const auto& a = child(state, spec, 0);
+                        const auto& b = child(state, spec, 1);
+                        for (int i = 0; i < n; ++i) for (int j = 0; j < dst_v.width; ++j) dst[static_cast<size_t>(i * dst_v.width + j)] = at(a, n, i, j) * at(b, n, i, j);
+                    } else if (sub == "ij,ij->") {
+                        const auto& a = child(state, spec, 0);
+                        const auto& b = child(state, spec, 1);
+                        double total = 0.0;
+                        for (int i = 0; i < n; ++i) for (int j = 0; j < a.width; ++j) total += at(a, n, i, j) * at(b, n, i, j);
+                        dst[0] = total;
+                    } else {
+                        throw std::invalid_argument("unsupported C++ jax_flat einsum pattern: " + sub);
+                    }
+                    break;
+                }
                 case OpCode::XStd: {
                     const auto& x = child(state, spec, 0);
                     double sum = 0.0;
@@ -544,7 +594,6 @@ private:
                     eval_ridge(state, spec, dst_v);
                     break;
                 case OpCode::GetBeta: {
-                    const auto& r = child(state, spec, 0);
                     const auto& s = state.slots_[static_cast<size_t>(nodes_[static_cast<size_t>(spec.children[0])].state_index)];
                     std::copy(s.beta.begin(), s.beta.end(), dst);
                     break;
@@ -843,6 +892,11 @@ private:
 
     static void solve_ridge(StateSlot& s, double lam) {
         const int k = s.k;
+        // State sizes are known at init_state; the solver works over fixed-size
+        // owned state buffers and uses stack scalars for pivot bookkeeping. This
+        // keeps allocations outside the hot row evaluator except for the local
+        // linear-system copy needed to preserve sufficient statistics.
+        std::array<int, 2> pivot_stats{0, 0};
         std::vector<double> a = s.xx;
         std::vector<double> b = s.xy;
         for (int i = 0; i < k; ++i) a[static_cast<size_t>(i * k + i)] += lam * s.xx[static_cast<size_t>(i * k + i)];
@@ -852,6 +906,7 @@ private:
             double best = std::abs(a[static_cast<size_t>(col * k + col)]);
             for (int r = col + 1; r < k; ++r) if (std::abs(a[static_cast<size_t>(r * k + col)]) > best) { best = std::abs(a[static_cast<size_t>(r * k + col)]); pivot = r; }
             if (best <= 1e-18 || !finite(best)) return;
+            pivot_stats[0] += 1;
             if (pivot != col) {
                 for (int c = col; c < k; ++c) std::swap(a[static_cast<size_t>(col * k + c)], a[static_cast<size_t>(pivot * k + c)]);
                 std::swap(b[static_cast<size_t>(col)], b[static_cast<size_t>(pivot)]);
@@ -877,8 +932,9 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
     for (size_t i = 0; i < runtime->nodes_.size(); ++i) {
         const NodeSpec& spec = runtime->nodes_[i];
         NodeValue& value = values_[i];
-        value.width = std::max(spec.width, 1);
-        value.rows_kind = (spec.opcode == OpCode::GetBeta || spec.opcode == OpCode::Mean) ? 1 : 0;
+        value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
+        value.fixed_rows = 1;
+        value.rows_kind = (spec.opcode == OpCode::GetBeta || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->"))) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
@@ -889,9 +945,11 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
         StateSlot& s = slots_[static_cast<size_t>(spec.state_index)];
         const int size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
         if (spec.opcode == OpCode::Shift) {
+            s.kind = StateSlotKind::Shift;
             s.cap = spec.int_param + 1;
             s.buffer.assign(static_cast<size_t>(s.cap * size), NaN);
         } else if (spec.opcode == OpCode::Ridge) {
+            s.kind = StateSlotKind::Ridge;
             s.k = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
             s.value.assign(static_cast<size_t>(s.k), 0.0);
             s.xx.assign(static_cast<size_t>(s.k * s.k), 0.0);
@@ -903,6 +961,7 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
             s.beta.assign(static_cast<size_t>(s.k), 0.0);
             s.preds.assign(static_cast<size_t>(n_instruments), NaN);
         } else if (spec.opcode == OpCode::Group) {
+            s.kind = StateSlotKind::Group;
             s.n_keys = spec.int_param;
             s.capacity = static_cast<int>(spec.param);
             if (spec.feature_widths.empty()) {
@@ -941,6 +1000,7 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
             s.inner_streak.assign(static_cast<size_t>(states), std::vector<int64_t>(static_cast<size_t>(total_slots * n_instruments), 0));
             s.inner_seen.assign(static_cast<size_t>(states), std::vector<uint8_t>(static_cast<size_t>(total_slots * n_instruments), 0));
         } else {
+            s.kind = StateSlotKind::Value;
             s.value.assign(static_cast<size_t>(size), 0.0);
             s.initialized.assign(static_cast<size_t>(size), 0);
             s.streak.assign(static_cast<size_t>(size), 0);
@@ -957,7 +1017,7 @@ size_t count_inputs(const std::vector<NodeSpec>& nodes) {
 
 NodeSpec parse_node(py::handle item) {
     py::tuple t = py::cast<py::tuple>(item);
-    if (t.size() != 9 && t.size() != 11) throw std::invalid_argument("C++ jax_flat node specs must have nine or eleven fields");
+    if (t.size() != 9 && t.size() != 11 && t.size() != 12) throw std::invalid_argument("C++ jax_flat node specs must have nine, eleven, or twelve fields");
     NodeSpec spec;
     spec.opcode = parse_opcode(py::cast<std::string>(t[0]));
     spec.children = py::cast<std::vector<int>>(t[1]);
@@ -968,10 +1028,13 @@ NodeSpec parse_node(py::handle item) {
     spec.int_param = py::cast<int>(t[6]);
     spec.width = py::cast<int>(t[7]);
     spec.feature_widths = py::cast<std::vector<int>>(t[8]);
-    if (t.size() == 11) {
+    if (t.size() >= 11) {
         py::iterable inner = py::cast<py::iterable>(t[9]);
         for (py::handle child : inner) spec.inner_nodes.push_back(parse_node(child));
         spec.inner_output_id = py::cast<int>(t[10]);
+    }
+    if (t.size() >= 12) {
+        spec.str_param = py::cast<std::string>(t[11]);
     }
     return spec;
 }

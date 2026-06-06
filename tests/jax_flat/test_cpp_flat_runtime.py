@@ -1,6 +1,7 @@
 import time
 
 import jax
+import pytest
 import numpy as np
 from trading_dsl_engine.jax_flat import compile_formula, compile_formula_cpp
 
@@ -138,3 +139,43 @@ def test_cpp_flat_micro_runtime_comparison_smoke(capsys):
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
     captured = capsys.readouterr()
     assert "cpp_flat_smoke" in captured.out
+
+
+def test_compile_formula_cpp_flag_and_unsupported_groupby_fallback_warning():
+    rows = 8
+    cols = 3
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols)
+    key = np.mod(close, 2.0)
+    data = {"close": close, "key": key}
+
+    assert compile_formula("add(close, 1.0)").cpp is True
+    assert compile_formula("add(close, 1.0)", cpp=False).cpp is False
+
+    formula = "groupby((key,), close, outer(self_))"
+    runtime_cpp = compile_formula(formula)
+    runtime_jax = compile_formula(formula, cpp=False)
+    with pytest.warns(RuntimeWarning, match="unsupported.*outer"):
+        _, fallback_out = runtime_cpp.run_batch(data)
+    _, jax_out = runtime_jax.run_batch(data)
+    np.testing.assert_allclose(np.asarray(fallback_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+def test_cpp_flat_outer_and_einsum_subset_match_jax_flat():
+    rows = 10
+    cols = 4
+    rng = np.random.default_rng(321)
+    close = rng.normal(size=(rows, cols))
+    open_ = rng.normal(size=(rows, cols))
+    high = rng.normal(size=(rows, cols))
+    close[2, 1] = np.nan
+    open_[4, 2] = np.nan
+    data = {"close": close, "open": open_, "high": high}
+    for formula in (
+        "outer(close)",
+        'einsum(close, open, "i,i->i")',
+        'einsum(close, open, high, "i,i,i->i")',
+        'einsum(close, bspline(fillna(open, 0.25), 3), "i,ij->i")',
+        'einsum(bspline(fillna(close, 0.25), 3), bspline(fillna(open, 0.5), 3), "ij,ij->ij")',
+        'einsum(bspline(fillna(close, 0.25), 3), bspline(fillna(open, 0.5), 3), "ij,ij->")',
+    ):
+        _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)

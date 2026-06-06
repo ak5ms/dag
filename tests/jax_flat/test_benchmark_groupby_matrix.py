@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import os
 import time
+
+import pytest
 from collections.abc import Callable
 
 import jax
 import numpy as np
 
 from trading_dsl_engine.jax_flat import compile_formula
+
+RUN_PERF = os.getenv("RUN_PERF_TESTS", "0") == "1"
 
 
 def _time(fn: Callable[[], object], runs: int) -> tuple[float, object]:
@@ -149,3 +153,23 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@pytest.mark.perf
+def test_groupby_matrix_perf_smoke():
+    rows = int(os.getenv("GROUPBY_MATRIX_ROWS", "128"))
+    if rows > 200 and not RUN_PERF:
+        pytest.skip("set RUN_PERF_TESTS=1 for groupby matrix perf runs above 200 rows")
+    data = _make_data(rows, 9)
+    formula = _formula(
+        key_mode="mixed_cols",
+        univ=True,
+        lhs_kind="stateless_lhs",
+        rhs_kind="stateful_rhs",
+        rhs_nested=True,
+        composed_root=False,
+    )
+    runtime = compile_formula(formula)
+    default_out = _run_default(runtime, data)
+    pure_out = _run_pure(runtime, data)
+    np.testing.assert_allclose(np.asarray(default_out), np.asarray(pure_out), rtol=1e-8, atol=1e-8, equal_nan=True)

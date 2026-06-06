@@ -10,8 +10,9 @@ ext_modules = [
     Pybind11Extension(
         "trading_dsl_engine.jax_flat._cpp_flat",
         ["src/trading_dsl_engine/jax_flat/engine.cpp"],
-        cxx_std=17,
-        extra_compile_args=["-O3"],
+        depends=["src/trading_dsl_engine/jax_flat/ops.cpp"],
+        cxx_std=23,
+        extra_compile_args=["-O3", "-std=c++2b"],
     )
 ]
 

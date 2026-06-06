@@ -77,7 +77,7 @@ def compile_formula_cpp(formula: str | Expr, dsl_registry: DSLFunctionRegistry |
     """
     from trading_dsl_engine.jax_flat import _cpp_flat
 
-    runtime = compile_formula(formula, dsl_registry=dsl_registry)
+    runtime = compile_formula(formula, dsl_registry=dsl_registry, cpp=False)
     node_specs, supported = _cpp_node_specs(runtime.program)
     core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves)
     return CppFlatRuntime(program=runtime.program, core=core, supported_ops=tuple(sorted(set(supported))))
@@ -86,8 +86,9 @@ def compile_formula_cpp(formula: str | Expr, dsl_registry: DSLFunctionRegistry |
 def _reshape_cpp_batch_output(program: StreamingProgram, raw, n_steps: int, n_instruments: int):
     root = program.nodes[program.outputs[0]].op
     arr = np.asarray(raw)
-    if root.output_kind == "matrix" and root.output_width is not None:
-        return arr.reshape((n_steps, n_instruments, int(root.output_width)))
+    if root.output_kind == "matrix":
+        width = int(root.output_width) if root.output_width is not None else n_instruments
+        return arr.reshape((n_steps, n_instruments, width))
     if root.output_kind == "scalar" and arr.ndim == 2 and arr.shape[1] == 1:
         return arr[:, 0]
     return arr
@@ -127,6 +128,7 @@ def _cpp_node_specs(program: StreamingProgram):
         feature_widths=(),
         inner_specs=(),
         inner_output_id=-1,
+        str_param="",
     ):
         return (
             name,
@@ -136,10 +138,11 @@ def _cpp_node_specs(program: StreamingProgram):
             float(literal),
             float(param),
             int(int_param),
-            int(width or 1),
+            int(1 if width is None else width),
             tuple(int(w) for w in feature_widths),
             tuple(inner_specs),
             int(inner_output_id),
+            str(str_param),
         )
 
     for idx, node in enumerate(program.nodes):
@@ -162,12 +165,16 @@ def _cpp_node_specs(program: StreamingProgram):
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
             cpp_width = width
+            if op.cpp_name == "outer":
+                cpp_width = 0
+            if op.cpp_name == "einsum" and op.output_width is None:
+                cpp_width = 0
             if op.cpp_name == "get_beta":
                 ridge_child = program.nodes[node.child_ids[0]].op
                 if not isinstance(ridge_child, RidgeOp):
                     raise NotImplementedError("C++ jax_flat get_beta expects direct Ridge child")
                 cpp_width = sum(ridge_child.feature_widths)
-            specs.append(spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width))
+            specs.append(spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width, str_param=getattr(op, "cpp_str_param", "")))
             supported.append(op.cpp_name)
             continue
         if isinstance(op, CumsumOp):
@@ -247,9 +254,10 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
             supported.append("inner_literal")
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
-            if width != 1:
-                raise NotImplementedError("C++ jax_flat groupby inner ops currently support vector/scalar width 1")
-            specs.append(spec_tuple(op.cpp_name, node.child_ids, param=op.cpp_param, int_param=op.cpp_int_param, width=width))
+            cpp_width = 0 if op.cpp_name in {"outer", "einsum"} and op.output_width is None else width
+            if cpp_width != 1:
+                raise NotImplementedError(f"C++ jax_flat groupby inner op {op.cpp_name!r} currently supports vector/scalar width 1")
+            specs.append(spec_tuple(op.cpp_name, node.child_ids, param=op.cpp_param, int_param=op.cpp_int_param, width=cpp_width, str_param=getattr(op, "cpp_str_param", "")))
             supported.append(f"inner_{op.cpp_name}")
             continue
         if isinstance(op, CumsumOp):

@@ -99,6 +99,7 @@ class NaryOp(Op):
     cpp_name: str | None = None
     cpp_param: float = 0.0
     cpp_int_param: int = 0
+    cpp_str_param: str = ""
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
@@ -664,7 +665,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
-    ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None),
+    ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
     ("get_beta", 1): lambda: NaryOp(_get_beta, cpp_name="get_beta"),
     ("get_preds", 1): lambda: NaryOp(_get_preds, cpp_name="get_preds"),
@@ -686,7 +687,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
     ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
     ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
-    ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values)),
+    ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
 }
 
 from trading_dsl_engine.jax_flat.ops_groupby import *
