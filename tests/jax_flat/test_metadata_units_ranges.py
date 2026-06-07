@@ -38,6 +38,17 @@ def test_runtime_range_uses_interval_arithmetic_through_operators():
     assert runtime.get_range() == ValueRange(0.0, 0.25)
 
 
+def test_same_variable_division_reduces_to_unit_range():
+    runtime = compile_formula(
+        "close / close",
+        metadata={"close": field(units={"dollar": 1}, range="real", types=("price",))},
+        cpp=False,
+    )
+
+    assert runtime.get_units().as_dict() == {}
+    assert runtime.get_range() == ValueRange(1.0, 1.0)
+
+
 def test_unit_incompatible_addition_fails_at_compile_time():
     with pytest.raises(MetadataError, match="add requires compatible units"):
         compile_formula(

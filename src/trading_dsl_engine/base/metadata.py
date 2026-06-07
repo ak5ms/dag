@@ -258,6 +258,31 @@ class MetadataError(ValueError):
     pass
 
 
+def _metadata_expr_key(node: Expr) -> tuple:
+    if isinstance(node, Identifier):
+        return ("id", node.name)
+    if isinstance(node, Number):
+        return ("num", node.value)
+    if isinstance(node, String):
+        return ("str", node.value)
+    if isinstance(node, Call):
+        return (
+            "call",
+            node.fn,
+            tuple(_metadata_expr_key(arg) for arg in node.args),
+            tuple((key, _metadata_expr_key(value)) for key, value in node.kwargs),
+        )
+    if isinstance(node, Universe):
+        return ("univ", node.groups)
+    if isinstance(node, KeyTuple):
+        return ("tuple", tuple(_metadata_expr_key(item) for item in node.items))
+    return ("unknown", type(node).__name__, id(node))
+
+
+def _same_expr(left: Expr, right: Expr) -> bool:
+    return _metadata_expr_key(left) == _metadata_expr_key(right)
+
+
 def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None) -> FormulaMetadata:
     cfg = MetadataConfig.from_value(config)
 
@@ -278,6 +303,8 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
         fn = node.fn
         if fn in {"add", "sub", "fillna"} and len(args) == 2:
             units = args[0].units.assert_compatible(args[1].units, fn)
+            if fn == "sub" and _same_expr(node.args[0], node.args[1]):
+                return FieldSpec(units, ValueRange(0.0, 0.0), args[0].types)
             rng = _range_add(args[0].range, args[1].range) if fn == "add" else _range_sub(args[0].range, args[1].range)
             if fn == "fillna":
                 rng = _range_union(args[0].range, args[1].range)
@@ -285,6 +312,8 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
         if fn == "mul" and len(args) == 2:
             return FieldSpec(args[0].units * args[1].units, _range_mul(args[0].range, args[1].range), frozenset())
         if fn in {"div", "floordiv"} and len(args) == 2:
+            if _same_expr(node.args[0], node.args[1]):
+                return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
             return FieldSpec(args[0].units / args[1].units, _range_div(args[0].range, args[1].range), frozenset())
         if fn == "pow" and len(args) == 2:
             exponent = _literal_number(node.args[1])
