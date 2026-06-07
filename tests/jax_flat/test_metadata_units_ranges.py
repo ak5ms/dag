@@ -49,6 +49,57 @@ def test_same_variable_division_reduces_to_unit_range():
     assert runtime.get_range() == ValueRange(1.0, 1.0)
 
 
+def test_algebraic_reductions_cover_arithmetic_identities():
+    schema = {"close": field(units={"dollar": 1}, range=(10, 20), types=("price",))}
+
+    identity_cases = [
+        ("close + 0", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("0 + close", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("close - 0", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("0 - close", {"dollar": 1.0}, ValueRange(-20.0, -10.0)),
+        ("close - close", {"dollar": 1.0}, ValueRange(0.0, 0.0)),
+        ("close * 1", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("1 * close", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("close * 0", {"dollar": 1.0}, ValueRange(0.0, 0.0)),
+        ("close / 1", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("close ** 1", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("close ** 0", {}, ValueRange(1.0, 1.0)),
+        ("close * close", {"dollar": 2.0}, ValueRange(100.0, 400.0)),
+        ("1 ** close", {}, ValueRange(1.0, 1.0)),
+        ("close % close", {"dollar": 1.0}, ValueRange(0.0, 0.0)),
+        ("0 % close", {}, ValueRange(0.0, 0.0)),
+        ("abs(close)", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+        ("fillna(close, close)", {"dollar": 1.0}, ValueRange(10.0, 20.0)),
+    ]
+    for formula, units, expected_range in identity_cases:
+        runtime = compile_formula(formula, metadata=schema, cpp=False)
+        assert runtime.get_units().as_dict() == units, formula
+        assert runtime.get_range() == expected_range, formula
+
+
+def test_algebraic_reductions_cover_conditionals_and_booleans():
+    schema = {"signal": field(range=(0, 1), types=("boolean",))}
+
+    cases = [
+        ("where(1, signal, 0)", ValueRange(0.0, 1.0)),
+        ("where(0, 1, signal)", ValueRange(0.0, 1.0)),
+        ("where(signal, 7, 7)", ValueRange(7.0, 7.0)),
+        ("signal == signal", ValueRange(1.0, 1.0)),
+        ("signal != signal", ValueRange(0.0, 0.0)),
+        ("signal < signal", ValueRange(0.0, 0.0)),
+        ("signal ^ signal", ValueRange(0.0, 0.0)),
+        ("signal & 1", ValueRange(0.0, 1.0)),
+        ("signal | 0", ValueRange(0.0, 1.0)),
+        ("signal & 0", ValueRange(0.0, 0.0)),
+        ("signal | 1", ValueRange(1.0, 1.0)),
+        ("isnan(1)", ValueRange(0.0, 0.0)),
+    ]
+    for formula, expected_range in cases:
+        runtime = compile_formula(formula, metadata=schema, cpp=False)
+        assert runtime.get_units().as_dict() == {}, formula
+        assert runtime.get_range() == expected_range, formula
+
+
 def test_unit_incompatible_addition_fails_at_compile_time():
     with pytest.raises(MetadataError, match="add requires compatible units"):
         compile_formula(

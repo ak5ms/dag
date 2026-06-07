@@ -283,6 +283,31 @@ def _same_expr(left: Expr, right: Expr) -> bool:
     return _metadata_expr_key(left) == _metadata_expr_key(right)
 
 
+def _literal_number(expr: Expr) -> float | None:
+    return float(expr.value) if isinstance(expr, Number) else None
+
+
+def _is_literal(expr: Expr, value: float) -> bool:
+    literal = _literal_number(expr)
+    return literal is not None and isclose(literal, value, rel_tol=0.0, abs_tol=1e-12)
+
+
+def _constant_field(value: float, types: Iterable[str] = ()) -> FieldSpec:
+    return FieldSpec(UnitInfo.dimensionless(), ValueRange(float(value), float(value)), frozenset(types))
+
+
+def _scale_field(spec: FieldSpec, factor: float) -> FieldSpec:
+    return FieldSpec(spec.units, _range_mul(spec.range, ValueRange(factor, factor)), spec.types)
+
+
+def _truthy_field(spec: FieldSpec) -> FieldSpec:
+    if spec.range.lower == 0.0 and spec.range.upper == 0.0:
+        return _constant_field(0.0, {"boolean"})
+    if spec.range.lower > 0.0 or spec.range.upper < 0.0:
+        return _constant_field(1.0, {"boolean"})
+    return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
+
+
 def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None) -> FormulaMetadata:
     cfg = MetadataConfig.from_value(config)
 
@@ -301,38 +326,111 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
 
     def _analyze_call(node: Call, args: list[FieldSpec]) -> FieldSpec:
         fn = node.fn
-        if fn in {"add", "sub", "fillna"} and len(args) == 2:
+        if fn == "add" and len(args) == 2:
+            if _is_literal(node.args[0], 0.0):
+                return args[1]
+            if _is_literal(node.args[1], 0.0):
+                return args[0]
             units = args[0].units.assert_compatible(args[1].units, fn)
-            if fn == "sub" and _same_expr(node.args[0], node.args[1]):
-                return FieldSpec(units, ValueRange(0.0, 0.0), args[0].types)
-            rng = _range_add(args[0].range, args[1].range) if fn == "add" else _range_sub(args[0].range, args[1].range)
-            if fn == "fillna":
-                rng = _range_union(args[0].range, args[1].range)
-            return FieldSpec(units, rng, args[0].types & args[1].types)
+            return FieldSpec(units, _range_add(args[0].range, args[1].range), args[0].types & args[1].types)
+        if fn == "sub" and len(args) == 2:
+            if _same_expr(node.args[0], node.args[1]):
+                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+            if _is_literal(node.args[1], 0.0):
+                return args[0]
+            if _is_literal(node.args[0], 0.0):
+                return _scale_field(args[1], -1.0)
+            units = args[0].units.assert_compatible(args[1].units, fn)
+            return FieldSpec(units, _range_sub(args[0].range, args[1].range), args[0].types & args[1].types)
+        if fn == "fillna" and len(args) == 2:
+            if _same_expr(node.args[0], node.args[1]):
+                return args[0]
+            units = args[0].units.assert_compatible(args[1].units, fn)
+            return FieldSpec(units, _range_union(args[0].range, args[1].range), args[0].types & args[1].types)
         if fn == "mul" and len(args) == 2:
+            if _is_literal(node.args[0], 0.0):
+                return FieldSpec(args[1].units, ValueRange(0.0, 0.0), args[1].types)
+            if _is_literal(node.args[1], 0.0):
+                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+            if _is_literal(node.args[0], 1.0):
+                return args[1]
+            if _is_literal(node.args[1], 1.0):
+                return args[0]
+            if _same_expr(node.args[0], node.args[1]):
+                return FieldSpec(args[0].units ** 2.0, _range_pow(args[0].range, 2.0), frozenset())
             return FieldSpec(args[0].units * args[1].units, _range_mul(args[0].range, args[1].range), frozenset())
         if fn in {"div", "floordiv"} and len(args) == 2:
             if _same_expr(node.args[0], node.args[1]):
                 return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
+            if _is_literal(node.args[1], 1.0):
+                return args[0]
+            if _is_literal(node.args[0], 0.0):
+                return FieldSpec(args[0].units / args[1].units, ValueRange(0.0, 0.0), frozenset())
             return FieldSpec(args[0].units / args[1].units, _range_div(args[0].range, args[1].range), frozenset())
         if fn == "pow" and len(args) == 2:
             exponent = _literal_number(node.args[1])
+            if exponent is not None:
+                if isclose(exponent, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                    return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
+                if isclose(exponent, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                    return args[0]
+            if _is_literal(node.args[0], 1.0):
+                return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
             units = UnitInfo.dimensionless() if exponent is None else args[0].units ** exponent
             rng = ValueRange.unknown() if exponent is None else _range_pow(args[0].range, exponent)
             return FieldSpec(units, rng, args[0].types if exponent == 1.0 else frozenset())
-        if fn in {"abs", "ffill", "ewm", "shift", "cumsum", "purify"} and args:
-            rng = _range_abs(args[0].range) if fn == "abs" else args[0].range
-            return FieldSpec(args[0].units, rng, args[0].types)
+        if fn == "abs" and args:
+            if args[0].range.lower >= 0.0:
+                return args[0]
+            return FieldSpec(args[0].units, _range_abs(args[0].range), args[0].types)
+        if fn in {"ffill", "ewm", "shift", "cumsum", "purify"} and args:
+            return FieldSpec(args[0].units, args[0].range, args[0].types)
         if fn == "mean" and args:
             return FieldSpec(args[0].units, args[0].range, args[0].types)
         if fn == "where" and len(args) == 3:
+            condition = _literal_number(node.args[0])
+            if condition is not None:
+                return args[1] if condition != 0.0 else args[2]
+            if _same_expr(node.args[1], node.args[2]):
+                return args[1]
             units = args[1].units.assert_compatible(args[2].units, fn)
             return FieldSpec(units, _range_union(args[1].range, args[2].range), args[1].types & args[2].types)
+        if fn == "eq" and len(args) == 2 and _same_expr(node.args[0], node.args[1]):
+            return _constant_field(1.0, {"boolean"})
+        if fn in {"ne", "lt", "gt"} and len(args) == 2 and _same_expr(node.args[0], node.args[1]):
+            return _constant_field(0.0, {"boolean"})
+        if fn in {"and", "and_"} and len(args) == 2:
+            if _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 0.0):
+                return _constant_field(0.0, {"boolean"})
+            if _is_literal(node.args[0], 1.0):
+                return _truthy_field(args[1])
+            if _is_literal(node.args[1], 1.0):
+                return _truthy_field(args[0])
+        if fn in {"or", "or_"} and len(args) == 2:
+            if _is_literal(node.args[0], 1.0) or _is_literal(node.args[1], 1.0):
+                return _constant_field(1.0, {"boolean"})
+            if _is_literal(node.args[0], 0.0):
+                return _truthy_field(args[1])
+            if _is_literal(node.args[1], 0.0):
+                return _truthy_field(args[0])
+        if fn == "xor" and len(args) == 2:
+            if _same_expr(node.args[0], node.args[1]):
+                return _constant_field(0.0, {"boolean"})
+            if _is_literal(node.args[0], 0.0):
+                return _truthy_field(args[1])
+            if _is_literal(node.args[1], 0.0):
+                return _truthy_field(args[0])
+        if fn == "isnan" and len(args) == 1 and isinstance(node.args[0], Number):
+            return _constant_field(0.0, {"boolean"})
         if fn in {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}:
             return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
         if fn in {"ln", "exp", "sign", "fraction", "xs_rank", "xs_sort", "xstd", "bspline", "rbf_basis", "future_rbf_basis_sum"}:
             return FieldSpec(UnitInfo.dimensionless(), _known_dimensionless_range(fn, args), frozenset())
-        if fn in {"ceil", "floor", "round", "mod"} and args:
+        if fn == "mod" and len(args) == 2:
+            if _same_expr(node.args[0], node.args[1]) or _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 1.0):
+                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+            return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
+        if fn in {"ceil", "floor", "round"} and args:
             return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
         if fn == "cat" and args:
             units = args[0].units
@@ -349,10 +447,6 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
 
     result = analyze(expr)
     return FormulaMetadata(result.units, result.range, result.types, cfg.fields, cfg.type_graph)
-
-
-def _literal_number(expr: Expr) -> float | None:
-    return float(expr.value) if isinstance(expr, Number) else None
 
 
 def _range_union(*ranges: ValueRange) -> ValueRange:
