@@ -15,6 +15,7 @@ import numpy as np
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
+from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     InstrumentBasisMeanOp,
@@ -64,6 +65,7 @@ class StreamingProgram:
     outputs: tuple[int, ...]
     input_names: tuple[str, ...]
     state_layout: StateLayout
+    metadata: FormulaMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,42 @@ class JaxFlatRuntime(eqx.Module):
     cpp: bool = eqx.field(default=True, static=True)
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     block: bool = True # False disables waiting (for runtime measurement)
+
+    def get_units(self):
+        """Return static unit exponents inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_units()
+
+    def get_range(self):
+        """Return the static domain/range interval inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_range()
+
+    def get_types(self):
+        """Return semantic output types after applying configured type relations."""
+        if self.program.metadata is None:
+            return frozenset()
+        return self.program.metadata.get_types()
+
+    def get_node_metadata(self, label: str | None = None):
+        """Return static metadata for analyzed formula nodes, optionally filtered by label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_metadata(label)
+
+    def get_node_types(self, label: str):
+        """Return semantic type sets for analyzed formula nodes with the given label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_types(label)
+
+    def get_type_relations(self):
+        """Return the configured semantic type relation graph."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.type_graph
 
     def init_state(self, n_instruments: int):
         vector_sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
@@ -1035,10 +1073,18 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
 
 
 
-def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None, cpp: bool = True) -> JaxFlatRuntime:
+def compile_formula(
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    cpp: bool = True,
+    metadata: MetadataConfig | dict | None = None,
+    type_relations=(),
+) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
+    metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
+    formula_metadata = analyze_formula_metadata(expr, metadata_config)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
@@ -1050,6 +1096,7 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
             outputs=(out,),
             input_names=tuple(input_names),
             state_layout=layout,
+            metadata=formula_metadata,
         ),
         cpp=cpp,
     )
