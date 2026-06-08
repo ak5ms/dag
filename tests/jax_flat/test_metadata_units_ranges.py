@@ -2,7 +2,8 @@ from importlib.util import module_from_spec, spec_from_file_location
 from math import inf
 from pathlib import Path
 
-from trading_dsl_engine.jax_flat import ValueRange, compile_formula, field, metadata
+from trading_dsl_engine.base import metadata as metadata_module
+from trading_dsl_engine.jax_flat import UnitInfo, ValueRange, compile_formula, field, metadata
 from trading_dsl_engine.jax_flat.ops import NaryOp, OP_FACTORIES
 
 
@@ -139,6 +140,52 @@ def test_metadata_auto_traces_nary_ops_for_ranges_and_types():
         runtime = compile_formula(formula, metadata=schema, cpp=False)
         assert runtime.get_range() == expected_range, formula
         assert runtime.get_types() == expected_types, formula
+
+
+
+def test_unit_info_converts_to_unxt_quantity_when_available(monkeypatch):
+    class _FakeUnxt:
+        class Quantity:
+            def __init__(self, value, unit):
+                self.value = value
+                self.unit = unit
+
+    monkeypatch.setattr(metadata_module, "_load_unxt", lambda: _FakeUnxt)
+
+    quantity = UnitInfo({"dollar": 1, "shares": 3}).to_unxt_quantity(2.5)
+
+    assert quantity.value == 2.5
+    assert quantity.unit == "dollar * shares**3"
+
+def test_metadata_range_tracing_uses_immrax_backend_when_available(monkeypatch):
+    class _FakeInterval:
+        def __init__(self, lower, upper):
+            self.lower = lower
+            self.upper = upper
+
+    class _FakeImmraxInclusion:
+        def __init__(self):
+            self.natif_calls = 0
+
+        def interval(self, lower, upper):
+            return _FakeInterval(lower, upper)
+
+        def natif(self, fn):
+            self.natif_calls += 1
+
+            def traced(arg):
+                return _FakeInterval(fn(arg.lower), fn(arg.upper))
+
+            return traced
+
+    fake_immrax = _FakeImmraxInclusion()
+    monkeypatch.setattr(metadata_module, "_load_immrax_inclusion", lambda: fake_immrax)
+    monkeypatch.setitem(OP_FACTORIES, ("double_plus_one", 1), lambda: NaryOp(lambda x: x * 2.0 + 1.0))
+
+    runtime = compile_formula("double_plus_one(x)", metadata={"x": field(range=(1, 3))}, cpp=False)
+
+    assert fake_immrax.natif_calls >= 1
+    assert runtime.get_range() == ValueRange(3.0, 7.0)
 
 
 def test_metadata_auto_traces_new_nary_op_from_operator_implementation(monkeypatch):

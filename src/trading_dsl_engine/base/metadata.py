@@ -91,9 +91,9 @@ class UnitInfo:
     def to_unxt_quantity(self, value: float = 1.0):
         if self.unknown:
             raise MetadataError("Cannot convert unknown formula units to unxt")
-        if util.find_spec("unxt") is None:
+        unxt = _load_unxt()
+        if unxt is None:
             raise MetadataError("unxt is not installed; install trading_dsl_engine with unxt support")
-        unxt = import_module("unxt")
         unit_expr = " * ".join(
             f"{name}**{power:g}" if not isclose(power, 1.0) else name
             for name, power in sorted(self.powers.items())
@@ -150,10 +150,14 @@ class ValueRange:
         return (self.lower, self.upper)
 
     def to_immrax_interval(self):
-        if util.find_spec("immrax") is None:
+        inclusion = _load_immrax_inclusion()
+        if inclusion is None:
             raise MetadataError("immrax is not installed; install trading_dsl_engine with immrax support")
-        immrax = import_module("immrax")
-        return immrax.interval(np.asarray([self.lower], dtype=float), np.asarray([self.upper], dtype=float))
+        return inclusion.interval(np.asarray([self.lower], dtype=float), np.asarray([self.upper], dtype=float))
+
+    @classmethod
+    def from_immrax_interval(cls, interval) -> ValueRange:
+        return cls(float(np.min(np.asarray(interval.lower, dtype=float))), float(np.max(np.asarray(interval.upper, dtype=float))))
 
 
 @dataclass(frozen=True)
@@ -299,6 +303,18 @@ class MetadataError(ValueError):
     pass
 
 
+def _load_immrax_inclusion():
+    if util.find_spec("immrax") is None:
+        return None
+    return import_module("immrax.inclusion")
+
+
+def _load_unxt():
+    if util.find_spec("unxt") is None:
+        return None
+    return import_module("unxt")
+
+
 def _metadata_expr_key(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
@@ -398,7 +414,22 @@ def _as_finite_values(value: Any) -> tuple[float, ...]:
     return tuple(float(v) for v in arr.reshape(-1))
 
 
-def _trace_numeric_range(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
+def _trace_numeric_range_with_immrax(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
+    inclusion = _load_immrax_inclusion()
+    if inclusion is None or any(not isfinite(rng.lower) or not isfinite(rng.upper) for rng in child_ranges):
+        return None
+    intervals = [rng.to_immrax_interval() for rng in child_ranges]
+    try:
+        traced_interval = inclusion.natif(fn)(*intervals)
+        value_range = ValueRange.from_immrax_interval(traced_interval)
+    except Exception:
+        return None
+    if not isfinite(value_range.lower) or not isfinite(value_range.upper):
+        return None
+    return _TraceResult(value_range, (value_range.lower, value_range.upper))
+
+
+def _trace_numeric_range_by_sampling(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
     samples = [_sample_range_values(rng) for rng in child_ranges]
     if not samples or any(len(values) == 0 for values in samples):
         return None
@@ -411,6 +442,10 @@ def _trace_numeric_range(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult
     if not outputs:
         return None
     return _TraceResult(ValueRange(min(outputs), max(outputs)), tuple(outputs))
+
+
+def _trace_numeric_range(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
+    return _trace_numeric_range_with_immrax(fn, child_ranges) or _trace_numeric_range_by_sampling(fn, child_ranges)
 
 
 def _build_trace_op(node: Call):
