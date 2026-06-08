@@ -100,6 +100,27 @@ def test_algebraic_reductions_cover_conditionals_and_booleans():
         assert runtime.get_range() == expected_range, formula
 
 
+def test_metadata_auto_traces_nary_ops_for_ranges_and_types():
+    schema = {
+        "x": field(range=(-1.2, 2.7)),
+        "y": field(range=(-2, 3)),
+    }
+
+    cases = [
+        ("ceil(x)", ValueRange(-1.0, 3.0), frozenset()),
+        ("floor(x)", ValueRange(-2.0, 2.0), frozenset()),
+        ("round(x)", ValueRange(-1.0, 3.0), frozenset()),
+        ("fraction(x)", ValueRange(0.0, 0.8), frozenset()),
+        ("sign(x)", ValueRange(-1.0, 1.0), frozenset()),
+        ("arctan(x)", ValueRange(-0.8760580505981934, 1.2160906747839564), frozenset()),
+        ("x > y", ValueRange(0.0, 1.0), frozenset({"boolean"})),
+    ]
+    for formula, expected_range, expected_types in cases:
+        runtime = compile_formula(formula, metadata=schema, cpp=False)
+        assert runtime.get_range() == expected_range, formula
+        assert runtime.get_types() == expected_types, formula
+
+
 def test_unit_incompatible_addition_fails_at_compile_time():
     with pytest.raises(MetadataError, match="add requires compatible units"):
         compile_formula(

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
 from importlib import import_module, util
+from itertools import product
 from math import exp, inf, isclose, isfinite
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -308,6 +309,73 @@ def _truthy_field(spec: FieldSpec) -> FieldSpec:
     return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
 
 
+def _sample_range_values(value_range: ValueRange) -> tuple[float, ...]:
+    candidates = [value_range.lower, value_range.upper]
+    if value_range.lower <= 0.0 <= value_range.upper:
+        candidates.append(0.0)
+    if isfinite(value_range.lower) and isfinite(value_range.upper):
+        candidates.append((value_range.lower + value_range.upper) / 2.0)
+    finite = []
+    for value in candidates:
+        if isfinite(value) and value not in finite:
+            finite.append(float(value))
+    return tuple(finite)
+
+
+def _as_finite_range(value: Any) -> ValueRange | None:
+    arr = np.asarray(value, dtype=float)
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return None
+    return ValueRange(float(np.min(arr)), float(np.max(arr)))
+
+
+def _trace_numeric_range(fn, child_ranges: Sequence[ValueRange]) -> ValueRange | None:
+    samples = [_sample_range_values(rng) for rng in child_ranges]
+    if not samples or any(len(values) == 0 for values in samples):
+        return None
+    outputs = []
+    for point in product(*samples):
+        traced = _as_finite_range(fn(*point))
+        if traced is not None:
+            outputs.extend((traced.lower, traced.upper))
+    if not outputs:
+        return None
+    return ValueRange(min(outputs), max(outputs))
+
+
+def _build_trace_op(node: Call):
+    from trading_dsl_engine.jax_flat.ops import ANY_ARITY, NaryOp, OP_FACTORIES
+
+    factory = OP_FACTORIES.get((node.fn, len(node.args)))
+    if factory is None:
+        factory = OP_FACTORIES.get((node.fn, ANY_ARITY))
+        if factory is None:
+            return None
+        static_args = tuple(arg.value for arg in node.args if isinstance(arg, String))
+        op = factory(*static_args)
+    else:
+        op = factory()
+    return op if isinstance(op, NaryOp) else None
+
+
+def _auto_trace_field(node: Call, args: Sequence[FieldSpec]) -> FieldSpec | None:
+    op = _build_trace_op(node)
+    if op is None:
+        return None
+    traced_range = _trace_numeric_range(op.fn, [arg.range for arg in args])
+    if traced_range is None:
+        return None
+    boolean_ops = {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}
+    unit_preserving_ops = {"ceil", "floor", "round", "fraction", "purify"}
+    if node.fn in boolean_ops:
+        return FieldSpec(UnitInfo.dimensionless(), traced_range, frozenset({"boolean"}))
+    if node.fn in unit_preserving_ops and args:
+        return FieldSpec(args[0].units, traced_range, args[0].types)
+    if node.fn in {"abs"} and args:
+        return FieldSpec(args[0].units, traced_range, args[0].types)
+    return FieldSpec(UnitInfo.dimensionless(), traced_range, frozenset())
+
+
 def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None) -> FormulaMetadata:
     cfg = MetadataConfig.from_value(config)
 
@@ -423,14 +491,23 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
         if fn == "isnan" and len(args) == 1 and isinstance(node.args[0], Number):
             return _constant_field(0.0, {"boolean"})
         if fn in {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}:
+            traced = _auto_trace_field(node, args)
+            if traced is not None:
+                return traced
             return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
-        if fn in {"ln", "exp", "sign", "fraction", "xs_rank", "xs_sort", "xstd", "bspline", "rbf_basis", "future_rbf_basis_sum"}:
+        if fn in {"ln", "exp", "sign", "arctan", "fraction", "xs_rank", "xs_sort", "xstd", "bspline", "rbf_basis", "future_rbf_basis_sum"}:
+            traced = _auto_trace_field(node, args)
+            if traced is not None:
+                return traced
             return FieldSpec(UnitInfo.dimensionless(), _known_dimensionless_range(fn, args), frozenset())
         if fn == "mod" and len(args) == 2:
             if _same_expr(node.args[0], node.args[1]) or _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 1.0):
                 return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
             return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
         if fn in {"ceil", "floor", "round"} and args:
+            traced = _auto_trace_field(node, args)
+            if traced is not None:
+                return traced
             return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
         if fn == "cat" and args:
             units = args[0].units
@@ -443,6 +520,9 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
             return args[0]
         if fn == "groupby" and len(args) == 3:
             return args[2]
+        traced = _auto_trace_field(node, args)
+        if traced is not None:
+            return traced
         return FieldSpec()
 
     result = analyze(expr)
