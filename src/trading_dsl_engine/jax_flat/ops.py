@@ -100,6 +100,8 @@ class InstrumentBasisMeanValue:
 @dataclass(frozen=True)
 class InputOp(Op):
     input_index: int
+    output_kind: str = "vector"
+    output_width: int | None = 1
 
 
 @dataclass(frozen=True)
