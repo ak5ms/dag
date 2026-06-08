@@ -4,7 +4,6 @@ from dataclasses import dataclass, field as dataclass_field
 from math import inf, isclose, isfinite
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-import immrax.inclusion as immrax_inclusion
 import jax.numpy as jnp
 import numpy as np
 import unxt
@@ -17,13 +16,48 @@ class MetadataError(ValueError):
     pass
 
 
-def _load_immrax_inclusion():
-    return immrax_inclusion
+@dataclass(frozen=True)
+class _Interval:
+    lower: Any
+    upper: Any
+
+
+class _IntervalInclusion:
+    """Small interval-inclusion adapter with the same shape as the future interval backend."""
+
+    def interval(self, lower, upper=None) -> _Interval:
+        if upper is None:
+            upper = lower
+        return _Interval(jnp.asarray(lower, dtype=float), jnp.asarray(upper, dtype=float))
+
+    def natif(self, fn: Callable[..., Any]) -> Callable[..., _Interval]:
+        def traced(*intervals: _Interval) -> _Interval:
+            outputs = []
+            for point in _interval_samples([item.lower for item in intervals], [item.upper for item in intervals]):
+                outputs.append(jnp.asarray(fn(*point), dtype=float))
+            stacked = jnp.stack([jnp.ravel(output) for output in outputs])
+            return self.interval(jnp.nanmin(stacked), jnp.nanmax(stacked))
+
+        return traced
+
+    def interval_union(self, intervals: Iterable[_Interval]) -> _Interval:
+        intervals = tuple(intervals)
+        if not intervals:
+            return self.interval(-inf, inf)
+        lower = jnp.nanmin(jnp.stack([jnp.ravel(item.lower) for item in intervals]))
+        upper = jnp.nanmax(jnp.stack([jnp.ravel(item.upper) for item in intervals]))
+        return self.interval(lower, upper)
+
+
+_INTERVAL_INCLUSION = _IntervalInclusion()
+
+
+def _load_interval_inclusion() -> _IntervalInclusion:
+    return _INTERVAL_INCLUSION
 
 
 def _load_unxt():
     return unxt
-
 
 
 _REGISTERED_UNXT_UNITS: set[str] = set()
@@ -41,6 +75,7 @@ def _ensure_unxt_domain_units(labels: Iterable[str]) -> None:
         _REGISTERED_UNXT_UNITS.add(label)
     if new_units:
         apyu.add_enabled_units(new_units)
+
 
 def _interval_samples(lows: Sequence[Any], ups: Sequence[Any]) -> Iterable[tuple[Any, ...]]:
     if not lows:
@@ -159,7 +194,7 @@ class UnitInfo:
 
 @dataclass(frozen=True)
 class ValueRange:
-    """Scalar bounds represented externally as lower/upper and internally as immrax intervals."""
+    """Scalar bounds represented externally as lower/upper and internally as intervals."""
 
     lower: float = -inf
     upper: float = inf
@@ -212,27 +247,27 @@ class ValueRange:
     def as_tuple(self) -> tuple[float, float]:
         return (self.lower, self.upper)
 
-    def to_immrax_interval(self):
-        return _load_immrax_inclusion().interval(jnp.asarray([self.lower], dtype=float), jnp.asarray([self.upper], dtype=float))
+    def to_interval(self):
+        return _load_interval_inclusion().interval(jnp.asarray([self.lower], dtype=float), jnp.asarray([self.upper], dtype=float))
 
     @classmethod
-    def from_immrax_interval(cls, interval) -> ValueRange:
+    def from_interval(cls, interval) -> ValueRange:
         lower, upper = _finite_scalar_bounds(interval)
         return cls(lower, upper)
 
     @classmethod
-    def via_immrax(cls, fn: Callable[..., Any], *ranges: ValueRange) -> ValueRange:
+    def via_interval(cls, fn: Callable[..., Any], *ranges: ValueRange) -> ValueRange:
         if any(not isfinite(rng.lower) or not isfinite(rng.upper) for rng in ranges):
             return cls.unknown()
-        inclusion = _load_immrax_inclusion()
-        intervals = [rng.to_immrax_interval() for rng in ranges]
+        inclusion = _load_interval_inclusion()
+        intervals = [rng.to_interval() for rng in ranges]
         try:
-            out = cls.from_immrax_interval(inclusion.natif(fn)(*intervals))
+            out = cls.from_interval(inclusion.natif(fn)(*intervals))
         except Exception:
             out = cls.unknown()
         if _is_well_ordered_finite(out):
             return out
-        return cls.from_immrax_interval(_immrax_sample_union(fn, intervals))
+        return cls.from_interval(_interval_sample_union(fn, intervals))
 
 
 
@@ -247,8 +282,8 @@ def _is_well_ordered_finite(value_range: ValueRange) -> bool:
     )
 
 
-def _immrax_sample_union(fn: Callable[..., Any], intervals: Sequence[Any]):
-    inclusion = _load_immrax_inclusion()
+def _interval_sample_union(fn: Callable[..., Any], intervals: Sequence[Any]):
+    inclusion = _load_interval_inclusion()
     lows = [interval.lower for interval in intervals]
     ups = [interval.upper for interval in intervals]
     result = None
@@ -483,7 +518,7 @@ def _auto_op(node: Call):
 
 
 def _call_range(fn: Callable[..., Any], ranges: Sequence[ValueRange]) -> ValueRange:
-    return ValueRange.via_immrax(lambda *xs: fn(*xs), *ranges)
+    return ValueRange.via_interval(lambda *xs: fn(*xs), *ranges)
 
 
 def _range_union(ranges: Sequence[ValueRange]) -> ValueRange:

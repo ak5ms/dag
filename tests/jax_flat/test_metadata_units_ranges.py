@@ -157,13 +157,14 @@ def test_unit_info_converts_to_unxt_quantity_when_available(monkeypatch):
     assert quantity.value == 2.5
     assert quantity.unit == "dollar * shares**3"
 
-def test_metadata_range_tracing_uses_immrax_backend_when_available(monkeypatch):
+
+def test_metadata_range_tracing_uses_interval_backend(monkeypatch):
     class _FakeInterval:
         def __init__(self, lower, upper):
             self.lower = lower
             self.upper = upper
 
-    class _FakeImmraxInclusion:
+    class _FakeIntervalInclusion:
         def __init__(self):
             self.natif_calls = 0
 
@@ -178,13 +179,13 @@ def test_metadata_range_tracing_uses_immrax_backend_when_available(monkeypatch):
 
             return traced
 
-    fake_immrax = _FakeImmraxInclusion()
-    monkeypatch.setattr(metadata_module, "_load_immrax_inclusion", lambda: fake_immrax)
+    fake_inclusion = _FakeIntervalInclusion()
+    monkeypatch.setattr(metadata_module, "_load_interval_inclusion", lambda: fake_inclusion)
     monkeypatch.setitem(OP_FACTORIES, ("double_plus_one", 1), lambda: NaryOp(lambda x: x * 2.0 + 1.0))
 
     runtime = compile_formula("double_plus_one(x)", metadata={"x": field(range=(1, 3))}, cpp=False)
 
-    assert fake_immrax.natif_calls >= 1
+    assert fake_inclusion.natif_calls >= 1
     assert runtime.get_range() == ValueRange(3.0, 7.0)
 
 
@@ -201,9 +202,9 @@ def test_metadata_auto_traces_new_nary_op_from_operator_implementation(monkeypat
     assert bool_runtime.get_types() == frozenset({"boolean"})
 
 
-def test_roll_ret_macro_traces_to_reasonable_return_metadata():
+def test_explicit_return_formula_traces_to_reasonable_return_metadata():
     runtime = compile_formula(
-        "roll_ret(close, 1, 1)",
+        "close / shift(close, 1, 1) - 1",
         metadata={"close": field(units={"dollar": 1}, range=(100, 200), types=("price",))},
         cpp=False,
     )

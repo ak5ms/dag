@@ -11,14 +11,13 @@ dependencies = [
     "numpy",
     "numba",
     "scipy",
-    "jax[cpu]~=0.6.1",
-    "equinox>=0.13.2",
+    "jax[cpu]",
+    "equinox",
     "pytest",
     "pytest-xdist",
     "pybind11>=2.12",
     "includeigen",
     "unxt>=1.11",
-    "immrax>=0.3.6",
 ]
 
 [tool.pytest.ini_options]

@@ -391,8 +391,3 @@ def ratio(a: Expr, b: Expr) -> Expr:
 @register_dsl_function("diff")
 def diff(x: Expr, nlag=1.0, max_size=1.0) -> Expr:
     return sub(x, shift(x, nlag, max_size))
-
-
-@register_dsl_function("roll_ret")
-def roll_ret(x: Expr, nlag=1.0, max_size=1.0) -> Expr:
-    return sub(div(x, shift(x, nlag, max_size)), 1.0)
