@@ -15,6 +15,7 @@ import numpy as np
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
+from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     InstrumentBasisMeanOp,
@@ -64,6 +65,7 @@ class StreamingProgram:
     outputs: tuple[int, ...]
     input_names: tuple[str, ...]
     state_layout: StateLayout
+    metadata: FormulaMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,42 @@ class JaxFlatRuntime(eqx.Module):
     cpp: bool = eqx.field(default=True, static=True)
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     block: bool = True # False disables waiting (for runtime measurement)
+
+    def get_units(self):
+        """Return static unit exponents inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_units()
+
+    def get_range(self):
+        """Return the static domain/range interval inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_range()
+
+    def get_types(self):
+        """Return semantic output types after applying configured type relations."""
+        if self.program.metadata is None:
+            return frozenset()
+        return self.program.metadata.get_types()
+
+    def get_node_metadata(self, label: str | None = None):
+        """Return static metadata for analyzed formula nodes, optionally filtered by label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_metadata(label)
+
+    def get_node_types(self, label: str):
+        """Return semantic type sets for analyzed formula nodes with the given label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_types(label)
+
+    def get_type_relations(self):
+        """Return the configured semantic type relation graph."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.type_graph
 
     def init_state(self, n_instruments: int):
         vector_sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
@@ -651,6 +689,43 @@ def _op_width(op: Op) -> int:
 
 
 
+def _shape_source_op(child_ops: tuple[Op, ...]) -> Op | None:
+    for child in child_ops:
+        if child.output_kind != "scalar":
+            return child
+    return child_ops[0] if child_ops else None
+
+
+def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
+    if not isinstance(op, NaryOp):
+        return op
+    shape_source = _shape_source_op(child_ops)
+    if shape_source is None:
+        return op
+    shape_preserving = {
+        "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
+        "isnan", "purify", "fraction", "add", "sub", "mul", "mod", "pow",
+        "div", "floordiv", "eq", "ne", "lt", "gt", "and", "or", "xor",
+        "fillna", "where",
+    }
+    if op.cpp_name not in shape_preserving:
+        return op
+    return replace(op, output_kind=shape_source.output_kind, output_width=shape_source.output_width)
+
+
+def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
+    if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
+        return None
+    child = child_ops[0]
+    if expr.fn == "get_preds":
+        return NaryOp(lambda value: value.preds, output_kind="vector", output_width=1, cpp_name="get_preds"), None
+    if isinstance(child, InstrumentBasisMeanOp):
+        return NaryOp(lambda value: value.beta, output_kind="matrix", output_width=child.feature_width, cpp_name="get_beta"), None
+    if isinstance(child, RidgeOp):
+        return NaryOp(lambda value: value.beta, output_kind="vector", output_width=sum(child.feature_widths), cpp_name="get_beta"), None
+    return NaryOp(lambda value: value.beta, output_kind=child.output_kind, output_width=child.output_width, cpp_name="get_beta"), None
+
+
 def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:
     if not child_ops:
         raise ValueError("stateless JAX call expects at least one child")
@@ -664,6 +739,9 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         raise ValueError("groupby must be compiled with its RHS subgraph")
     if expr.kwargs:
         raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
+    projection = _object_projection_op(expr, child_ops)
+    if projection is not None:
+        return projection
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
@@ -894,6 +972,24 @@ def _groupby_capacity_kwargs(expr: Call, has_universe_groups: bool) -> dict[str,
     }
 
 
+def _typed_groupby_inner_op(inner_op: InnerGraphOp, feed_ops: tuple[Op, ...]) -> InnerGraphOp:
+    typed_nodes = []
+    changed = False
+    for node in inner_op.nodes:
+        op = node.op
+        if isinstance(op, InputOp) and op.input_index < len(feed_ops):
+            feed_op = feed_ops[op.input_index]
+            op = InputOp(op.input_index, output_kind=feed_op.output_kind, output_width=feed_op.output_width)
+            changed = True
+        child_ops = tuple(typed_nodes[cid].op for cid in node.child_ids)
+        shaped_op = _shape_preserving_nary(op, child_ops)
+        changed = changed or shaped_op is not op
+        typed_nodes.append(replace(node, op=shaped_op) if shaped_op is not node.op else node)
+    node_tuple = tuple(typed_nodes)
+    output_kind = node_tuple[inner_op.output_id].op.output_kind
+    return replace(inner_op, nodes=node_tuple, output_kind=output_kind) if changed or output_kind != inner_op.output_kind else inner_op
+
+
 def _compile_groupby_node(
     expr: Call,
     memo: dict[tuple[Any, ...], int],
@@ -908,9 +1004,10 @@ def _compile_groupby_node(
     inner_op, feed_exprs = _compile_groupby_inner_op(expr.args[2], expr.args[1])
     universe_groups = _resolve_universe_groups(universe_items[0]) if universe_items else None
 
-    child_ids = tuple(_compile_node(k, memo, nodes, input_names) for k in dynamic_items) + tuple(
-        _compile_node(feed, memo, nodes, input_names) for feed in feed_exprs
-    )
+    key_child_ids = tuple(_compile_node(k, memo, nodes, input_names) for k in dynamic_items)
+    feed_child_ids = tuple(_compile_node(feed, memo, nodes, input_names) for feed in feed_exprs)
+    child_ids = key_child_ids + feed_child_ids
+    inner_op = _typed_groupby_inner_op(inner_op, tuple(nodes[cid].op for cid in feed_child_ids))
     idx = len(nodes)
     groupby_kwargs = _groupby_capacity_kwargs(expr, universe_groups is not None)
     nodes.append(
@@ -1035,10 +1132,18 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
 
 
 
-def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None, cpp: bool = True) -> JaxFlatRuntime:
+def compile_formula(
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    cpp: bool = True,
+    metadata: MetadataConfig | dict | None = None,
+    type_relations=(),
+) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
+    metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
+    formula_metadata = analyze_formula_metadata(expr, metadata_config)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
@@ -1050,6 +1155,7 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
             outputs=(out,),
             input_names=tuple(input_names),
             state_layout=layout,
+            metadata=formula_metadata,
         ),
         cpp=cpp,
     )
