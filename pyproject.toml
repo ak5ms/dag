@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "pybind11>=2.12"]
+requires = ["setuptools>=68", "wheel", "pybind11>=2.12", "includeigen"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,6 +16,13 @@ dependencies = [
     "pytest",
     "pytest-xdist",
     "pybind11>=2.12",
+    "includeigen",
+]
+
+[project.optional-dependencies]
+metadata = [
+    "unxt",
+    "immrax",
 ]
 
 [tool.pytest.ini_options]
