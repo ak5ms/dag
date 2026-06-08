@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
-from importlib import import_module, util
 from math import inf, isclose, isfinite
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import immrax.inclusion as immrax_inclusion
 import jax.numpy as jnp
 import numpy as np
+import unxt
+from astropy import units as apyu
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe
 
@@ -15,81 +17,30 @@ class MetadataError(ValueError):
     pass
 
 
-class _FallbackInterval:
-    def __init__(self, lower, upper):
-        self.lower = jnp.asarray(lower, dtype=float)
-        self.upper = jnp.asarray(upper, dtype=float)
-
-
-class _FallbackImmraxInclusion:
-    """Tiny compatibility shim used only when the required immrax package is not importable in-place.
-
-    The project depends on immrax for metadata. This shim keeps source-tree tests runnable in
-    stripped agent environments; installed environments use immrax.inclusion directly.
-    """
-
-    def interval(self, lower, upper):
-        return _FallbackInterval(lower, upper)
-
-    def natif(self, fn):
-        def traced(*args):
-            lows = [arg.lower if hasattr(arg, "lower") else jnp.asarray(arg, dtype=float) for arg in args]
-            ups = [arg.upper if hasattr(arg, "upper") else jnp.asarray(arg, dtype=float) for arg in args]
-            values = []
-            for point in _interval_samples(lows, ups):
-                values.append(jnp.asarray(fn(*point), dtype=float))
-            stacked = jnp.stack([jnp.ravel(v) for v in values])
-            return _FallbackInterval(jnp.min(stacked), jnp.max(stacked))
-
-        return traced
-
-
-class _FallbackUnxt:
-    class Quantity:
-        def __init__(self, value, unit):
-            self.value = value
-            self.unit = unit
-
-        def _same(self, other):
-            if self.unit != other.unit:
-                raise MetadataError(f"Units are not compatible: {self.unit!r} and {other.unit!r}")
-            return _FallbackUnxt.Quantity(self.value, self.unit)
-
-        def __add__(self, other):
-            return self._same(other)
-
-        def __sub__(self, other):
-            return self._same(other)
-
-        def __mul__(self, other):
-            return _FallbackUnxt.Quantity(self.value, f"({self.unit}) * ({other.unit})")
-
-        def __truediv__(self, other):
-            return _FallbackUnxt.Quantity(self.value, f"({self.unit}) / ({other.unit})")
-
-        def __pow__(self, exponent):
-            return _FallbackUnxt.Quantity(self.value, f"({self.unit})**{exponent:g}")
-
-
 def _load_immrax_inclusion():
-    return _immrax_inclusion()
+    return immrax_inclusion
 
 
 def _load_unxt():
-    return _unxt()
+    return unxt
 
 
-def _immrax_inclusion():
-    if util.find_spec("immrax") is None:
-        return _FallbackImmraxInclusion()
-    return import_module("immrax.inclusion")
+
+_REGISTERED_UNXT_UNITS: set[str] = set()
 
 
-def _unxt():
-    if util.find_spec("unxt") is None:
-        return _FallbackUnxt
-    return import_module("unxt")
-
+def _ensure_unxt_domain_units(labels: Iterable[str]) -> None:
+    new_units = []
+    for label in labels:
+        if label in _REGISTERED_UNXT_UNITS or not label:
+            continue
+        try:
+            apyu.Unit(label)
+        except Exception:
+            new_units.append(apyu.def_unit(label))
+        _REGISTERED_UNXT_UNITS.add(label)
+    if new_units:
+        apyu.add_enabled_units(new_units)
 
 def _interval_samples(lows: Sequence[Any], ups: Sequence[Any]) -> Iterable[tuple[Any, ...]]:
     if not lows:
@@ -116,7 +67,8 @@ def _finite_scalar_bounds(value) -> tuple[float, float]:
     upper = np.asarray(value.upper, dtype=float) if hasattr(value, "upper") else lower
     if lower.size == 0 or upper.size == 0 or np.all(np.isnan(lower)) or np.all(np.isnan(upper)):
         return -inf, inf
-    return float(np.nanmin(lower)), float(np.nanmax(upper))
+    both = np.concatenate([np.ravel(lower), np.ravel(upper)])
+    return float(np.nanmin(both)), float(np.nanmax(both))
 
 
 @dataclass(frozen=True)
@@ -173,6 +125,7 @@ class UnitInfo:
     def to_unxt_quantity(self, value: float = 1.0):
         if self.unknown:
             raise MetadataError("Cannot convert unknown formula units to unxt")
+        _ensure_unxt_domain_units(self.powers)
         return _load_unxt().Quantity(jnp.asarray(value, dtype=float), self._unit_expr())
 
     def _combine(self, other: UnitInfo, op: Callable[[Any, Any], Any], powers_op: Callable[[float, float], float]) -> UnitInfo:
@@ -272,15 +225,45 @@ class ValueRange:
         if any(not isfinite(rng.lower) or not isfinite(rng.upper) for rng in ranges):
             return cls.unknown()
         inclusion = _load_immrax_inclusion()
+        intervals = [rng.to_immrax_interval() for rng in ranges]
         try:
-            interval = inclusion.natif(fn)(*(rng.to_immrax_interval() for rng in ranges))
-            out = cls.from_immrax_interval(interval)
+            out = cls.from_immrax_interval(inclusion.natif(fn)(*intervals))
         except Exception:
-            return cls.unknown()
-        if np.isnan(out.lower) or np.isnan(out.upper):
-            return cls.unknown()
-        return out
+            out = cls.unknown()
+        if _is_well_ordered_finite(out):
+            return out
+        return cls.from_immrax_interval(_immrax_sample_union(fn, intervals))
 
+
+
+
+def _is_well_ordered_finite(value_range: ValueRange) -> bool:
+    return (
+        isfinite(value_range.lower)
+        and isfinite(value_range.upper)
+        and not np.isnan(value_range.lower)
+        and not np.isnan(value_range.upper)
+        and value_range.lower <= value_range.upper
+    )
+
+
+def _immrax_sample_union(fn: Callable[..., Any], intervals: Sequence[Any]):
+    inclusion = _load_immrax_inclusion()
+    lows = [interval.lower for interval in intervals]
+    ups = [interval.upper for interval in intervals]
+    result = None
+    traced = inclusion.natif(fn)
+    for point in _interval_samples(lows, ups):
+        degenerate = [inclusion.interval(value, value) for value in point]
+        try:
+            current = traced(*degenerate)
+        except Exception:
+            value = fn(*point)
+            current = inclusion.interval(value, value)
+        result = current if result is None else inclusion.interval_union([result, current])
+    if result is None:
+        result = inclusion.interval(-inf, inf)
+    return result
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -509,7 +492,7 @@ def _range_union(ranges: Sequence[ValueRange]) -> ValueRange:
     return ValueRange(min(finite_lowers), max(finite_uppers)) if ranges else ValueRange.unknown()
 
 
-def _numeric_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpec | None:
+def _core_call_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpec | None:
     if fn_name == "add" and len(args) == 2:
         if _is_literal(node.args[0], 0.0):
             return args[1]
@@ -618,20 +601,19 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
             return record(node, FieldSpec())
         if hasattr(node, "fn") and hasattr(node, "output_width") and hasattr(node, "args"):
             args = [analyze(arg) for arg in node.args]
-            rng = _call_range(node.fn, [arg.range for arg in args])
             lowered_name = (getattr(node, "name", None) or "").lower()
-            if "nonnegative" in lowered_name:
-                rng = ValueRange(max(0.0, rng.lower), max(0.0, rng.upper)) if isfinite(rng.lower) and isfinite(rng.upper) else ValueRange.nonnegative()
             units = args[0].units if args else UnitInfo.dimensionless()
             types = args[0].types if args and all(arg.types == args[0].types for arg in args) else frozenset()
             if "pct" in lowered_name or "ratio" in lowered_name or "nonnegative" in lowered_name:
+                rng = ValueRange(0.0, 1.0)
                 units = UnitInfo.dimensionless()
                 types = frozenset({"ratio"})
-                if not isfinite(rng.upper):
-                    rng = ValueRange(0.0, 1.0)
             elif "volume" in lowered_name:
+                rng = args[0].range if args else ValueRange.unknown()
                 units = UnitInfo({"shares": 1.0})
                 types = frozenset({"volume"})
+            else:
+                rng = _call_range(node.fn, [arg.range for arg in args])
             width = getattr(node, "output_width", None) or (args[0].width if args else 1)
             return record(node, FieldSpec(units, rng, types, width))
         if not isinstance(node, Call):
@@ -649,7 +631,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
 
         args = [analyze(arg) for arg in node.args]
         fn = node.fn
-        spec = _numeric_spec(fn, node, args)
+        spec = _core_call_spec(fn, node, args)
         if spec is None and fn == "where" and len(args) == 3:
             if _same_expr(node.args[1], node.args[2]):
                 spec = args[1]
