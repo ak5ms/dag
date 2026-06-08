@@ -12,16 +12,12 @@ dependencies = [
     "numba",
     "scipy",
     "jax[cpu]",
-    "equinox",
+    "equinox~=0.12.2",
     "pytest",
     "pytest-xdist",
     "pybind11>=2.12",
     "includeigen",
-]
-
-[project.optional-dependencies]
-metadata = [
-    "unxt",
+    "unxt<1.7",
     "immrax",
 ]
 

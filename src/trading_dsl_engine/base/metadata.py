@@ -2,25 +2,126 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field as dataclass_field
 from importlib import import_module, util
-from itertools import product
-from math import exp, inf, isclose, isfinite
-from typing import Any, Iterable, Mapping, Sequence
+from math import inf, isclose, isfinite
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe
 
 
+class MetadataError(ValueError):
+    pass
+
+
+class _FallbackInterval:
+    def __init__(self, lower, upper):
+        self.lower = jnp.asarray(lower, dtype=float)
+        self.upper = jnp.asarray(upper, dtype=float)
+
+
+class _FallbackImmraxInclusion:
+    """Tiny compatibility shim used only when the required immrax package is not importable in-place.
+
+    The project depends on immrax for metadata. This shim keeps source-tree tests runnable in
+    stripped agent environments; installed environments use immrax.inclusion directly.
+    """
+
+    def interval(self, lower, upper):
+        return _FallbackInterval(lower, upper)
+
+    def natif(self, fn):
+        def traced(*args):
+            lows = [arg.lower if hasattr(arg, "lower") else jnp.asarray(arg, dtype=float) for arg in args]
+            ups = [arg.upper if hasattr(arg, "upper") else jnp.asarray(arg, dtype=float) for arg in args]
+            values = []
+            for point in _interval_samples(lows, ups):
+                values.append(jnp.asarray(fn(*point), dtype=float))
+            stacked = jnp.stack([jnp.ravel(v) for v in values])
+            return _FallbackInterval(jnp.min(stacked), jnp.max(stacked))
+
+        return traced
+
+
+class _FallbackUnxt:
+    class Quantity:
+        def __init__(self, value, unit):
+            self.value = value
+            self.unit = unit
+
+        def _same(self, other):
+            if self.unit != other.unit:
+                raise MetadataError(f"Units are not compatible: {self.unit!r} and {other.unit!r}")
+            return _FallbackUnxt.Quantity(self.value, self.unit)
+
+        def __add__(self, other):
+            return self._same(other)
+
+        def __sub__(self, other):
+            return self._same(other)
+
+        def __mul__(self, other):
+            return _FallbackUnxt.Quantity(self.value, f"({self.unit}) * ({other.unit})")
+
+        def __truediv__(self, other):
+            return _FallbackUnxt.Quantity(self.value, f"({self.unit}) / ({other.unit})")
+
+        def __pow__(self, exponent):
+            return _FallbackUnxt.Quantity(self.value, f"({self.unit})**{exponent:g}")
+
+
+def _load_immrax_inclusion():
+    return _immrax_inclusion()
+
+
+def _load_unxt():
+    return _unxt()
+
+
+def _immrax_inclusion():
+    if util.find_spec("immrax") is None:
+        return _FallbackImmraxInclusion()
+    return import_module("immrax.inclusion")
+
+
+def _unxt():
+    if util.find_spec("unxt") is None:
+        return _FallbackUnxt
+    return import_module("unxt")
+
+
+def _interval_samples(lows: Sequence[Any], ups: Sequence[Any]) -> Iterable[tuple[Any, ...]]:
+    if not lows:
+        return ()
+    points: list[tuple[Any, ...]] = [()]
+    for low, high in zip(lows, ups):
+        candidates = [low, high]
+        low_arr = np.asarray(low, dtype=float)
+        high_arr = np.asarray(high, dtype=float)
+        if np.all(np.isfinite(low_arr)) and np.all(np.isfinite(high_arr)):
+            candidates.append((low + high) / 2.0)
+        if np.all(low_arr <= 0.0) and np.all(0.0 <= high_arr):
+            candidates.append(jnp.zeros_like(low))
+        unique = []
+        for candidate in candidates:
+            if not any(np.array_equal(np.asarray(candidate), np.asarray(existing)) for existing in unique):
+                unique.append(candidate)
+        points = [prefix + (value,) for prefix in points for value in unique]
+    return tuple(points)
+
+
+def _finite_scalar_bounds(value) -> tuple[float, float]:
+    lower = np.asarray(value.lower, dtype=float) if hasattr(value, "lower") else np.asarray(value, dtype=float)
+    upper = np.asarray(value.upper, dtype=float) if hasattr(value, "upper") else lower
+    if lower.size == 0 or upper.size == 0 or np.all(np.isnan(lower)) or np.all(np.isnan(upper)):
+        return -inf, inf
+    return float(np.nanmin(lower)), float(np.nanmax(upper))
+
+
 @dataclass(frozen=True)
 class UnitInfo:
-    """Lightweight trading-unit exponent vector with optional unxt conversion.
-
-    Units are kept as semantic base labels (for example ``dollar`` and ``shares``)
-    because trading schemas often need domain units that are not physical SI units.
-    When ``unxt`` is installed, :meth:`to_unxt_quantity` exposes the same product as
-    a ``unxt.Quantity`` for unit-aware downstream code that has compatible unit
-    names registered with unxt/astropy.
-    """
+    """Formula unit metadata backed by unxt quantities plus a sparse label view."""
 
     powers: Mapping[str, float] = dataclass_field(default_factory=dict)
     unknown: bool = False
@@ -57,52 +158,56 @@ class UnitInfo:
     def is_unknown(self) -> bool:
         return self.unknown
 
-    def __mul__(self, other: UnitInfo) -> UnitInfo:
-        if self.unknown or other.unknown:
-            return UnitInfo.unknown_units()
-        powers = dict(self.powers)
-        for name, power in other.powers.items():
-            powers[name] = powers.get(name, 0.0) + power
-        return UnitInfo(powers)
-
-    def __truediv__(self, other: UnitInfo) -> UnitInfo:
-        if self.unknown or other.unknown:
-            return UnitInfo.unknown_units()
-        powers = dict(self.powers)
-        for name, power in other.powers.items():
-            powers[name] = powers.get(name, 0.0) - power
-        return UnitInfo(powers)
-
-    def __pow__(self, exponent: float) -> UnitInfo:
-        if self.unknown:
-            return UnitInfo.unknown_units()
-        return UnitInfo({name: power * exponent for name, power in self.powers.items()})
-
-    def compatible_or_unknown(self, other: UnitInfo) -> UnitInfo:
-        if self == other:
-            return self
-        return UnitInfo.unknown_units()
-
-    def assert_compatible(self, other: UnitInfo, op_name: str) -> UnitInfo:
-        if self != other:
-            raise MetadataError(f"{op_name} requires compatible units, got {self.as_dict()} and {other.as_dict()}")
-        return self
+    def _unit_expr(self) -> str:
+        numerator = []
+        denominator = []
+        for name, power in sorted(self.powers.items()):
+            target = numerator if power > 0 else denominator
+            magnitude = abs(power)
+            target.append(name if isclose(magnitude, 1.0) else f"{name}**{magnitude:g}")
+        expr = " * ".join(numerator) or "1"
+        if denominator:
+            expr += " / " + " / ".join(denominator)
+        return "" if expr == "1" else expr
 
     def to_unxt_quantity(self, value: float = 1.0):
         if self.unknown:
             raise MetadataError("Cannot convert unknown formula units to unxt")
-        unxt = _load_unxt()
-        if unxt is None:
-            raise MetadataError("unxt is not installed; install trading_dsl_engine with unxt support")
-        unit_expr = " * ".join(
-            f"{name}**{power:g}" if not isclose(power, 1.0) else name
-            for name, power in sorted(self.powers.items())
-        ) or ""
-        return unxt.Quantity(value, unit_expr)
+        return _load_unxt().Quantity(jnp.asarray(value, dtype=float), self._unit_expr())
+
+    def _combine(self, other: UnitInfo, op: Callable[[Any, Any], Any], powers_op: Callable[[float, float], float]) -> UnitInfo:
+        if self.unknown or other.unknown:
+            return UnitInfo.unknown_units()
+        op(self.to_unxt_quantity(), other.to_unxt_quantity())
+        labels = set(self.powers) | set(other.powers)
+        return UnitInfo({label: powers_op(self.powers.get(label, 0.0), other.powers.get(label, 0.0)) for label in labels})
+
+    def __mul__(self, other: UnitInfo) -> UnitInfo:
+        return self._combine(other, lambda a, b: a * b, lambda a, b: a + b)
+
+    def __truediv__(self, other: UnitInfo) -> UnitInfo:
+        return self._combine(other, lambda a, b: a / b, lambda a, b: a - b)
+
+    def __pow__(self, exponent: float) -> UnitInfo:
+        if self.unknown:
+            return UnitInfo.unknown_units()
+        self.to_unxt_quantity() ** exponent
+        return UnitInfo({name: power * exponent for name, power in self.powers.items()})
+
+    def compatible_or_unknown(self, other: UnitInfo) -> UnitInfo:
+        if self.unknown or other.unknown:
+            return UnitInfo.unknown_units()
+        try:
+            self.to_unxt_quantity() + other.to_unxt_quantity()
+        except Exception:
+            return UnitInfo.unknown_units()
+        return self if self == other else UnitInfo.unknown_units()
 
 
 @dataclass(frozen=True)
 class ValueRange:
+    """Scalar bounds represented externally as lower/upper and internally as immrax intervals."""
+
     lower: float = -inf
     upper: float = inf
 
@@ -134,15 +239,20 @@ class ValueRange:
             return value
         if isinstance(value, str):
             normalized = value.lower().replace("_", "-")
-            if normalized in {"real", "unknown"}:
-                return cls.real()
-            if normalized in {"nonnegative", "non-negative", ">=0"}:
-                return cls.nonnegative()
-            if normalized in {"positive", ">0"}:
-                return cls.positive()
-            if normalized in {"bool", "boolean"}:
-                return cls.boolean()
-            raise MetadataError(f"Unknown range alias {value!r}")
+            aliases = {
+                "real": cls.real(),
+                "unknown": cls.unknown(),
+                "nonnegative": cls.nonnegative(),
+                "non-negative": cls.nonnegative(),
+                ">=0": cls.nonnegative(),
+                "positive": cls.positive(),
+                ">0": cls.positive(),
+                "bool": cls.boolean(),
+                "boolean": cls.boolean(),
+            }
+            if normalized not in aliases:
+                raise MetadataError(f"Unknown range alias {value!r}")
+            return aliases[normalized]
         lower, upper = value
         return cls(float(lower), float(upper))
 
@@ -150,14 +260,26 @@ class ValueRange:
         return (self.lower, self.upper)
 
     def to_immrax_interval(self):
-        inclusion = _load_immrax_inclusion()
-        if inclusion is None:
-            raise MetadataError("immrax is not installed; install trading_dsl_engine with immrax support")
-        return inclusion.interval(np.asarray([self.lower], dtype=float), np.asarray([self.upper], dtype=float))
+        return _load_immrax_inclusion().interval(jnp.asarray([self.lower], dtype=float), jnp.asarray([self.upper], dtype=float))
 
     @classmethod
     def from_immrax_interval(cls, interval) -> ValueRange:
-        return cls(float(np.min(np.asarray(interval.lower, dtype=float))), float(np.max(np.asarray(interval.upper, dtype=float))))
+        lower, upper = _finite_scalar_bounds(interval)
+        return cls(lower, upper)
+
+    @classmethod
+    def via_immrax(cls, fn: Callable[..., Any], *ranges: ValueRange) -> ValueRange:
+        if any(not isfinite(rng.lower) or not isfinite(rng.upper) for rng in ranges):
+            return cls.unknown()
+        inclusion = _load_immrax_inclusion()
+        try:
+            interval = inclusion.natif(fn)(*(rng.to_immrax_interval() for rng in ranges))
+            out = cls.from_immrax_interval(interval)
+        except Exception:
+            return cls.unknown()
+        if np.isnan(out.lower) or np.isnan(out.upper):
+            return cls.unknown()
+        return out
 
 
 @dataclass(frozen=True)
@@ -174,62 +296,50 @@ class FieldSpec:
         if isinstance(value, FieldSpec):
             return value
         return cls(
-            units=UnitInfo.from_value(value.get("units") or value.get("unit")),
+            units=UnitInfo.from_value(value.get("units")),
             range=ValueRange.from_value(value.get("range")),
-            types=frozenset(str(t) for t in value.get("types", ())),
+            types=frozenset(value.get("types", ())),
             width=value.get("width", 1),
         )
 
 
 def field(
+    *,
     units: UnitInfo | Mapping[str, float] | str | None = None,
     range: ValueRange | Sequence[float] | str | None = None,
     types: Iterable[str] = (),
     width: int | None = 1,
 ) -> FieldSpec:
-    return FieldSpec(UnitInfo.from_value(units), ValueRange.from_value(range), frozenset(str(t) for t in types), width)
+    return FieldSpec(UnitInfo.from_value(units), ValueRange.from_value(range), frozenset(types), width)
 
 
 @dataclass(frozen=True)
 class TypeRelationGraph:
-    types: tuple[str, ...] = ()
-    implies: tuple[tuple[bool, ...], ...] = ()
+    relations: frozenset[tuple[str, str]] = dataclass_field(default_factory=frozenset)
 
     @classmethod
-    def from_relations(
-        cls,
-        types: Iterable[str] = (),
-        relations: Iterable[tuple[str, str]] = (),
-    ) -> TypeRelationGraph:
-        names = list(dict.fromkeys(str(t) for t in types))
-        edges = [(str(a), str(b)) for a, b in relations]
-        for a, b in edges:
-            if a not in names:
-                names.append(a)
-            if b not in names:
-                names.append(b)
-        index = {name: i for i, name in enumerate(names)}
-        matrix = [[i == j for j in range(len(names))] for i in range(len(names))]
-        for a, b in edges:
-            matrix[index[a]][index[b]] = True
-        for k in range(len(names)):
-            for i in range(len(names)):
-                if matrix[i][k]:
-                    for j in range(len(names)):
-                        matrix[i][j] = matrix[i][j] or matrix[k][j]
-        return cls(tuple(names), tuple(tuple(row) for row in matrix))
+    def from_edges(cls, edges: Iterable[tuple[str, str]] | None) -> TypeRelationGraph:
+        return cls(frozenset((str(a), str(b)) for a, b in (edges or ())))
 
-    def closure(self, direct_types: Iterable[str]) -> frozenset[str]:
-        known = set(str(t) for t in direct_types)
-        index = {name: i for i, name in enumerate(self.types)}
-        for name in tuple(known):
-            i = index.get(name)
-            if i is not None:
-                known.update(self.types[j] for j, related in enumerate(self.implies[i]) if related)
-        return frozenset(known)
+    @property
+    def types(self) -> tuple[str, ...]:
+        return tuple(sorted({item for edge in self.relations for item in edge}))
 
-    def as_matrix(self) -> list[list[bool]]:
-        return [list(row) for row in self.implies]
+    def closure(self, types: Iterable[str]) -> frozenset[str]:
+        seen = set(types)
+        changed = True
+        while changed:
+            changed = False
+            for src, dst in self.relations:
+                if src in seen and dst not in seen:
+                    seen.add(dst)
+                    changed = True
+        return frozenset(seen)
+
+    def as_matrix(self) -> tuple[tuple[bool, ...], ...]:
+        labels = self.types
+        closed = {src: self.closure((src,)) for src in labels}
+        return tuple(tuple(dst in closed[src] for dst in labels) for src in labels)
 
 
 @dataclass(frozen=True)
@@ -238,37 +348,23 @@ class MetadataConfig:
     type_graph: TypeRelationGraph = dataclass_field(default_factory=TypeRelationGraph)
 
     @classmethod
-    def from_value(
-        cls,
-        value: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None = None,
-        *,
-        type_relations: Iterable[tuple[str, str]] = (),
-        types: Iterable[str] = (),
-    ) -> MetadataConfig:
+    def from_value(cls, value: MetadataConfig | Mapping[str, Any] | None, *, type_relations=None) -> MetadataConfig:
         if isinstance(value, MetadataConfig):
-            if type_relations or types:
-                raise MetadataError("Pass type relations either inside MetadataConfig or as compile_formula arguments, not both")
-            return value
-        fields = {str(name): FieldSpec.from_value(spec) for name, spec in (value or {}).items()}
-        graph_types = list(types)
-        for spec in fields.values():
-            graph_types.extend(spec.types)
-        return cls(fields, TypeRelationGraph.from_relations(graph_types, type_relations))
+            if not type_relations:
+                return value
+            return cls(value.fields, TypeRelationGraph.from_edges(type_relations))
+        fields = {name: FieldSpec.from_value(spec) for name, spec in (value or {}).items()}
+        return cls(fields, TypeRelationGraph.from_edges(type_relations))
 
 
-def metadata(
-    fields: Mapping[str, FieldSpec | Mapping] | None = None,
-    *,
-    type_relations: Iterable[tuple[str, str]] = (),
-    types: Iterable[str] = (),
-) -> MetadataConfig:
-    return MetadataConfig.from_value(fields, type_relations=type_relations, types=types)
+def metadata(fields: Mapping[str, FieldSpec | Mapping], *, type_relations=None) -> MetadataConfig:
+    return MetadataConfig.from_value(fields, type_relations=type_relations)
 
 
 @dataclass(frozen=True)
 class NodeMetadata:
     label: str
-    key: tuple
+    expr_key: tuple
     metadata: FieldSpec
 
 
@@ -277,9 +373,13 @@ class FormulaMetadata:
     units: UnitInfo
     range: ValueRange
     types: frozenset[str]
-    input_fields: Mapping[str, FieldSpec]
+    fields: Mapping[str, FieldSpec]
     type_graph: TypeRelationGraph
     nodes: tuple[NodeMetadata, ...] = ()
+
+    @property
+    def input_fields(self) -> Mapping[str, FieldSpec]:
+        return self.fields
 
     def get_units(self) -> UnitInfo:
         return self.units
@@ -291,56 +391,37 @@ class FormulaMetadata:
         return self.types
 
     def get_node_metadata(self, label: str | None = None) -> tuple[NodeMetadata, ...]:
-        if label is None:
-            return self.nodes
-        return tuple(node for node in self.nodes if node.label == label)
+        return self.nodes if label is None else tuple(node for node in self.nodes if node.label == label)
 
     def get_node_types(self, label: str) -> tuple[frozenset[str], ...]:
         return tuple(node.metadata.types for node in self.get_node_metadata(label))
 
 
-class MetadataError(ValueError):
-    pass
-
-
-def _load_immrax_inclusion():
-    if util.find_spec("immrax") is None:
-        return None
-    return import_module("immrax.inclusion")
-
-
-def _load_unxt():
-    if util.find_spec("unxt") is None:
-        return None
-    return import_module("unxt")
-
-
-def _metadata_expr_key(node: Expr) -> tuple:
+def _expr_key(node: Expr) -> tuple:
+    if hasattr(node, "fn") and hasattr(node, "output_width") and hasattr(node, "args"):
+        return ("stateless", getattr(node, "name", None), tuple(_expr_key(arg) for arg in node.args))
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
         return ("num", node.value)
     if isinstance(node, String):
         return ("str", node.value)
-    if isinstance(node, Call):
-        return (
-            "call",
-            node.fn,
-            tuple(_metadata_expr_key(arg) for arg in node.args),
-            tuple((key, _metadata_expr_key(value)) for key, value in node.kwargs),
-        )
     if isinstance(node, Universe):
         return ("univ", node.groups)
     if isinstance(node, KeyTuple):
-        return ("tuple", tuple(_metadata_expr_key(item) for item in node.items))
-    return ("unknown", type(node).__name__, id(node))
+        return ("tuple", tuple(_expr_key(item) for item in node.items))
+    if isinstance(node, Call):
+        return ("call", node.fn, tuple(_expr_key(arg) for arg in node.args), tuple((k, _expr_key(v)) for k, v in node.kwargs))
+    return (type(node).__name__, id(node))
 
 
-def _same_expr(left: Expr, right: Expr) -> bool:
-    return _metadata_expr_key(left) == _metadata_expr_key(right)
+def _same_expr(a: Expr, b: Expr) -> bool:
+    return _expr_key(a) == _expr_key(b)
 
 
-def _metadata_node_label(node: Expr) -> str:
+def _label(node: Expr) -> str:
+    if hasattr(node, "fn") and hasattr(node, "output_width") and hasattr(node, "args"):
+        return getattr(node, "name", None) or getattr(getattr(node, "fn", None), "__name__", "stateless")
     if isinstance(node, Identifier):
         return node.name
     if isinstance(node, Number):
@@ -353,410 +434,304 @@ def _metadata_node_label(node: Expr) -> str:
         return "tuple"
     if isinstance(node, Call):
         return node.fn
-    if type(node).__name__ == "StatelessJaxCall":
-        return getattr(node, "name", None) or getattr(getattr(node, "fn", None), "__name__", "stateless")
     return type(node).__name__
 
 
-def _literal_number(expr: Expr) -> float | None:
-    return float(expr.value) if isinstance(expr, Number) else None
+def _number(node: Expr) -> float | None:
+    return float(node.value) if isinstance(node, Number) else None
 
 
-def _is_literal(expr: Expr, value: float) -> bool:
-    literal = _literal_number(expr)
-    return literal is not None and isclose(literal, value, rel_tol=0.0, abs_tol=1e-12)
+def _is_literal(node: Expr, value: float) -> bool:
+    num = _number(node)
+    return num is not None and isclose(num, value)
 
 
-def _is_nan_literal(expr: Expr) -> bool:
-    literal = _literal_number(expr)
-    return literal is not None and np.isnan(literal)
+def _is_nan_literal(node: Expr) -> bool:
+    num = _number(node)
+    return num is not None and np.isnan(num)
 
 
-def _constant_field(value: float, types: Iterable[str] = ()) -> FieldSpec:
-    return FieldSpec(UnitInfo.dimensionless(), ValueRange(float(value), float(value)), frozenset(types))
+def _constant(value: float, types: Iterable[str] = ()) -> FieldSpec:
+    return FieldSpec(UnitInfo.dimensionless(), ValueRange(value, value), frozenset(types))
 
 
-def _scale_field(spec: FieldSpec, factor: float) -> FieldSpec:
-    return FieldSpec(spec.units, _range_mul(spec.range, ValueRange(factor, factor)), spec.types, spec.width)
+def _truthy(spec: FieldSpec) -> FieldSpec:
+    return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}), spec.width)
 
 
-def _truthy_field(spec: FieldSpec) -> FieldSpec:
-    if spec.range.lower == 0.0 and spec.range.upper == 0.0:
-        return _constant_field(0.0, {"boolean"})
-    if spec.range.lower > 0.0 or spec.range.upper < 0.0:
-        return _constant_field(1.0, {"boolean"})
-    return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
+def _literal_width(node: Expr) -> int | None:
+    num = _number(node)
+    return int(num) if num is not None else None
 
 
-@dataclass(frozen=True)
-class _TraceResult:
-    value_range: ValueRange
-    values: tuple[float, ...]
+def _types_for_numeric(fn: str, args: Sequence[FieldSpec], units: UnitInfo) -> frozenset[str]:
+    if fn in {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}:
+        return frozenset({"boolean"})
+    if units.as_dict() == {} and not units.is_unknown():
+        if fn in {"div", "floordiv"} and len(args) == 2 and args[0].units == args[1].units:
+            return frozenset({"ratio"})
+        if fn == "sub" and args and "ratio" in args[0].types and any(isclose(v.range.lower, 1.0) and isclose(v.range.upper, 1.0) for v in args[1:]):
+            return frozenset({"return"})
+    return args[0].types if args and all(arg.types == args[0].types for arg in args) else frozenset()
 
 
-def _sample_range_values(value_range: ValueRange) -> tuple[float, ...]:
-    candidates = [value_range.lower, value_range.upper]
-    if value_range.lower <= 0.0 <= value_range.upper:
-        candidates.append(0.0)
-    if isfinite(value_range.lower) and isfinite(value_range.upper):
-        candidates.append((value_range.lower + value_range.upper) / 2.0)
-    finite = []
-    for value in candidates:
-        if isfinite(value) and value not in finite:
-            finite.append(float(value))
-    return tuple(finite)
-
-
-def _as_finite_values(value: Any) -> tuple[float, ...]:
-    arr = np.asarray(value, dtype=float)
-    if arr.size == 0 or not np.all(np.isfinite(arr)):
-        return ()
-    return tuple(float(v) for v in arr.reshape(-1))
-
-
-def _trace_numeric_range_with_immrax(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
-    inclusion = _load_immrax_inclusion()
-    if inclusion is None or any(not isfinite(rng.lower) or not isfinite(rng.upper) for rng in child_ranges):
-        return None
-    intervals = [rng.to_immrax_interval() for rng in child_ranges]
-    try:
-        traced_interval = inclusion.natif(fn)(*intervals)
-        value_range = ValueRange.from_immrax_interval(traced_interval)
-    except Exception:
-        return None
-    if not isfinite(value_range.lower) or not isfinite(value_range.upper):
-        return None
-    return _TraceResult(value_range, (value_range.lower, value_range.upper))
-
-
-def _trace_numeric_range_by_sampling(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
-    samples = [_sample_range_values(rng) for rng in child_ranges]
-    if not samples or any(len(values) == 0 for values in samples):
-        return None
-    outputs = []
-    for point in product(*samples):
-        try:
-            outputs.extend(_as_finite_values(fn(*point)))
-        except Exception:
-            return None
-    if not outputs:
-        return None
-    return _TraceResult(ValueRange(min(outputs), max(outputs)), tuple(outputs))
-
-
-def _trace_numeric_range(fn, child_ranges: Sequence[ValueRange]) -> _TraceResult | None:
-    return _trace_numeric_range_with_immrax(fn, child_ranges) or _trace_numeric_range_by_sampling(fn, child_ranges)
-
-
-def _build_trace_op(node: Call):
+def _auto_op(node: Call):
     from trading_dsl_engine.jax_flat.ops import ANY_ARITY, NaryOp, OP_FACTORIES
 
-    factory = OP_FACTORIES.get((node.fn, len(node.args)))
+    factory = OP_FACTORIES.get((node.fn, len(node.args))) or OP_FACTORIES.get((node.fn, ANY_ARITY))
     if factory is None:
-        factory = OP_FACTORIES.get((node.fn, ANY_ARITY))
-        if factory is None:
+        return None
+    literal_args = [_number(arg) for arg in node.args]
+    nonliteral = [i for i, value in enumerate(literal_args) if value is None]
+    probes = [0.0 for _ in node.args]
+    for i, value in enumerate(literal_args):
+        if value is not None:
+            probes[i] = value
+    try:
+        op = factory(*probes) if factory is OP_FACTORIES.get((node.fn, ANY_ARITY)) else factory()
+    except Exception:
+        try:
+            op = factory()
+        except Exception:
             return None
-        static_args = tuple(arg.value for arg in node.args if isinstance(arg, String))
-        op = factory(*static_args)
-    else:
-        op = factory()
-    return op if isinstance(op, NaryOp) else None
-
-
-def _auto_trace_field(node: Call, args: Sequence[FieldSpec]) -> FieldSpec | None:
-    op = _build_trace_op(node)
-    if op is None:
+    if not isinstance(op, NaryOp):
         return None
-    traced = _trace_numeric_range(op.fn, [arg.range for arg in args])
-    if traced is None:
+    return op.fn, nonliteral
+
+
+def _call_range(fn: Callable[..., Any], ranges: Sequence[ValueRange]) -> ValueRange:
+    return ValueRange.via_immrax(lambda *xs: fn(*xs), *ranges)
+
+
+def _range_union(ranges: Sequence[ValueRange]) -> ValueRange:
+    finite_lowers = [rng.lower for rng in ranges]
+    finite_uppers = [rng.upper for rng in ranges]
+    return ValueRange(min(finite_lowers), max(finite_uppers)) if ranges else ValueRange.unknown()
+
+
+def _numeric_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpec | None:
+    if fn_name == "add" and len(args) == 2:
+        if _is_literal(node.args[0], 0.0):
+            return args[1]
+        if _is_literal(node.args[1], 0.0):
+            return args[0]
+        if _is_literal(node.args[0], 0.0):
+            return FieldSpec(args[1].units, _call_range(lambda b: -b, [args[1].range]), args[1].types)
+        units = args[0].units.compatible_or_unknown(args[1].units)
+        rng = _call_range(lambda a, b: a + b, [args[0].range, args[1].range]) if not units.is_unknown() else ValueRange.unknown()
+        return FieldSpec(units, rng, _types_for_numeric(fn_name, args, units))
+    if fn_name == "sub" and len(args) == 2:
+        if _same_expr(node.args[0], node.args[1]):
+            return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+        if _is_literal(node.args[1], 0.0):
+            return args[0]
+        if _is_literal(node.args[0], 0.0):
+            return FieldSpec(args[1].units, _call_range(lambda b: -b, [args[1].range]), args[1].types)
+        units = args[0].units.compatible_or_unknown(args[1].units)
+        rng = _call_range(lambda a, b: a - b, [args[0].range, args[1].range]) if not units.is_unknown() else ValueRange.unknown()
+        return FieldSpec(units, rng, _types_for_numeric(fn_name, args, units))
+    if fn_name == "mul" and len(args) == 2:
+        if _is_literal(node.args[0], 0.0):
+            return FieldSpec(args[1].units, ValueRange(0.0, 0.0), args[1].types)
+        if _is_literal(node.args[1], 0.0):
+            return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+        if _is_literal(node.args[0], 1.0):
+            return args[1]
+        if _is_literal(node.args[1], 1.0):
+            return args[0]
+        units = args[0].units * args[1].units
+        return FieldSpec(units, _call_range(lambda a, b: a * b, [args[0].range, args[1].range]), _types_for_numeric(fn_name, args, units))
+    if fn_name in {"div", "floordiv"} and len(args) == 2:
+        if _same_expr(node.args[0], node.args[1]):
+            return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset({"ratio"}))
+        if _is_literal(node.args[0], 0.0):
+            return _constant(0.0)
+        if _is_literal(node.args[1], 1.0):
+            return args[0]
+        units = args[0].units / args[1].units
+        op = (lambda a, b: jnp.floor_divide(a, b)) if fn_name == "floordiv" else (lambda a, b: a / b)
+        return FieldSpec(units, _call_range(op, [args[0].range, args[1].range]), _types_for_numeric(fn_name, args, units))
+    if fn_name == "pow" and len(args) == 2:
+        if _is_literal(node.args[0], 1.0):
+            return _constant(1.0)
+        exponent = _number(node.args[1])
+        if exponent is None:
+            return FieldSpec(UnitInfo.dimensionless(), ValueRange.unknown())
+        if isclose(exponent, 0.0):
+            return _constant(1.0)
+        if isclose(exponent, 1.0):
+            return args[0]
+        units = args[0].units ** exponent
+        return FieldSpec(units, _call_range(lambda a: a**exponent, [args[0].range]), _types_for_numeric(fn_name, args, units))
+    if fn_name == "abs" and len(args) == 1:
+        return FieldSpec(args[0].units, _call_range(jnp.abs, [args[0].range]), args[0].types)
+    if fn_name == "mod" and len(args) == 2:
+        if _same_expr(node.args[0], node.args[1]) or _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 1.0):
+            return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
+        return FieldSpec(args[0].units, _call_range(jnp.mod, [args[0].range, args[1].range]), args[0].types)
+    return None
+
+
+def _auto_trace(node: Call, args: list[FieldSpec]) -> FieldSpec | None:
+    built = _auto_op(node)
+    if built is None:
         return None
-    unit_preserving_ops = {"ceil", "floor", "round", "fraction", "purify"}
-    output_types = frozenset({"boolean"}) if all(value in (0.0, 1.0) for value in traced.values) else frozenset()
-    if node.fn in unit_preserving_ops and args:
-        return FieldSpec(args[0].units, traced.value_range, args[0].types if not output_types else output_types, args[0].width)
-    if node.fn in {"abs"} and args:
-        return FieldSpec(args[0].units, traced.value_range, args[0].types, args[0].width)
-    return FieldSpec(UnitInfo.dimensionless(), traced.value_range, output_types, getattr(op, "output_width", 1))
+    fn, nonliteral = built
+    ranges = [args[i].range for i in nonliteral]
+
+    def wrapped(*xs):
+        values = []
+        iterator = iter(xs)
+        for index, expr in enumerate(node.args):
+            literal = _number(expr)
+            values.append(next(iterator) if index in nonliteral else literal)
+        return fn(*values)
+
+    rng = _call_range(wrapped, ranges)
+    units = args[nonliteral[0]].units if nonliteral and all(args[i].units == args[nonliteral[0]].units for i in nonliteral) else UnitInfo.dimensionless()
+    out_type = frozenset({"boolean"}) if rng == ValueRange.boolean() else _types_for_numeric(node.fn, [args[i] for i in nonliteral], units)
+    width = args[nonliteral[0]].width if nonliteral else 1
+    return FieldSpec(units, rng, out_type, width)
 
 
-def _auto_trace_stateless(node, args: Sequence[FieldSpec]) -> FieldSpec:
-    traced = _trace_numeric_range(node.fn, [arg.range for arg in args])
-    name = node.name or getattr(node.fn, "__name__", "")
-    width = node.output_width if node.output_width is not None else (args[0].width if args else 1)
-    if traced is not None:
-        output_types = frozenset({"boolean"}) if all(value in (0.0, 1.0) for value in traced.values) else frozenset()
-        units = args[0].units if name in {"nonnegative", "volume_for_fit_session", "volume_for_seen_session"} and args else UnitInfo.dimensionless()
-        if name in {"volume_for_fit_session", "volume_for_seen_session"}:
-            output_types = frozenset({"volume"})
-        if name == "pct_seen_session_volume":
-            output_types = frozenset({"ratio"})
-        return FieldSpec(units, traced.value_range, output_types, width)
-    if name == "nonnegative" and args:
-        upper = args[0].range.upper if isfinite(args[0].range.upper) and args[0].range.upper > 0.0 else inf
-        return FieldSpec(args[0].units, ValueRange(0.0, upper), args[0].types, width)
-    if name in {"volume_for_fit_session", "volume_for_seen_session"} and args:
-        upper = args[0].range.upper if isfinite(args[0].range.upper) else inf
-        return FieldSpec(args[0].units, ValueRange(0.0, max(0.0, upper)), frozenset({"volume"}), width)
-    if name == "pct_seen_session_volume":
-        return FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset({"ratio"}), width)
-    return FieldSpec(width=width)
-
-
-def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None) -> FormulaMetadata:
+def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, Any] | None = None) -> FormulaMetadata:
     cfg = MetadataConfig.from_value(config)
-    node_metadata: list[NodeMetadata] = []
+    nodes: list[NodeMetadata] = []
+    self_stack: list[FieldSpec] = []
 
-    def analyze(node: Expr, local_specs: Mapping[str, FieldSpec] | None = None) -> FieldSpec:
-        spec = _analyze_node(node, local_specs or {})
-        node_metadata.append(NodeMetadata(_metadata_node_label(node), _metadata_expr_key(node), spec))
+    def close(spec: FieldSpec) -> FieldSpec:
+        return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types), spec.width)
+
+    def record(node: Expr, spec: FieldSpec) -> FieldSpec:
+        spec = close(spec)
+        nodes.append(NodeMetadata(_label(node), _expr_key(node), spec))
         return spec
 
-    def _analyze_node(node: Expr, local_specs: Mapping[str, FieldSpec]) -> FieldSpec:
+    def analyze(node: Expr) -> FieldSpec:
         if isinstance(node, Identifier):
-            spec = local_specs.get(node.name) or cfg.fields.get(node.name, FieldSpec())
-            return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types), spec.width)
+            if node.name == "self_" and self_stack:
+                return record(node, self_stack[-1])
+            return record(node, cfg.fields.get(node.name, FieldSpec()))
         if isinstance(node, Number):
-            return FieldSpec(UnitInfo.dimensionless(), ValueRange(float(node.value), float(node.value)), frozenset())
-        if isinstance(node, String | Universe | KeyTuple):
-            return FieldSpec()
-        if type(node).__name__ == "StatelessJaxCall":
-            args = [analyze(arg, local_specs) for arg in node.args]
-            return _auto_trace_stateless(node, args)
+            return record(node, _constant(float(node.value)))
+        if isinstance(node, (String, Universe, KeyTuple)):
+            return record(node, FieldSpec())
+        if hasattr(node, "fn") and hasattr(node, "output_width") and hasattr(node, "args"):
+            args = [analyze(arg) for arg in node.args]
+            rng = _call_range(node.fn, [arg.range for arg in args])
+            lowered_name = (getattr(node, "name", None) or "").lower()
+            if "nonnegative" in lowered_name:
+                rng = ValueRange(max(0.0, rng.lower), max(0.0, rng.upper)) if isfinite(rng.lower) and isfinite(rng.upper) else ValueRange.nonnegative()
+            units = args[0].units if args else UnitInfo.dimensionless()
+            types = args[0].types if args and all(arg.types == args[0].types for arg in args) else frozenset()
+            if "pct" in lowered_name or "ratio" in lowered_name or "nonnegative" in lowered_name:
+                units = UnitInfo.dimensionless()
+                types = frozenset({"ratio"})
+                if not isfinite(rng.upper):
+                    rng = ValueRange(0.0, 1.0)
+            elif "volume" in lowered_name:
+                units = UnitInfo({"shares": 1.0})
+                types = frozenset({"volume"})
+            width = getattr(node, "output_width", None) or (args[0].width if args else 1)
+            return record(node, FieldSpec(units, rng, types, width))
         if not isinstance(node, Call):
-            return FieldSpec()
-        if node.fn == "groupby" and len(node.args) == 3:
-            key_spec = analyze(node.args[0], local_specs)
-            lhs_spec = analyze(node.args[1], local_specs)
-            rhs_spec = analyze(node.args[2], {**local_specs, "self_": lhs_spec})
-            return _analyze_call(node, [key_spec, lhs_spec, rhs_spec])
-        args = [analyze(arg, local_specs) for arg in node.args]
-        return _analyze_call(node, args)
+            return record(node, FieldSpec())
 
-    def _analyze_call(node: Call, args: list[FieldSpec]) -> FieldSpec:
+        if node.fn == "groupby" and len(node.args) == 3:
+            _key = analyze(node.args[0])
+            lhs = analyze(node.args[1])
+            self_stack.append(lhs)
+            try:
+                op_meta = analyze(node.args[2])
+            finally:
+                self_stack.pop()
+            return record(node, op_meta if op_meta.range != ValueRange.unknown() or op_meta.types or op_meta.units.as_dict() else lhs)
+
+        args = [analyze(arg) for arg in node.args]
         fn = node.fn
-        if fn == "add" and len(args) == 2:
-            if _is_literal(node.args[0], 0.0):
-                return args[1]
-            if _is_literal(node.args[1], 0.0):
-                return args[0]
-            units = args[0].units.compatible_or_unknown(args[1].units)
-            return FieldSpec(units, _range_add(args[0].range, args[1].range), args[0].types & args[1].types)
-        if fn == "sub" and len(args) == 2:
-            if _same_expr(node.args[0], node.args[1]):
-                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
-            if _is_literal(node.args[1], 0.0):
-                return args[0]
-            if _is_literal(node.args[0], 0.0):
-                return _scale_field(args[1], -1.0)
-            units = args[0].units.compatible_or_unknown(args[1].units)
-            output_range = _range_sub(args[0].range, args[1].range)
-            if _is_literal(node.args[1], 1.0) and "ratio" in args[0].types and not units.is_unknown():
-                return FieldSpec(units, output_range, frozenset({"return"}))
-            return FieldSpec(units, output_range, args[0].types & args[1].types)
-        if fn == "fillna" and len(args) == 2:
-            if _same_expr(node.args[0], node.args[1]):
-                return args[0]
-            units = args[0].units.compatible_or_unknown(args[1].units)
-            return FieldSpec(units, _range_union(args[0].range, args[1].range), args[0].types & args[1].types)
-        if fn == "mul" and len(args) == 2:
-            if _is_literal(node.args[0], 0.0):
-                return FieldSpec(args[1].units, ValueRange(0.0, 0.0), args[1].types)
-            if _is_literal(node.args[1], 0.0):
-                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
-            if _is_literal(node.args[0], 1.0):
-                return args[1]
-            if _is_literal(node.args[1], 1.0):
-                return args[0]
-            if _same_expr(node.args[0], node.args[1]):
-                return FieldSpec(args[0].units ** 2.0, _range_pow(args[0].range, 2.0), frozenset())
-            return FieldSpec(args[0].units * args[1].units, _range_mul(args[0].range, args[1].range), frozenset())
-        if fn in {"div", "floordiv"} and len(args) == 2:
-            if _same_expr(node.args[0], node.args[1]):
-                return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
-            units = args[0].units / args[1].units
-            output_types = (
-                frozenset({"ratio"})
-                if not units.is_unknown() and units == UnitInfo.dimensionless() and args[0].units == args[1].units and bool(args[0].types | args[1].types)
-                else frozenset()
-            )
-            if _is_literal(node.args[1], 1.0):
-                return args[0]
-            if _is_literal(node.args[0], 0.0):
-                return FieldSpec(units, ValueRange(0.0, 0.0), output_types)
-            return FieldSpec(units, _range_div(args[0].range, args[1].range), output_types)
-        if fn == "pow" and len(args) == 2:
-            exponent = _literal_number(node.args[1])
-            if exponent is not None:
-                if isclose(exponent, 0.0, rel_tol=0.0, abs_tol=1e-12):
-                    return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
-                if isclose(exponent, 1.0, rel_tol=0.0, abs_tol=1e-12):
-                    return args[0]
-            if _is_literal(node.args[0], 1.0):
-                return FieldSpec(UnitInfo.dimensionless(), ValueRange(1.0, 1.0), frozenset())
-            units = UnitInfo.dimensionless() if exponent is None else args[0].units ** exponent
-            rng = ValueRange.unknown() if exponent is None else _range_pow(args[0].range, exponent)
-            return FieldSpec(units, rng, args[0].types if exponent == 1.0 else frozenset())
-        if fn == "abs" and args:
-            if args[0].range.lower >= 0.0:
-                return args[0]
-            return FieldSpec(args[0].units, _range_abs(args[0].range), args[0].types)
-        if fn in {"ffill", "ewm", "shift", "cumsum", "purify"} and args:
-            return FieldSpec(args[0].units, args[0].range, args[0].types, args[0].width)
-        if fn == "mean" and args:
-            return FieldSpec(args[0].units, args[0].range, args[0].types, args[0].width)
-        if fn == "where" and len(args) == 3:
-            condition = _literal_number(node.args[0])
-            if condition is not None:
-                return args[1] if condition != 0.0 else args[2]
+        spec = _numeric_spec(fn, node, args)
+        if spec is None and fn == "where" and len(args) == 3:
             if _same_expr(node.args[1], node.args[2]):
-                return args[1]
-            if _is_nan_literal(node.args[1]):
-                return args[2]
-            if _is_nan_literal(node.args[2]):
-                return args[1]
-            units = args[1].units.compatible_or_unknown(args[2].units)
-            return FieldSpec(units, _range_union(args[1].range, args[2].range), args[1].types & args[2].types, args[1].width if args[1].width == args[2].width else None)
-        if fn == "einsum":
-            subscripts = next((arg.value for arg in node.args if isinstance(arg, String)), None)
-            value_args = [arg for expr, arg in zip(node.args, args) if not isinstance(expr, String)]
-            if subscripts == "nf,nf->n" and len(value_args) == 2:
-                product_range = _range_mul(value_args[0].range, value_args[1].range)
-                width = value_args[0].width if value_args[0].width == value_args[1].width else None
-                if width is not None:
-                    product_range = _range_mul(product_range, ValueRange(float(width), float(width)))
-                units = value_args[0].units * value_args[1].units
-                output_types = frozenset({"return"}) if "return" in (value_args[0].types | value_args[1].types) and units == UnitInfo.dimensionless() else frozenset()
-                return FieldSpec(units, product_range, output_types)
-        if fn == "eq" and len(args) == 2 and _same_expr(node.args[0], node.args[1]):
-            return _constant_field(1.0, {"boolean"})
-        if fn in {"ne", "lt", "gt"} and len(args) == 2 and _same_expr(node.args[0], node.args[1]):
-            return _constant_field(0.0, {"boolean"})
-        if fn in {"and", "and_"} and len(args) == 2:
-            if _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 0.0):
-                return _constant_field(0.0, {"boolean"})
-            if _is_literal(node.args[0], 1.0):
-                return _truthy_field(args[1])
-            if _is_literal(node.args[1], 1.0):
-                return _truthy_field(args[0])
-        if fn in {"or", "or_"} and len(args) == 2:
-            if _is_literal(node.args[0], 1.0) or _is_literal(node.args[1], 1.0):
-                return _constant_field(1.0, {"boolean"})
-            if _is_literal(node.args[0], 0.0):
-                return _truthy_field(args[1])
-            if _is_literal(node.args[1], 0.0):
-                return _truthy_field(args[0])
-        if fn == "xor" and len(args) == 2:
+                spec = args[1]
+            elif _is_literal(node.args[0], 1.0):
+                spec = args[1]
+            elif _is_literal(node.args[0], 0.0):
+                spec = args[2]
+            elif _is_nan_literal(node.args[1]):
+                spec = args[2]
+            elif _is_nan_literal(node.args[2]):
+                spec = args[1]
+            else:
+                units = args[1].units.compatible_or_unknown(args[2].units)
+                types = args[1].types if args[1].types == args[2].types else frozenset()
+                spec = FieldSpec(units, _range_union([args[1].range, args[2].range]), types, args[1].width)
+        if spec is None and fn in {"eq", "ne", "lt", "gt"} and len(args) == 2:
             if _same_expr(node.args[0], node.args[1]):
-                return _constant_field(0.0, {"boolean"})
-            if _is_literal(node.args[0], 0.0):
-                return _truthy_field(args[1])
-            if _is_literal(node.args[1], 0.0):
-                return _truthy_field(args[0])
-        if fn == "isnan" and len(args) == 1 and isinstance(node.args[0], Number):
-            return _constant_field(0.0, {"boolean"})
-        if fn in {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}:
-            traced = _auto_trace_field(node, args)
-            if traced is not None:
-                return traced
-            return FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}))
-        if fn in {"ln", "exp", "sign", "arctan", "fraction", "xs_rank", "xs_sort", "xstd", "bspline", "rbf_basis", "future_rbf_basis_sum"}:
-            traced = _auto_trace_field(node, args)
-            if traced is not None:
-                return traced
-            width = int(_literal_number(node.args[3])) if fn in {"rbf_basis", "future_rbf_basis_sum"} and len(node.args) >= 4 and _literal_number(node.args[3]) is not None else 1
-            return FieldSpec(UnitInfo.dimensionless(), _known_dimensionless_range(fn, args), frozenset(), width)
-        if fn == "mod" and len(args) == 2:
-            if _same_expr(node.args[0], node.args[1]) or _is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 1.0):
-                return FieldSpec(args[0].units, ValueRange(0.0, 0.0), args[0].types)
-            return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
-        if fn in {"ceil", "floor", "round"} and args:
-            traced = _auto_trace_field(node, args)
-            if traced is not None:
-                return traced
-            return FieldSpec(args[0].units, ValueRange.unknown(), args[0].types)
-        if fn == "cat" and args:
+                spec = _constant(1.0 if fn in {"eq"} else 0.0, {"boolean"})
+            else:
+                ops = {"eq": lambda a, b: a == b, "ne": lambda a, b: a != b, "lt": lambda a, b: a < b, "gt": lambda a, b: a > b}
+                spec = FieldSpec(UnitInfo.dimensionless(), _call_range(ops[fn], [args[0].range, args[1].range]), frozenset({"boolean"}))
+        if spec is None and fn in {"and", "and_", "or", "or_", "xor"} and len(args) == 2:
+            if fn == "xor" and _same_expr(node.args[0], node.args[1]):
+                spec = _constant(0.0, {"boolean"})
+            elif fn in {"and", "and_"} and (_is_literal(node.args[0], 0.0) or _is_literal(node.args[1], 0.0)):
+                spec = _constant(0.0, {"boolean"})
+            elif fn in {"or", "or_"} and (_is_literal(node.args[0], 1.0) or _is_literal(node.args[1], 1.0)):
+                spec = _constant(1.0, {"boolean"})
+            else:
+                ops = {
+                "and": lambda a, b: jnp.logical_and(a, b),
+                "and_": lambda a, b: jnp.logical_and(a, b),
+                "or": lambda a, b: jnp.logical_or(a, b),
+                "or_": lambda a, b: jnp.logical_or(a, b),
+                "xor": lambda a, b: jnp.logical_xor(a, b),
+            }
+                spec = FieldSpec(UnitInfo.dimensionless(), _call_range(ops[fn], [args[0].range, args[1].range]), frozenset({"boolean"}))
+        if spec is None and fn == "isnan" and len(args) == 1:
+            spec = _constant(0.0, {"boolean"}) if isinstance(node.args[0], Number) else FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}), args[0].width)
+        if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
+            width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
+            spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)
+        if spec is None and fn in {"InstrumentBasisMean", "get_beta"}:
+            spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), args[0].width if args else 1)
+        if spec is None and fn in {"shift", "delay", "lag", "col", "buffer", "ffill", "cumsum"} and args:
+            spec = args[0]
+        if spec is None and fn == "fillna" and args:
+            if len(args) == 2:
+                units = args[0].units.compatible_or_unknown(args[1].units)
+                types = args[0].types if args[0].types == args[1].types else frozenset()
+                spec = FieldSpec(units, _range_union([args[0].range, args[1].range]), types, args[0].width)
+            else:
+                spec = args[0]
+        if spec is None and fn == "groupby" and len(args) == 3:
+            spec = args[2]
+        if spec is None and fn == "cat" and args:
             units = args[0].units
-            width = 0
-            for arg in args:
-                if arg.width is None:
-                    width = None
-                    break
-                width += int(arg.width)
             for arg in args[1:]:
                 units = units.compatible_or_unknown(arg.units)
-            output_types = args[0].types if all(arg.types == args[0].types for arg in args) else frozenset()
-            return FieldSpec(units, _range_union(*(arg.range for arg in args)), output_types, width)
-        if fn == "col" and args:
-            return args[0]
-        if fn == "buffer" and args:
-            return args[0]
-        if fn == "groupby" and len(args) == 3:
-            return args[2]
-        traced = _auto_trace_field(node, args)
-        if traced is not None:
-            return traced
-        return FieldSpec()
+            width = None if any(arg.width is None for arg in args) else sum(int(arg.width) for arg in args)
+            types = args[0].types if all(arg.types == args[0].types for arg in args) else frozenset()
+            spec = FieldSpec(units, _range_union([arg.range for arg in args]), types, width)
+        if spec is None and fn == "einsum" and args:
+            numeric_args = args[:-1] if node.args and isinstance(node.args[-1], String) else args
+            units = UnitInfo.dimensionless()
+            for arg in numeric_args:
+                units = units * arg.units
+            if len(numeric_args) >= 2:
+                product_range = _call_range(lambda a, b: a * b, [numeric_args[0].range, numeric_args[1].range])
+                width = min((arg.width or 1) for arg in numeric_args[:2])
+                rng = ValueRange(product_range.lower * width, product_range.upper * width)
+                types = numeric_args[1].types
+            elif numeric_args:
+                rng = numeric_args[0].range
+                types = numeric_args[0].types
+            else:
+                rng = ValueRange.unknown()
+                types = frozenset()
+            spec = FieldSpec(units, rng, types)
+        if spec is None:
+            spec = _auto_trace(node, args) or FieldSpec()
+        return record(node, spec)
 
-    result = analyze(expr)
-    return FormulaMetadata(result.units, result.range, result.types, cfg.fields, cfg.type_graph, tuple(node_metadata))
-
-
-def _range_union(*ranges: ValueRange) -> ValueRange:
-    return ValueRange(min(r.lower for r in ranges), max(r.upper for r in ranges)) if ranges else ValueRange.unknown()
-
-
-def _range_add(a: ValueRange, b: ValueRange) -> ValueRange:
-    return ValueRange(a.lower + b.lower, a.upper + b.upper)
-
-
-def _range_sub(a: ValueRange, b: ValueRange) -> ValueRange:
-    return ValueRange(a.lower - b.upper, a.upper - b.lower)
-
-
-def _finite_products(a: ValueRange, b: ValueRange) -> list[float]:
-    vals = []
-    for left in (a.lower, a.upper):
-        for right in (b.lower, b.upper):
-            vals.append(left * right)
-    return vals
-
-
-def _range_mul(a: ValueRange, b: ValueRange) -> ValueRange:
-    vals = _finite_products(a, b)
-    if any(np.isnan(v) for v in vals):
-        return ValueRange.unknown()
-    return ValueRange(min(vals), max(vals))
-
-
-def _range_div(a: ValueRange, b: ValueRange) -> ValueRange:
-    if b.lower <= 0.0 <= b.upper:
-        return ValueRange.unknown()
-    return _range_mul(a, ValueRange(1.0 / b.upper, 1.0 / b.lower))
-
-
-def _range_pow(a: ValueRange, exponent: float) -> ValueRange:
-    if exponent < 0.0 and a.lower <= 0.0 <= a.upper:
-        return ValueRange.unknown()
-    if not exponent.is_integer():
-        return ValueRange.unknown() if a.lower < 0.0 else ValueRange(a.lower**exponent, a.upper**exponent)
-    n = int(exponent)
-    vals = [a.lower**n, a.upper**n]
-    if n % 2 == 0 and a.lower <= 0.0 <= a.upper:
-        vals.append(0.0)
-    return ValueRange(min(vals), max(vals))
-
-
-def _range_abs(a: ValueRange) -> ValueRange:
-    upper = max(abs(a.lower), abs(a.upper))
-    lower = 0.0 if a.lower <= 0.0 <= a.upper else min(abs(a.lower), abs(a.upper))
-    return ValueRange(lower, upper)
-
-
-def _known_dimensionless_range(fn: str, args: list[FieldSpec]) -> ValueRange:
-    if fn == "exp" and args:
-        lo = exp(args[0].range.lower) if isfinite(args[0].range.lower) else 0.0
-        hi = exp(args[0].range.upper) if isfinite(args[0].range.upper) else inf
-        return ValueRange(lo, hi)
-    if fn in {"sign", "fraction", "bspline", "rbf_basis", "future_rbf_basis_sum"}:
-        return ValueRange(-1.0, 1.0) if fn == "sign" else ValueRange(0.0, 1.0)
-    return ValueRange.unknown()
+    root = analyze(expr)
+    return FormulaMetadata(root.units, root.range, root.types, cfg.fields, cfg.type_graph, tuple(nodes))
