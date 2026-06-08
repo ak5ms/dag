@@ -166,6 +166,18 @@ class JaxFlatRuntime(eqx.Module):
             return frozenset()
         return self.program.metadata.get_types()
 
+    def get_node_metadata(self, label: str | None = None):
+        """Return static metadata for analyzed formula nodes, optionally filtered by label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_metadata(label)
+
+    def get_node_types(self, label: str):
+        """Return semantic type sets for analyzed formula nodes with the given label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_types(label)
+
     def get_type_relations(self):
         """Return the configured semantic type relation graph."""
         if self.program.metadata is None:

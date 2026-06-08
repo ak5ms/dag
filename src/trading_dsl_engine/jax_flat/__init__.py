@@ -1,4 +1,4 @@
-from trading_dsl_engine.base.metadata import MetadataConfig, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
+from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
 from trading_dsl_engine.jax_flat.custom import StatelessJaxCall, StatelessJaxFunction, stateless
 from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
 
@@ -19,6 +19,7 @@ __all__ = [
     "StatelessJaxFunction",
     "stateless",
     "MetadataConfig",
+    "NodeMetadata",
     "TypeRelationGraph",
     "UnitInfo",
     "ValueRange",

@@ -15,6 +15,17 @@ def _session_pov_benchmark_module():
     return module
 
 
+def _assert_any_node(runtime, label, expected_types, expected_range=None, expected_units=None, width=None):
+    matches = [node.metadata for node in runtime.get_node_metadata(label) if node.metadata.types == expected_types]
+    if expected_range is not None:
+        matches = [meta for meta in matches if meta.range == expected_range]
+    if expected_units is not None:
+        matches = [meta for meta in matches if meta.units.as_dict() == expected_units and not meta.units.is_unknown()]
+    if width is not None:
+        matches = [meta for meta in matches if meta.width == width]
+    assert matches, label
+
+
 def test_runtime_exposes_unit_exponents_and_range_for_formula():
     schema = metadata(
         {
@@ -179,6 +190,18 @@ def test_session_pov_roll_formula_metadata_traces_through_root_roll():
     assert not runtime.get_units().is_unknown()
     assert runtime.get_range() == ValueRange(-1.0, 2.0)
     assert runtime.get_types() == frozenset({"return"})
+
+    _assert_any_node(runtime, "volume_for_seen_session", frozenset({"volume"}), ValueRange(0.0, 200.0), {"shares": 1.0})
+    _assert_any_node(runtime, "self_", frozenset({"volume"}), ValueRange(0.0, 200.0), {"shares": 1.0})
+    _assert_any_node(runtime, "cumsum", frozenset({"volume"}), ValueRange(0.0, 200.0), {"shares": 1.0})
+    _assert_any_node(runtime, "groupby", frozenset({"volume"}), ValueRange(0.0, 200.0), {"shares": 1.0})
+    _assert_any_node(runtime, "pct_seen_session_volume", frozenset({"ratio"}), ValueRange(0.0, 1.0), {})
+    _assert_any_node(runtime, "where", frozenset({"price"}), ValueRange(100.0, 200.0), {"dollar": 1.0})
+    _assert_any_node(runtime, "shift", frozenset({"price"}), ValueRange(100.0, 200.0), {"dollar": 1.0})
+    _assert_any_node(runtime, "div", frozenset({"ratio"}), ValueRange(0.5, 2.0), {})
+    _assert_any_node(runtime, "sub", frozenset({"return"}), ValueRange(-0.5, 1.0), {})
+    _assert_any_node(runtime, "cat", frozenset({"return"}), ValueRange(-0.5, 1.0), {}, width=2)
+    _assert_any_node(runtime, "einsum", frozenset({"return"}), ValueRange(-1.0, 2.0), {})
 
 
 def test_unit_incompatible_addition_keeps_formula_compilable_with_unknown_units():

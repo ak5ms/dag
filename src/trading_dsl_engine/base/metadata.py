@@ -262,12 +262,20 @@ def metadata(
 
 
 @dataclass(frozen=True)
+class NodeMetadata:
+    label: str
+    key: tuple
+    metadata: FieldSpec
+
+
+@dataclass(frozen=True)
 class FormulaMetadata:
     units: UnitInfo
     range: ValueRange
     types: frozenset[str]
     input_fields: Mapping[str, FieldSpec]
     type_graph: TypeRelationGraph
+    nodes: tuple[NodeMetadata, ...] = ()
 
     def get_units(self) -> UnitInfo:
         return self.units
@@ -277,6 +285,14 @@ class FormulaMetadata:
 
     def get_types(self) -> frozenset[str]:
         return self.types
+
+    def get_node_metadata(self, label: str | None = None) -> tuple[NodeMetadata, ...]:
+        if label is None:
+            return self.nodes
+        return tuple(node for node in self.nodes if node.label == label)
+
+    def get_node_types(self, label: str) -> tuple[frozenset[str], ...]:
+        return tuple(node.metadata.types for node in self.get_node_metadata(label))
 
 
 class MetadataError(ValueError):
@@ -306,6 +322,24 @@ def _metadata_expr_key(node: Expr) -> tuple:
 
 def _same_expr(left: Expr, right: Expr) -> bool:
     return _metadata_expr_key(left) == _metadata_expr_key(right)
+
+
+def _metadata_node_label(node: Expr) -> str:
+    if isinstance(node, Identifier):
+        return node.name
+    if isinstance(node, Number):
+        return "literal"
+    if isinstance(node, String):
+        return "string"
+    if isinstance(node, Universe):
+        return "univ"
+    if isinstance(node, KeyTuple):
+        return "tuple"
+    if isinstance(node, Call):
+        return node.fn
+    if type(node).__name__ == "StatelessJaxCall":
+        return getattr(node, "name", None) or getattr(getattr(node, "fn", None), "__name__", "stateless")
+    return type(node).__name__
 
 
 def _literal_number(expr: Expr) -> float | None:
@@ -435,21 +469,32 @@ def _auto_trace_stateless(node, args: Sequence[FieldSpec]) -> FieldSpec:
 
 def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, FieldSpec | Mapping] | None) -> FormulaMetadata:
     cfg = MetadataConfig.from_value(config)
+    node_metadata: list[NodeMetadata] = []
 
-    def analyze(node: Expr) -> FieldSpec:
+    def analyze(node: Expr, local_specs: Mapping[str, FieldSpec] | None = None) -> FieldSpec:
+        spec = _analyze_node(node, local_specs or {})
+        node_metadata.append(NodeMetadata(_metadata_node_label(node), _metadata_expr_key(node), spec))
+        return spec
+
+    def _analyze_node(node: Expr, local_specs: Mapping[str, FieldSpec]) -> FieldSpec:
         if isinstance(node, Identifier):
-            spec = cfg.fields.get(node.name, FieldSpec())
-            return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types))
+            spec = local_specs.get(node.name) or cfg.fields.get(node.name, FieldSpec())
+            return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types), spec.width)
         if isinstance(node, Number):
             return FieldSpec(UnitInfo.dimensionless(), ValueRange(float(node.value), float(node.value)), frozenset())
         if isinstance(node, String | Universe | KeyTuple):
             return FieldSpec()
         if type(node).__name__ == "StatelessJaxCall":
-            args = [analyze(arg) for arg in node.args]
+            args = [analyze(arg, local_specs) for arg in node.args]
             return _auto_trace_stateless(node, args)
         if not isinstance(node, Call):
             return FieldSpec()
-        args = [analyze(arg) for arg in node.args]
+        if node.fn == "groupby" and len(node.args) == 3:
+            key_spec = analyze(node.args[0], local_specs)
+            lhs_spec = analyze(node.args[1], local_specs)
+            rhs_spec = analyze(node.args[2], {**local_specs, "self_": lhs_spec})
+            return _analyze_call(node, [key_spec, lhs_spec, rhs_spec])
+        args = [analyze(arg, local_specs) for arg in node.args]
         return _analyze_call(node, args)
 
     def _analyze_call(node: Call, args: list[FieldSpec]) -> FieldSpec:
@@ -618,7 +663,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, F
         return FieldSpec()
 
     result = analyze(expr)
-    return FormulaMetadata(result.units, result.range, result.types, cfg.fields, cfg.type_graph)
+    return FormulaMetadata(result.units, result.range, result.types, cfg.fields, cfg.type_graph, tuple(node_metadata))
 
 
 def _range_union(*ranges: ValueRange) -> ValueRange:
