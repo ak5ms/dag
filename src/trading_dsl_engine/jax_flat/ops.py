@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.special as jsp_special
 
 jax.config.update("jax_enable_x64", True)
 
@@ -109,6 +110,22 @@ class LiteralOp(Op):
     value: float
     output_kind: str = "scalar"
     output_width: int | None = 1
+
+
+@dataclass(frozen=True)
+class CacheOp(Op):
+    storage: str = "ram"
+    output_kind: str = "vector"
+    output_width: int | None = 1
+    cpp_name: str | None = "cache"
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        return None, child_values[0]
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        return None, child_sequences[0]
 
 
 @dataclass(frozen=True)
@@ -653,6 +670,7 @@ class RidgeOp(Op):
         )
 
     def tick(self, state: RidgeState, *child_values: jax.Array):
+
         if self.has_weights:
             feature_values = child_values[: len(self.feature_widths)]
             y, weights, hl, lam = child_values[-4:]
@@ -667,6 +685,10 @@ class RidgeOp(Op):
         y_vec = y[:, 0] if y.ndim == 2 else y
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
         preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
+
+        # TODO: verify this implementation with tests
+        # if not self.is_stateful:
+        #     return self._stateless_tick(xmat, y_vec, weights, lam, row_valid)
 
         xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
         hl_value = _scalar_value(hl)
@@ -704,7 +726,40 @@ class RidgeOp(Op):
         )
         return next_state, RidgeValue(beta=beta, preds=preds)
 
+    def _stateless_tick(self, xmat, y_vec, weights, lam, row_valid):
+        xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
+        # hl_value = _scalar_value(hl)
+        lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
+        # rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
+        # alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
+
+        # a_xx = alpha ** (state.t - state.last_xx)
+        # a_xy = alpha ** (state.t - state.last_xy)
+        # updated_xx = jnp.where(state.has_xx, state.xx * (1.0 - a_xx) + xx_new * a_xx, xx_new)
+        # updated_xy = jnp.where(state.has_xy, state.xy * (1.0 - a_xy) + xy_new * a_xy, xy_new)
+        updated_xx = xx_new
+        updated_xy = xy_new
+        # xx = jnp.where(xx_valid, updated_xx, state.xx)
+        # xy = jnp.where(xy_valid, updated_xy, state.xy)
+        xx = updated_xx
+        xy = updated_xy
+        has_xx = xx_valid
+        has_xy = xy_valid
+        # last_xx = jnp.where(xx_valid, state.t, state.last_xx)
+        # last_xy = jnp.where(xy_valid, state.t, state.last_xy)
+
+        xx = 0.5 * (xx + xx.T)
+        # last_xx = jnp.maximum(last_xx, last_xx.T)
+        # has_xx = has_xx | has_xx.T
+        system = xx + lam_value * jnp.diag(jnp.diag(xx))
+        beta_candidate = jnp.linalg.solve(system, xy)
+        # beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, state.beta)
+        beta = beta_candidate
+        preds = jnp.where(row_valid, xmat @ beta, jnp.nan)
+        return None, RidgeValue(beta=beta, preds=preds)
+
     def scan_batch(self, state: RidgeState, *child_sequences: jax.Array):
+
         if self.has_weights:
             feature_sequences = child_sequences[: len(self.feature_widths)]
             y_seq, weights_seq, hl_seq, lam_seq = child_sequences[-4:]
@@ -720,6 +775,11 @@ class RidgeOp(Op):
         xmat_seq = jax.vmap(row_xmat)(*feature_sequences)
         y_arr = jnp.asarray(y_seq)
         y_vec_seq = y_arr[:, :, 0] if y_arr.ndim == 3 else y_arr
+        # TODO: verify this implementation with tests
+        # if not self.is_stateful:
+        #     row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(y_vec_seq, xmat_seq)
+        #     return (jax.vmap(self._stateless_tick)(xmat_seq, y_vec_seq, weights_seq, lam_seq, row_valid_seq))
+
 
         def moment_step(carry, values):
             xx_c, xy_c, has_xx_c, has_xy_c, last_xx_c, last_xy_c, t_c = carry
@@ -895,14 +955,23 @@ def _xstd(x):
     return jnp.where(valid, z, jnp.nan)
 
 
+def _norm_inv(x):
+    return jsp_special.ndtri(x)
+
+
+def _xs_norm(x):
+    denom = jnp.nansum(jnp.abs(x))
+    return jnp.where(denom > 0.0, x / denom, jnp.nan)
+
+
 def _xs_rank(x):
     valid = jnp.isfinite(x)
     n_valid = jnp.sum(valid).astype(jnp.int32)
     compact = jnp.where(valid, x, jnp.inf)
     sorted_compact = jnp.sort(compact)
     le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
-    ranks = le_counts.astype(jnp.float64) / jnp.maximum(n_valid, 1).astype(jnp.float64)
-    return jnp.where(valid, ranks, jnp.nan)
+    ranks = le_counts.astype(jnp.float64) / (n_valid.astype(jnp.float64) + 1.0)
+    return jnp.where(valid, _norm_inv(ranks), jnp.nan)
 
 
 def _xs_sort(x):
@@ -921,13 +990,6 @@ def _bspline(x, n_basis: int):
     values = jnp.where(total <= 1e-18, 1.0 / n_basis, values / total)
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
 
-
-def _get_beta(value: RidgeValue):
-    return value.beta
-
-
-def _get_preds(value: RidgeValue):
-    return value.preds
 
 
 def _col(matrix, index: int):
@@ -949,14 +1011,16 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan"),
     ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify"),
     ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction"),
+    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
+    ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
+    ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
+    ("get_preds", 1): lambda: NaryOp(lambda x: x.preds, cpp_name="get_preds"),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
-    ("get_beta", 1): lambda: NaryOp(_get_beta, cpp_name="get_beta"),
-    ("get_preds", 1): lambda: NaryOp(_get_preds, cpp_name="get_preds"),
     ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),
     ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub"),
     ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul"),
@@ -975,6 +1039,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
     ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
     ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
+    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
     ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
 }
 
