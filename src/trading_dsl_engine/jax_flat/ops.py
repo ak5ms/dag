@@ -684,12 +684,10 @@ class RidgeOp(Op):
         y = jnp.asarray(y)
         y_vec = y[:, 0] if y.ndim == 2 else y
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
+        if not self.is_stateful:
+            return self._stateless_tick(xmat, y_vec, weights, lam, row_valid)
+
         preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
-
-        # TODO: verify this implementation with tests
-        # if not self.is_stateful:
-        #     return self._stateless_tick(xmat, y_vec, weights, lam, row_valid)
-
         xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
         hl_value = _scalar_value(hl)
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
@@ -727,34 +725,12 @@ class RidgeOp(Op):
         return next_state, RidgeValue(beta=beta, preds=preds)
 
     def _stateless_tick(self, xmat, y_vec, weights, lam, row_valid):
-        xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
-        # hl_value = _scalar_value(hl)
+        xx_new, xy_new, _, _ = self._moments(xmat, y_vec, weights)
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
-        # rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
-        # alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
 
-        # a_xx = alpha ** (state.t - state.last_xx)
-        # a_xy = alpha ** (state.t - state.last_xy)
-        # updated_xx = jnp.where(state.has_xx, state.xx * (1.0 - a_xx) + xx_new * a_xx, xx_new)
-        # updated_xy = jnp.where(state.has_xy, state.xy * (1.0 - a_xy) + xy_new * a_xy, xy_new)
-        updated_xx = xx_new
-        updated_xy = xy_new
-        # xx = jnp.where(xx_valid, updated_xx, state.xx)
-        # xy = jnp.where(xy_valid, updated_xy, state.xy)
-        xx = updated_xx
-        xy = updated_xy
-        has_xx = xx_valid
-        has_xy = xy_valid
-        # last_xx = jnp.where(xx_valid, state.t, state.last_xx)
-        # last_xy = jnp.where(xy_valid, state.t, state.last_xy)
-
-        xx = 0.5 * (xx + xx.T)
-        # last_xx = jnp.maximum(last_xx, last_xx.T)
-        # has_xx = has_xx | has_xx.T
+        xx = 0.5 * (xx_new + xx_new.T)
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate = jnp.linalg.solve(system, xy)
-        # beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, state.beta)
-        beta = beta_candidate
+        beta = jnp.linalg.solve(system, xy_new)
         preds = jnp.where(row_valid, xmat @ beta, jnp.nan)
         return None, RidgeValue(beta=beta, preds=preds)
 
@@ -775,11 +751,11 @@ class RidgeOp(Op):
         xmat_seq = jax.vmap(row_xmat)(*feature_sequences)
         y_arr = jnp.asarray(y_seq)
         y_vec_seq = y_arr[:, :, 0] if y_arr.ndim == 3 else y_arr
-        # TODO: verify this implementation with tests
-        # if not self.is_stateful:
-        #     row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(y_vec_seq, xmat_seq)
-        #     return (jax.vmap(self._stateless_tick)(xmat_seq, y_vec_seq, weights_seq, lam_seq, row_valid_seq))
-
+        if not self.is_stateful:
+            row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(
+                y_vec_seq, xmat_seq
+            )
+            return jax.vmap(self._stateless_tick)(xmat_seq, y_vec_seq, weights_seq, lam_seq, row_valid_seq)
 
         def moment_step(carry, values):
             xx_c, xy_c, has_xx_c, has_xy_c, last_xx_c, last_xy_c, t_c = carry
