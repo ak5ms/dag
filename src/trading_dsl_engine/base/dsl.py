@@ -155,6 +155,10 @@ shift = op("shift")
 buffer = op("buffer")
 ewm = op("ewm")
 xs_rank = op("xs_rank")
+norm_inv = op("norm_inv")
+xs_norm = op("xs_norm")
+clip = op("clip")
+cache = op("cache")
 outer = op("outer")
 bspline = op("bspline")
 rbf_basis = op("rbf_basis")
@@ -379,6 +383,7 @@ def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> E
 
 get_beta = op("get_beta")
 get_preds = op("get_preds")
+get_hat = op("get_hat")
 rolling_quantile = op("rolling_quantile")
 mean = op("mean")
 

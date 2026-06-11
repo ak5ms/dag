@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <Eigen/Dense>
+#include <unsupported/Eigen/SpecialFunctions>
 
 #include <algorithm>
 #include <array>
@@ -46,6 +47,10 @@ enum class OpCode : int {
     IsNan,
     Purify,
     Fraction,
+    NormInv,
+    XsNorm,
+    Cache,
+    Clip,
     XStd,
     XsRank,
     XsSort,
@@ -98,6 +103,10 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "isnan") return OpCode::IsNan;
     if (name == "purify") return OpCode::Purify;
     if (name == "fraction") return OpCode::Fraction;
+    if (name == "norm_inv") return OpCode::NormInv;
+    if (name == "xs_norm") return OpCode::XsNorm;
+    if (name == "cache") return OpCode::Cache;
+    if (name == "clip") return OpCode::Clip;
     if (name == "xstd") return OpCode::XStd;
     if (name == "xs_rank") return OpCode::XsRank;
     if (name == "xs_sort") return OpCode::XsSort;
@@ -257,6 +266,15 @@ struct GroupState {
 
 
 inline bool finite(double x) { return std::isfinite(x); }
+
+inline double norm_inv(double p) {
+    if (std::isnan(p)) return NaN;
+    if (p <= 0.0) return -std::numeric_limits<double>::infinity();
+    if (p >= 1.0) return std::numeric_limits<double>::infinity();
+    return Eigen::numext::ndtri(p);
+}
+
+
 inline bool same_double_key(double a, double b) { return (std::isnan(a) && std::isnan(b)) || a == b; }
 
 int count_inner_states(const std::vector<NodeSpec>& nodes) {
@@ -559,14 +577,16 @@ private:
                 case OpCode::And:
                 case OpCode::Or:
                 case OpCode::Xor:
-                case OpCode::FillNa: {
+                case OpCode::FillNa:
+                case OpCode::Clip:
+                case OpCode::Cache: {
                     const auto& l = child(state, spec, 0);
-                    const auto& r = child(state, spec, 1);
+                    const auto* r_ptr = spec.children.size() > 1 ? &child(state, spec, 1) : nullptr;
                     const int width = dst_v.width;
                     for (int i = 0; i < n; ++i) {
                         for (int c = 0; c < width; ++c) {
                             const double a = at(l, n, i, c);
-                            const double b = at(r, n, i, c);
+                            const double b = r_ptr == nullptr ? NaN : at(*r_ptr, n, i, c);
                             double out = NaN;
                             if (spec.opcode == OpCode::Add) out = a + b;
                             else if (spec.opcode == OpCode::Sub) out = a - b;
@@ -576,6 +596,8 @@ private:
                             else if (spec.opcode == OpCode::Pow) out = std::pow(a, b);
                             else if (spec.opcode == OpCode::FloorDiv) out = b == 0.0 ? NaN : std::floor(a / b);
                             else if (spec.opcode == OpCode::FillNa) out = std::isnan(a) ? b : a;
+                            else if (spec.opcode == OpCode::Clip) out = std::min(std::max(a, b), at(child(state, spec, 2), n, i, c));
+                            else if (spec.opcode == OpCode::Cache) out = a;
                             else if (std::isnan(a) || std::isnan(b)) out = NaN;
                             else if (spec.opcode == OpCode::Eq) out = a == b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Ne) out = a != b ? 1.0 : 0.0;
@@ -611,7 +633,8 @@ private:
                 case OpCode::Arctan:
                 case OpCode::IsNan:
                 case OpCode::Purify:
-                case OpCode::Fraction: {
+                case OpCode::Fraction:
+                case OpCode::NormInv: {
                     const auto& x = child(state, spec, 0);
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
@@ -625,7 +648,9 @@ private:
                         else if (spec.opcode == OpCode::Arctan) dst[i] = std::atan(v);
                         else if (spec.opcode == OpCode::IsNan) dst[i] = std::isnan(v) ? 1.0 : 0.0;
                         else if (spec.opcode == OpCode::Purify) dst[i] = finite(v) ? v : NaN;
-                        else dst[i] = v - std::floor(v);
+                        else if (spec.opcode == OpCode::Fraction) dst[i] = v - std::floor(v);
+                        else if (spec.opcode == OpCode::NormInv) dst[i] = norm_inv(v);
+                        else dst[i] = v;
                     }
                     break;
                 }
@@ -693,6 +718,15 @@ private:
                     }
                     break;
                 }
+                case OpCode::XsNorm: {
+                    const auto& x = child(state, spec, 0);
+                    Eigen::Map<const Vec> x_vec(x.data.data(), n);
+                    Eigen::Map<Vec> out(dst, n);
+                    const double denom = x_vec.array().isFinite().select(x_vec.array().abs(), 0.0).sum();
+                    if (denom > 0.0) out.array() = x_vec.array() / denom;
+                    else out.array().setConstant(NaN);
+                    break;
+                }
                 case OpCode::XStd: {
                     const auto& x = child(state, spec, 0);
                     double sum = 0.0;
@@ -722,10 +756,10 @@ private:
                     compact.reserve(static_cast<size_t>(n));
                     for (int i = 0; i < n; ++i) if (finite(x.data[static_cast<size_t>(i)])) compact.push_back(x.data[static_cast<size_t>(i)]);
                     std::sort(compact.begin(), compact.end());
-                    const double denom = std::max<size_t>(compact.size(), 1);
+                    const double denom = static_cast<double>(compact.size() + 1);
                     for (int i = 0; i < n; ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        dst[i] = finite(v) ? static_cast<double>(std::upper_bound(compact.begin(), compact.end(), v) - compact.begin()) / denom : NaN;
+                        dst[i] = finite(v) ? norm_inv(static_cast<double>(std::upper_bound(compact.begin(), compact.end(), v) - compact.begin()) / denom) : NaN;
                     }
                     break;
                 }
@@ -893,6 +927,9 @@ private:
             case OpCode::IsNan: return std::isnan(a) ? 1.0 : 0.0;
             case OpCode::Purify: return finite(a) ? a : NaN;
             case OpCode::Fraction: return a - std::floor(a);
+            case OpCode::NormInv: return norm_inv(a);
+            case OpCode::Cache: return a;
+            case OpCode::Clip: return std::min(std::max(a, b), c);
             default: return NaN;
         }
     }

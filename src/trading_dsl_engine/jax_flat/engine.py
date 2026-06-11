@@ -22,6 +22,7 @@ from trading_dsl_engine.jax_flat.ops import (
     RbfBasisOp,
     FutureRbfBasisSumOp,
     BufferShiftOp,
+    CacheOp,
     EwmOp,
     FFillOp,
     GroupByOp,
@@ -66,6 +67,7 @@ class StreamingProgram:
     input_names: tuple[str, ...]
     state_layout: StateLayout
     metadata: FormulaMetadata | None = None
+    cache_nodes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,7 +148,17 @@ class JaxFlatRuntime(eqx.Module):
     runtimes: list[float] = eqx.field(default_factory=list, static=True)
     cpp: bool = eqx.field(default=True, static=True)
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
+    cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
     block: bool = True # False disables waiting (for runtime measurement)
+
+
+    def get_cached_values(self):
+        """Return batch-materialized values for top-level cache(...) nodes keyed by node id."""
+        return dict(self.cached_values)
+
+    def clear_cached_values(self) -> None:
+        """Drop materialized batch cache values from previous runs."""
+        self.cached_values.clear()
 
     def get_units(self):
         """Return static unit exponents inferred for this formula output."""
@@ -274,15 +286,14 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-        if self.cpp and (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
+        if self.cpp and not self.program.cache_nodes and (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
             accelerated = _try_cpp_accelerated_batch(self, inputs, states)
             if accelerated is not None:
                 return accelerated
         if _has_memmap_input(inputs) or out_path:
             return _run_chunked_batch(self, inputs, states, out_path)
-        if not states:
-            return _jit_batch_from_initial_state(self, inputs)
-        return _jit_batch(self, states, inputs)
+        result = _jit_batch_from_initial_state(self, inputs) if not states else _jit_batch(self, states, inputs)
+        return _finalize_batch_result(self, result)
 
 
 
@@ -410,19 +421,61 @@ def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: s
     chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
     states = runtime.init_state(n_instruments) if not states else states
     out = None
+    cache_outs = None
 
     for start in range(0, n_steps, chunk_size):
         stop = min(start + chunk_size, n_steps)
         chunk_inputs = tuple(jnp.asarray(_input_chunk(arr, start, stop)) for arr in inputs)
-        states, chunk_out = _scan_batch_chunk(runtime, states, chunk_inputs)
+        states, chunk_out, chunk_cache = _scan_batch_chunk(runtime, states, chunk_inputs)
         chunk_out_np = np.asarray(jax.block_until_ready(chunk_out))
+        chunk_cache_np = tuple(np.asarray(jax.block_until_ready(value)) for value in chunk_cache)
         if out is None:
             out = _output_array(out_path, n_steps, chunk_out_np)
+        if cache_outs is None:
+            cache_outs = tuple(_cache_output_array(runtime, node_id, n_steps, value) for node_id, value in zip(runtime.program.cache_nodes, chunk_cache_np))
         out[start:stop] = chunk_out_np
+        for cache_out, value in zip(cache_outs, chunk_cache_np):
+            cache_out[start:stop] = value
+            _flush_memmap_output(cache_out)
         _flush_memmap_output(out)
 
+    _store_cache_arrays(runtime, cache_outs or ())
     return states, out
 
+
+
+def _cache_output_array(runtime: JaxFlatRuntime, node_id: int, n_steps: int, value: np.ndarray):
+    op = runtime.program.nodes[node_id].op
+    if not isinstance(op, CacheOp):
+        raise TypeError(f"cache node {node_id} is {type(op).__name__}")
+    shape = (n_steps,) + value.shape[1:]
+    if op.storage == "disk":
+        return np.memmap(_fresh_memmap_path(f"trading_dsl_engine_jax_flat_cache_{node_id}_"), mode="w+", dtype=value.dtype, shape=shape)
+    return np.empty(shape, dtype=value.dtype)
+
+
+def _store_cache_arrays(runtime: JaxFlatRuntime, values) -> None:
+    runtime.cached_values.clear()
+    for node_id, value in zip(runtime.program.cache_nodes, values):
+        runtime.cached_values[int(node_id)] = value
+
+
+def _finalize_batch_result(runtime: JaxFlatRuntime, result):
+    states, out, cache_outs = result
+    materialized = tuple(_materialize_cache_value(runtime, node_id, value) for node_id, value in zip(runtime.program.cache_nodes, cache_outs))
+    _store_cache_arrays(runtime, materialized)
+    return states, out
+
+
+def _materialize_cache_value(runtime: JaxFlatRuntime, node_id: int, value):
+    value_np = np.asarray(jax.block_until_ready(value))
+    op = runtime.program.nodes[node_id].op
+    if isinstance(op, CacheOp) and op.storage == "disk":
+        out = np.memmap(_fresh_memmap_path(f"trading_dsl_engine_jax_flat_cache_{node_id}_"), mode="w+", dtype=value_np.dtype, shape=value_np.shape)
+        out[:] = value_np
+        _flush_memmap_output(out)
+        return out
+    return value_np
 
 def _is_groupby_capacity_error(exc: Exception) -> bool:
     message = str(exc)
@@ -490,33 +543,35 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
             value,
         )
 
-    states, chunk0_out = scan_chunk(state0, 0, chunk_size)
+    states, chunk0_out, chunk0_cache = scan_chunk(state0, 0, chunk_size)
 
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
         return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
 
     out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
+    cache0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
 
     def body(chunk_i, carry):
-        states_c, out_c = carry
+        states_c, out_c, cache_c = carry
         start = chunk_i * chunk_size
-        states_n, chunk_out = scan_chunk(states_c, start, chunk_size)
-        return states_n, set_chunk(out_c, start, chunk_out)
+        states_n, chunk_out, chunk_cache = scan_chunk(states_c, start, chunk_size)
+        return states_n, set_chunk(out_c, start, chunk_out), set_chunk(cache_c, start, chunk_cache)
 
-    states, out = jax.lax.fori_loop(
+    states, out, cache_out = jax.lax.fori_loop(
         1,
         n_full_chunks,
         body,
-        (states, out0),
+        (states, out0, cache0),
     )
 
     if remainder:
         start = n_full_chunks * chunk_size
-        states, tail_out = scan_chunk(states, start, remainder)
+        states, tail_out, tail_cache = scan_chunk(states, start, remainder)
         out = set_chunk(out, start, tail_out)
+        cache_out = set_chunk(cache_out, start, tail_cache)
 
-    return states, out
+    return states, out, cache_out
 
 
 @jax.jit
@@ -543,7 +598,8 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
         values[idx] = value
 
     outs = tuple(values[i] for i in runtime.program.outputs)
-    return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
+    cache_outs = tuple(values[i] for i in runtime.program.cache_nodes)
+    return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0), cache_outs
 
 
 
@@ -565,6 +621,14 @@ def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
             if len(args) != 1 or lag is None or max_lag is None:
                 raise ValueError("shift keyword form requires x, lag, and max_lag")
             return Call("shift", (args[0], lag, max_lag))
+        if node.fn == "cache":
+            unsupported = set(kw) - {"where", "storage"}
+            if unsupported:
+                raise ValueError(f"Unsupported cache keyword argument(s): {sorted(unsupported)}")
+            storage = kw.pop("where", kw.pop("storage", String("ram")))
+            if len(args) != 1:
+                raise ValueError("cache expects exactly one value argument")
+            return Call("cache", (args[0], storage))
         if node.fn == "buffer":
             unsupported = set(kw) - {"min", "max"}
             if unsupported:
@@ -706,7 +770,7 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
         "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
         "isnan", "purify", "fraction", "add", "sub", "mul", "mod", "pow",
         "div", "floordiv", "eq", "ne", "lt", "gt", "and", "or", "xor",
-        "fillna", "where",
+        "fillna", "where", "clip", "norm_inv", "xs_norm", "cache",
     }
     if op.cpp_name not in shape_preserving:
         return op
@@ -714,11 +778,13 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
 
 
 def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
-    if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
+    if expr.fn not in {"get_beta", "get_preds", "get_hat"} or len(expr.args) != 1 or not child_ops:
         return None
     child = child_ops[0]
     if expr.fn == "get_preds":
         return NaryOp(lambda value: value.preds, output_kind="vector", output_width=1, cpp_name="get_preds"), None
+    if expr.fn == "get_hat":
+        return NaryOp(lambda value: value.hat, output_kind="matrix", output_width=None, cpp_name=None), None
     if isinstance(child, InstrumentBasisMeanOp):
         return NaryOp(lambda value: value.beta, output_kind="matrix", output_width=child.feature_width, cpp_name="get_beta"), None
     if isinstance(child, RidgeOp):
@@ -742,6 +808,15 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
     projection = _object_projection_op(expr, child_ops)
     if projection is not None:
         return projection
+    if expr.fn == "cache" and len(expr.args) in (1, 2):
+        storage = "ram"
+        if len(expr.args) == 2:
+            if not isinstance(expr.args[1], String):
+                raise ValueError("cache storage must be a string literal")
+            storage = expr.args[1].value
+        if storage not in {"ram", "disk"}:
+            raise ValueError("cache storage must be 'ram' or 'disk'")
+        return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
@@ -845,7 +920,9 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if not feature_ops:
             raise ValueError("Ridge expects at least one feature arg")
         feature_widths = tuple(_op_width(op) for op in feature_ops)
-        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights), None
+        hl_arg = expr.args[-2]
+        is_stateful = not (isinstance(hl_arg, Number) and float(hl_arg.value) == 0.0)
+        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights, is_stateful=is_stateful), None
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
     if builder is None:
         raise ValueError(f"Unsupported function {expr.fn}/{len(expr.args)} in jax_flat")
@@ -1093,7 +1170,7 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
     child_ids = tuple(
         _compile_node(a, memo, nodes, input_names)
         for a in expr.args
-        if not ((expr.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
+        if not (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
@@ -1148,14 +1225,17 @@ def compile_formula(
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
     out = _compile_node(expr, memo, nodes, input_names)
-    layout = _build_state_layout(tuple(nodes))
+    node_tuple = tuple(nodes)
+    layout = _build_state_layout(node_tuple)
+    cache_nodes = tuple(idx for idx, node in enumerate(node_tuple) if isinstance(node.op, CacheOp))
     return JaxFlatRuntime(
         program=StreamingProgram(
-            nodes=tuple(nodes),
+            nodes=node_tuple,
             outputs=(out,),
             input_names=tuple(input_names),
             state_layout=layout,
             metadata=formula_metadata,
+            cache_nodes=cache_nodes,
         ),
         cpp=cpp,
     )

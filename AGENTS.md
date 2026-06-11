@@ -104,7 +104,7 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 
 - Always use absolute imports (e.g., `from trading_dsl_engine...`), not relative imports.
 - Keep implementations concise and generic; avoid repetitive boilerplate.
-- Native C++ should read like a carefully reviewed systems component: prefer named state structs, Eigen-backed math/state buffers, small factory helpers, and clear ownership boundaries over monolithic slots, nested container soup, or broad if/else initialization blocks.
+- Native C++ should read like a carefully reviewed systems component: prefer named state structs, Eigen-backed math/state buffers, vetted high-performance numerical libraries (for example SciPy special functions, Eigen unsupported special functions, or Boost.Math), small factory helpers, and clear ownership boundaries over monolithic slots, nested container soup, broad if/else initialization blocks, or hand-rolled numerical approximations. Do not invoke pybind/Python (`py::...`) APIs inside tick or batch hot paths; keep Python interaction at binding, validation, and construction boundaries.
 - Prefer factories/templates/registries over hardcoded branching.
 - Prefer `make_nary_op` for stateless scalar/vector/matrix operators, including axis reducers, before adding custom operator classes.
 - Do not wrap imports in try/except blocks.
