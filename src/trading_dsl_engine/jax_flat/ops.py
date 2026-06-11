@@ -709,7 +709,7 @@ class RidgeOp(Op):
         last_xx = jnp.maximum(last_xx, last_xx.T)
         has_xx = has_xx | has_xx.T
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate, hat = self._solve_beta_and_hat(xmat, system, xy, weights)
+        beta_candidate, hat = self._solve_stateful_beta_and_hat(xmat, system, xy, weights)
         beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, state.beta)
         next_state = RidgeState(
             xx=xx,
@@ -782,7 +782,7 @@ class RidgeOp(Op):
         )(lam_seq)
         diag_seq = jax.vmap(lambda xx: jnp.diag(jnp.diag(xx)))(xx_seq)
         systems = xx_seq + lam_values[:, None, None] * diag_seq
-        beta_candidates, hat_seq = jax.vmap(self._solve_beta_and_hat)(xmat_seq, systems, xy_seq, weights_seq)
+        beta_candidates, hat_seq = jax.vmap(self._solve_stateful_beta_and_hat)(xmat_seq, systems, xy_seq, weights_seq)
         finite_beta = jnp.all(jnp.isfinite(beta_candidates), axis=1)
 
         def beta_step(beta_prev, values):
@@ -813,25 +813,42 @@ class RidgeOp(Op):
         return next_state, RidgeValue(beta=beta_seq, preds=preds_seq, hat=hat_seq)
 
     @classmethod
-    def _solve_beta_and_hat(cls, xmat, system, xy, weights):
-        xtw = cls._xtw(xmat, weights)
-        xtw = jnp.where(jnp.isfinite(xtw), xtw, 0.0)
-        rhs = jnp.concatenate((xy[:, None], xtw), axis=1)
-        solution = jnp.linalg.solve(system, rhs)
-        return solution[:, 0], xmat @ solution[:, 1:]
+    def _solve_stateful_beta_and_hat(cls, xmat, system, xy, weights):
+        x0, _, b = cls._weighted_design_rhs(xmat, jnp.zeros((xmat.shape[0],), dtype=xmat.dtype), weights)
+        rhs = jnp.concatenate((xy[:, None], b), axis=1)
+        solution = cls._solve(system, rhs)
+        return solution[:, 0], x0 @ solution[:, 1:]
+
+    @classmethod
+    def _solve_beta(cls, xmat, system, y, weights):
+        x0, y0, b = cls._weighted_design_rhs(xmat, y, weights)
+        z = cls._solve(system, b)
+        return z @ y0, x0 @ z
 
     @staticmethod
-    def _xtw(xmat, weights):
+    def _solve(system, rhs):
+        return jnp.linalg.solve(system, rhs)
+
+    @staticmethod
+    def _weighted_design_rhs(xmat, y, weights):
+        x0 = jnp.where(jnp.isfinite(xmat), xmat, 0.0)
+        y0 = jnp.where(jnp.isfinite(y), y, 0.0)
         weights = jnp.asarray(weights)
         if weights.ndim == 0:
-            return xmat.T * weights
-        if weights.ndim == 1:
-            return xmat.T * jnp.where(jnp.isfinite(weights), weights, 0.0)[None, :]
-        if weights.shape[0] == 1 and weights.shape[1] == 1:
-            return xmat.T * weights[0, 0]
-        if weights.shape[1] == 1:
-            return xmat.T * jnp.where(jnp.isfinite(weights[:, 0]), weights[:, 0], 0.0)[None, :]
-        return xmat.T @ jnp.where(jnp.isfinite(weights), weights, 0.0)
+            w = jnp.where(jnp.isfinite(weights), weights, 0.0)
+            b = x0.T * w
+        elif weights.ndim == 1:
+            w = jnp.where(jnp.isfinite(weights), weights, 0.0)
+            b = x0.T * w[None, :]
+        elif weights.shape[0] == 1 and weights.shape[1] == 1:
+            w = jnp.where(jnp.isfinite(weights[0, 0]), weights[0, 0], 0.0)
+            b = x0.T * w
+        elif weights.shape[1] == 1:
+            w = jnp.where(jnp.isfinite(weights[:, 0]), weights[:, 0], 0.0)
+            b = x0.T * w[None, :]
+        else:
+            b = x0.T @ jnp.where(jnp.isfinite(weights), weights, 0.0)
+        return x0, y0, jnp.where(jnp.isfinite(b), b, 0.0)
 
     def _stateless_value(self, *child_values):
         if self.has_weights:
@@ -850,7 +867,7 @@ class RidgeOp(Op):
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
         xx = 0.5 * (xx + xx.T)
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate, hat = self._solve_beta_and_hat(xmat, system, xy, weights)
+        beta_candidate, hat = self._solve_beta(xmat, system, y_vec, weights)
         beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, jnp.zeros_like(beta_candidate))
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
         preds = jnp.where(row_valid, xmat @ beta, jnp.nan)

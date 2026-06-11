@@ -56,6 +56,28 @@ def test_hl_zero_ridge_is_stateless_and_get_hat_projects_current_row():
     assert not ridge_op.is_stateful
 
 
+
+def test_hl_zero_ridge_solves_weighted_design_once_for_beta_and_hat_nan_consistency():
+    x1 = np.array([[1.0, np.nan, 3.0, 4.0]], dtype=np.float64)
+    x2 = np.array([[2.0, 4.0, 1.0, np.nan]], dtype=np.float64)
+    y = np.array([[5.0, np.nan, 7.0, 11.0]], dtype=np.float64)
+    weights = np.array([[1.0, 2.0, 0.5, 1.0]], dtype=np.float64)
+
+    beta = _run("get_beta(Ridge(cat(x1, x2), y, weights, 0, 0.1))", x1=x1, x2=x2, y=y, weights=weights)[0]
+    hat = _run("get_hat(Ridge(cat(x1, x2), y, weights, 0, 0.1))", x1=x1, x2=x2, y=y, weights=weights)[0]
+
+    xmat = np.nan_to_num(np.stack((x1[0], x2[0]), axis=1), nan=0.0)
+    y0 = np.nan_to_num(y[0], nan=0.0)
+    w0 = np.nan_to_num(weights[0], nan=0.0)
+    xx = xmat.T @ (xmat * w0[:, None])
+    system = xx + 0.1 * np.diag(np.diag(xx))
+    b = xmat.T * w0[None, :]
+    z = np.linalg.solve(system, b)
+
+    np.testing.assert_allclose(beta, z @ y0, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(hat, xmat @ z, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(hat @ y0, xmat @ beta, rtol=1e-12, atol=1e-12)
+
 def test_cpp_flat_new_stateless_ops_match_jax_flat():
     x = np.array([[0.2, 0.5, 0.8], [0.1, np.nan, 0.9]], dtype=np.float64)
     for formula in ("norm_inv(x)", "xs_norm(x)", "clip(x, 0.25, 0.75)", "cache(xs_rank(x))"):
