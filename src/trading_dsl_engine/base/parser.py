@@ -82,6 +82,11 @@ class Expr:
 
         return call("sub", 0.0, self)
 
+    def __invert__(self):
+        from trading_dsl_engine.base.dsl import call
+
+        return call("sub", 1.0, self)
+
     def __abs__(self):
         return self._call("abs")
 
@@ -206,6 +211,8 @@ class _AstParser:
                 return Call("sub", (Number(0.0), self._expr(node.operand)))
             if isinstance(node.op, ast.UAdd):
                 return self._expr(node.operand)
+            if isinstance(node.op, ast.Invert):
+                return Call("sub", (Number(1.0), self._expr(node.operand)))
         if isinstance(node, ast.BinOp):
             op_name = self._binop_name(node.op)
             return Call(op_name, (self._expr(node.left), self._expr(node.right)))

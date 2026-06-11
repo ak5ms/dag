@@ -15,6 +15,7 @@ from trading_dsl_engine.jax_flat.engine import (
     compile_formula as compile_formula_jax,
 )
 from trading_dsl_engine.jax_flat.ops import (
+    CacheOp,
     CumsumOp,
     EwmOp,
     FFillOp,
@@ -183,6 +184,10 @@ def _cpp_node_specs(program: StreamingProgram):
             specs.append(group_spec)
             supported.extend(group_supported)
             continue
+        if isinstance(op, CacheOp):
+            specs.append(spec_tuple("cache", node.child_ids, width=width))
+            supported.append("cache")
+            continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
             cpp_width = width
             if op.cpp_name == "outer":
@@ -299,6 +304,10 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
         if isinstance(op, LiteralOp):
             specs.append(spec_tuple("literal", literal=op.value, width=1))
             supported.append("inner_literal")
+            continue
+        if isinstance(op, CacheOp):
+            specs.append(spec_tuple("cache", node.child_ids, width=width))
+            supported.append("cache")
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
             cpp_width = 0 if op.cpp_name in {"outer", "einsum"} and op.output_width is None else width
