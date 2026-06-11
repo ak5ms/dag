@@ -685,6 +685,7 @@ class RidgeOp(Op):
         y_vec = y[:, 0] if y.ndim == 2 else y
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
         if not self.is_stateful:
+            # TODO: implement cpp equivalent for stateless
             return self._stateless_tick(xmat, y_vec, weights, lam, row_valid)
 
         preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
@@ -752,6 +753,7 @@ class RidgeOp(Op):
         y_arr = jnp.asarray(y_seq)
         y_vec_seq = y_arr[:, :, 0] if y_arr.ndim == 3 else y_arr
         if not self.is_stateful:
+            # TODO: implement cpp equivalent for stateless
             row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(
                 y_vec_seq, xmat_seq
             )
