@@ -778,18 +778,17 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
 
 
 def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
-    if expr.fn not in {"get_beta", "get_preds", "get_hat"} or len(expr.args) != 1 or not child_ops:
+    if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
         return None
     child = child_ops[0]
+    op = OP_FACTORIES[(expr.fn, 1)]()
     if expr.fn == "get_preds":
-        return NaryOp(lambda value: value.preds, output_kind="vector", output_width=1, cpp_name="get_preds"), None
-    if expr.fn == "get_hat":
-        return NaryOp(lambda value: value.hat, output_kind="matrix", output_width=None, cpp_name=None), None
+        return replace(op, output_kind="vector", output_width=1), None
     if isinstance(child, InstrumentBasisMeanOp):
-        return NaryOp(lambda value: value.beta, output_kind="matrix", output_width=child.feature_width, cpp_name="get_beta"), None
+        return replace(op, output_kind="matrix", output_width=child.feature_width), None
     if isinstance(child, RidgeOp):
-        return NaryOp(lambda value: value.beta, output_kind="vector", output_width=sum(child.feature_widths), cpp_name="get_beta"), None
-    return NaryOp(lambda value: value.beta, output_kind=child.output_kind, output_width=child.output_width, cpp_name="get_beta"), None
+        return replace(op, output_kind="vector", output_width=sum(child.feature_widths)), None
+    return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
 
 
 def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:

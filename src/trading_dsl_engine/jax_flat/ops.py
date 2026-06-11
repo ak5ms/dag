@@ -89,7 +89,6 @@ class InstrumentBasisMeanState:
 class RidgeValue:
     beta: jax.Array
     preds: jax.Array
-    hat: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -709,7 +708,7 @@ class RidgeOp(Op):
         last_xx = jnp.maximum(last_xx, last_xx.T)
         has_xx = has_xx | has_xx.T
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate, hat = self._solve_stateful_beta_and_hat(xmat, system, xy, weights)
+        beta_candidate = self._solve(system, xy)
         beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, state.beta)
         next_state = RidgeState(
             xx=xx,
@@ -722,7 +721,7 @@ class RidgeOp(Op):
             preds=preds,
             t=state.t + 1,
         )
-        return next_state, RidgeValue(beta=beta, preds=preds, hat=hat)
+        return next_state, RidgeValue(beta=beta, preds=preds)
 
     def scan_batch(self, state: RidgeState, *child_sequences: jax.Array):
         if not self.is_stateful:
@@ -782,7 +781,7 @@ class RidgeOp(Op):
         )(lam_seq)
         diag_seq = jax.vmap(lambda xx: jnp.diag(jnp.diag(xx)))(xx_seq)
         systems = xx_seq + lam_values[:, None, None] * diag_seq
-        beta_candidates, hat_seq = jax.vmap(self._solve_stateful_beta_and_hat)(xmat_seq, systems, xy_seq, weights_seq)
+        beta_candidates = jax.vmap(self._solve)(systems, xy_seq)
         finite_beta = jnp.all(jnp.isfinite(beta_candidates), axis=1)
 
         def beta_step(beta_prev, values):
@@ -810,20 +809,13 @@ class RidgeOp(Op):
             preds=preds_seq[-1],
             t=t,
         )
-        return next_state, RidgeValue(beta=beta_seq, preds=preds_seq, hat=hat_seq)
-
-    @classmethod
-    def _solve_stateful_beta_and_hat(cls, xmat, system, xy, weights):
-        x0, _, b = cls._weighted_design_rhs(xmat, jnp.zeros((xmat.shape[0],), dtype=xmat.dtype), weights)
-        rhs = jnp.concatenate((xy[:, None], b), axis=1)
-        solution = cls._solve(system, rhs)
-        return solution[:, 0], x0 @ solution[:, 1:]
+        return next_state, RidgeValue(beta=beta_seq, preds=preds_seq)
 
     @classmethod
     def _solve_beta(cls, xmat, system, y, weights):
-        x0, y0, b = cls._weighted_design_rhs(xmat, y, weights)
+        _, y0, b = cls._weighted_design_rhs(xmat, y, weights)
         z = cls._solve(system, b)
-        return z @ y0, x0 @ z
+        return z @ y0
 
     @staticmethod
     def _solve(system, rhs):
@@ -867,11 +859,11 @@ class RidgeOp(Op):
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
         xx = 0.5 * (xx + xx.T)
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate, hat = self._solve_beta(xmat, system, y_vec, weights)
+        beta_candidate = self._solve_beta(xmat, system, y_vec, weights)
         beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, jnp.zeros_like(beta_candidate))
         row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
         preds = jnp.where(row_valid, xmat @ beta, jnp.nan)
-        return RidgeValue(beta=beta, preds=preds, hat=hat)
+        return RidgeValue(beta=beta, preds=preds)
 
     @staticmethod
     def _as_feature_matrix(value):
@@ -1013,17 +1005,6 @@ def _bspline(x, n_basis: int):
     return jnp.where(jnp.isnan(x)[:, None], jnp.nan, values)
 
 
-def _get_beta(value: RidgeValue):
-    return getattr(value, "beta", value)
-
-
-def _get_preds(value: RidgeValue):
-    return getattr(value, "preds", value)
-
-
-def _get_hat(value: RidgeValue):
-    return getattr(value, "hat", value)
-
 
 def _col(matrix, index: int):
     return jnp.asarray(matrix)[:, index]
@@ -1047,6 +1028,8 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
     ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
+    ("get_beta", 1): lambda: NaryOp(lambda x: getattr(x, "beta", x), cpp_name="get_beta"),
+    ("get_preds", 1): lambda: NaryOp(lambda x: getattr(x, "preds", x), cpp_name="get_preds"),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
