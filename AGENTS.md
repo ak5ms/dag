@@ -97,6 +97,7 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 `pytest` is configured in `pyproject.toml` to run with pytest-xdist using 12 workers (`-n 12`). Run perf tests with `-n 0` because their wall-clock guardrails are calibrated for serial benchmark execution. If perf tests are too heavy for the environment, clearly note that and run the targeted non-performance test(s) instead.
 
 - Always run the targeted non-performance `jax_flat`/DSL tests at the end before finalizing unless explicitly told not to.
+- If any test/check fails during the task, fix the failure before finalizing even when it appears unrelated to the requested change, unless the requested change intentionally diverges from that test; in that exceptional case, explain the intentional divergence explicitly.
 - Pytest output is configured to include per-test durations; use this to catch regressions in compile/runtime costs.
 - Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
 
