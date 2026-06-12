@@ -945,11 +945,11 @@ def _xs_norm(x):
 def _xs_rank(x):
     valid = jnp.isfinite(x)
     n_valid = jnp.sum(valid).astype(jnp.int32)
-    compact = jnp.where(valid, x, jnp.inf)
+    compact = jnp.where(valid, x, jnp.nan)
     sorted_compact = jnp.sort(compact)
     le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
     ranks = le_counts.astype(jnp.float64) / (n_valid.astype(jnp.float64) + 1.0)
-    return jnp.where(valid, _norm_inv(ranks), jnp.nan)
+    return _norm_inv(jnp.where(valid, ranks, jnp.nan))
 
 
 def _xs_sort(x):
