@@ -121,6 +121,39 @@ def test_algebraic_reductions_cover_conditionals_and_booleans():
         assert runtime.get_range() == expected_range, formula
 
 
+def test_object_projection_metadata_uses_model_target_units_without_auto_tracing_accessors():
+    schema = {
+        "ev_ts": field(range=(0, 10), types=("timestamp",)),
+        "start": field(range=(0, 0), types=("timestamp",)),
+        "end": field(range=(10, 10), types=("timestamp",)),
+        "volume": field(units="shares", range=(0, 100), types=("volume",)),
+    }
+
+    preds_runtime = compile_formula(
+        "get_preds(InstrumentBasisMean(rbf_basis(ev_ts, start, end, 3), volume, 1.0, 4.0))",
+        metadata=schema,
+        cpp=False,
+    )
+    beta_runtime = compile_formula(
+        "get_beta(InstrumentBasisMean(rbf_basis(ev_ts, start, end, 3), volume, 1.0, 4.0))",
+        metadata=schema,
+        cpp=False,
+    )
+    ridge_runtime = compile_formula(
+        "get_preds(Ridge(rbf_basis(ev_ts, start, end, 3), volume, 1.0, 4.0, 0.1))",
+        metadata=schema,
+        cpp=False,
+    )
+
+    assert preds_runtime.get_units().as_dict() == {"shares": 1.0}
+    assert preds_runtime.get_types() == frozenset({"volume"})
+    assert preds_runtime.get_range() == ValueRange.unknown()
+    assert preds_runtime.get_node_metadata("get_preds")[0].metadata.width == 1
+    assert beta_runtime.get_units().as_dict() == {"shares": 1.0}
+    assert beta_runtime.get_node_metadata("get_beta")[0].metadata.width == 3
+    assert ridge_runtime.get_units().as_dict() == {"shares": 1.0}
+
+
 def test_metadata_auto_traces_nary_ops_for_ranges_and_types():
     schema = {
         "x": field(range=(-1.2, 2.7)),

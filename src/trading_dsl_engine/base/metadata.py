@@ -306,6 +306,7 @@ class FieldSpec:
     range: ValueRange = dataclass_field(default_factory=ValueRange.unknown)
     types: frozenset[str] = dataclass_field(default_factory=frozenset)
     width: int | None = 1
+    object_fields: Mapping[str, "FieldSpec"] = dataclass_field(default_factory=dict)
 
     @classmethod
     def from_value(cls, value: FieldSpec | Mapping | None) -> FieldSpec:
@@ -527,6 +528,41 @@ def _range_union(ranges: Sequence[ValueRange]) -> ValueRange:
     return ValueRange(min(finite_lowers), max(finite_uppers)) if ranges else ValueRange.unknown()
 
 
+def _safe_unit_div(numerator: UnitInfo, denominator: UnitInfo) -> UnitInfo:
+    try:
+        return numerator / denominator
+    except Exception:
+        return UnitInfo.unknown_units()
+
+
+def _common_feature_units(features: Sequence[FieldSpec]) -> UnitInfo:
+    if not features:
+        return UnitInfo.dimensionless()
+    units = features[0].units
+    if units.is_unknown() or any(feature.units != units for feature in features[1:]):
+        return UnitInfo.unknown_units()
+    return units
+
+
+def _model_projection_fields(fn_name: str, args: Sequence[FieldSpec]) -> Mapping[str, FieldSpec] | None:
+    if fn_name == "InstrumentBasisMean" and len(args) in (3, 4):
+        features = args[0]
+        y = args[1]
+        beta = FieldSpec(_safe_unit_div(y.units, features.units), ValueRange.unknown(), y.types, features.width)
+        preds = FieldSpec(y.units, ValueRange.unknown(), y.types, 1)
+        return {"beta": beta, "preds": preds}
+    if fn_name == "Ridge" and len(args) >= 4:
+        has_weights = len(args) >= 5
+        features = args[:-4] if has_weights else args[:-3]
+        y = args[-4] if has_weights else args[-3]
+        feature_units = _common_feature_units(features)
+        beta_width = None if any(feature.width is None for feature in features) else sum(int(feature.width) for feature in features)
+        beta = FieldSpec(_safe_unit_div(y.units, feature_units), ValueRange.unknown(), y.types, beta_width)
+        preds = FieldSpec(y.units, ValueRange.unknown(), y.types, 1)
+        return {"beta": beta, "preds": preds}
+    return None
+
+
 def _core_call_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpec | None:
     if fn_name == "add" and len(args) == 2:
         if _is_literal(node.args[0], 0.0):
@@ -618,7 +654,8 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
     self_stack: list[FieldSpec] = []
 
     def close(spec: FieldSpec) -> FieldSpec:
-        return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types), spec.width)
+        object_fields = {name: close(field_spec) for name, field_spec in spec.object_fields.items()}
+        return FieldSpec(spec.units, spec.range, cfg.type_graph.closure(spec.types), spec.width, object_fields)
 
     def record(node: Expr, spec: FieldSpec) -> FieldSpec:
         spec = close(spec)
@@ -709,8 +746,13 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
         if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
             width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)
-        if spec is None and fn in {"InstrumentBasisMean", "get_beta"}:
-            spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), args[0].width if args else 1)
+        if spec is None:
+            object_fields = _model_projection_fields(fn, args)
+            if object_fields is not None:
+                spec = FieldSpec(object_fields=object_fields)
+        if spec is None and fn in {"get_beta", "get_preds"} and len(args) == 1:
+            field_name = "beta" if fn == "get_beta" else "preds"
+            spec = args[0].object_fields.get(field_name) or FieldSpec(width=args[0].width if fn == "get_beta" else 1)
         if spec is None and fn in {"shift", "delay", "lag", "col", "buffer", "ffill", "cumsum"} and args:
             spec = args[0]
         if spec is None and fn == "fillna" and args:
