@@ -85,6 +85,7 @@ PIP_CACHE_DIR=.pip-cache python -m pip install -e .
 JAX, Equinox, pytest, and pytest-xdist are mandatory project dependencies in `pyproject.toml`; do not treat the JAX backend as optional in setup or tests. The `.venv/` and `.pip-cache/` directories are gitignored and must not be committed.
 
 During iteration, run only the relevant targeted tests for the files/behavior being changed. Do not repeatedly run the full suite while iterating.
+When testing numerical edge cases, prefer a compact cartesian product of thoughtful input regimes (for example all/some/no NaNs across x/y/weights, regularized/unregularized solves, stateful/stateless modes, and degenerate/nondegenerate feature variance) over isolated one-off examples, and report the timings for these cartesian-product tests so regressions can be monitored.
 If a long-running pytest command starts showing failures in streamed output, you may preemptively terminate that run early to iterate faster, then rerun targeted tests after fixes.
 
 Unless explicitly instructed otherwise, final validation should stay limited to targeted `jax_flat` and shared DSL tests for the changed behavior. Do not run the deprecated Numba/non-flat-JAX suites by default. If performance behavior changes in `jax_flat`, run the relevant active performance test(s), for example:
