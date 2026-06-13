@@ -1,4 +1,5 @@
 from dataclasses import replace
+from itertools import product
 
 import numpy as np
 
@@ -135,6 +136,101 @@ def test_hl_zero_ridge_nan_cartesian_product_uses_pairwise_moments():
     np.testing.assert_allclose(np.asarray(tick_out.beta), stateful_beta[0], rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(np.asarray(tick_out.preds), projected_preds[0], rtol=1e-12, atol=1e-12, equal_nan=True)
     np.testing.assert_allclose(projected_beta, stateful_beta, rtol=1e-12, atol=1e-12)
+
+
+def test_hl_zero_ridge_stateless_all_nan_weights_do_not_emit_nonfinite_beta():
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+    y = np.array([[2.0, 3.0, 4.0]], dtype=np.float64)
+    w = np.array([[np.nan, np.nan, np.nan]], dtype=np.float64)
+
+    stateless_beta = _run("get_beta(Ridge(x, y, w, 0, 0.1))", x=x, y=y, w=w)
+    stateful_beta = _run_with_ridge_statefulness(
+        "get_beta(Ridge(x, y, w, 0, 0.1))", is_stateful=True, x=x, y=y, w=w
+    )
+    stateless_preds = _run("get_preds(Ridge(x, y, w, 0, 0.1))", x=x, y=y, w=w)
+    stateful_preds = _run_with_ridge_statefulness(
+        "get_preds(Ridge(x, y, w, 0, 0.1))", is_stateful=True, x=x, y=y, w=w
+    )
+
+    assert np.all(np.isfinite(stateless_beta))
+    np.testing.assert_allclose(stateless_beta, stateful_beta, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(stateless_preds, stateful_preds, rtol=1e-12, atol=1e-12)
+
+
+def test_hl_zero_ridge_stateless_single_nan_weight_skips_weighted_instrument():
+    x = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+    y = np.array([[2.0, 3.0, 4.0]], dtype=np.float64)
+    w = np.array([[1.0, np.nan, 1.0]], dtype=np.float64)
+
+    stateless_beta = _run("get_beta(Ridge(x, y, w, 0, 0.1))", x=x, y=y, w=w)
+    stateful_beta = _run_with_ridge_statefulness(
+        "get_beta(Ridge(x, y, w, 0, 0.1))", is_stateful=True, x=x, y=y, w=w
+    )
+    stateless_preds = _run("get_preds(Ridge(x, y, w, 0, 0.1))", x=x, y=y, w=w)
+    stateful_preds = _run_with_ridge_statefulness(
+        "get_preds(Ridge(x, y, w, 0, 0.1))", is_stateful=True, x=x, y=y, w=w
+    )
+
+    assert np.all(np.isfinite(stateless_beta))
+    assert np.all(np.isfinite(stateless_preds))
+    np.testing.assert_allclose(stateless_beta, stateful_beta, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(stateless_preds, stateful_preds, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(stateless_preds, x * stateless_beta, rtol=1e-12, atol=1e-12)
+
+
+def test_ridge_beta_statefulness_cartesian_realistic_nan_inputs():
+    rng = np.random.default_rng(20260613)
+    n_rows = 10_000
+    n_cols = 9
+    close = np.exp(rng.normal(0.0, 0.02, size=(n_rows, n_cols))) + 10.0
+    open_ = close * (1.0 + rng.normal(0.0, 0.001, size=(n_rows, n_cols)))
+    y = rng.normal(size=(n_rows, n_cols))
+    half_spread = np.exp(rng.normal(-2.0, 0.4, size=(n_rows, n_cols)))
+    nan_mask = rng.random((n_rows, n_cols)) < 0.08
+    e_by_sigma = {
+        0.0: np.zeros((n_rows, n_cols), dtype=np.float64),
+        1.0: rng.normal(0.0, 1.0, size=(n_rows, n_cols)),
+    }
+
+    def with_nan_pattern(values, pattern):
+        out = values.copy()
+        if pattern == "all":
+            out[:] = np.nan
+        elif pattern == "some":
+            out[nan_mask] = np.nan
+        return out
+
+    x1 = "xs_rank(ewm(open / close, 30))"
+    features = f"cat({x1}, sub(e, {x1}))"
+    weights = "fillna(pow(half_spread, -2.0), 0.0)"
+    nan_patterns = ("none", "some", "all")
+
+    for hl, lam in product((0.0, 30.0), (0.0, 0.1)):
+        formula = f"get_beta(Ridge({features}, y, {weights}, {hl}, {lam}))"
+        runtime = compile_formula(formula, cpp=False)
+        stateful_runtime = _with_ridge_statefulness(runtime, is_stateful=True)
+        for sigma, e in e_by_sigma.items():
+            for x_nan, y_nan, w_nan in product(nan_patterns, repeat=3):
+                case = f"hl={hl}, lam={lam}, sigma={sigma}, x={x_nan}, y={y_nan}, w={w_nan}"
+                data = {
+                    "open": with_nan_pattern(open_, x_nan),
+                    "close": close,
+                    "e": e,
+                    "y": with_nan_pattern(y, y_nan),
+                    "half_spread": with_nan_pattern(half_spread, w_nan),
+                }
+                _, out = runtime.run_batch(data)
+                beta = np.asarray(out)
+                assert np.all(np.isfinite(beta)), case
+                if hl == 0.0:
+                    _, stateful_out = stateful_runtime.run_batch(data)
+                    np.testing.assert_allclose(
+                        beta,
+                        np.asarray(stateful_out),
+                        rtol=1e-10,
+                        atol=1e-10,
+                        err_msg=case,
+                    )
 
 
 def test_cpp_flat_new_stateless_ops_match_jax_flat():

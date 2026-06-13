@@ -324,16 +324,16 @@ def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
         _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
         return None
     try:
-        node_specs, _ = _cpp_node_specs(runtime.program)
+        node_specs, _, state_count = _cpp_node_specs(runtime.program)
     except NotImplementedError as exc:
         _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
         return None
 
     n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves, n_instruments)
+    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
     core = _CPP_ACCELERATOR_CACHE.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves)
+        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
         _CPP_ACCELERATOR_CACHE[key] = core
     state = states if _is_cpp_flat_state(states) else core.init_state(n_instruments)
     np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)

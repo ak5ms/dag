@@ -1104,16 +1104,17 @@ private:
             }
         }
 
-        // Emit predictions from the previous beta before the sufficient statistics update.
+        std::vector<uint8_t> row_valid(static_cast<size_t>(n), 0);
         for (int row = 0; row < n; ++row) {
-            bool row_valid = finite(at(yv, n, row, 0));
+            bool valid_row = finite(at(yv, n, row, 0));
             double pred = 0.0;
             for (int a = 0; a < k; ++a) {
                 const double x = xmat(row, a);
-                row_valid &= finite(x);
+                valid_row &= finite(x);
                 pred += (finite(x) ? x : 0.0) * s.beta[a];
             }
-            s.preds[row] = row_valid ? pred : NaN;
+            row_valid[static_cast<size_t>(row)] = valid_row ? 1 : 0;
+            s.preds[row] = valid_row ? pred : NaN;
         }
 
         RowMatrix xx_new = RowMatrix::Zero(k, k);
@@ -1145,11 +1146,24 @@ private:
         }
 
         const double hl = at(hlv, n, 0, 0);
+        const bool instant = !finite(hl) || hl <= 0.0;
         for (int a = 0; a < k; ++a) {
-            if (xy_valid[a]) update_ew_stat(s.xy[a], s.has_xy[a], s.last_xy[a], xy_new[a], s.t, hl);
+            if (instant) {
+                s.xy[a] = xy_valid[a] ? xy_new[a] : 0.0;
+                s.has_xy[a] = xy_valid[a];
+                if (xy_valid[a]) s.last_xy[a] = s.t;
+            } else if (xy_valid[a]) {
+                update_ew_stat(s.xy[a], s.has_xy[a], s.last_xy[a], xy_new[a], s.t, hl);
+            }
             for (int b = 0; b < k; ++b) {
                 const size_t idx = static_cast<size_t>(a * k + b);
-                if (xx_valid[idx]) update_ew_stat(s.xx(a, b), s.has_xx[idx], s.last_xx[idx], xx_new(a, b), s.t, hl);
+                if (instant) {
+                    s.xx(a, b) = xx_valid[idx] ? xx_new(a, b) : 0.0;
+                    s.has_xx[idx] = xx_valid[idx];
+                    if (xx_valid[idx]) s.last_xx[idx] = s.t;
+                } else if (xx_valid[idx]) {
+                    update_ew_stat(s.xx(a, b), s.has_xx[idx], s.last_xx[idx], xx_new(a, b), s.t, hl);
+                }
             }
         }
         for (int a = 0; a < k; ++a) {
@@ -1161,7 +1175,18 @@ private:
         }
         const double lam_raw = at(lamv, n, 0, 0);
         const double lam = std::max(finite(lam_raw) ? lam_raw : 0.0, 0.0);
-        solve_ridge(s, lam);
+        Vec fallback = instant ? Vec::Zero(k) : s.beta;
+        s.beta = solve_ridge(s.xx, s.xy, lam, fallback);
+        if (instant) {
+            for (int row = 0; row < n; ++row) {
+                double pred = 0.0;
+                for (int a = 0; a < k; ++a) {
+                    const double x = xmat(row, a);
+                    pred += (finite(x) ? x : 0.0) * s.beta[a];
+                }
+                s.preds[row] = row_valid[static_cast<size_t>(row)] ? pred : NaN;
+            }
+        }
         ++s.t;
         std::copy(s.preds.data(), s.preds.data() + s.preds.size(), dst_v.data.begin());
     }
@@ -1175,18 +1200,23 @@ private:
         last = t;
     }
 
-    static void solve_ridge(RidgeState& s, double lam) {
-        const int k = s.k;
-        RowMatrix lhs = s.xx;
-        lhs.diagonal().array() += lam * s.xx.diagonal().array();
-        if (!lhs.allFinite() || !s.xy.allFinite()) return;
+    static Vec solve_ridge(const RowMatrix& xx, const Vec& xy, double lam, const Vec& fallback) {
+        RowMatrix lhs = xx;
+        lhs.diagonal().array() += lam * xx.diagonal().array();
+        if (!lhs.allFinite() || !xy.allFinite()) return fallback;
 
         Eigen::ColPivHouseholderQR<RowMatrix> solver(lhs);
-        solver.setThreshold(1e-12);
-        if (solver.rank() < k) return;
+        Vec beta = solver.solve(xy);
+        if (beta.allFinite()) return beta;
 
-        Vec beta = solver.solve(s.xy);
-        if (beta.allFinite()) s.beta = std::move(beta);
+        Eigen::JacobiSVD<RowMatrix> svd(lhs, Eigen::ComputeThinU | Eigen::ComputeThinV);
+        const auto& singular = svd.singularValues();
+        if (singular.size() == 0) return fallback;
+        const double scale = std::max(1.0, singular.array().abs().maxCoeff());
+        const double tol = std::numeric_limits<double>::epsilon() * static_cast<double>(std::max(lhs.rows(), lhs.cols())) * scale;
+        Vec inv = singular.unaryExpr([tol](double value) { return std::abs(value) > tol ? 1.0 / value : 0.0; });
+        beta = svd.matrixV() * inv.asDiagonal() * svd.matrixU().transpose() * xy;
+        return beta.allFinite() ? beta : fallback;
     }
 
 

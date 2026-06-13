@@ -688,11 +688,12 @@ class RidgeOp(Op):
             # TODO: implement cpp equivalent for stateless
             return self._stateless_tick(xmat, y_vec, weights, lam, row_valid)
 
-        preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
+        prior_preds = jnp.where(row_valid, xmat @ state.beta, jnp.nan)
         xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
         hl_value = _scalar_value(hl)
         lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
-        rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
+        instant = (hl_value <= 0.0) | jnp.isnan(hl_value)
+        rho = jnp.where(instant, 0.0, jnp.exp(jnp.log(0.5) / hl_value))
         alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
 
         a_xx = alpha ** (state.t - state.last_xx)
@@ -701,8 +702,10 @@ class RidgeOp(Op):
         updated_xy = jnp.where(state.has_xy, state.xy * (1.0 - a_xy) + xy_new * a_xy, xy_new)
         xx = jnp.where(xx_valid, updated_xx, state.xx)
         xy = jnp.where(xy_valid, updated_xy, state.xy)
-        has_xx = state.has_xx | xx_valid
-        has_xy = state.has_xy | xy_valid
+        xx = jnp.where(instant, jnp.where(xx_valid, xx_new, 0.0), xx)
+        xy = jnp.where(instant, jnp.where(xy_valid, xy_new, 0.0), xy)
+        has_xx = jnp.where(instant, xx_valid, state.has_xx | xx_valid)
+        has_xy = jnp.where(instant, xy_valid, state.has_xy | xy_valid)
         last_xx = jnp.where(xx_valid, state.t, state.last_xx)
         last_xy = jnp.where(xy_valid, state.t, state.last_xy)
 
@@ -710,8 +713,9 @@ class RidgeOp(Op):
         last_xx = jnp.maximum(last_xx, last_xx.T)
         has_xx = has_xx | has_xx.T
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta_candidate = jnp.linalg.solve(system, xy)
-        beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, state.beta)
+        beta_fallback = jnp.where(instant, jnp.zeros_like(state.beta), state.beta)
+        beta = self._solve_with_pinv_fallback(system, xy, beta_fallback)
+        preds = jnp.where(instant, jnp.where(row_valid, xmat @ beta, jnp.nan), prior_preds)
         next_state = RidgeState(
             xx=xx,
             xy=xy,
@@ -731,7 +735,7 @@ class RidgeOp(Op):
 
         xx = 0.5 * (xx_new + xx_new.T)
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta = jnp.linalg.solve(system, xy_new)
+        beta = self._solve_with_pinv_fallback(system, xy_new, jnp.zeros_like(xy_new))
         preds = jnp.where(row_valid, xmat @ beta, jnp.nan)
         return None, RidgeValue(beta=beta, preds=preds)
 
@@ -752,11 +756,11 @@ class RidgeOp(Op):
         xmat_seq = jax.vmap(row_xmat)(*feature_sequences)
         y_arr = jnp.asarray(y_seq)
         y_vec_seq = y_arr[:, :, 0] if y_arr.ndim == 3 else y_arr
+        row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(
+            y_vec_seq, xmat_seq
+        )
         if not self.is_stateful:
             # TODO: implement cpp equivalent for stateless
-            row_valid_seq = jax.vmap(lambda y_vec, xmat: jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1))(
-                y_vec_seq, xmat_seq
-            )
             return jax.vmap(self._stateless_tick)(xmat_seq, y_vec_seq, weights_seq, lam_seq, row_valid_seq)
 
         def moment_step(carry, values):
@@ -765,7 +769,8 @@ class RidgeOp(Op):
             del lam
             xx_new, xy_new, xx_valid, xy_valid = self._moments(xmat, y_vec, weights)
             hl_value = _scalar_value(hl)
-            rho = jnp.where((hl_value <= 0.0) | jnp.isnan(hl_value), 0.0, jnp.exp(jnp.log(0.5) / hl_value))
+            instant = (hl_value <= 0.0) | jnp.isnan(hl_value)
+            rho = jnp.where(instant, 0.0, jnp.exp(jnp.log(0.5) / hl_value))
             alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
 
             a_xx = alpha ** (t_c - last_xx_c)
@@ -774,8 +779,10 @@ class RidgeOp(Op):
             updated_xy = jnp.where(has_xy_c, xy_c * (1.0 - a_xy) + xy_new * a_xy, xy_new)
             xx = jnp.where(xx_valid, updated_xx, xx_c)
             xy = jnp.where(xy_valid, updated_xy, xy_c)
-            has_xx = has_xx_c | xx_valid
-            has_xy = has_xy_c | xy_valid
+            xx = jnp.where(instant, jnp.where(xx_valid, xx_new, 0.0), xx)
+            xy = jnp.where(instant, jnp.where(xy_valid, xy_new, 0.0), xy)
+            has_xx = jnp.where(instant, xx_valid, has_xx_c | xx_valid)
+            has_xy = jnp.where(instant, xy_valid, has_xy_c | xy_valid)
             last_xx = jnp.where(xx_valid, t_c, last_xx_c)
             last_xy = jnp.where(xy_valid, t_c, last_xy_c)
 
@@ -802,18 +809,26 @@ class RidgeOp(Op):
         finite_beta = jnp.all(jnp.isfinite(beta_candidates), axis=1)
 
         def beta_step(beta_prev, values):
-            beta_candidate, finite, xmat, y_vec = values
+            beta_candidate, finite, system, xy, xmat, y_vec, hl = values
             row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
-            preds = jnp.where(row_valid, xmat @ beta_prev, jnp.nan)
-            beta = jnp.where(finite, beta_candidate, beta_prev)
+            instant = (_scalar_value(hl) <= 0.0) | jnp.isnan(_scalar_value(hl))
+            beta_fallback = jnp.where(instant, jnp.zeros_like(beta_prev), beta_prev)
+            beta = self._finish_solve_with_pinv_fallback(beta_candidate, finite, system, xy, beta_fallback)
+            emit_beta = jnp.where(instant, beta, beta_prev)
+            preds = jnp.where(row_valid, xmat @ emit_beta, jnp.nan)
             return beta, (beta, preds)
 
         beta, (beta_seq, preds_seq) = jax.lax.scan(
             beta_step,
             state.beta,
-            (beta_candidates, finite_beta, xmat_seq, y_vec_seq),
+            (beta_candidates, finite_beta, systems, xy_seq, xmat_seq, y_vec_seq, hl_seq),
             unroll=32,
         )
+        instant_seq = jax.vmap(lambda hl: (_scalar_value(hl) <= 0.0) | jnp.isnan(_scalar_value(hl)))(hl_seq)
+        _, instant_out = jax.vmap(self._stateless_tick)(xmat_seq, y_vec_seq, weights_seq, lam_seq, row_valid_seq)
+        beta_seq = jnp.where(instant_seq[:, None], instant_out.beta, beta_seq)
+        preds_seq = jnp.where(instant_seq[:, None], instant_out.preds, preds_seq)
+        beta = jnp.where(instant_seq[-1], beta_seq[-1], beta)
         xx, xy, has_xx, has_xy, last_xx, last_xy, t = carry
         next_state = RidgeState(
             xx=xx,
@@ -828,6 +843,21 @@ class RidgeOp(Op):
         )
         return next_state, RidgeValue(beta=beta_seq, preds=preds_seq)
 
+    @staticmethod
+    def _solve_with_pinv_fallback(system, rhs, fallback):
+        beta_candidate = jnp.linalg.solve(system, rhs)
+        finite = jnp.all(jnp.isfinite(beta_candidate))
+        return RidgeOp._finish_solve_with_pinv_fallback(beta_candidate, finite, system, rhs, fallback)
+
+    @staticmethod
+    def _finish_solve_with_pinv_fallback(beta_candidate, finite, system, rhs, fallback):
+        beta = jax.lax.cond(
+            finite,
+            lambda _: beta_candidate,
+            lambda _: jnp.linalg.pinv(system) @ rhs,
+            operand=None,
+        )
+        return jnp.where(jnp.all(jnp.isfinite(beta)), beta, fallback)
 
     @staticmethod
     def _as_feature_matrix(value):
