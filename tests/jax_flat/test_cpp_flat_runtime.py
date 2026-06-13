@@ -15,6 +15,14 @@ def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
 
 
+def _assert_cpp_matches_pure_jax(formula, data, *, rtol=1e-10, atol=1e-10):
+    cpp_runtime = compile_formula_native(formula)
+    jax_runtime = compile_formula(formula, cpp=False)
+    _, cpp_out = cpp_runtime.run_batch(data)
+    _, jax_out = jax_runtime.run_batch(data)
+    np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
+
+
 def test_cpp_flat_stateless_chain_matches_jax_flat():
     rows = 32
     cols = 5
@@ -77,6 +85,18 @@ def test_cpp_flat_ridge_projections_match_jax_flat():
     _assert_cpp_matches_jax("get_preds(Ridge(cat(close, open), open, 1.0, 8.0, 0.01))", data)
     _assert_cpp_matches_jax("get_beta(Ridge(cat(close, open), open, 1.0, 8.0, 0.01))", data)
 
+
+
+def test_cpp_flat_instant_ridge_nan_weights_match_jax_flat():
+    x = np.array([[1.0, 2.0, 3.0], [2.0, 1.0, 4.0]], dtype=np.float64)
+    y = np.array([[2.0, 3.0, 4.0], [1.0, np.nan, 5.0]], dtype=np.float64)
+    w_all_nan = np.full_like(x, np.nan)
+    w_some_nan = np.array([[1.0, np.nan, 1.0], [0.5, 1.0, np.nan]], dtype=np.float64)
+
+    for weights in (w_all_nan, w_some_nan):
+        data = {"x": x, "y": y, "w": weights}
+        _assert_cpp_matches_pure_jax("get_beta(Ridge(x, y, w, 0.0, 0.1))", data)
+        _assert_cpp_matches_pure_jax("get_preds(Ridge(x, y, w, 0.0, 0.1))", data)
 
 
 def test_cpp_flat_rbf_and_instrument_basis_mean_match_jax_flat():

@@ -88,8 +88,8 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
     from trading_dsl_engine.jax_flat import _cpp_flat
 
     runtime = compile_formula_jax(formula, dsl_registry=dsl_registry, cpp=False)
-    node_specs, supported = _cpp_node_specs(runtime.program)
-    core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], runtime.program.state_layout.total_leaves)
+    node_specs, supported, state_count = _cpp_node_specs(runtime.program)
+    core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
     return CppFlatRuntime(program=runtime.program, core=core, supported_ops=tuple(sorted(set(supported))))
 
 
@@ -136,6 +136,7 @@ def _cpp_node_specs(program: StreamingProgram):
         raise NotImplementedError("C++ jax_flat currently supports exactly one output")
     specs = []
     supported = []
+    state_count = program.state_layout.total_leaves
 
     def spec_tuple(
         name,
@@ -247,12 +248,14 @@ def _cpp_node_specs(program: StreamingProgram):
             supported.append("instrument_basis_mean")
             continue
         if isinstance(op, RidgeOp):
-            k = sum(op.feature_widths)
+            if state_index < 0:
+                state_index = state_count
+                state_count += 1
             specs.append(spec_tuple("ridge", node.child_ids, state_index=state_index, width=1, feature_widths=op.feature_widths))
             supported.append("ridge")
             continue
         raise NotImplementedError(f"C++ jax_flat does not yet support node {idx}: {type(op).__name__}")
-    return tuple(specs), supported
+    return tuple(specs), supported, state_count
 
 
 
