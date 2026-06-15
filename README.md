@@ -108,6 +108,7 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 - A visual checklist for NaN behavior is available in `docs/ewm_regression_nan_handling.svg`.
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
+- `RegXS(x1, x2, ..., xk, lambda)` is a stateless JAX-flat factor-portfolio helper for cross-sectional regressions. `get_fp(RegXS(...))` emits an `(n_instruments, k)` matrix of per-instrument factor-portfolio weights computed from the regularized cross-sectional `X'X`; predictor NaNs are filled with zero for products, while each `X_i * X_j` moment is divided by the finite pair-intersection count `n_ij`. RegXS currently runs on the pure JAX-flat path; formulas using it are intentionally not native-C++ lowered yet.
 
 ## JAX backend
 

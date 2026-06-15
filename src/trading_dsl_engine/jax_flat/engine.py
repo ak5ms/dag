@@ -33,6 +33,7 @@ from trading_dsl_engine.jax_flat.ops import (
     OP_FACTORIES,
     Op,
     RidgeOp,
+    RegXSOp,
     ShiftOp,
     _bspline,
     _cat,
@@ -778,12 +779,14 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
 
 
 def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
-    if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
+    if expr.fn not in {"get_beta", "get_preds", "get_fp"} or len(expr.args) != 1 or not child_ops:
         return None
     child = child_ops[0]
     op = OP_FACTORIES[(expr.fn, 1)]()
     if expr.fn == "get_preds":
         return replace(op, output_kind="vector", output_width=1), None
+    if expr.fn == "get_fp" and isinstance(child, RegXSOp):
+        return replace(op, output_kind="matrix", output_width=sum(child.feature_widths)), None
     if isinstance(child, InstrumentBasisMeanOp):
         return replace(op, output_kind="matrix", output_width=child.feature_width), None
     if isinstance(child, RidgeOp):
@@ -913,6 +916,11 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         has_weights = len(expr.args) == 4
         feature_op = child_ops[0]
         return InstrumentBasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
+    if expr.fn == "RegXS" and len(expr.args) >= 2:
+        feature_ops = child_ops[:-1]
+        if not feature_ops:
+            raise ValueError("RegXS expects at least one feature arg")
+        return RegXSOp(feature_widths=tuple(_op_width(op) for op in feature_ops)), None
     if expr.fn == "Ridge" and len(expr.args) >= 4:
         has_weights = len(expr.args) >= 5
         feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]

@@ -93,6 +93,12 @@ class RidgeValue:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class RegXSValue:
+    fp: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class InstrumentBasisMeanValue:
     beta: jax.Array
     preds: jax.Array
@@ -647,6 +653,54 @@ class FutureRbfBasisSumOp(Op):
 
 
 @dataclass(frozen=True)
+class RegXSOp(Op):
+    feature_widths: tuple[int, ...]
+    output_kind: str = "object"
+    output_width: int | None = None
+    is_stateful: bool = False
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        feature_values = child_values[: len(self.feature_widths)]
+        lam = child_values[-1]
+        xmat = jnp.concatenate(tuple(RidgeOp._as_feature_matrix(value) for value in feature_values), axis=1)
+        return None, RegXSValue(fp=self._factor_portfolio(xmat, lam))
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        feature_sequences = child_sequences[: len(self.feature_widths)]
+        lam_seq = child_sequences[-1]
+
+        def row_xmat(*feature_rows):
+            return jnp.concatenate(tuple(RidgeOp._as_feature_matrix(value) for value in feature_rows), axis=1)
+
+        xmat_seq = jax.vmap(row_xmat)(*feature_sequences)
+        return None, RegXSValue(fp=jax.vmap(self._factor_portfolio)(xmat_seq, lam_seq))
+
+    @staticmethod
+    def _xx_moments(xmat):
+        valid = jnp.isfinite(xmat)
+        x0 = jnp.where(valid, xmat, 0.0)
+        counts = valid.astype(jnp.float64).T @ valid.astype(jnp.float64)
+        sums = x0.T @ x0
+        xx = jnp.where(counts > 0.0, sums / jnp.maximum(counts, 1.0), 0.0)
+        return xx
+
+    @staticmethod
+    def _factor_portfolio(xmat, lam):
+        xx = RegXSOp._xx_moments(xmat)
+        lam_value = jnp.maximum(jnp.where(jnp.isnan(_scalar_value(lam)), 0.0, _scalar_value(lam)), 0.0)
+        system = xx + lam_value * jnp.diag(jnp.diag(xx))
+        inv = jnp.linalg.pinv(system)
+        valid = jnp.isfinite(xmat)
+        x0 = jnp.where(valid, xmat, 0.0)
+        counts = jnp.sum(valid, axis=0).astype(jnp.float64)
+        scaled_x = x0 / jnp.maximum(counts, 1.0)
+        fp = scaled_x @ inv.T
+        return jnp.where(valid, fp, jnp.nan)
+
+
+@dataclass(frozen=True)
 class RidgeOp(Op):
     feature_widths: tuple[int, ...]
     has_weights: bool
@@ -1024,6 +1078,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
     ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
     ("get_preds", 1): lambda: NaryOp(lambda x: x.preds, cpp_name="get_preds"),
+    ("get_fp", 1): lambda: NaryOp(lambda x: x.fp),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
