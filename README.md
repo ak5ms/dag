@@ -70,6 +70,13 @@ Normal Python composition can use `var("close")`/`var("open")` identifiers and e
 
 The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile_seconds`) so compile-time CSE behavior and compile latency can be validated.
 
+
+## Formula alpha search
+
+`trading_dsl_engine.base.alpha_search` provides a DEAP-backed, Python-level formula alpha search scaffold. It evolves composed DSL `Expr` candidates from a strongly typed, user-specified `AlphaPrimitiveSet` whose terminals are grouped by kind (for example vector features and positive-scalar halflives/lookbacks), evaluates candidates through an injected objective callable, and admits candidates to the pool only through a configurable additive predicate. The search is staged by depth: round `i` only evaluates formulas whose expression depth is at most `i`, making it straightforward to grow complexity gradually.
+
+The module includes compositional fitness helpers for the initial Sharpe-style objective (`alpha / ewm_var(roll_rets, HL)` with shifted, tradability-masked PnL) and a pool-aware ridge objective helper that combines the existing alpha pool with a candidate via `Ridge(...)`/`get_beta(...)`. Candidate filters are ordinary callables; `dimensionless_filter(...)` uses compile-time metadata so searches can restrict alphas by units or other static metadata without changing runtime hot paths.
+
 ## Data contract
 
 - Inputs are aligned 2D arrays with shape `(time, n_instruments)`.
