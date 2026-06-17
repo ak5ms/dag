@@ -257,3 +257,76 @@ def test_cpp_flat_groupby_inner_ewm_min_periods_matches_jax_flat():
     close[5, 3] = np.nan
     data = {"close": close, "key": key}
     _assert_cpp_matches_pure_jax("groupby((key,), close, ewm(self_, 3.0, 2.0))", data)
+
+
+def test_cpp_hybrid_batch_runs_supported_subgraph_before_jax_lambda():
+    from trading_dsl_engine.base.dsl import cumsum, groupby, self_, var
+    from trading_dsl_engine.jax_flat import stateless
+
+    rows = 20
+    cols = 4
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.1
+    key = np.mod(np.arange(rows, dtype=np.float64)[:, None] + np.arange(cols, dtype=np.float64)[None, :], 3.0)
+    close[3, 2] = np.nan
+    data = {"close": close, "key": key}
+
+    plus_one = stateless(lambda x: x + 1.0, name="plus_one")
+    formula = plus_one(groupby((var("key"),), var("close"), cumsum(self_)))
+    runtime_cpp = compile_formula(formula)
+    runtime_jax = compile_formula(formula, cpp=False)
+
+    hybrid_state, hybrid_out = runtime_cpp.run_batch(data)
+    _, jax_out = runtime_jax.run_batch(data)
+
+    np.testing.assert_allclose(np.asarray(hybrid_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+    assert any(name.startswith("__cpp_subgraph_") for name in runtime_cpp.program.input_names) is False
+
+
+def test_cpp_hybrid_batch_can_stage_cpp_before_and_after_jax_lambda():
+    from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, var
+    from trading_dsl_engine.jax_flat import stateless
+
+    rows = 24
+    cols = 4
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.05
+    key = np.mod(np.arange(rows, dtype=np.float64)[:, None] + np.arange(cols, dtype=np.float64)[None, :], 3.0)
+    close[4, 1] = np.nan
+    data = {"close": close, "key": key}
+
+    plus_one = stateless(lambda x: x + 1.0, name="plus_one")
+    grouped = groupby((var("key"),), var("close"), cumsum(self_))
+    formula = plus_one(grouped) * (ewm(var("close"), 5.0) + 3.0)
+    runtime_cpp = compile_formula(formula)
+    runtime_jax = compile_formula(formula, cpp=False)
+
+    hybrid_state, hybrid_out = runtime_cpp.run_batch(data)
+    _, jax_out = runtime_jax.run_batch(data)
+
+    np.testing.assert_allclose(np.asarray(hybrid_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+    assert type(hybrid_state).__name__ == "CppFlatState"
+
+
+def test_cpp_hybrid_batch_handles_multiple_jax_frontiers_and_native_islands():
+    from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, var
+    from trading_dsl_engine.jax_flat import stateless
+
+    rows = 22
+    cols = 4
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.07
+    key = np.mod(np.arange(rows, dtype=np.float64)[:, None] + np.arange(cols, dtype=np.float64)[None, :], 4.0)
+    close[5, 2] = np.nan
+    data = {"close": close, "key": key}
+
+    plus_one = stateless(lambda x: x + 1.0, name="plus_one")
+    minus_one = stateless(lambda x: x - 1.0, name="minus_one")
+    grouped = groupby((var("key"),), var("close"), cumsum(self_))
+    smoothed = ewm(var("close"), 5.0)
+    formula = (plus_one(grouped) + minus_one(smoothed)) * (ewm(var("close"), 3.0) + 3.0)
+    runtime_cpp = compile_formula(formula)
+    runtime_jax = compile_formula(formula, cpp=False)
+
+    hybrid_state, hybrid_out = runtime_cpp.run_batch(data)
+    _, jax_out = runtime_jax.run_batch(data)
+
+    np.testing.assert_allclose(np.asarray(hybrid_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+    assert type(hybrid_state).__name__ == "CppFlatState"

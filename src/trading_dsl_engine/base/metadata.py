@@ -709,7 +709,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
         if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
             width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)
-        if spec is None and fn in {"InstrumentBasisMean", "get_beta"}:
+        if spec is None and fn in {"InstrumentBasisMean", "get_beta", "get_preds"}:
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), args[0].width if args else 1)
         if spec is None and fn in {"shift", "delay", "lag", "col", "buffer", "ffill", "cumsum"} and args:
             spec = args[0]
