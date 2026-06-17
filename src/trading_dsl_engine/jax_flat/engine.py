@@ -605,44 +605,175 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
 
 
 
+_UNARY_ARG_NAMES = ("x", "value")
+_BINARY_ARG_NAMES = (("left", "lhs", "l", "x"), ("right", "rhs", "r", "y"))
+_TERNARY_ARG_NAMES = (("x", "condition", "cond"), ("true", "then", "if_true"), ("false", "else_", "if_false"))
+
+
+_CALL_ARG_ALIASES: dict[str, tuple[tuple[str, ...], ...]] = {
+    **{
+        name: (_UNARY_ARG_NAMES,)
+        for name in {
+            "abs",
+            "ln",
+            "ceil",
+            "floor",
+            "exp",
+            "sign",
+            "arctan",
+            "isnan",
+            "purify",
+            "fraction",
+            "norm_inv",
+            "xs_norm",
+            "xs_rank",
+            "get_beta",
+            "get_preds",
+            "xs_sort",
+            "xstd",
+            "mean",
+            "outer",
+            "cumsum",
+        }
+    },
+    **{
+        name: _BINARY_ARG_NAMES
+        for name in {
+            "add",
+            "sub",
+            "mul",
+            "mod",
+            "pow",
+            "div",
+            "floordiv",
+            "eq",
+            "ne",
+            "lt",
+            "gt",
+            "and",
+            "and_",
+            "or",
+            "or_",
+            "xor",
+            "fillna",
+        }
+    },
+    "where": _TERNARY_ARG_NAMES,
+    "clip": (("x", "value"), ("lo", "lower", "min"), ("hi", "upper", "max")),
+    "round": (_UNARY_ARG_NAMES, ("decimals", "ndigits")),
+    "ewm": (_UNARY_ARG_NAMES, ("span", "halflife", "hl"), ("min_periods",)),
+    "roll_mean": (_UNARY_ARG_NAMES, ("lookback", "window"), ("min_periods",)),
+    "ffill": (_UNARY_ARG_NAMES, ("limit",)),
+    "shift": (_UNARY_ARG_NAMES, ("lag", "nlag"), ("max_lag", "max_size")),
+    "buffer": (("shift_expr", "x", "value"), ("min", "min_lag"), ("max", "max_lag")),
+    "cache": (_UNARY_ARG_NAMES, ("where", "storage")),
+    "cat": tuple((f"arg{i}", f"x{i}") for i in range(64)),
+    "einsum": tuple((f"arg{i}", f"x{i}") for i in range(64)) + (("subscripts", "spec"),),
+    "bspline": (_UNARY_ARG_NAMES, ("n_basis", "basis", "width")),
+    "rbf_basis": (("ev_ts", "x"), ("session_start", "start"), ("session_end", "end"), ("n_basis", "basis", "width")),
+    "future_rbf_basis_sum": (
+        ("ev_ts", "x"),
+        ("session_start", "start"),
+        ("session_end", "end"),
+        ("n_basis", "basis", "width"),
+        ("n_steps", "steps"),
+    ),
+    "col": (("matrix", "x"), ("index", "idx")),
+    "InstrumentBasisMean": (("features", "x"), ("y", "target"), ("weights", "w"), ("hl", "halflife")),
+    "Ridge": tuple((f"feature{i}", f"x{i}") for i in range(1, 33))
+    + (("y", "target"), ("weights", "w"), ("hl", "halflife"), ("lambda_", "lam", "regularization")),
+}
+
+
+def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    if not kwargs or fn == "groupby":
+        return args
+    if fn == "Ridge":
+        aliases = {
+            "y": "y",
+            "target": "y",
+            "weights": "weights",
+            "w": "weights",
+            "hl": "hl",
+            "halflife": "hl",
+            "lambda_": "lambda",
+            "lam": "lambda",
+            "regularization": "lambda",
+        }
+        normalized: dict[str, Expr] = {}
+        unsupported = []
+        for name, value in kwargs:
+            normalized_name = aliases.get(name)
+            if normalized_name is None:
+                unsupported.append(name)
+                continue
+            if normalized_name in normalized:
+                raise ValueError(f"Ridge got multiple values for argument {name!r}")
+            normalized[normalized_name] = value
+        if unsupported:
+            raise ValueError(f"Unsupported Ridge keyword argument(s): {sorted(unsupported)}")
+        y = normalized.get("y")
+        weights = normalized.get("weights")
+        hl = normalized.get("hl")
+        lambda_value = normalized.get("lambda")
+        tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
+        if any(value is None for value in tail):
+            raise ValueError("Ridge keyword form requires y, hl, and lambda_/lam")
+        return args + tail
+    if fn == "einsum" and kwargs:
+        aliases = {"subscripts": "subscripts", "spec": "subscripts"}
+        normalized: dict[str, Expr] = {}
+        unsupported = []
+        for name, value in kwargs:
+            normalized_name = aliases.get(name)
+            if normalized_name is None:
+                unsupported.append(name)
+                continue
+            if normalized_name in normalized:
+                raise ValueError(f"einsum got multiple values for argument {name!r}")
+            normalized[normalized_name] = value
+        if unsupported:
+            raise ValueError(f"Unsupported einsum keyword argument(s): {sorted(unsupported)}")
+        subscripts = normalized.get("subscripts")
+        if subscripts is None:
+            return args
+        return args + (subscripts,)
+    aliases = _CALL_ARG_ALIASES.get(fn)
+    if aliases is None and (fn, len(args) + len(kwargs)) in OP_FACTORIES:
+        aliases = tuple((f"arg{i}", f"x{i}") for i in range(len(args) + len(kwargs)))
+    if aliases is None:
+        return args
+
+    positions_by_name = {name: idx for idx, names in enumerate(aliases) for name in names}
+    values: list[Expr | None] = list(args)
+    seen_kwargs: set[int] = set()
+    for name, value in kwargs:
+        if name not in positions_by_name:
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = positions_by_name[name]
+        if position < len(args):
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        if position in seen_kwargs:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_kwargs.add(position)
+
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        expected = aliases[missing_position][0]
+        raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
 def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
     if isinstance(node, Call):
         args = tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args)
         kwargs = tuple((key, _normalize_static_jax_flat_kwargs(value)) for key, value in node.kwargs)
         if not kwargs:
             return Call(node.fn, args)
-        kw = dict(kwargs)
-        if node.fn == "shift":
-            unsupported = set(kw) - {"lag", "nlag", "max_lag", "max_size"}
-            if unsupported:
-                raise ValueError(f"Unsupported shift keyword argument(s): {sorted(unsupported)}")
-            lag = kw.pop("lag") if "lag" in kw else kw.pop("nlag", None)
-            max_lag = kw.pop("max_lag") if "max_lag" in kw else kw.pop("max_size", None)
-            if len(args) > 1 or (len(args) == 1 and lag is None):
-                raise ValueError("shift keyword form expects shift(x, lag=..., max_lag=...)")
-            if len(args) != 1 or lag is None or max_lag is None:
-                raise ValueError("shift keyword form requires x, lag, and max_lag")
-            return Call("shift", (args[0], lag, max_lag))
-        if node.fn == "cache":
-            unsupported = set(kw) - {"where", "storage"}
-            if unsupported:
-                raise ValueError(f"Unsupported cache keyword argument(s): {sorted(unsupported)}")
-            storage = kw.pop("where", kw.pop("storage", String("ram")))
-            if len(args) != 1:
-                raise ValueError("cache expects exactly one value argument")
-            return Call("cache", (args[0], storage))
-        if node.fn == "buffer":
-            unsupported = set(kw) - {"min", "max"}
-            if unsupported:
-                raise ValueError(f"Unsupported buffer keyword argument(s): {sorted(unsupported)}")
-            min_lag = kw.pop("min", None)
-            max_lag = kw.pop("max", None)
-            if len(args) > 1 or (len(args) == 1 and min_lag is None):
-                raise ValueError("buffer keyword form expects buffer(shift_expr, min=..., max=...)")
-            if len(args) != 1 or min_lag is None or max_lag is None:
-                raise ValueError("buffer keyword form requires shift_expr, min, and max")
-            return Call("buffer", (args[0], min_lag, max_lag))
-        return Call(node.fn, args, kwargs)
+        return Call(node.fn, _normalize_call_kwargs(node.fn, args, kwargs))
     if isinstance(node, RollingJaxCall):
         return RollingJaxCall(
             fn=node.fn,
@@ -1301,6 +1432,7 @@ def compile_formula(
     type_relations=(),
 ) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
     metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
