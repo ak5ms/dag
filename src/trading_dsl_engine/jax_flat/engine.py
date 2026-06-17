@@ -879,18 +879,20 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         output = subscripts.split("->", 1)[1] if "->" in subscripts else ""
         if output == "":
             return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="scalar", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
-        if output == "i":
-            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
-        if output in {"ij", "jk", "ik"}:
+        index_widths = {}
+        input_terms = subscripts.split("->", 1)[0].split(",")
+        for term, op in zip(input_terms, child_ops):
+            compact = term.replace("...", "")
+            if len(compact) >= 1:
+                index_widths.setdefault(compact[0], 1)
+            if len(compact) >= 2 and op.output_width is not None:
+                index_widths[compact[1]] = int(op.output_width)
+        if len(output) == 1:
+            width = index_widths.get(output, 1)
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
+        if len(output) == 2:
             # Matrix width is inferred from the last output index when possible;
             # dynamic widths (for outer-like i,j output) use None.
-            index_widths = {}
-            input_terms = subscripts.split("->", 1)[0].split(",")
-            for term, op in zip(input_terms, child_ops):
-                if len(term) == 2 and op.output_width is not None:
-                    index_widths[term[1]] = int(op.output_width)
-                elif term == "i":
-                    index_widths["i"] = 1
             width = index_widths.get(output[-1])
             return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="matrix", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
     variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))

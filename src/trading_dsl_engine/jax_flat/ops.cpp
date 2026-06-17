@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -155,6 +156,148 @@ struct NodeSpec {
     int inner_output_id = -1;
     std::string str_param;
 };
+
+
+struct EinsumPlan {
+    std::vector<std::vector<std::string>> inputs;
+    std::vector<std::string> output;
+    std::vector<std::string> summed;
+};
+
+static std::vector<std::string> parse_einsum_term(const std::string& term) {
+    std::vector<std::string> labels;
+    for (size_t i = 0; i < term.size();) {
+        if (term.compare(i, 3, "...") == 0) {
+            labels.push_back("...");
+            i += 3;
+        } else if (std::isalpha(static_cast<unsigned char>(term[i]))) {
+            labels.emplace_back(1, term[i]);
+            ++i;
+        } else {
+            throw std::invalid_argument("invalid C++ jax_flat einsum label in pattern: " + term);
+        }
+    }
+    return labels;
+}
+
+static std::vector<std::string> split_einsum_csv(const std::string& text) {
+    std::vector<std::string> terms;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        terms.push_back(text.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return terms;
+}
+
+static int explicit_label_count(const std::vector<std::string>& labels) {
+    return static_cast<int>(std::count_if(labels.begin(), labels.end(), [](const std::string& label) { return label != "..."; }));
+}
+
+static std::vector<std::string> expand_ellipsis(const std::vector<std::string>& labels, int ellipsis_rank, int operand_rank) {
+    std::vector<std::string> out;
+    const bool has_ellipsis = std::find(labels.begin(), labels.end(), "...") != labels.end();
+    const int term_ellipsis_rank = has_ellipsis ? operand_rank - explicit_label_count(labels) : 0;
+    if (term_ellipsis_rank < 0) throw std::invalid_argument("C++ jax_flat einsum operand rank is smaller than explicit labels");
+    const int broadcast_pad = ellipsis_rank - term_ellipsis_rank;
+    for (const auto& label : labels) {
+        if (label == "...") {
+            for (int i = 0; i < broadcast_pad; ++i) out.push_back("@" + std::to_string(i));
+            for (int i = 0; i < term_ellipsis_rank; ++i) out.push_back("@" + std::to_string(broadcast_pad + i));
+        } else {
+            out.push_back(label);
+        }
+    }
+    return out;
+}
+
+static EinsumPlan make_einsum_plan(const NodeSpec& spec) {
+    const std::string& sub = spec.str_param;
+    const size_t arrow = sub.find("->");
+    if (arrow == std::string::npos) throw std::invalid_argument("C++ jax_flat einsum requires explicit output pattern: " + sub);
+    const auto input_text = split_einsum_csv(sub.substr(0, arrow));
+    if (input_text.size() != spec.children.size()) throw std::invalid_argument("C++ jax_flat einsum input count mismatch: " + sub);
+    std::vector<std::vector<std::string>> parsed_inputs;
+    parsed_inputs.reserve(input_text.size());
+    int ellipsis_rank = 0;
+    for (size_t i = 0; i < input_text.size(); ++i) {
+        auto labels = parse_einsum_term(input_text[i]);
+        parsed_inputs.push_back(labels);
+        if (std::find(labels.begin(), labels.end(), "...") != labels.end()) {
+            const int rank = spec.feature_widths.at(i) == 1 ? 1 : 2;
+            ellipsis_rank = std::max(ellipsis_rank, rank - explicit_label_count(labels));
+        }
+    }
+    auto parsed_output = parse_einsum_term(sub.substr(arrow + 2));
+    EinsumPlan plan;
+    for (size_t i = 0; i < parsed_inputs.size(); ++i) {
+        const int rank = spec.feature_widths.at(i) == 1 ? 1 : 2;
+        auto expanded = expand_ellipsis(parsed_inputs[i], ellipsis_rank, rank);
+        if (static_cast<int>(expanded.size()) != rank && static_cast<int>(expanded.size()) != 0) {
+            throw std::invalid_argument("C++ jax_flat einsum rank mismatch: " + sub);
+        }
+        plan.inputs.push_back(std::move(expanded));
+    }
+    plan.output = expand_ellipsis(parsed_output, ellipsis_rank, explicit_label_count(parsed_output) + (std::find(parsed_output.begin(), parsed_output.end(), "...") != parsed_output.end() ? ellipsis_rank : 0));
+    std::vector<std::string> all;
+    for (const auto& term : plan.inputs) for (const auto& label : term) all.push_back(label);
+    for (const auto& label : all) {
+        if (std::find(plan.output.begin(), plan.output.end(), label) == plan.output.end()
+            && std::find(plan.summed.begin(), plan.summed.end(), label) == plan.summed.end()) {
+            plan.summed.push_back(label);
+        }
+    }
+    return plan;
+}
+
+
+constexpr int kMaxEinsumAxes = 16;
+constexpr int kMaxEinsumRank = 4;
+constexpr int kMaxEinsumInputs = 8;
+
+struct EinsumExecPlan {
+    int n_inputs = 0;
+    int n_labels = 0;
+    int output_rank = 0;
+    int summed_rank = 0;
+    std::array<int, kMaxEinsumInputs> input_rank{};
+    std::array<std::array<int, kMaxEinsumRank>, kMaxEinsumInputs> input_label_pos{};
+    std::array<int, kMaxEinsumAxes> output_label_pos{};
+    std::array<int, kMaxEinsumAxes> summed_label_pos{};
+};
+
+static int find_or_add_label(std::array<std::string, kMaxEinsumAxes>& labels, int& n_labels, const std::string& label) {
+    for (int i = 0; i < n_labels; ++i) if (labels[static_cast<size_t>(i)] == label) return i;
+    if (n_labels >= kMaxEinsumAxes) throw std::invalid_argument("C++ jax_flat einsum exceeds supported axis count");
+    labels[static_cast<size_t>(n_labels)] = label;
+    return n_labels++;
+}
+
+static EinsumExecPlan make_einsum_exec_plan(const NodeSpec& spec) {
+    const EinsumPlan parsed = make_einsum_plan(spec);
+    if (parsed.inputs.size() > kMaxEinsumInputs) throw std::invalid_argument("C++ jax_flat einsum exceeds supported input count");
+    EinsumExecPlan plan;
+    plan.n_inputs = static_cast<int>(parsed.inputs.size());
+    std::array<std::string, kMaxEinsumAxes> labels{};
+    for (size_t input_i = 0; input_i < parsed.inputs.size(); ++input_i) {
+        const auto& term = parsed.inputs[input_i];
+        if (term.size() > kMaxEinsumRank) throw std::invalid_argument("C++ jax_flat einsum exceeds supported operand rank");
+        plan.input_rank[input_i] = static_cast<int>(term.size());
+        for (size_t axis = 0; axis < term.size(); ++axis) {
+            plan.input_label_pos[input_i][axis] = find_or_add_label(labels, plan.n_labels, term[axis]);
+        }
+    }
+    if (parsed.output.size() > kMaxEinsumRank || parsed.summed.size() > kMaxEinsumRank) {
+        throw std::invalid_argument("C++ jax_flat einsum exceeds supported output or contraction rank");
+    }
+    plan.output_rank = static_cast<int>(parsed.output.size());
+    plan.summed_rank = static_cast<int>(parsed.summed.size());
+    for (size_t axis = 0; axis < parsed.output.size(); ++axis) plan.output_label_pos[axis] = find_or_add_label(labels, plan.n_labels, parsed.output[axis]);
+    for (size_t axis = 0; axis < parsed.summed.size(); ++axis) plan.summed_label_pos[axis] = find_or_add_label(labels, plan.n_labels, parsed.summed[axis]);
+    return plan;
+}
 
 struct NodeValue {
     int rows_kind = 0;  // 0 => instrument-aligned rows; 1 => fixed flat rows; 2 => fixed matrix rows
@@ -331,6 +474,10 @@ public:
             throw std::invalid_argument("invalid C++ jax_flat output id");
         }
         assign_native_state_indices();
+        einsum_plans_.reserve(nodes_.size());
+        for (const auto& spec : nodes_) {
+            einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
+        }
     }
 
     State init_state(int n_instruments) const { return State(this, n_instruments); }
@@ -381,6 +528,7 @@ private:
     std::vector<NodeSpec> nodes_;
     int output_id_;
     int n_states_;
+    std::vector<EinsumExecPlan> einsum_plans_;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
@@ -525,6 +673,83 @@ private:
             else if (ts >= e) idx = steps;
             idx = std::min(std::max(idx, 0), steps);
             for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = suffix[static_cast<size_t>(idx * k + b)];
+        }
+    }
+
+
+    static int einsum_label_dim(int label_pos, const EinsumExecPlan& plan, const NodeSpec& spec, int n) {
+        int dim = 1;
+        for (int input_i = 0; input_i < plan.n_inputs; ++input_i) {
+            for (int axis = 0; axis < plan.input_rank[static_cast<size_t>(input_i)]; ++axis) {
+                if (plan.input_label_pos[static_cast<size_t>(input_i)][static_cast<size_t>(axis)] != label_pos) continue;
+                const int candidate = axis == 0 ? n : spec.feature_widths.at(static_cast<size_t>(input_i));
+                if (dim != 1 && candidate != 1 && dim != candidate) {
+                    throw std::invalid_argument("C++ jax_flat einsum label dimension mismatch");
+                }
+                dim = std::max(dim, candidate);
+            }
+        }
+        return dim;
+    }
+
+    static size_t einsum_operand_offset(const NodeValue& value, int n, const EinsumExecPlan& plan, int input_i, const std::array<int, kMaxEinsumAxes>& idx) {
+        if (plan.input_rank[static_cast<size_t>(input_i)] == 0) return 0;
+        const int row_dim = value.rows(n);
+        const int col_dim = value.width;
+        int row = 0;
+        int col = 0;
+        for (int axis = 0; axis < plan.input_rank[static_cast<size_t>(input_i)]; ++axis) {
+            const int label_pos = plan.input_label_pos[static_cast<size_t>(input_i)][static_cast<size_t>(axis)];
+            const int v = idx[static_cast<size_t>(label_pos)];
+            if (axis == 0) row = row_dim == 1 ? 0 : v;
+            else col = col_dim == 1 ? 0 : v;
+        }
+        return static_cast<size_t>(row * col_dim + col);
+    }
+
+    static bool increment_einsum_indices(std::array<int, kMaxEinsumAxes>& idx, const std::array<int, kMaxEinsumAxes>& label_positions, int rank, const std::array<int, kMaxEinsumAxes>& dims) {
+        for (int axis = rank - 1; axis >= 0; --axis) {
+            const int label_pos = label_positions[static_cast<size_t>(axis)];
+            if (++idx[static_cast<size_t>(label_pos)] < dims[static_cast<size_t>(label_pos)]) return true;
+            idx[static_cast<size_t>(label_pos)] = 0;
+        }
+        return false;
+    }
+
+    void eval_einsum(State& state, const NodeSpec& spec, const EinsumExecPlan& plan, NodeValue& dst_v) const {
+        const int n = state.n_instruments_;
+        std::array<int, kMaxEinsumAxes> dims{};
+        for (int label_pos = 0; label_pos < plan.n_labels; ++label_pos) dims[static_cast<size_t>(label_pos)] = einsum_label_dim(label_pos, plan, spec, n);
+        const int out_size = dst_v.size(n);
+        int expected = 1;
+        for (int axis = 0; axis < plan.output_rank; ++axis) expected *= dims[static_cast<size_t>(plan.output_label_pos[static_cast<size_t>(axis)])];
+        if (expected != out_size) throw std::invalid_argument("C++ jax_flat einsum inferred output shape does not match lowered shape");
+        std::array<int, kMaxEinsumAxes> idx{};
+        std::array<int, kMaxEinsumAxes> output_idx{};
+        for (int out_flat = 0; out_flat < out_size; ++out_flat) {
+            int rem = out_flat;
+            for (int axis = plan.output_rank - 1; axis >= 0; --axis) {
+                const int label_pos = plan.output_label_pos[static_cast<size_t>(axis)];
+                const int d = dims[static_cast<size_t>(label_pos)];
+                output_idx[static_cast<size_t>(label_pos)] = rem % d;
+                rem /= d;
+            }
+            idx.fill(0);
+            for (int axis = 0; axis < plan.output_rank; ++axis) {
+                const int label_pos = plan.output_label_pos[static_cast<size_t>(axis)];
+                idx[static_cast<size_t>(label_pos)] = output_idx[static_cast<size_t>(label_pos)];
+            }
+            double sum = 0.0;
+            while (true) {
+                double prod = 1.0;
+                for (int child_i = 0; child_i < plan.n_inputs; ++child_i) {
+                    const auto& value = child(state, spec, static_cast<size_t>(child_i));
+                    prod *= value.data[einsum_operand_offset(value, n, plan, child_i, idx)];
+                }
+                sum += prod;
+                if (plan.summed_rank == 0 || !increment_einsum_indices(idx, plan.summed_label_pos, plan.summed_rank, dims)) break;
+            }
+            dst_v.data[static_cast<size_t>(out_flat)] = sum;
         }
     }
 
@@ -691,52 +916,7 @@ private:
                     break;
                 }
                 case OpCode::Einsum: {
-                    const std::string& sub = spec.str_param;
-                    if (sub == "i,i->i" || sub == "i,i,i->i") {
-                        Eigen::Map<Vec> out(dst, n);
-                        out.setOnes();
-                        for (int child_id : spec.children) {
-                            const auto& child_v = state.values_[static_cast<size_t>(child_id)];
-                            Eigen::Map<const Vec> child_vec(child_v.data.data(), n);
-                            out.array() *= child_vec.array();
-                        }
-                    } else if (sub == "i,ij->i") {
-                        const auto& x = child(state, spec, 0);
-                        const auto& m = child(state, spec, 1);
-                        Eigen::Map<const Vec> x_vec(x.data.data(), n);
-                        Eigen::Map<const RowMatrix> matrix(m.data.data(), n, m.width);
-                        Eigen::Map<Vec> out(dst, n);
-                        out.array() = x_vec.array() * matrix.rowwise().sum().array();
-                    } else if (sub == "ij,ij->i") {
-                        const auto& a = child(state, spec, 0);
-                        const auto& b = child(state, spec, 1);
-                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
-                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
-                        Eigen::Map<Vec> out(dst, n);
-                        out.array() = (left.array() * right.array()).rowwise().sum();
-                    } else if (sub == "ij,ij->ij") {
-                        const auto& a = child(state, spec, 0);
-                        const auto& b = child(state, spec, 1);
-                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
-                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
-                        Eigen::Map<RowMatrix> out(dst, n, dst_v.width);
-                        out.array() = left.array() * right.array();
-                    } else if (sub == "ij,ik->jk") {
-                        const auto& a = child(state, spec, 0);
-                        const auto& b = child(state, spec, 1);
-                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
-                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
-                        Eigen::Map<RowMatrix> out(dst, a.width, b.width);
-                        out.noalias() = left.transpose() * right;
-                    } else if (sub == "ij,ij->") {
-                        const auto& a = child(state, spec, 0);
-                        const auto& b = child(state, spec, 1);
-                        Eigen::Map<const RowMatrix> left(a.data.data(), n, a.width);
-                        Eigen::Map<const RowMatrix> right(b.data.data(), n, b.width);
-                        dst[0] = (left.array() * right.array()).sum();
-                    } else {
-                        throw std::invalid_argument("unsupported C++ jax_flat einsum pattern: " + sub);
-                    }
+                    eval_einsum(state, spec, einsum_plans_[node_i], dst_v);
                     break;
                 }
                 case OpCode::XsNorm: {
@@ -1310,7 +1490,13 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
         const bool instrument_beta = spec.opcode == OpCode::GetBeta
             && !spec.children.empty()
             && runtime->nodes_[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
-        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || (spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk")))) ? 1 : 0;
+        bool fixed_einsum_rows = spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk"));
+        if (spec.opcode == OpCode::Einsum) {
+            const size_t arrow = spec.str_param.find("->");
+            const std::string out = arrow == std::string::npos ? std::string() : spec.str_param.substr(arrow + 2);
+            if (out.size() == 1 && out != "i") fixed_einsum_rows = true;
+        }
+        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
