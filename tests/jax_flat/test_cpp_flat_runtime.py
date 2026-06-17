@@ -330,3 +330,28 @@ def test_cpp_hybrid_batch_handles_multiple_jax_frontiers_and_native_islands():
 
     np.testing.assert_allclose(np.asarray(hybrid_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
     assert type(hybrid_state).__name__ == "CppFlatState"
+
+
+def test_cpp_hybrid_batch_accepts_memmap_inputs(tmp_path):
+    rows = 18
+    cols = 4
+    close_path = tmp_path / "close.dat"
+    key_path = tmp_path / "key.dat"
+    close = np.memmap(close_path, mode="w+", dtype=np.float64, shape=(rows, cols))
+    key = np.memmap(key_path, mode="w+", dtype=np.float64, shape=(rows, cols))
+    base = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols)
+    close[:] = base * 0.1
+    key[:] = np.mod(base, 3.0)
+    close.flush()
+    key.flush()
+
+    data = {"close": close, "key": key}
+    formula = "groupby((key,), close, cumsum(self_))"
+    runtime_cpp = compile_formula(formula)
+    runtime_jax = compile_formula(formula, cpp=False)
+
+    state, cpp_out = runtime_cpp.run_batch(data)
+    _, jax_out = runtime_jax.run_batch({"close": np.asarray(close), "key": np.asarray(key)})
+
+    np.testing.assert_allclose(np.asarray(cpp_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+    assert type(state).__name__ == "CppFlatState"
