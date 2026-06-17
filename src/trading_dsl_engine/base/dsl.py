@@ -161,8 +161,8 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "ewm": _dsl_signature("x", "hl", "min_periods"),
     "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
     "ffill": _dsl_signature("x", "limit"),
-    "shift": _dsl_signature("x", "nlag", "max_size"),
-    "buffer": _dsl_signature("shift_expr", "min_lag", "max_lag"),
+    "shift": _dsl_signature("x", "lag", "max_lag"),
+    "buffer": _dsl_signature("shift_expr", "min", "max"),
     "cache": _dsl_signature("x", "where"),
     "bspline": _dsl_signature("x", "n_basis"),
     "rbf_basis": _dsl_signature("ev_ts", "session_start", "session_end", "n_basis"),
@@ -173,6 +173,10 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "einsum": _dsl_signature(variadic="args"),
     "groupby": _dsl_signature("key_tuple", "lhs", "op_using_self_"),
 }
+
+
+def get_dsl_op_signature(name: str) -> Signature | None:
+    return _DSL_OP_SIGNATURES.get(name)
 
 
 def op(name: str) -> Callable[..., Expr]:

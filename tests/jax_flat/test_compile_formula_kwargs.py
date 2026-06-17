@@ -6,7 +6,7 @@ from trading_dsl_engine.jax_flat.engine import compile_formula
 
 def test_compile_formula_accepts_kwargs_for_stateless_ops():
     runtime = compile_formula(
-        "where(cond=mask, true=clip(x=value, min=0, max=10), false=fillna(x=fallback, y=0))",
+        "where(condition=mask, true=clip(x=value, lo=0, hi=10), false=fillna(x=fallback, y=0))",
         cpp=False,
     )
 
@@ -27,8 +27,8 @@ def test_compile_formula_accepts_kwargs_for_stateless_ops():
 def test_compile_formula_accepts_kwargs_for_stateful_and_static_arg_ops():
     runtime = compile_formula(
         "cat("
-        "arg0=ewm(x=close, span=2, min_periods=1), "
-        "arg1=shift(x=close, nlag=lag, max_size=3), "
+        "arg0=ewm(x=close, hl=2, min_periods=1), "
+        "arg1=shift(x=close, lag=lag, max_lag=3), "
         "arg2=round(x=open, decimals=0)"
         ")",
         cpp=False,
@@ -48,7 +48,7 @@ def test_compile_formula_accepts_kwargs_for_stateful_and_static_arg_ops():
 
 
 def test_compile_formula_accepts_kwargs_for_variadic_and_object_ops():
-    runtime = compile_formula("get_beta(x=Ridge(x, y=target, hl=0, lam=0.1))", cpp=False)
+    runtime = compile_formula("get_beta(x=Ridge(x, y=target, hl=0, lambda_=0.1))", cpp=False)
 
     x = jnp.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]], dtype=jnp.float64)
     target = 2.0 * x

@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, get_dsl_op_signature
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
@@ -605,164 +605,76 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
 
 
 
-_UNARY_ARG_NAMES = ("x", "value")
-_BINARY_ARG_NAMES = (("left", "lhs", "l", "x"), ("right", "rhs", "r", "y"))
-_TERNARY_ARG_NAMES = (("x", "condition", "cond"), ("true", "then", "if_true"), ("false", "else_", "if_false"))
+
+def _normalize_variadic_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if not name.startswith("arg") or not name[3:].isdigit():
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = int(name[3:])
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        raise ValueError(f"{fn} missing required argument 'arg{missing_position}' before keyword arguments")
+    return tuple(value for value in values if value is not None)
 
 
-_CALL_ARG_ALIASES: dict[str, tuple[tuple[str, ...], ...]] = {
-    **{
-        name: (_UNARY_ARG_NAMES,)
-        for name in {
-            "abs",
-            "ln",
-            "ceil",
-            "floor",
-            "exp",
-            "sign",
-            "arctan",
-            "isnan",
-            "purify",
-            "fraction",
-            "norm_inv",
-            "xs_norm",
-            "xs_rank",
-            "get_beta",
-            "get_preds",
-            "xs_sort",
-            "xstd",
-            "mean",
-            "outer",
-            "cumsum",
-        }
-    },
-    **{
-        name: _BINARY_ARG_NAMES
-        for name in {
-            "add",
-            "sub",
-            "mul",
-            "mod",
-            "pow",
-            "div",
-            "floordiv",
-            "eq",
-            "ne",
-            "lt",
-            "gt",
-            "and",
-            "and_",
-            "or",
-            "or_",
-            "xor",
-            "fillna",
-        }
-    },
-    "where": _TERNARY_ARG_NAMES,
-    "clip": (("x", "value"), ("lo", "lower", "min"), ("hi", "upper", "max")),
-    "round": (_UNARY_ARG_NAMES, ("decimals", "ndigits")),
-    "ewm": (_UNARY_ARG_NAMES, ("span", "halflife", "hl"), ("min_periods",)),
-    "roll_mean": (_UNARY_ARG_NAMES, ("lookback", "window"), ("min_periods",)),
-    "ffill": (_UNARY_ARG_NAMES, ("limit",)),
-    "shift": (_UNARY_ARG_NAMES, ("lag", "nlag"), ("max_lag", "max_size")),
-    "buffer": (("shift_expr", "x", "value"), ("min", "min_lag"), ("max", "max_lag")),
-    "cache": (_UNARY_ARG_NAMES, ("where", "storage")),
-    "cat": tuple((f"arg{i}", f"x{i}") for i in range(64)),
-    "einsum": tuple((f"arg{i}", f"x{i}") for i in range(64)) + (("subscripts", "spec"),),
-    "bspline": (_UNARY_ARG_NAMES, ("n_basis", "basis", "width")),
-    "rbf_basis": (("ev_ts", "x"), ("session_start", "start"), ("session_end", "end"), ("n_basis", "basis", "width")),
-    "future_rbf_basis_sum": (
-        ("ev_ts", "x"),
-        ("session_start", "start"),
-        ("session_end", "end"),
-        ("n_basis", "basis", "width"),
-        ("n_steps", "steps"),
-    ),
-    "col": (("matrix", "x"), ("index", "idx")),
-    "InstrumentBasisMean": (("features", "x"), ("y", "target"), ("weights", "w"), ("hl", "halflife")),
-    "Ridge": tuple((f"feature{i}", f"x{i}") for i in range(1, 33))
-    + (("y", "target"), ("weights", "w"), ("hl", "halflife"), ("lambda_", "lam", "regularization")),
-}
+def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: dict[str, Expr] = {}
+    for name, value in kwargs:
+        if name not in {"y", "weights", "hl", "lambda_"}:
+            raise ValueError(f"Unsupported Ridge keyword argument(s): {[name]}")
+        if name in values:
+            raise ValueError(f"Ridge got multiple values for argument {name!r}")
+        values[name] = value
+
+    y = values.get("y")
+    hl = values.get("hl")
+    lambda_value = values.get("lambda_")
+    weights = values.get("weights")
+    tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
+    if any(value is None for value in tail):
+        raise ValueError("Ridge keyword form requires y, hl, and lambda_")
+    return args + tail
 
 
 def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
     if not kwargs or fn == "groupby":
         return args
     if fn == "Ridge":
-        aliases = {
-            "y": "y",
-            "target": "y",
-            "weights": "weights",
-            "w": "weights",
-            "hl": "hl",
-            "halflife": "hl",
-            "lambda_": "lambda",
-            "lam": "lambda",
-            "regularization": "lambda",
-        }
-        normalized: dict[str, Expr] = {}
-        unsupported = []
-        for name, value in kwargs:
-            normalized_name = aliases.get(name)
-            if normalized_name is None:
-                unsupported.append(name)
-                continue
-            if normalized_name in normalized:
-                raise ValueError(f"Ridge got multiple values for argument {name!r}")
-            normalized[normalized_name] = value
-        if unsupported:
-            raise ValueError(f"Unsupported Ridge keyword argument(s): {sorted(unsupported)}")
-        y = normalized.get("y")
-        weights = normalized.get("weights")
-        hl = normalized.get("hl")
-        lambda_value = normalized.get("lambda")
-        tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
-        if any(value is None for value in tail):
-            raise ValueError("Ridge keyword form requires y, hl, and lambda_/lam")
-        return args + tail
-    if fn == "einsum" and kwargs:
-        aliases = {"subscripts": "subscripts", "spec": "subscripts"}
-        normalized: dict[str, Expr] = {}
-        unsupported = []
-        for name, value in kwargs:
-            normalized_name = aliases.get(name)
-            if normalized_name is None:
-                unsupported.append(name)
-                continue
-            if normalized_name in normalized:
-                raise ValueError(f"einsum got multiple values for argument {name!r}")
-            normalized[normalized_name] = value
-        if unsupported:
-            raise ValueError(f"Unsupported einsum keyword argument(s): {sorted(unsupported)}")
-        subscripts = normalized.get("subscripts")
-        if subscripts is None:
-            return args
-        return args + (subscripts,)
-    aliases = _CALL_ARG_ALIASES.get(fn)
-    if aliases is None and (fn, len(args) + len(kwargs)) in OP_FACTORIES:
-        aliases = tuple((f"arg{i}", f"x{i}") for i in range(len(args) + len(kwargs)))
-    if aliases is None:
-        return args
+        return _normalize_ridge_kwargs(args, kwargs)
+    if fn in {"cat", "einsum"}:
+        return _normalize_variadic_kwargs(fn, args, kwargs)
 
-    positions_by_name = {name: idx for idx, names in enumerate(aliases) for name in names}
+    signature = get_dsl_op_signature(fn)
+    if signature is None:
+        return args
+    parameter_names = tuple(
+        name for name, param in signature.parameters.items() if param.kind is not param.VAR_POSITIONAL
+    )
+    positions_by_name = {name: idx for idx, name in enumerate(parameter_names)}
     values: list[Expr | None] = list(args)
-    seen_kwargs: set[int] = set()
+    seen_positions: set[int] = set()
     for name, value in kwargs:
         if name not in positions_by_name:
             raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
         position = positions_by_name[name]
-        if position < len(args):
-            raise ValueError(f"{fn} got multiple values for argument {name!r}")
-        if position in seen_kwargs:
+        if position < len(args) or position in seen_positions:
             raise ValueError(f"{fn} got multiple values for argument {name!r}")
         while len(values) <= position:
             values.append(None)
         values[position] = value
-        seen_kwargs.add(position)
+        seen_positions.add(position)
 
     if any(value is None for value in values):
         missing_position = next(i for i, value in enumerate(values) if value is None)
-        expected = aliases[missing_position][0]
+        expected = parameter_names[missing_position]
         raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
     return tuple(value for value in values if value is not None)
 
