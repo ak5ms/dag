@@ -28,10 +28,9 @@ AdditivePredicate = Callable[[Expr, Sequence[Expr], float], bool]
 
 def ewm_var(x: Expr, span: Expr | float, min_periods: Expr | float | None = None) -> Expr:
     if min_periods is None:
-        min_periods = 5 * span
-    is_valid = cumsum(fillna(x == x, 0.0)) > (min_periods - 1.0)
-    out = ewm(x * x, span) - ewm(x, span) ** 2
-    return where(and_(is_valid, out > 0.0), out, float("nan"))
+        min_periods = 1 * span
+    out = ewm(x ** 2, span, min_periods=min_periods) - ewm(x, span, min_periods=min_periods) ** 2
+    return out
 
 
 def ewm_std(x: Expr, span: Expr | float, min_periods: Expr | float | None = None) -> Expr:
