@@ -205,7 +205,10 @@ class JaxFlatRuntime(eqx.Module):
         for idx, node in enumerate(self.program.nodes):
             op = node.op
             if isinstance(op, InputOp):
-                values[idx] = vector_sample
+                if op.output_kind == "matrix":
+                    values[idx] = jnp.zeros((n_instruments, op.output_width or n_instruments), dtype=jnp.float64)
+                else:
+                    values[idx] = vector_sample
                 continue
             if isinstance(op, LiteralOp):
                 values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
@@ -288,10 +291,15 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-        if self.cpp and not self.program.cache_nodes and (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
-            accelerated = _try_cpp_accelerated_batch(self, inputs, states)
-            if accelerated is not None:
-                return accelerated
+        if self.cpp and not self.program.cache_nodes and not states and not out_path:
+            try:
+                from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
+            except Exception as exc:
+                _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
+            else:
+                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback)
+                if hybrid is not None:
+                    return hybrid
         if _has_memmap_input(inputs) or out_path:
             return _run_chunked_batch(self, inputs, states, out_path)
         result = _jit_batch_from_initial_state(self, inputs) if not states else _jit_batch(self, states, inputs)
@@ -302,45 +310,6 @@ class JaxFlatRuntime(eqx.Module):
 def _is_cpp_flat_state(states) -> bool:
     return type(states).__name__ == "CppFlatState"
 
-
-def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
-    """Optionally run C++ flat batch for fully supported programs.
-
-    This is a runtime accelerator, not a semantic fallback: unsupported programs,
-    callers with explicit state, memmaps, or disabled native acceleration continue
-    through the normal JAX path. The C++ module is imported lazily so the standard
-    JAX-flat import path does not require a built extension.
-    """
-    if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
-        return None
-    # Avoid regressing the pure JAX vectorized path for simple formulas; the
-    # automatic accelerator currently targets grouped formulas where the native
-    # row transition materially improves steady-state runtime. Explicit
-    # trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...) remains available for non-group formulas.
-    if not any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
-        return None
-    try:
-        from trading_dsl_engine.jax_flat import _cpp_flat
-        from trading_dsl_engine.jax_flat.engine_cpp import _cpp_node_specs, _reshape_cpp_batch_output
-    except Exception as exc:
-        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
-        return None
-    try:
-        node_specs, _, state_count = _cpp_node_specs(runtime.program)
-    except NotImplementedError as exc:
-        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
-        return None
-
-    n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
-    core = _CPP_ACCELERATOR_CACHE.get(key)
-    if core is None:
-        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
-        _CPP_ACCELERATOR_CACHE[key] = core
-    state = states if _is_cpp_flat_state(states) else core.init_state(n_instruments)
-    np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
-    raw = core.run_batch(state, *np_inputs)
-    return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
 
 
 def _warn_cpp_fallback(runtime: JaxFlatRuntime, message: str) -> None:
@@ -372,7 +341,7 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
                 f"({runtime.program.input_names}), got {len(inputs)}"
             )
     for name, arr in zip(runtime.program.input_names, inputs):
-        if arr.ndim != 2:
+        if arr.ndim != 2 and not name.startswith("__cpp_subgraph_"):
             raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
     return inputs
 
