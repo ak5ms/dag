@@ -228,3 +228,32 @@ def test_cpp_flat_outer_and_einsum_subset_match_jax_flat():
         'einsum(bspline(fillna(close, 0.25), 2), bspline(fillna(open, 0.5), 3), "ij,ik->jk")',
     ):
         _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)
+
+
+def test_cpp_flat_roll_mean_and_ewm_min_periods_match_jax_flat():
+    rows = 48
+    cols = 5
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    close = 0.5 * row - col
+    close[0, 0] = 0.0
+    close[1, 2] = np.nan
+    close[4, 0] = np.nan
+    close[9, 3] = np.nan
+    data = {"close": close}
+    _assert_cpp_matches_pure_jax("add(roll_mean(close, 5, 3), ewm(close, 4.0, 3.0))", data)
+    _assert_cpp_matches_pure_jax("ewm(close, 4.0, 1.0)", data)
+
+
+def test_cpp_flat_groupby_inner_ewm_min_periods_matches_jax_flat():
+    rows = 36
+    cols = 4
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    close = row * 0.1 - col
+    close[0, 0] = 0.0
+    key = np.mod(row + col, 3.0)
+    close[2, 1] = np.nan
+    close[5, 3] = np.nan
+    data = {"close": close, "key": key}
+    _assert_cpp_matches_pure_jax("groupby((key,), close, ewm(self_, 3.0, 2.0))", data)
