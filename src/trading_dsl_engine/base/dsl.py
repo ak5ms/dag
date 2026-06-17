@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from inspect import Parameter, Signature
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, UniverseItem
 
@@ -99,11 +100,91 @@ def grouped(lhs, key) -> GroupedExpr:
     return GroupedExpr(lhs, key)
 
 
+def _dsl_signature(*names: str, variadic: str | None = None) -> Signature:
+    params = [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD) for name in names]
+    if variadic is not None:
+        params.append(Parameter(variadic, Parameter.VAR_POSITIONAL))
+    return Signature(params)
+
+
+_DSL_OP_SIGNATURES: dict[str, Signature] = {
+    **{
+        name: _dsl_signature("x")
+        for name in {
+            "abs",
+            "ln",
+            "ceil",
+            "floor",
+            "exp",
+            "sign",
+            "arctan",
+            "isnan",
+            "purify",
+            "fraction",
+            "norm_inv",
+            "xs_norm",
+            "xs_rank",
+            "get_beta",
+            "get_preds",
+            "xs_sort",
+            "xstd",
+            "mean",
+            "outer",
+            "cumsum",
+        }
+    },
+    **{
+        name: _dsl_signature("x", "y")
+        for name in {
+            "add",
+            "sub",
+            "mul",
+            "mod",
+            "pow",
+            "div",
+            "floordiv",
+            "eq",
+            "ne",
+            "lt",
+            "gt",
+            "and",
+            "and_",
+            "or",
+            "or_",
+            "xor",
+            "fillna",
+        }
+    },
+    "where": _dsl_signature("condition", "true", "false"),
+    "clip": _dsl_signature("x", "lo", "hi"),
+    "round": _dsl_signature("x", "decimals"),
+    "ewm": _dsl_signature("x", "hl", "min_periods"),
+    "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
+    "ffill": _dsl_signature("x", "limit"),
+    "shift": _dsl_signature("x", "lag", "max_lag"),
+    "buffer": _dsl_signature("shift_expr", "min", "max"),
+    "cache": _dsl_signature("x", "where"),
+    "bspline": _dsl_signature("x", "n_basis"),
+    "rbf_basis": _dsl_signature("ev_ts", "session_start", "session_end", "n_basis"),
+    "future_rbf_basis_sum": _dsl_signature("ev_ts", "session_start", "session_end", "n_basis", "n_steps"),
+    "col": _dsl_signature("matrix", "index"),
+    "InstrumentBasisMean": _dsl_signature("features", "y", "weights", "hl"),
+    "cat": _dsl_signature(variadic="args"),
+    "einsum": _dsl_signature(variadic="args"),
+    "groupby": _dsl_signature("key_tuple", "lhs", "op_using_self_"),
+}
+
+
+def get_dsl_op_signature(name: str) -> Signature | None:
+    return _DSL_OP_SIGNATURES.get(name)
+
+
 def op(name: str) -> Callable[..., Expr]:
     def _op(*args, **kwargs) -> Expr:
         return call(name, *args, **kwargs)
 
     _op.__name__ = name
+    _op.__signature__ = _DSL_OP_SIGNATURES.get(name, Signature())
     return _op
 
 

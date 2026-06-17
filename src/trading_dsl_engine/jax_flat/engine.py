@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, get_dsl_op_signature
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
@@ -605,44 +605,87 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
 
 
 
+
+def _normalize_variadic_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if not name.startswith("arg") or not name[3:].isdigit():
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = int(name[3:])
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        raise ValueError(f"{fn} missing required argument 'arg{missing_position}' before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
+def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: dict[str, Expr] = {}
+    for name, value in kwargs:
+        if name not in {"y", "weights", "hl", "lambda_"}:
+            raise ValueError(f"Unsupported Ridge keyword argument(s): {[name]}")
+        if name in values:
+            raise ValueError(f"Ridge got multiple values for argument {name!r}")
+        values[name] = value
+
+    y = values.get("y")
+    hl = values.get("hl")
+    lambda_value = values.get("lambda_")
+    weights = values.get("weights")
+    tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
+    if any(value is None for value in tail):
+        raise ValueError("Ridge keyword form requires y, hl, and lambda_")
+    return args + tail
+
+
+def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    if not kwargs or fn == "groupby":
+        return args
+    if fn == "Ridge":
+        return _normalize_ridge_kwargs(args, kwargs)
+    if fn in {"cat", "einsum"}:
+        return _normalize_variadic_kwargs(fn, args, kwargs)
+
+    signature = get_dsl_op_signature(fn)
+    if signature is None:
+        return args
+    parameter_names = tuple(
+        name for name, param in signature.parameters.items() if param.kind is not param.VAR_POSITIONAL
+    )
+    positions_by_name = {name: idx for idx, name in enumerate(parameter_names)}
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if name not in positions_by_name:
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = positions_by_name[name]
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        expected = parameter_names[missing_position]
+        raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
 def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
     if isinstance(node, Call):
         args = tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args)
         kwargs = tuple((key, _normalize_static_jax_flat_kwargs(value)) for key, value in node.kwargs)
         if not kwargs:
             return Call(node.fn, args)
-        kw = dict(kwargs)
-        if node.fn == "shift":
-            unsupported = set(kw) - {"lag", "nlag", "max_lag", "max_size"}
-            if unsupported:
-                raise ValueError(f"Unsupported shift keyword argument(s): {sorted(unsupported)}")
-            lag = kw.pop("lag") if "lag" in kw else kw.pop("nlag", None)
-            max_lag = kw.pop("max_lag") if "max_lag" in kw else kw.pop("max_size", None)
-            if len(args) > 1 or (len(args) == 1 and lag is None):
-                raise ValueError("shift keyword form expects shift(x, lag=..., max_lag=...)")
-            if len(args) != 1 or lag is None or max_lag is None:
-                raise ValueError("shift keyword form requires x, lag, and max_lag")
-            return Call("shift", (args[0], lag, max_lag))
-        if node.fn == "cache":
-            unsupported = set(kw) - {"where", "storage"}
-            if unsupported:
-                raise ValueError(f"Unsupported cache keyword argument(s): {sorted(unsupported)}")
-            storage = kw.pop("where", kw.pop("storage", String("ram")))
-            if len(args) != 1:
-                raise ValueError("cache expects exactly one value argument")
-            return Call("cache", (args[0], storage))
-        if node.fn == "buffer":
-            unsupported = set(kw) - {"min", "max"}
-            if unsupported:
-                raise ValueError(f"Unsupported buffer keyword argument(s): {sorted(unsupported)}")
-            min_lag = kw.pop("min", None)
-            max_lag = kw.pop("max", None)
-            if len(args) > 1 or (len(args) == 1 and min_lag is None):
-                raise ValueError("buffer keyword form expects buffer(shift_expr, min=..., max=...)")
-            if len(args) != 1 or min_lag is None or max_lag is None:
-                raise ValueError("buffer keyword form requires shift_expr, min, and max")
-            return Call("buffer", (args[0], min_lag, max_lag))
-        return Call(node.fn, args, kwargs)
+        return Call(node.fn, _normalize_call_kwargs(node.fn, args, kwargs))
     if isinstance(node, RollingJaxCall):
         return RollingJaxCall(
             fn=node.fn,
@@ -1301,6 +1344,7 @@ def compile_formula(
     type_relations=(),
 ) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
     metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
