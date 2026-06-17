@@ -28,6 +28,7 @@ from trading_dsl_engine.jax_flat.ops import (
     Op,
     RbfBasisOp,
     RidgeOp,
+    RollingMeanOp,
     ShiftOp,
 )
 
@@ -214,8 +215,13 @@ def _cpp_node_specs(program: StreamingProgram):
             supported.append("cumsum")
             continue
         if isinstance(op, EwmOp) and op.span is not None:
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, width=width))
+            min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
             supported.append("ewm")
+            continue
+        if isinstance(op, RollingMeanOp):
+            specs.append(spec_tuple("roll_mean", node.child_ids, state_index=state_index, param=op.min_periods, int_param=op.lookback, width=width))
+            supported.append("roll_mean")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:
             limit = -1 if op.limit is None else op.limit
@@ -324,7 +330,8 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
             supported.append("inner_cumsum")
             continue
         if isinstance(op, EwmOp) and op.span is not None:
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, width=width))
+            min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
             supported.append("inner_ewm")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:

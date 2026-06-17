@@ -73,6 +73,7 @@ enum class OpCode : int {
     Col,
     Cumsum,
     Ewm,
+    RollMean,
     FFill,
     Shift,
     InstrumentBasisMean,
@@ -129,6 +130,7 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "col") return OpCode::Col;
     if (name == "cumsum") return OpCode::Cumsum;
     if (name == "ewm") return OpCode::Ewm;
+    if (name == "roll_mean") return OpCode::RollMean;
     if (name == "ffill") return OpCode::FFill;
     if (name == "shift") return OpCode::Shift;
     if (name == "instrument_basis_mean") return OpCode::InstrumentBasisMean;
@@ -175,6 +177,22 @@ struct ValueState {
           initialized(ByteVec::Zero(size)),
           streak(I64Vec::Zero(size)),
           seen(ByteVec::Zero(size)) {}
+};
+
+
+struct RollingMeanState {
+    RowMatrix buffer;
+    Vec total;
+    I64Vec valid_count;
+    int pos = 0;
+    int count = 0;
+    int lookback = 0;
+
+    RollingMeanState(int window = 0, int row_size = 0)
+        : buffer(RowMatrix::Constant(window, row_size, NaN)),
+          total(Vec::Zero(row_size)),
+          valid_count(I64Vec::Zero(row_size)),
+          lookback(window) {}
 };
 
 struct ShiftState {
@@ -297,6 +315,7 @@ private:
     std::vector<NodeValue> values_;
     std::vector<ValueState> value_states_;
     std::vector<ShiftState> shift_states_;
+    std::vector<RollingMeanState> rolling_mean_states_;
     std::vector<RidgeState> ridge_states_;
     std::vector<InstrumentBasisMeanState> instrument_basis_mean_states_;
     std::vector<GroupState> group_states_;
@@ -396,12 +415,13 @@ private:
 
     static ValueState& value_state(State& state, const NodeSpec& spec) { return state.value_states_.at(static_cast<size_t>(spec.state_index)); }
     static ShiftState& shift_state(State& state, const NodeSpec& spec) { return state.shift_states_.at(static_cast<size_t>(spec.state_index)); }
+    static RollingMeanState& rolling_mean_state(State& state, const NodeSpec& spec) { return state.rolling_mean_states_.at(static_cast<size_t>(spec.state_index)); }
     static RidgeState& ridge_state(State& state, const NodeSpec& spec) { return state.ridge_states_.at(static_cast<size_t>(spec.state_index)); }
     static InstrumentBasisMeanState& instrument_basis_mean_state(State& state, const NodeSpec& spec) { return state.instrument_basis_mean_states_.at(static_cast<size_t>(spec.state_index)); }
     static GroupState& group_state(State& state, const NodeSpec& spec) { return state.group_states_.at(static_cast<size_t>(spec.state_index)); }
 
     void assign_native_state_indices() {
-        std::array<int, 5> next{0, 0, 0, 0, 0};
+        std::array<int, 6> next{0, 0, 0, 0, 0, 0};
         for (NodeSpec& spec : nodes_) {
             if (spec.state_index < 0) continue;
             spec.state_index = next[static_cast<size_t>(state_bucket(spec.opcode))]++;
@@ -410,10 +430,11 @@ private:
 
     static int state_bucket(OpCode opcode) {
         switch (opcode) {
-            case OpCode::Shift: return 1;
-            case OpCode::Ridge: return 2;
-            case OpCode::InstrumentBasisMean: return 3;
-            case OpCode::Group: return 4;
+            case OpCode::RollMean: return 1;
+            case OpCode::Shift: return 2;
+            case OpCode::Ridge: return 3;
+            case OpCode::InstrumentBasisMean: return 4;
+            case OpCode::Group: return 5;
             default: return 0;
         }
     }
@@ -824,11 +845,38 @@ private:
                     auto& s = value_state(state, spec);
                     const auto& x = child(state, spec, 0);
                     const double alpha = 2.0 / (spec.param + 1.0);
+                    const int min_periods = spec.int_param;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        if (finite(v)) { s.value[i] = s.initialized[i] ? alpha * v + (1.0 - alpha) * s.value[i] : v; s.initialized[i] = 1; }
-                        dst[i] = s.initialized[i] ? s.value[i] : NaN;
+                        if (finite(v)) {
+                            s.value[i] = s.initialized[i] ? alpha * v + (1.0 - alpha) * s.value[i] : v;
+                            s.initialized[i] = 1;
+                            s.streak[i] += 1;
+                        }
+                        const bool enough = min_periods < 0 || s.streak[i] >= min_periods;
+                        dst[i] = (s.initialized[i] && enough) ? s.value[i] : NaN;
                     }
+                    break;
+                }
+                case OpCode::RollMean: {
+                    auto& s = rolling_mean_state(state, spec);
+                    const auto& x = child(state, spec, 0);
+                    const int row_size = dst_v.size(n);
+                    const int min_periods = static_cast<int>(std::llround(spec.param));
+                    for (int i = 0; i < row_size; ++i) {
+                        const double old = s.buffer(s.pos, i);
+                        const bool old_valid = finite(old);
+                        const double v = x.data[static_cast<size_t>(i)];
+                        const bool valid = finite(v);
+                        s.total[i] += (valid ? v : 0.0) - (old_valid ? old : 0.0);
+                        s.valid_count[i] += (valid ? 1 : 0) - (old_valid ? 1 : 0);
+                        s.buffer(s.pos, i) = v;
+                        dst[i] = (s.count + 1 >= min_periods && s.valid_count[i] >= min_periods)
+                            ? s.total[i] / static_cast<double>(s.valid_count[i])
+                            : NaN;
+                    }
+                    s.pos = (s.pos + 1) % s.lookback;
+                    s.count = std::min(s.count + 1, s.lookback);
                     break;
                 }
                 case OpCode::FFill: {
@@ -957,12 +1005,14 @@ private:
                 const double v = child_value(0);
                 auto& state_v = s.inner_values.at(static_cast<size_t>(node.state_index));
                 auto& init = s.inner_initialized.at(static_cast<size_t>(node.state_index));
+                auto& count = s.inner_streak.at(static_cast<size_t>(node.state_index));
                 const double alpha = 2.0 / (node.param + 1.0);
                 if (finite(v)) {
                     state_v[off] = init[off] ? alpha * v + (1.0 - alpha) * state_v[off] : v;
                     init[off] = 1;
+                    count[off] += 1;
                 }
-                return init[off] ? state_v[off] : NaN;
+                return (init[off] && (node.int_param < 0 || count[off] >= node.int_param)) ? state_v[off] : NaN;
             }
             case OpCode::FFill: {
                 const double v = child_value(0);
@@ -1270,6 +1320,9 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
         const int node_size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
 
         switch (spec.opcode) {
+            case OpCode::RollMean:
+                rolling_mean_states_.emplace_back(spec.int_param, node_size);
+                break;
             case OpCode::Shift:
                 shift_states_.emplace_back(spec.int_param + 1, node_size);
                 break;

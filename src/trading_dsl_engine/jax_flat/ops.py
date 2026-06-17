@@ -34,6 +34,25 @@ class Op:
 class EwmState:
     value: jax.Array
     initialized: jax.Array
+    count: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class RollingMeanState:
+    buffer: jax.Array
+    pos: jax.Array
+    count: jax.Array
+    total: jax.Array
+    valid_count: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class RollingState:
+    buffer: jax.Array
+    pos: jax.Array
+    count: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -150,12 +169,17 @@ class NaryOp(Op):
 @dataclass(frozen=True)
 class EwmOp(Op):
     span: float | None = None
+    min_periods: float | None = None
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
 
     def init_state(self, sample: jax.Array):
-        return EwmState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
+        return EwmState(
+            value=jnp.zeros_like(sample),
+            initialized=jnp.zeros_like(sample, dtype=bool),
+            count=jnp.zeros_like(sample, dtype=jnp.int64),
+        )
 
     def tick(self, state: EwmState, *child_values: jax.Array):
         x = child_values[0]
@@ -166,8 +190,102 @@ class EwmOp(Op):
         init_or_valid = initialized | valid
         blended = alpha * x + (1.0 - alpha) * value
         next_value = jnp.where(valid, jnp.where(initialized, blended, x), value)
-        out = jnp.where(init_or_valid, next_value, jnp.nan)
-        return EwmState(value=next_value, initialized=init_or_valid), out
+        next_count = state.count + valid.astype(jnp.int64)
+        min_periods = self.min_periods if self.min_periods is not None else None
+        if min_periods is None and len(child_values) > 2:
+            min_periods = _scalar_value(child_values[2])
+        enough = True if min_periods is None else next_count >= jnp.rint(min_periods).astype(jnp.int64)
+        out = jnp.where(init_or_valid & enough, next_value, jnp.nan)
+        return EwmState(value=next_value, initialized=init_or_valid, count=next_count), out
+
+
+@dataclass(frozen=True)
+class RollingMeanOp(Op):
+    lookback: int
+    min_periods: int
+    output_kind: str = "vector"
+    output_width: int | None = 1
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        sample = jnp.asarray(sample)
+        return RollingMeanState(
+            buffer=jnp.full((self.lookback,) + sample.shape, jnp.nan, dtype=jnp.float64),
+            pos=jnp.asarray(0, dtype=jnp.int32),
+            count=jnp.asarray(0, dtype=jnp.int32),
+            total=jnp.zeros_like(sample, dtype=jnp.float64),
+            valid_count=jnp.zeros_like(sample, dtype=jnp.int64),
+        )
+
+    def tick(self, state: RollingMeanState, *child_values: jax.Array):
+        x = jnp.asarray(child_values[0])
+        old = state.buffer[state.pos]
+        old_valid = jnp.isfinite(old)
+        valid = jnp.isfinite(x)
+        total = state.total - jnp.where(old_valid, old, 0.0) + jnp.where(valid, x, 0.0)
+        valid_count = state.valid_count - old_valid.astype(jnp.int64) + valid.astype(jnp.int64)
+        count = jnp.minimum(state.count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(self.lookback, dtype=jnp.int32))
+        out = total / jnp.where(valid_count > 0, valid_count, jnp.nan)
+        out = jnp.where((count >= self.min_periods) & (valid_count >= self.min_periods), out, jnp.nan)
+        next_state = RollingMeanState(
+            buffer=state.buffer.at[state.pos].set(x),
+            pos=jnp.mod(state.pos + 1, self.lookback),
+            count=count,
+            total=total,
+            valid_count=valid_count,
+        )
+        return next_state, out
+
+    def scan_batch(self, state: RollingMeanState, *child_sequences: jax.Array):
+        def step(carry, x):
+            state_c = RollingMeanState(*carry)
+            next_state, out = self.tick(state_c, x)
+            return (next_state.buffer, next_state.pos, next_state.count, next_state.total, next_state.valid_count), out
+
+        carry, out = jax.lax.scan(
+            step,
+            (state.buffer, state.pos, state.count, state.total, state.valid_count),
+            child_sequences[0],
+            unroll=32,
+        )
+        return RollingMeanState(*carry), out
+
+
+@dataclass(frozen=True)
+class RollingOp(Op):
+    lookback: int
+    min_periods: int
+    fn: Callable[[jax.Array], jax.Array]
+    output_kind: str = "vector"
+    output_width: int | None = 1
+    is_stateful: bool = True
+
+    def init_state(self, sample: jax.Array):
+        sample = jnp.asarray(sample)
+        return RollingState(
+            buffer=jnp.full((self.lookback,) + sample.shape, jnp.nan, dtype=jnp.float64),
+            pos=jnp.asarray(0, dtype=jnp.int32),
+            count=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def tick(self, state: RollingState, *child_values: jax.Array):
+        x = jnp.asarray(child_values[0])
+        buffer = state.buffer.at[state.pos].set(x)
+        count = jnp.minimum(state.count + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(self.lookback, dtype=jnp.int32))
+        chronological = buffer[jnp.mod(state.pos + 1 + jnp.arange(self.lookback, dtype=jnp.int32), self.lookback)]
+        valid_count = jnp.sum(jnp.isfinite(chronological), axis=0)
+        enough = (count >= self.min_periods) & (valid_count >= self.min_periods)
+        out = jnp.where(enough, self.fn(chronological), jnp.nan)
+        return RollingState(buffer=buffer, pos=jnp.mod(state.pos + 1, self.lookback), count=count), out
+
+    def scan_batch(self, state: RollingState, *child_sequences: jax.Array):
+        def step(carry, x):
+            state_c = RollingState(*carry)
+            next_state, out = self.tick(state_c, x)
+            return (next_state.buffer, next_state.pos, next_state.count), out
+
+        carry, out = jax.lax.scan(step, (state.buffer, state.pos, state.count), child_sequences[0], unroll=32)
+        return RollingState(*carry), out
 
 
 @dataclass(frozen=True)

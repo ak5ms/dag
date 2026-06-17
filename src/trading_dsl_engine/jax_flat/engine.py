@@ -16,7 +16,7 @@ import numpy as np
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
-from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
+from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     InstrumentBasisMeanOp,
     RbfBasisOp,
@@ -29,6 +29,8 @@ from trading_dsl_engine.jax_flat.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    RollingMeanOp,
+    RollingOp,
     ANY_ARITY,
     OP_FACTORIES,
     Op,
@@ -641,6 +643,16 @@ def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
                 raise ValueError("buffer keyword form requires shift_expr, min, and max")
             return Call("buffer", (args[0], min_lag, max_lag))
         return Call(node.fn, args, kwargs)
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
             fn=node.fn,
@@ -666,6 +678,17 @@ def _expr_key(node: Expr):
             node.fn,
             tuple(_expr_key(a) for a in node.args),
             tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return (
+            "jax_rolling",
+            id(node.fn),
+            node.lookback,
+            node.min_periods,
+            node.output_kind,
+            node.output_width,
+            node.name,
+            tuple(_expr_key(a) for a in node.args),
         )
     if isinstance(node, StatelessJaxCall):
         return (
@@ -726,6 +749,16 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
             node.fn,
             tuple(_replace_self(a, lhs) for a in node.args),
             tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_replace_self(arg, lhs) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
         )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
@@ -791,6 +824,14 @@ def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, in
     return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
 
 
+def _build_rolling_jax_op(expr: RollingJaxCall, child_ops: tuple[Op, ...]) -> Op:
+    if len(child_ops) != 1:
+        raise ValueError("rolling JAX call expects one child")
+    output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+    output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+    return RollingOp(expr.lookback, expr.min_periods, expr.fn, output_kind=output_kind, output_width=output_width)
+
+
 def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:
     if not child_ops:
         raise ValueError("stateless JAX call expects at least one child")
@@ -850,10 +891,31 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
-    if expr.fn == "ewm" and len(expr.args) == 2:
-        if isinstance(expr.args[1], Number):
-            return EwmOp(span=float(expr.args[1].value)), 1
-        return EwmOp(), None
+    if expr.fn == "ewm" and len(expr.args) in (2, 3):
+        span = float(expr.args[1].value) if isinstance(expr.args[1], Number) else None
+        min_periods = None
+        drop: int | tuple[int, ...] | None = 1 if span is not None else None
+        if len(expr.args) == 3:
+            if isinstance(expr.args[2], Number):
+                min_periods = float(expr.args[2].value)
+                drop = (1, 2) if span is not None else 2
+            else:
+                drop = 1 if span is not None else None
+        return EwmOp(span=span, min_periods=min_periods), drop
+    if expr.fn == "roll_mean" and len(expr.args) in (2, 3):
+        lookback = _literal_int_arg(expr.args[1], "roll_mean", 2)
+        min_periods = lookback if len(expr.args) == 2 else _literal_int_arg(expr.args[2], "roll_mean", 3)
+        if lookback <= 0 or min_periods <= 0 or min_periods > lookback:
+            raise ValueError("roll_mean expects 0 < min_periods <= lookback")
+        return (
+            RollingMeanOp(
+                lookback=lookback,
+                min_periods=min_periods,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            tuple(range(1, len(expr.args))),
+        )
     if expr.fn == "ffill" and len(expr.args) in (1, 2):
         limit = None
         dynamic_limit = False
@@ -983,6 +1045,13 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             return idx
         if isinstance(node, String):
             raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
+
+        if isinstance(node, RollingJaxCall):
+            child_ids = tuple(build(a) for a in node.args)
+            idx = len(nodes)
+            nodes.append(DagNode(op=_build_rolling_jax_op(node, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+            memo[key] = idx
+            return idx
 
         if isinstance(node, StatelessJaxCall):
             child_ids = tuple(build(a) for a in node.args)
@@ -1148,6 +1217,12 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         return idx
     if isinstance(expr, String):
         raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
+    if isinstance(expr, RollingJaxCall):
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+        idx = len(nodes)
+        nodes.append(DagNode(op=_build_rolling_jax_op(expr, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+        memo[key] = idx
+        return idx
     if isinstance(expr, StatelessJaxCall):
         child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
         idx = len(nodes)
@@ -1194,6 +1269,16 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
         if _expr_key(result) == _expr_key(expanded_node):
             return expanded_node
         return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
             fn=node.fn,
