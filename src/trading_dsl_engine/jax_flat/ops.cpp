@@ -517,9 +517,12 @@ public:
         std::vector<const double*> base_ptrs;
         base_ptrs.reserve(input_arrays.size());
         for (const auto& arr : input_arrays) base_ptrs.push_back(static_cast<const double*>(arr.request().ptr));
-        for (int64_t t = 0; t < rows; ++t) {
-            for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
-            eval_row(state, state.row_ptrs_, &out_buf(t, 0));
+        {
+            py::gil_scoped_release release;
+            for (int64_t t = 0; t < rows; ++t) {
+                for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
+                eval_row(state, state.row_ptrs_, &out_buf(t, 0));
+            }
         }
     }
 

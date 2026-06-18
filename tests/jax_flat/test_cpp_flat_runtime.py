@@ -332,6 +332,43 @@ def test_cpp_hybrid_batch_handles_multiple_jax_frontiers_and_native_islands():
     assert type(hybrid_state).__name__ == "CppFlatState"
 
 
+def test_cpp_hybrid_candidates_allow_shared_input_independent_islands():
+    from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, roll_mean, self_, var
+    from trading_dsl_engine.jax_flat import engine_cpp, stateless
+
+    plus_one = stateless(lambda x: x + 1.0, name="plus_one")
+    minus_one = stateless(lambda x: x - 1.0, name="minus_one")
+    affine_square = stateless(lambda x: x * x + 0.25, name="affine_square")
+    grouped = groupby((var("key"),), var("close"), cumsum(self_))
+    formula = (
+        plus_one(grouped)
+        + minus_one(ewm(var("close"), 21.0))
+    ) * (affine_square(roll_mean(var("close"), 64, 8)) + 3.0)
+
+    runtime = compile_formula(formula, cpp=False)
+
+    assert engine_cpp._cpp_hybrid_candidates(runtime.program) == (2, 5, 10)
+
+def test_cpp_hybrid_runs_jax_frontier_islands_in_parallel(monkeypatch):
+    from trading_dsl_engine.jax_flat import engine_cpp
+    from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime
+
+    runtime = compile_formula("add(close, open)", cpp=False)
+    data = (jax.numpy.ones((2, 2), dtype=jax.numpy.float64), jax.numpy.ones((2, 2), dtype=jax.numpy.float64))
+    starts = []
+
+    def slow_run_batch_once(self, inputs, states, use_cpp):
+        starts.append(time.perf_counter())
+        time.sleep(0.20)
+        return None, jax.numpy.asarray(float(self.program.outputs[0]))
+
+    monkeypatch.setattr(JaxFlatRuntime, "_run_batch_once", slow_run_batch_once)
+
+    values = engine_cpp._run_jax_frontiers(runtime, (), (0, 1), data)
+
+    assert max(starts) - min(starts) < 0.10
+    np.testing.assert_allclose(values, np.asarray([0.0, 1.0]))
+
 def test_cpp_hybrid_batch_accepts_memmap_inputs(tmp_path):
     rows = 18
     cols = 4
