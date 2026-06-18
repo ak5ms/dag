@@ -706,6 +706,17 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
                 spec = FieldSpec(UnitInfo.dimensionless(), _call_range(ops[fn], [args[0].range, args[1].range]), frozenset({"boolean"}))
         if spec is None and fn == "isnan" and len(args) == 1:
             spec = _constant(0.0, {"boolean"}) if isinstance(node.args[0], Number) else FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}), args[0].width)
+        if spec is None and fn == "xs_rank" and len(args) == 1:
+            spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset({"dimensionless"}), args[0].width)
+        if spec is None and fn == "clip" and len(args) == 3:
+            lower = _number(node.args[1])
+            upper = _number(node.args[2])
+            if lower is not None and upper is not None:
+                lo, hi = (lower, upper) if lower <= upper else (upper, lower)
+                in_range = args[0].range
+                bounded_lower = max(in_range.lower, lo) if isfinite(in_range.lower) else lo
+                bounded_upper = min(in_range.upper, hi) if isfinite(in_range.upper) else hi
+                spec = FieldSpec(args[0].units, ValueRange(bounded_lower, bounded_upper), args[0].types, args[0].width)
         if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
             width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)

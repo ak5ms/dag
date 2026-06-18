@@ -14,7 +14,7 @@ from trading_dsl_engine.base.alpha_search import (
     ridge_pool_alpha_pnl,
     search_formulas,
 )
-from trading_dsl_engine.base.dsl import var
+from trading_dsl_engine.base.dsl import clip, xs_rank, var
 from trading_dsl_engine.base.metadata import analyze_formula_metadata
 from trading_dsl_engine.base.parser import Call, Expr
 
@@ -84,6 +84,15 @@ def test_filter_alpha_candidates_by_static_range_and_type_tags():
     valid_meta = analyze_formula_metadata(valid[0], fields)
     assert valid_meta.get_range().as_tuple() == (0.0, 1.0)
     assert "dimensionless" in valid_meta.get_types()
+
+
+def test_rank_clip_range_metadata_for_price_ratio_alpha():
+    fields = futures_field_metadata(levels=range(1))
+    expr = clip(xs_rank(var("mp_out0.open") / var("mp_out0.close")), -3.0, 3.0)
+    meta = analyze_formula_metadata(expr, fields)
+
+    assert meta.get_range().as_tuple() == (0.0, 1.0)
+    assert "dimensionless" in meta.get_types()
 
 
 def test_depth_three_generation_example_filters_dimensionless_not_in_pool():
