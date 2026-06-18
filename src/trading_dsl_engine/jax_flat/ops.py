@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Callable
 
 import jax
@@ -137,6 +138,8 @@ class NaryOp(Op):
     cpp_param: float = 0.0
     cpp_int_param: int = 0
     cpp_str_param: str = ""
+    metadata_range: Callable[[tuple[Any, ...], tuple[float | None, ...]], tuple[float, float] | None] | None = None
+    metadata_types: tuple[str, ...] = ()
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
@@ -972,6 +975,16 @@ def _xs_norm(x):
     return jnp.where(denom > 0.0, x / denom, jnp.nan)
 
 
+def _clip_metadata_range(ranges: tuple[Any, ...], literals: tuple[float | None, ...]) -> tuple[float, float] | None:
+    if len(ranges) != 3 or len(literals) != 3 or literals[1] is None or literals[2] is None:
+        return None
+    lo, hi = (literals[1], literals[2]) if literals[1] <= literals[2] else (literals[2], literals[1])
+    in_range = ranges[0]
+    lower = max(in_range.lower, lo) if isfinite(in_range.lower) else lo
+    upper = min(in_range.upper, hi) if isfinite(in_range.upper) else hi
+    return lower, upper
+
+
 def _xs_rank(x):
     valid = jnp.isfinite(x)
     n_valid = jnp.sum(valid).astype(jnp.int32)
@@ -1021,7 +1034,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction"),
     ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
     ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
-    ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
+    ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank", metadata_range=lambda _ranges, _literals: (0.0, 1.0), metadata_types=("dimensionless",)),
     ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
     ("get_preds", 1): lambda: NaryOp(lambda x: x.preds, cpp_name="get_preds"),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
@@ -1047,7 +1060,7 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
     ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
     ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
-    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
+    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip", metadata_range=_clip_metadata_range),
     ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
 }
 
