@@ -265,3 +265,64 @@ def test_unit_incompatible_addition_keeps_formula_compilable_with_unknown_units(
     assert runtime.get_units().is_unknown()
     assert runtime.get_units().as_dict() == {}
     assert runtime.get_range().as_tuple() == (-inf, inf)
+
+
+def test_futures_field_metadata_expands_user_schema_and_filters_tags():
+    from trading_dsl_engine.base.terminals import feature_names_with_tags, futures_field_metadata
+
+    fields = futures_field_metadata(levels=range(2))
+    assert fields["ap1_out0"]["range"] == ">0"
+    assert {"price", "ask", "level_1", "front_month_contract"}.issubset(fields["ap1_out0"]["types"])
+    assert fields["is_tradable_out0"]["range"] == "boolean"
+    front_prices = feature_names_with_tags(fields, include=("price", "front_month_contract"))
+    assert "mp_out0.close" in front_prices
+    assert "mp_out1.close" not in front_prices
+
+
+def test_filter_alpha_candidates_by_static_range_and_type_tags():
+    from math import isfinite
+
+    from trading_dsl_engine.base.dsl import var
+    from trading_dsl_engine.base.terminals import futures_field_metadata
+
+    fields = futures_field_metadata(levels=range(1))
+
+    def is_bounded_dimensionless(expr):
+        meta = metadata_module.analyze_formula_metadata(expr, fields)
+        value_range = meta.get_range()
+        return (
+            "dimensionless" in meta.get_types()
+            and isfinite(value_range.lower)
+            and isfinite(value_range.upper)
+        )
+
+    candidates = [var("vw_halfspread_out0"), var("vwap_out0"), var("volume_out0")]
+    valid = [candidate for candidate in candidates if is_bounded_dimensionless(candidate)]
+
+    assert valid == [var("vw_halfspread_out0")]
+    valid_meta = metadata_module.analyze_formula_metadata(valid[0], fields)
+    assert valid_meta.get_range().as_tuple() == (0.0, 1.0)
+    assert "dimensionless" in valid_meta.get_types()
+
+
+def test_complex_alpha_node_units_and_type_relations():
+    from trading_dsl_engine.base.dsl import clip, xs_rank, var
+    from trading_dsl_engine.base.terminals import futures_field_metadata, futures_type_relations
+
+    fields = futures_field_metadata(levels=range(1))
+    config = metadata_module.metadata(fields, type_relations=futures_type_relations(levels=range(1)))
+    expr = clip(xs_rank(var("mp_out0.open") / var("mp_out0.close")), -3.0, 3.0) + var("vw_halfspread_out0")
+    meta = metadata_module.analyze_formula_metadata(expr, config)
+    by_label = {node.label: node.metadata for node in meta.get_node_metadata()}
+
+    assert by_label["mp_out0.open"].units.as_dict() == {"price": 1.0}
+    assert by_label["mp_out0.close"].units.as_dict() == {"price": 1.0}
+    assert "price" in by_label["mp_out0.open"].types
+    assert "book_level" in by_label["mp_out0.open"].types
+    assert by_label["div"].units.as_dict() == {}
+    assert "ratio" in by_label["div"].types
+    assert by_label["xs_rank"].units.as_dict() == {}
+    assert by_label["clip"].units.as_dict() == {}
+    assert by_label["vw_halfspread_out0"].units.as_dict() == {}
+    assert "dimensionless" in by_label["vw_halfspread_out0"].types
+    assert meta.get_units().as_dict() == {}

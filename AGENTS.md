@@ -28,6 +28,7 @@ Priorities, in order:
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Keep op-specific private helper functions on the relevant operator class as `@staticmethod`; these static methods may be reused from another class when that is the cleanest shared implementation.
 - Formula metadata must stay static and off the compiled hot path: unit/type/range propagation should run at compile time, expose runtime inspection methods such as `get_units()`/`get_range()`, and avoid changing streaming tick or batch semantics.
+- Formula alpha generation/search belongs at Python compile/search time; keep DEAP evolution, objective orchestration, and candidate filtering outside JAX-flat live/batch hot paths.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
 - When adding new active `jax_flat` operators, implement both the pure JAX-flat operator and corresponding native C++ lowering/runtime support unless the task explicitly scopes C++ out; document and test any intentional C++ fallback.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
@@ -36,6 +37,8 @@ Priorities, in order:
 
 - Shared parser/validation changes: `src/trading_dsl_engine/base/parser.py`
 - Shared DSL macro composition + registry isolation: `src/trading_dsl_engine/base/dsl.py`
+- Shared formula-alpha search scaffolding and DEAP integration: `src/trading_dsl_engine/base/alpha_search.py`
+- Shared field terminal schemas/type relations for formula search: `src/trading_dsl_engine/base/terminals.py`
 - Shared operator plugin specs: `src/trading_dsl_engine/base/registry.py`
 - Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
 - Active JAX-flat op kernels/factories: `src/trading_dsl_engine/jax_flat/ops.py`
@@ -98,6 +101,7 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 `pytest` is configured in `pyproject.toml` to run with pytest-xdist using 12 workers (`-n 12`). Run perf tests with `-n 0` because their wall-clock guardrails are calibrated for serial benchmark execution. If perf tests are too heavy for the environment, clearly note that and run the targeted non-performance test(s) instead.
 
 - Always run the targeted non-performance `jax_flat`/DSL tests at the end before finalizing unless explicitly told not to.
+- Before adding a new test file, review the relevant existing tests directory and place tests into an existing focused `.py` file when one already covers that behavior, rather than creating a new mixed-concern test file by default.
 - Pytest output is configured to include per-test durations; use this to catch regressions in compile/runtime costs.
 - Whenever behavior/architecture expectations change, update both `README.md` and `AGENTS.md` in the same PR.
 
