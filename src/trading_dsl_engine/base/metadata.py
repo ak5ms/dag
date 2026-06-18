@@ -625,15 +625,42 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
         nodes.append(NodeMetadata(_label(node), _expr_key(node), spec))
         return spec
 
+    # Metadata propagation is pure for a given expression and active self_ binding.
+    # Large Python-composed formulas often reuse the same Expr objects/subtrees
+    # multiple times; without memoization, range tracing revisits every duplicate
+    # subtree and can spend most compile time in interval sampling.
+    analysis_cache: dict[tuple[tuple, tuple], FieldSpec] = {}
+
+    def spec_key(spec: FieldSpec) -> tuple:
+        return (
+            tuple(sorted(spec.units.as_dict().items())),
+            spec.units.is_unknown(),
+            spec.range.as_tuple(),
+            tuple(sorted(spec.types)),
+            spec.width,
+        )
+
+    def cache_context() -> tuple:
+        return tuple(spec_key(spec) for spec in self_stack)
+
     def analyze(node: Expr) -> FieldSpec:
+        key = (_expr_key(node), cache_context())
+        cached = analysis_cache.get(key)
+        if cached is not None:
+            return record(node, cached)
+
+        def finish(spec: FieldSpec) -> FieldSpec:
+            spec = close(spec)
+            analysis_cache[key] = spec
+            return record(node, spec)
         if isinstance(node, Identifier):
             if node.name == "self_" and self_stack:
-                return record(node, self_stack[-1])
-            return record(node, cfg.fields.get(node.name, FieldSpec()))
+                return finish(self_stack[-1])
+            return finish(cfg.fields.get(node.name, FieldSpec()))
         if isinstance(node, Number):
-            return record(node, _constant(float(node.value)))
+            return finish(_constant(float(node.value)))
         if isinstance(node, (String, Universe, KeyTuple)):
-            return record(node, FieldSpec())
+            return finish(FieldSpec())
         if hasattr(node, "fn") and hasattr(node, "output_width") and hasattr(node, "args"):
             args = [analyze(arg) for arg in node.args]
             lowered_name = (getattr(node, "name", None) or "").lower()
@@ -650,9 +677,9 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
             else:
                 rng = _call_range(node.fn, [arg.range for arg in args])
             width = getattr(node, "output_width", None) or (args[0].width if args else 1)
-            return record(node, FieldSpec(units, rng, types, width))
+            return finish(FieldSpec(units, rng, types, width))
         if not isinstance(node, Call):
-            return record(node, FieldSpec())
+            return finish(FieldSpec())
 
         if node.fn == "groupby" and len(node.args) == 3:
             _key = analyze(node.args[0])
@@ -662,7 +689,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
                 op_meta = analyze(node.args[2])
             finally:
                 self_stack.pop()
-            return record(node, op_meta if op_meta.range != ValueRange.unknown() or op_meta.types or op_meta.units.as_dict() else lhs)
+            return finish(op_meta if op_meta.range != ValueRange.unknown() or op_meta.types or op_meta.units.as_dict() else lhs)
 
         args = [analyze(arg) for arg in node.args]
         fn = node.fn
@@ -709,7 +736,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
         if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
             width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)
-        if spec is None and fn in {"InstrumentBasisMean", "get_beta"}:
+        if spec is None and fn in {"InstrumentBasisMean", "get_beta", "get_preds"}:
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), args[0].width if args else 1)
         if spec is None and fn in {"shift", "delay", "lag", "col", "buffer", "ffill", "cumsum"} and args:
             spec = args[0]
@@ -748,7 +775,7 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
             spec = FieldSpec(units, rng, types)
         if spec is None:
             spec = _auto_trace(node, args) or FieldSpec()
-        return record(node, spec)
+        return finish(spec)
 
     root = analyze(expr)
     return FormulaMetadata(root.units, root.range, root.types, cfg.fields, cfg.type_graph, tuple(nodes))

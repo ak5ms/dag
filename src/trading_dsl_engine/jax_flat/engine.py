@@ -13,10 +13,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, get_dsl_op_signature
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
-from trading_dsl_engine.jax_flat.custom import StatelessJaxCall
+from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
     InstrumentBasisMeanOp,
     RbfBasisOp,
@@ -29,6 +29,8 @@ from trading_dsl_engine.jax_flat.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    RollingMeanOp,
+    RollingOp,
     ANY_ARITY,
     OP_FACTORIES,
     Op,
@@ -203,7 +205,10 @@ class JaxFlatRuntime(eqx.Module):
         for idx, node in enumerate(self.program.nodes):
             op = node.op
             if isinstance(op, InputOp):
-                values[idx] = vector_sample
+                if op.output_kind == "matrix":
+                    values[idx] = jnp.zeros((n_instruments, op.output_width or n_instruments), dtype=jnp.float64)
+                else:
+                    values[idx] = vector_sample
                 continue
             if isinstance(op, LiteralOp):
                 values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
@@ -286,10 +291,15 @@ class JaxFlatRuntime(eqx.Module):
         for arr in inputs[1:]:
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-        if self.cpp and not self.program.cache_nodes and (not states or _is_cpp_flat_state(states)) and not _has_memmap_input(inputs) and not out_path:
-            accelerated = _try_cpp_accelerated_batch(self, inputs, states)
-            if accelerated is not None:
-                return accelerated
+        if self.cpp and not self.program.cache_nodes and not states and not out_path:
+            try:
+                from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
+            except Exception as exc:
+                _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
+            else:
+                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback)
+                if hybrid is not None:
+                    return hybrid
         if _has_memmap_input(inputs) or out_path:
             return _run_chunked_batch(self, inputs, states, out_path)
         result = _jit_batch_from_initial_state(self, inputs) if not states else _jit_batch(self, states, inputs)
@@ -300,45 +310,6 @@ class JaxFlatRuntime(eqx.Module):
 def _is_cpp_flat_state(states) -> bool:
     return type(states).__name__ == "CppFlatState"
 
-
-def _try_cpp_accelerated_batch(runtime: JaxFlatRuntime, inputs, states=None):
-    """Optionally run C++ flat batch for fully supported programs.
-
-    This is a runtime accelerator, not a semantic fallback: unsupported programs,
-    callers with explicit state, memmaps, or disabled native acceleration continue
-    through the normal JAX path. The C++ module is imported lazily so the standard
-    JAX-flat import path does not require a built extension.
-    """
-    if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
-        return None
-    # Avoid regressing the pure JAX vectorized path for simple formulas; the
-    # automatic accelerator currently targets grouped formulas where the native
-    # row transition materially improves steady-state runtime. Explicit
-    # trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...) remains available for non-group formulas.
-    if not any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
-        return None
-    try:
-        from trading_dsl_engine.jax_flat import _cpp_flat
-        from trading_dsl_engine.jax_flat.engine_cpp import _cpp_node_specs, _reshape_cpp_batch_output
-    except Exception as exc:
-        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
-        return None
-    try:
-        node_specs, _, state_count = _cpp_node_specs(runtime.program)
-    except NotImplementedError as exc:
-        _warn_cpp_fallback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
-        return None
-
-    n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
-    core = _CPP_ACCELERATOR_CACHE.get(key)
-    if core is None:
-        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
-        _CPP_ACCELERATOR_CACHE[key] = core
-    state = states if _is_cpp_flat_state(states) else core.init_state(n_instruments)
-    np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
-    raw = core.run_batch(state, *np_inputs)
-    return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
 
 
 def _warn_cpp_fallback(runtime: JaxFlatRuntime, message: str) -> None:
@@ -370,7 +341,7 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
                 f"({runtime.program.input_names}), got {len(inputs)}"
             )
     for name, arr in zip(runtime.program.input_names, inputs):
-        if arr.ndim != 2:
+        if arr.ndim != 2 and not name.startswith("__cpp_subgraph_"):
             raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
     return inputs
 
@@ -603,44 +574,97 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs):
 
 
 
+
+def _normalize_variadic_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if not name.startswith("arg") or not name[3:].isdigit():
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = int(name[3:])
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        raise ValueError(f"{fn} missing required argument 'arg{missing_position}' before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
+def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: dict[str, Expr] = {}
+    for name, value in kwargs:
+        if name not in {"y", "weights", "hl", "lambda_"}:
+            raise ValueError(f"Unsupported Ridge keyword argument(s): {[name]}")
+        if name in values:
+            raise ValueError(f"Ridge got multiple values for argument {name!r}")
+        values[name] = value
+
+    y = values.get("y")
+    hl = values.get("hl")
+    lambda_value = values.get("lambda_")
+    weights = values.get("weights")
+    tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
+    if any(value is None for value in tail):
+        raise ValueError("Ridge keyword form requires y, hl, and lambda_")
+    return args + tail
+
+
+def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    if not kwargs or fn == "groupby":
+        return args
+    if fn == "Ridge":
+        return _normalize_ridge_kwargs(args, kwargs)
+    if fn in {"cat", "einsum"}:
+        return _normalize_variadic_kwargs(fn, args, kwargs)
+
+    signature = get_dsl_op_signature(fn)
+    if signature is None:
+        return args
+    parameter_names = tuple(
+        name for name, param in signature.parameters.items() if param.kind is not param.VAR_POSITIONAL
+    )
+    positions_by_name = {name: idx for idx, name in enumerate(parameter_names)}
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if name not in positions_by_name:
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = positions_by_name[name]
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        expected = parameter_names[missing_position]
+        raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
 def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
     if isinstance(node, Call):
         args = tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args)
         kwargs = tuple((key, _normalize_static_jax_flat_kwargs(value)) for key, value in node.kwargs)
         if not kwargs:
             return Call(node.fn, args)
-        kw = dict(kwargs)
-        if node.fn == "shift":
-            unsupported = set(kw) - {"lag", "nlag", "max_lag", "max_size"}
-            if unsupported:
-                raise ValueError(f"Unsupported shift keyword argument(s): {sorted(unsupported)}")
-            lag = kw.pop("lag") if "lag" in kw else kw.pop("nlag", None)
-            max_lag = kw.pop("max_lag") if "max_lag" in kw else kw.pop("max_size", None)
-            if len(args) > 1 or (len(args) == 1 and lag is None):
-                raise ValueError("shift keyword form expects shift(x, lag=..., max_lag=...)")
-            if len(args) != 1 or lag is None or max_lag is None:
-                raise ValueError("shift keyword form requires x, lag, and max_lag")
-            return Call("shift", (args[0], lag, max_lag))
-        if node.fn == "cache":
-            unsupported = set(kw) - {"where", "storage"}
-            if unsupported:
-                raise ValueError(f"Unsupported cache keyword argument(s): {sorted(unsupported)}")
-            storage = kw.pop("where", kw.pop("storage", String("ram")))
-            if len(args) != 1:
-                raise ValueError("cache expects exactly one value argument")
-            return Call("cache", (args[0], storage))
-        if node.fn == "buffer":
-            unsupported = set(kw) - {"min", "max"}
-            if unsupported:
-                raise ValueError(f"Unsupported buffer keyword argument(s): {sorted(unsupported)}")
-            min_lag = kw.pop("min", None)
-            max_lag = kw.pop("max", None)
-            if len(args) > 1 or (len(args) == 1 and min_lag is None):
-                raise ValueError("buffer keyword form expects buffer(shift_expr, min=..., max=...)")
-            if len(args) != 1 or min_lag is None or max_lag is None:
-                raise ValueError("buffer keyword form requires shift_expr, min, and max")
-            return Call("buffer", (args[0], min_lag, max_lag))
-        return Call(node.fn, args, kwargs)
+        return Call(node.fn, _normalize_call_kwargs(node.fn, args, kwargs))
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
             fn=node.fn,
@@ -666,6 +690,17 @@ def _expr_key(node: Expr):
             node.fn,
             tuple(_expr_key(a) for a in node.args),
             tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return (
+            "jax_rolling",
+            id(node.fn),
+            node.lookback,
+            node.min_periods,
+            node.output_kind,
+            node.output_width,
+            node.name,
+            tuple(_expr_key(a) for a in node.args),
         )
     if isinstance(node, StatelessJaxCall):
         return (
@@ -726,6 +761,16 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
             node.fn,
             tuple(_replace_self(a, lhs) for a in node.args),
             tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_replace_self(arg, lhs) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
         )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
@@ -791,6 +836,14 @@ def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, in
     return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
 
 
+def _build_rolling_jax_op(expr: RollingJaxCall, child_ops: tuple[Op, ...]) -> Op:
+    if len(child_ops) != 1:
+        raise ValueError("rolling JAX call expects one child")
+    output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+    output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+    return RollingOp(expr.lookback, expr.min_periods, expr.fn, output_kind=output_kind, output_width=output_width)
+
+
 def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:
     if not child_ops:
         raise ValueError("stateless JAX call expects at least one child")
@@ -826,18 +879,20 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         output = subscripts.split("->", 1)[1] if "->" in subscripts else ""
         if output == "":
             return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="scalar", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
-        if output == "i":
-            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
-        if output in {"ij", "jk", "ik"}:
+        index_widths = {}
+        input_terms = subscripts.split("->", 1)[0].split(",")
+        for term, op in zip(input_terms, child_ops):
+            compact = term.replace("...", "")
+            if len(compact) >= 1:
+                index_widths.setdefault(compact[0], 1)
+            if len(compact) >= 2 and op.output_width is not None:
+                index_widths[compact[1]] = int(op.output_width)
+        if len(output) == 1:
+            width = index_widths.get(output, 1)
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
+        if len(output) == 2:
             # Matrix width is inferred from the last output index when possible;
             # dynamic widths (for outer-like i,j output) use None.
-            index_widths = {}
-            input_terms = subscripts.split("->", 1)[0].split(",")
-            for term, op in zip(input_terms, child_ops):
-                if len(term) == 2 and op.output_width is not None:
-                    index_widths[term[1]] = int(op.output_width)
-                elif term == "i":
-                    index_widths["i"] = 1
             width = index_widths.get(output[-1])
             return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="matrix", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
     variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
@@ -850,10 +905,31 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
-    if expr.fn == "ewm" and len(expr.args) == 2:
-        if isinstance(expr.args[1], Number):
-            return EwmOp(span=float(expr.args[1].value)), 1
-        return EwmOp(), None
+    if expr.fn == "ewm" and len(expr.args) in (2, 3):
+        span = float(expr.args[1].value) if isinstance(expr.args[1], Number) else None
+        min_periods = None
+        drop: int | tuple[int, ...] | None = 1 if span is not None else None
+        if len(expr.args) == 3:
+            if isinstance(expr.args[2], Number):
+                min_periods = float(expr.args[2].value)
+                drop = (1, 2) if span is not None else 2
+            else:
+                drop = 1 if span is not None else None
+        return EwmOp(span=span, min_periods=min_periods), drop
+    if expr.fn == "roll_mean" and len(expr.args) in (2, 3):
+        lookback = _literal_int_arg(expr.args[1], "roll_mean", 2)
+        min_periods = lookback if len(expr.args) == 2 else _literal_int_arg(expr.args[2], "roll_mean", 3)
+        if lookback <= 0 or min_periods <= 0 or min_periods > lookback:
+            raise ValueError("roll_mean expects 0 < min_periods <= lookback")
+        return (
+            RollingMeanOp(
+                lookback=lookback,
+                min_periods=min_periods,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            tuple(range(1, len(expr.args))),
+        )
     if expr.fn == "ffill" and len(expr.args) in (1, 2):
         limit = None
         dynamic_limit = False
@@ -983,6 +1059,13 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
             return idx
         if isinstance(node, String):
             raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
+
+        if isinstance(node, RollingJaxCall):
+            child_ids = tuple(build(a) for a in node.args)
+            idx = len(nodes)
+            nodes.append(DagNode(op=_build_rolling_jax_op(node, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+            memo[key] = idx
+            return idx
 
         if isinstance(node, StatelessJaxCall):
             child_ids = tuple(build(a) for a in node.args)
@@ -1148,6 +1231,12 @@ def _compile_node(expr: Expr, memo: dict[tuple[Any, ...], int], nodes: list[DagN
         return idx
     if isinstance(expr, String):
         raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
+    if isinstance(expr, RollingJaxCall):
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
+        idx = len(nodes)
+        nodes.append(DagNode(op=_build_rolling_jax_op(expr, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+        memo[key] = idx
+        return idx
     if isinstance(expr, StatelessJaxCall):
         child_ids = tuple(_compile_node(a, memo, nodes, input_names) for a in expr.args)
         idx = len(nodes)
@@ -1194,6 +1283,16 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
         if _expr_key(result) == _expr_key(expanded_node):
             return expanded_node
         return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
     if isinstance(node, StatelessJaxCall):
         return StatelessJaxCall(
             fn=node.fn,
@@ -1216,6 +1315,7 @@ def compile_formula(
     type_relations=(),
 ) -> JaxFlatRuntime:
     expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
     metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)

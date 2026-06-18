@@ -44,6 +44,41 @@ class StatelessJaxFunction:
         )
 
 
+@dataclass(frozen=True, eq=False)
+class RollingJaxCall(Expr):
+    """Expression node for experimental rolling-window JAX callables."""
+
+    fn: Callable[[jax.Array], jax.Array]
+    args: tuple[Expr, ...]
+    lookback: int
+    min_periods: int
+    output_kind: OutputKind | None = None
+    output_width: int | None = None
+    name: str | None = None
+
+
+def rolling(x, lookback: int, min_periods: int | None, fn: Callable[[jax.Array], jax.Array], *, output_kind: OutputKind | None = None, output_width: int | None = None, name: str | None = None) -> RollingJaxCall:
+    """Build an experimental generic rolling-window expression.
+
+    ``fn`` receives a ``(lookback, ...)`` JAX array with unavailable/invalid
+    observations represented as NaN and should reduce over axis 0.
+    """
+
+    lookback_i = int(lookback)
+    min_periods_i = lookback_i if min_periods is None else int(min_periods)
+    if lookback_i <= 0 or min_periods_i <= 0 or min_periods_i > lookback_i:
+        raise ValueError("rolling expects 0 < min_periods <= lookback")
+    return RollingJaxCall(
+        fn=fn,
+        args=(ensure_expr(x),),
+        lookback=lookback_i,
+        min_periods=min_periods_i,
+        output_kind=output_kind,
+        output_width=output_width,
+        name=name or getattr(fn, "__name__", None),
+    )
+
+
 def stateless(
     fn: Callable[..., jax.Array] | None = None,
     *,

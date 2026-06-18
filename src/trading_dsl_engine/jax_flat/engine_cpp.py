@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Callable
+import os
 
+import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
@@ -10,6 +12,7 @@ from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.jax_flat.engine import (
     DagNode,
     InnerGraphOp,
+    StateFieldRef,
     StateLayout,
     StreamingProgram,
     compile_formula as compile_formula_jax,
@@ -28,6 +31,7 @@ from trading_dsl_engine.jax_flat.ops import (
     Op,
     RbfBasisOp,
     RidgeOp,
+    RollingMeanOp,
     ShiftOp,
 )
 
@@ -214,8 +218,13 @@ def _cpp_node_specs(program: StreamingProgram):
             supported.append("cumsum")
             continue
         if isinstance(op, EwmOp) and op.span is not None:
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, width=width))
+            min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
             supported.append("ewm")
+            continue
+        if isinstance(op, RollingMeanOp):
+            specs.append(spec_tuple("roll_mean", node.child_ids, state_index=state_index, param=op.min_periods, int_param=op.lookback, width=width))
+            supported.append("roll_mean")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:
             limit = -1 if op.limit is None else op.limit
@@ -324,7 +333,8 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
             supported.append("inner_cumsum")
             continue
         if isinstance(op, EwmOp) and op.span is not None:
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, width=width))
+            min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
             supported.append("inner_ewm")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:
@@ -334,6 +344,260 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
             continue
         raise NotImplementedError(f"C++ jax_flat groupby inner node {idx} unsupported: {type(op).__name__}")
     return tuple(specs), supported
+
+
+# --- JAX/C++ island handling for hybrid jax_flat batch execution: start ---
+
+def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None]):
+    """Run full-native or staged native/JAX/native batch execution when possible."""
+    if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
+        return None
+    full = _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=False)
+    if full is not None:
+        return full
+
+    candidates = _cpp_hybrid_candidates(runtime.program)
+    if not candidates:
+        if any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
+            _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        return None
+    try:
+        from trading_dsl_engine.jax_flat import _cpp_flat
+    except Exception as exc:
+        warn_callback(runtime, f"C++ jax_flat hybrid accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
+        return None
+
+    n_steps, n_instruments = inputs[0].shape
+    extra_inputs = []
+    candidate_programs = []
+    for node_id in candidates:
+        subprogram = _subprogram_for_node(runtime.program, node_id)
+        try:
+            node_specs, _, state_count = _cpp_node_specs(subprogram)
+        except NotImplementedError:
+            continue
+        key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
+        core = accelerator_cache.get(key)
+        if core is None:
+            core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
+            accelerator_cache[key] = core
+        state = core.init_state(n_instruments)
+        raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
+        extra_inputs.append(np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)))
+        candidate_programs.append(node_id)
+    if not extra_inputs:
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        return None
+
+    staged = _try_cpp_staged_output_batch(runtime, inputs, tuple(candidate_programs), tuple(extra_inputs), accelerator_cache)
+    if staged is not None:
+        return staged
+
+    residual = _program_with_cpp_inputs(runtime.program, tuple(candidate_programs))
+    residual_runtime = replace(runtime, program=residual, cpp=False)
+    residual_inputs = tuple(inputs) + tuple(jnp.asarray(arr) for arr in extra_inputs)
+    return residual_runtime._run_batch_once(residual_inputs, None, False)
+
+
+def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], *, emit_warning: bool):
+    try:
+        from trading_dsl_engine.jax_flat import _cpp_flat
+        node_specs, _, state_count = _cpp_node_specs(runtime.program)
+    except Exception as exc:
+        if emit_warning:
+            warn_callback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
+        return None
+
+    n_steps, n_instruments = inputs[0].shape
+    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
+    core = accelerator_cache.get(key)
+    if core is None:
+        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
+        accelerator_cache[key] = core
+    state = core.init_state(n_instruments)
+    raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
+    return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
+
+
+def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, ...], upstream_values: tuple[np.ndarray, ...], accelerator_cache: dict[tuple[Any, ...], Any]):
+    if len(runtime.program.outputs) != 1:
+        return None
+    root_id = runtime.program.outputs[0]
+    try:
+        subprogram, frontier_ids = _subprogram_for_node_with_frontier(runtime.program, root_id)
+    except NotImplementedError:
+        return None
+    if not frontier_ids:
+        return None
+    try:
+        from trading_dsl_engine.jax_flat import _cpp_flat
+        node_specs, _, state_count = _cpp_node_specs(subprogram)
+    except Exception:
+        return None
+
+    residual = _program_with_cpp_inputs(runtime.program, upstream_node_ids)
+    residual = replace(residual, outputs=frontier_ids)
+    residual_runtime = replace(runtime, program=residual, cpp=False)
+    residual_inputs = tuple(inputs) + tuple(jnp.asarray(arr) for arr in upstream_values)
+    _, frontier_out = residual_runtime._run_batch_once(residual_inputs, None, False)
+    frontier_values = _split_frontier_outputs(frontier_out, len(frontier_ids))
+
+    n_steps, n_instruments = inputs[0].shape
+    key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
+    core = accelerator_cache.get(key)
+    if core is None:
+        core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
+        accelerator_cache[key] = core
+    state = core.init_state(n_instruments)
+    original_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+    frontier_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in frontier_values)
+    raw = core.run_batch(state, *(original_inputs + frontier_inputs))
+    return state, _reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)
+
+
+def _split_frontier_outputs(frontier_out, n_frontiers: int) -> tuple[np.ndarray, ...]:
+    if n_frontiers == 1:
+        return (np.asarray(frontier_out),)
+    arr = np.asarray(frontier_out)
+    if arr.ndim >= 1 and arr.shape[0] == n_frontiers:
+        return tuple(np.asarray(arr[i]) for i in range(n_frontiers))
+    return tuple(np.asarray(x) for x in frontier_out)
+
+
+def _is_cpp_boundary_op(op: Op) -> bool:
+    return (
+        isinstance(
+            op,
+            (
+                InputOp,
+                LiteralOp,
+                CacheOp,
+                GroupByOp,
+                CumsumOp,
+                EwmOp,
+                FFillOp,
+                RollingMeanOp,
+                ShiftOp,
+                RbfBasisOp,
+                FutureRbfBasisSumOp,
+                InstrumentBasisMeanOp,
+                RidgeOp,
+            ),
+        )
+        or (isinstance(op, NaryOp) and op.cpp_name is not None)
+    )
+
+
+def _subprogram_for_node_with_frontier(program: StreamingProgram, node_id: int) -> tuple[StreamingProgram, tuple[int, ...]]:
+    frontier: list[int] = []
+    remap: dict[int, int] = {}
+    nodes: list[DagNode] = []
+
+    def build(old_id: int, *, force_frontier: bool = False) -> int:
+        if old_id in remap:
+            return remap[old_id]
+        op = program.nodes[old_id].op
+        if force_frontier or not _is_cpp_boundary_op(op):
+            if old_id not in frontier:
+                frontier.append(old_id)
+            input_index = len(program.input_names) + frontier.index(old_id)
+            remap[old_id] = len(nodes)
+            nodes.append(DagNode(InputOp(input_index, output_kind=op.output_kind, output_width=op.output_width), ()))
+            return remap[old_id]
+        child_ids = []
+        for child_id in program.nodes[old_id].child_ids:
+            child_op = program.nodes[child_id].op
+            child_ids.append(build(child_id, force_frontier=not _is_cpp_boundary_op(child_op)))
+        remap[old_id] = len(nodes)
+        nodes.append(DagNode(op, tuple(child_ids)))
+        return remap[old_id]
+
+    root_op = program.nodes[node_id].op
+    if not _is_cpp_boundary_op(root_op):
+        raise NotImplementedError("root is not C++ lowerable")
+    output = build(node_id)
+    subprogram = StreamingProgram(
+        nodes=tuple(nodes),
+        outputs=(output,),
+        input_names=program.input_names + tuple(f"__jax_frontier_{idx}" for idx in frontier),
+        state_layout=_state_layout_for_nodes(tuple(nodes)),
+        metadata=None,
+        cache_nodes=(),
+    )
+    _cpp_node_specs(subprogram)
+    return subprogram, tuple(frontier)
+
+
+def _cpp_hybrid_candidates(program: StreamingProgram) -> tuple[int, ...]:
+    selected: list[int] = []
+    covered: set[int] = set()
+    for node_id in range(len(program.nodes) - 1, -1, -1):
+        if node_id in covered or node_id in program.outputs:
+            continue
+        op = program.nodes[node_id].op
+        ancestors = _ancestor_ids(program, node_id)
+        is_projection = isinstance(op, NaryOp) and op.cpp_name in {"get_beta", "get_preds"}
+        is_supported_stateless = (
+            isinstance(op, NaryOp)
+            and op.cpp_name is not None
+            and any(program.nodes[cid].op.is_stateful for cid in ancestors if cid != node_id)
+        )
+        if not (is_projection or is_supported_stateless or isinstance(op, (GroupByOp, CumsumOp, EwmOp, FFillOp, RollingMeanOp, ShiftOp))):
+            continue
+        if ancestors & covered:
+            continue
+        try:
+            _cpp_node_specs(_subprogram_for_node(program, node_id))
+        except Exception:
+            continue
+        selected.append(node_id)
+        covered.update(ancestors)
+    return tuple(sorted(selected))
+
+
+def _ancestor_ids(program: StreamingProgram, node_id: int) -> set[int]:
+    seen: set[int] = set()
+    stack = [node_id]
+    while stack:
+        idx = stack.pop()
+        if idx in seen:
+            continue
+        seen.add(idx)
+        stack.extend(program.nodes[idx].child_ids)
+    return seen
+
+
+def _state_layout_for_nodes(nodes: tuple[DagNode, ...]) -> StateLayout:
+    fields = []
+    total = 0
+    for node in nodes:
+        if node.op.is_stateful:
+            fields.append(StateFieldRef(total))
+            total += 1
+        else:
+            fields.append(StateFieldRef(-1))
+    return StateLayout(tuple(fields), total)
+
+
+def _subprogram_for_node(program: StreamingProgram, node_id: int) -> StreamingProgram:
+    ids = sorted(_ancestor_ids(program, node_id))
+    remap = {old: new for new, old in enumerate(ids)}
+    nodes = tuple(DagNode(program.nodes[old].op, tuple(remap[c] for c in program.nodes[old].child_ids)) for old in ids)
+    return StreamingProgram(nodes=nodes, outputs=(remap[node_id],), input_names=program.input_names, state_layout=_state_layout_for_nodes(nodes), metadata=None, cache_nodes=())
+
+
+def _program_with_cpp_inputs(program: StreamingProgram, node_ids: tuple[int, ...]) -> StreamingProgram:
+    replacements = {node_id: len(program.input_names) + i for i, node_id in enumerate(node_ids)}
+    nodes = []
+    for idx, node in enumerate(program.nodes):
+        if idx in replacements:
+            op = node.op
+            nodes.append(DagNode(InputOp(replacements[idx], output_kind=op.output_kind, output_width=op.output_width), ()))
+        else:
+            nodes.append(node)
+    return replace(program, nodes=tuple(nodes), input_names=program.input_names + tuple(f"__cpp_subgraph_{i}" for i in node_ids), state_layout=_state_layout_for_nodes(tuple(nodes)))
+
+# --- JAX/C++ island handling for hybrid jax_flat batch execution: end ---
 
 def _require_vector_cpp_op(op: Op, name: str) -> None:
     if op.output_kind != "vector" or op.output_width not in (None, 1):

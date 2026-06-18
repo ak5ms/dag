@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
-from trading_dsl_engine.jax_flat.custom import StatelessJaxCall, StatelessJaxFunction, stateless
+from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall, StatelessJaxFunction, rolling, stateless
 from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
 
 
@@ -36,8 +36,10 @@ __all__ = [
     "_cpp_flat",
     "compile_formula",
     "StatelessJaxCall",
+    "RollingJaxCall",
     "StatelessJaxFunction",
     "stateless",
+    "rolling",
     "MetadataConfig",
     "NodeMetadata",
     "TypeRelationGraph",

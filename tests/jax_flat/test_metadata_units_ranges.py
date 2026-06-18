@@ -3,6 +3,7 @@ from math import inf
 from pathlib import Path
 
 from trading_dsl_engine.base import metadata as metadata_module
+from trading_dsl_engine.base.dsl import cumsum, exp, ln, shift, var
 from trading_dsl_engine.jax_flat import UnitInfo, ValueRange, compile_formula, field, metadata
 from trading_dsl_engine.jax_flat.ops import NaryOp, OP_FACTORIES
 
@@ -250,6 +251,29 @@ def test_session_pov_roll_formula_metadata_traces_through_root_roll():
     _assert_any_node(runtime, "sub", frozenset({"return"}), ValueRange(-0.5, 1.0), {})
     _assert_any_node(runtime, "cat", frozenset({"return"}), ValueRange(-0.5, 1.0), {}, width=2)
     _assert_any_node(runtime, "einsum", frozenset({"return"}), ValueRange(-1.0, 2.0), {})
+
+
+def test_metadata_analysis_reuses_repeated_subtrees(monkeypatch):
+    calls = {"count": 0}
+    original = metadata_module._call_range
+
+    def counted_call_range(fn, ranges):
+        calls["count"] += 1
+        return original(fn, ranges)
+
+    monkeypatch.setattr(metadata_module, "_call_range", counted_call_range)
+    x = var("close")
+    ret = x / shift(x, 1, 1) - 1.0
+    repeated = exp(cumsum(ln(1.0 + ret)))
+
+    runtime = compile_formula(
+        repeated / repeated,
+        metadata={"close": field(units={"dollar": 1}, range=(100, 200), types=("price",))},
+        cpp=False,
+    )
+
+    assert runtime.get_range() == ValueRange(1.0, 1.0)
+    assert calls["count"] < 12
 
 
 def test_unit_incompatible_addition_keeps_formula_compilable_with_unknown_units():
