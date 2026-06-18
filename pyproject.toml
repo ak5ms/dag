@@ -18,6 +18,7 @@ dependencies = [
     "pybind11>=2.12",
     "includeigen",
     "unxt>=1.11",
+    "deap",
 ]
 
 [tool.pytest.ini_options]
