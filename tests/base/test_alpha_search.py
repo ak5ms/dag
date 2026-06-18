@@ -86,6 +86,15 @@ def test_filter_alpha_candidates_by_static_range_and_type_tags():
     assert "dimensionless" in valid_meta.get_types()
 
 
+def test_positive_price_ratio_range_metadata_is_nonnegative():
+    fields = futures_field_metadata(levels=range(1))
+    expr = var("mp_out0.open") / var("mp_out0.close")
+    meta = analyze_formula_metadata(expr, fields)
+
+    assert meta.get_range().lower == 0.0
+    assert meta.get_range().upper == float("inf")
+
+
 def test_rank_clip_range_metadata_for_price_ratio_alpha():
     fields = futures_field_metadata(levels=range(1))
     expr = clip(xs_rank(var("mp_out0.open") / var("mp_out0.close")), -3.0, 3.0)

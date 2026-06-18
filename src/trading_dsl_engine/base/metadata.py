@@ -514,7 +514,7 @@ def _auto_op(node: Call):
             return None
     if not isinstance(op, NaryOp):
         return None
-    return op, nonliteral
+    return op.fn, nonliteral
 
 
 def _call_range(fn: Callable[..., Any], ranges: Sequence[ValueRange]) -> ValueRange:
@@ -525,6 +525,18 @@ def _range_union(ranges: Sequence[ValueRange]) -> ValueRange:
     finite_lowers = [rng.lower for rng in ranges]
     finite_uppers = [rng.upper for rng in ranges]
     return ValueRange(min(finite_lowers), max(finite_uppers)) if ranges else ValueRange.unknown()
+
+
+def _div_value_range(numerator: ValueRange, denominator: ValueRange) -> ValueRange:
+    if denominator.lower <= 0.0 <= denominator.upper:
+        if numerator.lower >= 0.0 and denominator.upper > 0.0 and denominator.lower >= 0.0:
+            return ValueRange(0.0, inf)
+        return ValueRange.unknown()
+    if numerator.lower >= 0.0 and denominator.lower >= 0.0:
+        lower = numerator.lower / denominator.upper if isfinite(denominator.upper) else 0.0
+        upper = numerator.upper / denominator.lower if isfinite(numerator.upper) and denominator.lower > 0.0 else inf
+        return ValueRange(lower, upper)
+    return _call_range(lambda a, b: a / b, [numerator, denominator])
 
 
 def _core_call_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpec | None:
@@ -567,8 +579,8 @@ def _core_call_spec(fn_name: str, node: Call, args: list[FieldSpec]) -> FieldSpe
         if _is_literal(node.args[1], 1.0):
             return args[0]
         units = args[0].units / args[1].units
-        op = (lambda a, b: jnp.floor_divide(a, b)) if fn_name == "floordiv" else (lambda a, b: a / b)
-        return FieldSpec(units, _call_range(op, [args[0].range, args[1].range]), _types_for_numeric(fn_name, args, units))
+        rng = _call_range(lambda a, b: jnp.floor_divide(a, b), [args[0].range, args[1].range]) if fn_name == "floordiv" else _div_value_range(args[0].range, args[1].range)
+        return FieldSpec(units, rng, _types_for_numeric(fn_name, args, units))
     if fn_name == "pow" and len(args) == 2:
         if _is_literal(node.args[0], 1.0):
             return _constant(1.0)
@@ -594,17 +606,8 @@ def _auto_trace(node: Call, args: list[FieldSpec]) -> FieldSpec | None:
     built = _auto_op(node)
     if built is None:
         return None
-    op, nonliteral = built
+    fn, nonliteral = built
     ranges = [args[i].range for i in nonliteral]
-    literal_args = tuple(_number(expr) for expr in node.args)
-    width = args[nonliteral[0]].width if nonliteral else 1
-    units = args[nonliteral[0]].units if nonliteral and all(args[i].units == args[nonliteral[0]].units for i in nonliteral) else UnitInfo.dimensionless()
-    if op.metadata_types and "dimensionless" in op.metadata_types:
-        units = UnitInfo.dimensionless()
-    metadata_range = op.metadata_range(tuple(arg.range for arg in args), literal_args) if op.metadata_range is not None else None
-    if metadata_range is not None:
-        out_type = frozenset(op.metadata_types) if op.metadata_types else _types_for_numeric(node.fn, [args[i] for i in nonliteral], units)
-        return FieldSpec(units, ValueRange(*metadata_range), out_type, width)
 
     def wrapped(*xs):
         values = []
@@ -612,10 +615,12 @@ def _auto_trace(node: Call, args: list[FieldSpec]) -> FieldSpec | None:
         for index, expr in enumerate(node.args):
             literal = _number(expr)
             values.append(next(iterator) if index in nonliteral else literal)
-        return op.fn(*values)
+        return fn(*values)
 
     rng = _call_range(wrapped, ranges)
+    units = args[nonliteral[0]].units if nonliteral and all(args[i].units == args[nonliteral[0]].units for i in nonliteral) else UnitInfo.dimensionless()
     out_type = frozenset({"boolean"}) if rng == ValueRange.boolean() else _types_for_numeric(node.fn, [args[i] for i in nonliteral], units)
+    width = args[nonliteral[0]].width if nonliteral else 1
     return FieldSpec(units, rng, out_type, width)
 
 
@@ -713,6 +718,17 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
                 spec = FieldSpec(UnitInfo.dimensionless(), _call_range(ops[fn], [args[0].range, args[1].range]), frozenset({"boolean"}))
         if spec is None and fn == "isnan" and len(args) == 1:
             spec = _constant(0.0, {"boolean"}) if isinstance(node.args[0], Number) else FieldSpec(UnitInfo.dimensionless(), ValueRange.boolean(), frozenset({"boolean"}), args[0].width)
+        if spec is None and fn == "xs_rank" and len(args) == 1:
+            spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset({"dimensionless"}), args[0].width)
+        if spec is None and fn == "clip" and len(args) == 3:
+            lower = _number(node.args[1])
+            upper = _number(node.args[2])
+            if lower is not None and upper is not None:
+                lo, hi = (lower, upper) if lower <= upper else (upper, lower)
+                in_range = args[0].range
+                bounded_lower = max(in_range.lower, lo) if isfinite(in_range.lower) else lo
+                bounded_upper = min(in_range.upper, hi) if isfinite(in_range.upper) else hi
+                spec = FieldSpec(args[0].units, ValueRange(bounded_lower, bounded_upper), args[0].types, args[0].width)
         if spec is None and fn in {"rbf_basis", "future_rbf_basis_sum", "bspline"}:
             width = _literal_width(node.args[3]) if len(node.args) > 3 else 1
             spec = FieldSpec(UnitInfo.dimensionless(), ValueRange(0.0, 1.0), frozenset(), width)
