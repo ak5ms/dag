@@ -28,6 +28,7 @@ Priorities, in order:
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Keep op-specific private helper functions on the relevant operator class as `@staticmethod`; these static methods may be reused from another class when that is the cleanest shared implementation.
 - Formula metadata must stay static and off the compiled hot path: unit/type/range propagation should run at compile time, expose runtime inspection methods such as `get_units()`/`get_range()`, and avoid changing streaming tick or batch semantics.
+- Formula alpha generation/search belongs at Python compile/search time; keep DEAP evolution, objective orchestration, and candidate filtering outside JAX-flat live/batch hot paths.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
 - When adding new active `jax_flat` operators, implement both the pure JAX-flat operator and corresponding native C++ lowering/runtime support unless the task explicitly scopes C++ out; document and test any intentional C++ fallback.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
@@ -36,6 +37,7 @@ Priorities, in order:
 
 - Shared parser/validation changes: `src/trading_dsl_engine/base/parser.py`
 - Shared DSL macro composition + registry isolation: `src/trading_dsl_engine/base/dsl.py`
+- Shared formula-alpha search scaffolding and DEAP integration: `src/trading_dsl_engine/base/alpha_search.py`
 - Shared operator plugin specs: `src/trading_dsl_engine/base/registry.py`
 - Shared compile/lower pipeline: `src/trading_dsl_engine/base/compiler.py`
 - Active JAX-flat op kernels/factories: `src/trading_dsl_engine/jax_flat/ops.py`
