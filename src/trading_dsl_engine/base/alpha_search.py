@@ -248,8 +248,46 @@ def feature_names_with_tags(
     return tuple(out)
 
 
+def futures_type_relations(levels: Iterable[int] = range(10)) -> tuple[tuple[str, str], ...]:
+    edges = [
+        ("ask", "price"),
+        ("bid", "price"),
+        ("mid", "price"),
+        ("trade_vwap", "price"),
+        ("mid_price_vwap", "price"),
+        ("spread_fraction", "dimensionless"),
+        ("boolean_0_1", "dimensionless"),
+        ("trade_cross_pct", "contract_quantity_weighted_dimensionless"),
+        ("day_count", "calendar_time"),
+        ("event_timestamp", "calendar_time"),
+        ("session_start", "calendar_time"),
+        ("session_end", "calendar_time"),
+        ("next_session_start", "calendar_time"),
+        ("next_session_end", "calendar_time"),
+    ]
+    edges.extend((f"level_{level}", "book_level") for level in levels)
+    return tuple(edges)
+
+
 def _field(types: Iterable[str], value_range: str | tuple[float, float]) -> dict[str, object]:
-    return {"types": tuple(types), "range": value_range}
+    type_tuple = tuple(types)
+    out: dict[str, object] = {"types": type_tuple, "range": value_range}
+    unit = _unit_for_types(type_tuple)
+    if unit is not None:
+        out["units"] = unit
+    return out
+
+
+def _unit_for_types(types: tuple[str, ...]) -> str | None:
+    if "price" in types:
+        return "price"
+    if "calendar_time" in types:
+        return "calendar_time"
+    if "contract_quantity" in types or "contract_quantity_weighted_dimensionless" in types:
+        return "contract_quantity"
+    if "count" in types:
+        return "count"
+    return None
 
 
 def _terminal_name(prefix: str, idx: int, value: Expr | str | int | float) -> str:
@@ -270,6 +308,7 @@ __all__ = [
     "ewm_var",
     "feature_names_with_tags",
     "futures_field_metadata",
+    "futures_type_relations",
     "individual_to_expr",
     "make_alpha_pset",
     "ridge_pool_alpha_pnl",

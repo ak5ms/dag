@@ -8,6 +8,7 @@ from trading_dsl_engine.base.alpha_search import (
     PositiveIntScalar,
     feature_names_with_tags,
     futures_field_metadata,
+    futures_type_relations,
     default_alpha_pnl,
     individual_to_expr,
     make_alpha_pset,
@@ -15,7 +16,7 @@ from trading_dsl_engine.base.alpha_search import (
     search_formulas,
 )
 from trading_dsl_engine.base.dsl import clip, xs_rank, var
-from trading_dsl_engine.base.metadata import analyze_formula_metadata
+from trading_dsl_engine.base.metadata import analyze_formula_metadata, metadata
 from trading_dsl_engine.base.parser import Call, Expr
 
 
@@ -84,6 +85,28 @@ def test_filter_alpha_candidates_by_static_range_and_type_tags():
     valid_meta = analyze_formula_metadata(valid[0], fields)
     assert valid_meta.get_range().as_tuple() == (0.0, 1.0)
     assert "dimensionless" in valid_meta.get_types()
+
+
+def test_complex_alpha_node_units_and_type_relations():
+    fields = futures_field_metadata(levels=range(1))
+    config = metadata(fields, type_relations=futures_type_relations(levels=range(1)))
+    expr = clip(xs_rank(var("mp_out0.open") / var("mp_out0.close")), -3.0, 3.0) + var("vw_halfspread_out0")
+    meta = analyze_formula_metadata(expr, config)
+    by_label = {node.label: node.metadata for node in meta.get_node_metadata()}
+
+    assert by_label["mp_out0.open"].units.as_dict() == {"price": 1.0}
+    assert by_label["mp_out0.close"].units.as_dict() == {"price": 1.0}
+    assert "price" in by_label["mp_out0.open"].types
+    assert "book_level" in by_label["mp_out0.open"].types
+    assert by_label["div"].units.as_dict() == {}
+    assert "ratio" in by_label["div"].types
+    assert by_label["xs_rank"].units.as_dict() == {}
+    assert "dimensionless" in by_label["xs_rank"].types
+    assert by_label["clip"].units.as_dict() == {}
+    assert by_label["vw_halfspread_out0"].units.as_dict() == {}
+    assert "dimensionless" in by_label["vw_halfspread_out0"].types
+    assert meta.get_units().as_dict() == {}
+    assert "dimensionless" in meta.get_types()
 
 
 def test_positive_price_ratio_range_metadata_is_nonnegative():

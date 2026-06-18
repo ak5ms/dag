@@ -490,6 +490,8 @@ def _types_for_numeric(fn: str, args: Sequence[FieldSpec], units: UnitInfo) -> f
             return frozenset({"ratio"})
         if fn == "sub" and args and "ratio" in args[0].types and any(isclose(v.range.lower, 1.0) and isclose(v.range.upper, 1.0) for v in args[1:]):
             return frozenset({"return"})
+        if args and all("dimensionless" in arg.types for arg in args):
+            return frozenset({"dimensionless"})
     return args[0].types if args and all(arg.types == args[0].types for arg in args) else frozenset()
 
 
