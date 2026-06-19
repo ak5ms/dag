@@ -133,18 +133,6 @@ class LiteralOp(Op):
     output_width: int | None = 1
 
 
-class CacheWriteTarget:
-    def __init__(self, array: np.ndarray):
-        self.array = array
-
-    def write(self, start, value) -> None:
-        start_i = int(np.asarray(start))
-        value_np = np.asarray(value)
-        self.array[start_i : start_i + value_np.shape[0]] = value_np
-        if isinstance(self.array, np.memmap):
-            self.array.flush()
-
-
 @dataclass(frozen=True)
 class CacheOp(Op):
     storage: str = "ram"

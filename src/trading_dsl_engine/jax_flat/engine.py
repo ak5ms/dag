@@ -37,7 +37,6 @@ from trading_dsl_engine.jax_flat.ops import (
     Op,
     RidgeOp,
     ShiftOp,
-    CacheWriteTarget,
     _bspline,
     _cat,
     _col,
@@ -49,16 +48,21 @@ from trading_dsl_engine.jax_flat.ops import (
 
 class MemmapPathTracker:
     def __init__(self):
-        self.paths: list[str] = []
+        self.memmaps: list[np.memmap] = []
 
-    def add(self, path: str) -> None:
-        self.paths.append(path)
+    def add(self, memmap: np.memmap) -> None:
+        self.memmaps.append(memmap)
 
     def cleanup(self) -> None:
-        paths = list(self.paths)
-        self.paths.clear()
-        for path in paths:
+        memmaps = list(self.memmaps)
+        self.memmaps.clear()
+        for memmap in memmaps:
+            path = memmap.filename
+            mapped = getattr(memmap, "_mmap", None)
             try:
+                memmap.flush()
+                if mapped is not None:
+                    mapped.close()
                 os.unlink(path)
             except FileNotFoundError:
                 pass
@@ -67,6 +71,18 @@ class MemmapPathTracker:
 
     def __del__(self):
         self.cleanup()
+
+
+class CacheWriteTarget:
+    def __init__(self, array: np.ndarray):
+        self.array = array
+
+    def write(self, start, value) -> None:
+        start_i = int(np.asarray(start))
+        value_np = np.asarray(value)
+        self.array[start_i : start_i + value_np.shape[0]] = value_np
+        if isinstance(self.array, np.memmap):
+            self.array.flush()
 
 
 @dataclass(frozen=True)
@@ -162,11 +178,7 @@ class InnerGraphOp(Op):
             child_values = tuple(values[cid] for cid in node.child_ids)
             field = self.state_layout.node_fields[idx]
             node_state = None if field.index < 0 else state_leaves[field.index]
-            next_state, value = (
-            op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
-            if isinstance(op, CacheOp)
-            else op.scan_batch(node_state, *child_values)
-        )
+            next_state, value = op.scan_batch(node_state, *child_values)
             if field.index >= 0:
                 new_state[field.index] = next_state
             values[idx] = value
@@ -192,7 +204,7 @@ class JaxFlatRuntime(eqx.Module):
     def clear_cached_values(self) -> None:
         """Drop materialized batch cache values from previous runs and remove disk cache files."""
         self.cached_values.clear()
-        _cleanup_memmap_paths(self)
+        self.cache_memmap_tracker.cleanup()
 
     def get_units(self):
         """Return static unit exponents inferred for this formula output."""
@@ -416,10 +428,6 @@ def _has_disk_cache_node(runtime: JaxFlatRuntime) -> bool:
     )
 
 
-def _cleanup_memmap_paths(runtime: JaxFlatRuntime) -> None:
-    runtime.cache_memmap_tracker.cleanup()
-
-
 def _fresh_memmap_path(prefix: str) -> str:
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
     os.close(fd)
@@ -430,8 +438,9 @@ def _tracked_cache_memmap(runtime: JaxFlatRuntime, node_id: int, dtype, shape):
     run_index = len(runtime.runtimes)
     prefix = f"trading_dsl_engine_jax_flat_cache_pid{os.getpid()}_rt{id(runtime):x}_run{run_index}_node{node_id}_"
     path = _fresh_memmap_path(prefix)
-    runtime.cache_memmap_tracker.add(path)
-    return np.memmap(path, mode="w+", dtype=dtype, shape=shape)
+    out = np.memmap(path, mode="w+", dtype=dtype, shape=shape)
+    runtime.cache_memmap_tracker.add(out)
+    return out
 
 
 def _input_chunk(arr, start: int, stop: int):
