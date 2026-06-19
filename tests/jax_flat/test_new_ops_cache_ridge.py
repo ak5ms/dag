@@ -1,9 +1,11 @@
 from dataclasses import replace
 from itertools import product
+import os
 
 import numpy as np
 
 from trading_dsl_engine.jax_flat import compile_formula
+from trading_dsl_engine.jax_flat import engine as jax_flat_engine
 from trading_dsl_engine.jax_flat.engine import _build_state_layout
 from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
 from trading_dsl_engine.jax_flat.ops import RidgeOp
@@ -48,6 +50,76 @@ def test_cache_clip_norm_and_invert_magic():
     np.testing.assert_allclose(_run("clip(x, 0.0, 2.5)", x=x), np.clip(x, 0.0, 2.5), equal_nan=True)
     np.testing.assert_allclose(_run("xs_norm(x)", x=x)[0], [1.0 / 7.0, 2.0 / 7.0, 4.0 / 7.0])
     np.testing.assert_allclose(_run("~x", x=x), 1.0 - x, equal_nan=True)
+
+
+
+
+def test_cached_runtime_values_feed_matching_subgraphs_and_tuples():
+    x = np.array([[1.0, 2.0, np.nan], [4.0, -1.0, 3.0]], dtype=np.float64)
+    y = np.array([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]], dtype=np.float64)
+
+    cache_runtime_a = compile_formula("cache(x + 1.0)", cpp=False)
+    cache_runtime_b = compile_formula("cache(y - 2.0)", cpp=False)
+    cache_runtime_a.run_batch({"x": x})
+    cache_runtime_b.run_batch({"y": y})
+
+    runtime = compile_formula(
+        "((2.0 * (x + 1.0)) + ((x + 1.0) * (y - 2.0)))",
+        runtimes=(cache_runtime_a, cache_runtime_b),
+        cpp=False,
+    )
+    _, out = runtime.run_batch({"x": x, "y": y})
+
+    assert any(name.startswith("__cache_runtime_") for name in runtime.program.input_names)
+    expected = (2.0 * (x + 1.0)) + ((x + 1.0) * (y - 2.0))
+    np.testing.assert_allclose(out, expected, equal_nan=True)
+
+
+def test_compile_formula_runtime_cache_requires_materialized_values():
+    cache_runtime = compile_formula("cache(x + 1.0)", cpp=False)
+
+    with np.testing.assert_raises_regex(ValueError, "Run run_batch first"):
+        compile_formula("x + 1.0", runtimes=cache_runtime, cpp=False)
+
+
+def test_disk_cache_streams_to_memmap_and_cleans_unique_run_files(monkeypatch):
+    x = np.arange(10.0, dtype=np.float64).reshape(5, 2)
+    monkeypatch.setattr(jax_flat_engine, "_BATCH_CHUNK_SIZE", 2)
+    runtime = compile_formula('cache(x, "disk")', cpp=False)
+
+    _, first_out = runtime.run_batch({"x": x})
+    first_cached = next(iter(runtime.get_cached_values().values()))
+    first_path = first_cached.filename
+
+    assert isinstance(first_out, np.memmap)
+    assert first_out is first_cached
+    assert os.path.exists(first_path)
+    assert "run0" in os.path.basename(first_path)
+    np.testing.assert_allclose(first_cached, x)
+
+    _, second_out = runtime.run_batch({"x": x + 1.0})
+    second_cached = next(iter(runtime.get_cached_values().values()))
+    second_path = second_cached.filename
+
+    assert isinstance(second_out, np.memmap)
+    assert second_out is second_cached
+    assert second_path != first_path
+    assert not os.path.exists(first_path)
+    assert os.path.exists(second_path)
+    np.testing.assert_allclose(second_cached, x + 1.0)
+
+    runtime.clear_cached_values()
+    assert not os.path.exists(second_path)
+
+    nested_runtime = compile_formula('cache(x + 1.0, "disk") * 2.0', cpp=False)
+    _, nested_out = nested_runtime.run_batch({"x": x})
+    nested_cached = next(iter(nested_runtime.get_cached_values().values()))
+
+    assert isinstance(nested_cached, np.memmap)
+    np.testing.assert_allclose(nested_out, (x + 1.0) * 2.0)
+    np.testing.assert_allclose(nested_cached, x + 1.0)
+    nested_runtime.clear_cached_values()
+    assert not os.path.exists(nested_cached.filename)
 
 
 def test_xs_rank_uses_n_plus_one_and_normal_scores():
