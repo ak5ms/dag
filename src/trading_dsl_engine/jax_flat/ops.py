@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import jax
+from jax.experimental import io_callback
 import jax.numpy as jnp
+import numpy as np
 import jax.scipy.special as jsp_special
 
 jax.config.update("jax_enable_x64", True)
@@ -137,14 +139,27 @@ class CacheOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     cpp_name: str | None = "cache"
+    cache_write_target: Any = None
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
         return None, child_values[0]
 
     def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        return self.scan_batch_with_start(state, jnp.asarray(0, dtype=jnp.int64), *child_sequences)
+
+    def scan_batch_with_start(self, state: Any, batch_start: jax.Array, *child_sequences: jax.Array):
         del state
-        return None, child_sequences[0]
+        value = child_sequences[0]
+        if self.cache_write_target is not None:
+            io_callback(
+                lambda start, chunk, target=self.cache_write_target: target.write(start, chunk),
+                None,
+                batch_start,
+                value,
+                ordered=False,
+            )
+        return None, value
 
 
 @dataclass(frozen=True)
