@@ -108,6 +108,24 @@ def test_cpp_einsum_generic_reduces_to_non_instrument_label():
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
+def test_cpp_einsum_accepts_feature_vector_label_names_like_jax():
+    from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
+
+    x1 = np.array([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5], [2.0, 3.0, 4.0]], dtype=np.float64)
+    x2 = np.array([[0.5, 1.5, 2.5], [0.25, 1.25, 2.25], [0.75, 1.75, 2.75]], dtype=np.float64)
+    y = np.array([[2.0, 3.0, 4.0], [2.5, 3.5, 4.5], [3.0, 4.0, 5.0]], dtype=np.float64)
+    formula = 'einsum(get_beta(Ridge(cat(x1, x2), y, 0.0, 0.1)), cat(x1, x2), "f,nf->n")'
+
+    jax_runtime = compile_formula(formula, cpp=False)
+    cpp_runtime = compile_formula_native(formula)
+    inputs = {"x1": x1, "x2": x2, "y": y}
+    _, jax_out = jax_runtime.run_batch(inputs)
+    _, cpp_out = cpp_runtime.run_batch(inputs)
+
+    assert cpp_out.shape == (3, 3)
+    np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=1e-12, atol=1e-12, equal_nan=True)
+
+
 @pytest.mark.perf
 @pytest.mark.skipif(os.getenv("RUN_PERF_TESTS", "0") != "1", reason="set RUN_PERF_TESTS=1 to enable perf tests")
 def test_perf_cpp_einsum_3m_x_9_x_20_features_vs_jitted_jax():
