@@ -9,6 +9,7 @@ description = "Numba-compiled streaming DSL engine for trading features"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "pandas",
     "numba",
     "scipy",
     "jax[cpu]",

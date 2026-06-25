@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections.abc import Iterable
 from typing import Any
+from inspect import Parameter
 import mmap
 import os
 import time
@@ -14,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, get_dsl_op_signature
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, ensure_expr, get_dsl_op_signature
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
@@ -754,10 +755,13 @@ def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[
         values[position] = value
         seen_positions.add(position)
 
-    if any(value is None for value in values):
-        missing_position = next(i for i, value in enumerate(values) if value is None)
-        expected = parameter_names[missing_position]
-        raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+    for idx, value in enumerate(values):
+        if value is None:
+            default = signature.parameters[parameter_names[idx]].default
+            if default is Parameter.empty:
+                expected = parameter_names[idx]
+                raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+            values[idx] = None if default is None else ensure_expr(default)
     return tuple(value for value in values if value is not None)
 
 
@@ -927,7 +931,7 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
     shape_preserving = {
         "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
         "isnan", "purify", "fraction", "add", "sub", "mul", "mod", "pow",
-        "div", "floordiv", "eq", "ne", "lt", "gt", "and", "or", "xor",
+        "div", "floordiv", "eq", "ne", "lt", "gt", "le", "ge", "and", "or", "xor",
         "fillna", "where", "clip", "norm_inv", "xs_norm", "cache",
     }
     if op.cpp_name not in shape_preserving:
@@ -1018,17 +1022,30 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
             decimals = int(round(float(expr.args[1].value)))
             return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
-    if expr.fn == "ewm" and len(expr.args) in (2, 3):
+    if expr.fn == "ewm" and len(expr.args) in (2, 3, 4, 5):
         span = float(expr.args[1].value) if isinstance(expr.args[1], Number) else None
         min_periods = None
         drop: int | tuple[int, ...] | None = 1 if span is not None else None
-        if len(expr.args) == 3:
+        if len(expr.args) >= 3:
             if isinstance(expr.args[2], Number):
                 min_periods = float(expr.args[2].value)
                 drop = (1, 2) if span is not None else 2
             else:
                 drop = 1 if span is not None else None
-        return EwmOp(span=span, min_periods=min_periods), drop
+        ignore_na = True
+        adjust = False
+        drop_indices = set()
+        if isinstance(drop, tuple):
+            drop_indices.update(drop)
+        elif isinstance(drop, int):
+            drop_indices.add(drop)
+        if len(expr.args) >= 4:
+            ignore_na = bool(_literal_int_arg(expr.args[3], "ewm", 4))
+            drop_indices.add(3)
+        if len(expr.args) >= 5:
+            adjust = bool(_literal_int_arg(expr.args[4], "ewm", 5))
+            drop_indices.add(4)
+        return EwmOp(span=span, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust), tuple(sorted(drop_indices)) if drop_indices else None
     if expr.fn == "roll_mean" and len(expr.args) in (2, 3):
         lookback = _literal_int_arg(expr.args[1], "roll_mean", 2)
         min_periods = lookback if len(expr.args) == 2 else _literal_int_arg(expr.args[2], "roll_mean", 3)
@@ -1064,8 +1081,9 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
             ),
             drop_child_idx,
         )
-    if expr.fn == "shift" and len(expr.args) in (2, 3):
-        max_size_arg = expr.args[2] if len(expr.args) == 3 else expr.args[1]
+    if expr.fn == "shift" and len(expr.args) in (1, 2, 3):
+        lag_arg = expr.args[1] if len(expr.args) >= 2 else Number(1.0)
+        max_size_arg = expr.args[2] if len(expr.args) == 3 else lag_arg
         max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
         return (
             ShiftOp(

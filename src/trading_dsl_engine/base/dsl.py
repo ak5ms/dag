@@ -100,8 +100,9 @@ def grouped(lhs, key) -> GroupedExpr:
     return GroupedExpr(lhs, key)
 
 
-def _dsl_signature(*names: str, variadic: str | None = None) -> Signature:
-    params = [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD) for name in names]
+def _dsl_signature(*names: str, variadic: str | None = None, defaults: dict[str, object] | None = None) -> Signature:
+    defaults = defaults or {}
+    params = [Parameter(name, Parameter.POSITIONAL_OR_KEYWORD, default=defaults.get(name, Parameter.empty)) for name in names]
     if variadic is not None:
         params.append(Parameter(variadic, Parameter.VAR_POSITIONAL))
     return Signature(params)
@@ -158,10 +159,10 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "where": _dsl_signature("condition", "true", "false"),
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
-    "ewm": _dsl_signature("x", "hl", "min_periods"),
+    "ewm": _dsl_signature("x", "hl", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
     "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
     "ffill": _dsl_signature("x", "limit"),
-    "shift": _dsl_signature("x", "lag", "max_lag"),
+    "shift": _dsl_signature("x", "lag", "max_lag", defaults={"lag": 1, "max_lag": None}),
     "buffer": _dsl_signature("shift_expr", "min", "max"),
     "cache": _dsl_signature("x", "where"),
     "bspline": _dsl_signature("x", "n_basis"),
@@ -218,6 +219,8 @@ xor = op("xor")
 where = op("where")
 lt = op("lt")
 gt = op("gt")
+le = op("le")
+ge = op("ge")
 abs = op("abs")
 isnan = op("isnan")
 fillna = op("fillna")
