@@ -1,22 +1,81 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from inspect import Parameter, Signature
+from inspect import Parameter, Signature, signature
 
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, UniverseItem
 
 
 class DSLFunctionRegistry:
     def __init__(self) -> None:
-        self._fns: dict[str, Callable[..., Expr]] = {}
+        self._fns: dict[str, list[tuple[Signature, Callable[..., Expr]]]] = {}
+        self._annotations: dict[str, dict[str, object]] = {}
 
     def register(self, name: str, fn: Callable[..., Expr], overwrite: bool = True) -> None:
         if not overwrite and name in self._fns:
             raise ValueError(f"DSL function already registered: {name}")
-        self._fns[name] = fn
+        overloads = self._fns.get(name, [])
+        sig = signature(fn)
+        for param_name, param in sig.parameters.items():
+            if param.annotation is Parameter.empty:
+                continue
+            annotations = self._annotations.setdefault(name, {})
+            previous = annotations.get(param_name, Parameter.empty)
+            if previous is not Parameter.empty and previous != param.annotation:
+                raise TypeError(
+                    f"Conflicting annotation for DSL function {name!r} parameter {param_name!r}: "
+                    f"{previous!r} != {param.annotation!r}"
+                )
+            annotations[param_name] = param.annotation
+        if any(_same_signature(existing, sig) for existing, _ in overloads):
+            raise ValueError(f"DSL function overload already registered: {name}{sig}")
+        overloads.append((sig, fn))
+        self._fns[name] = overloads
 
     def get(self, name: str) -> Callable[..., Expr] | None:
-        return self._fns.get(name)
+        overloads = self._fns.get(name)
+        if not overloads:
+            return None
+
+        def _dispatch(*args, **kwargs) -> Expr:
+            op_sig = _DSL_OP_SIGNATURES.get(name)
+            op_matches = _signature_matches(op_sig, *args, **kwargs)
+            for sig, fn in overloads:
+                match = _signature_match(sig, *args, **kwargs)
+                if match is None or (op_matches and _uses_only_defaults(match)):
+                    continue
+                return ensure_expr(fn(*args, **kwargs))
+            if op_matches:
+                return call(name, *args, **kwargs)
+            raise TypeError(f"No matching DSL function overload for {name}{_call_shape(args, kwargs)}")
+
+        return _dispatch
+
+
+def _same_signature(left: Signature, right: Signature) -> bool:
+    return tuple(left.parameters.values()) == tuple(right.parameters.values())
+
+
+def _signature_match(sig: Signature | None, *args, **kwargs):
+    if sig is None:
+        return None
+    try:
+        return sig.bind(*args, **kwargs)
+    except TypeError:
+        return None
+
+
+def _signature_matches(sig: Signature | None, *args, **kwargs) -> bool:
+    return _signature_match(sig, *args, **kwargs) is not None
+
+
+def _uses_only_defaults(bound) -> bool:
+    return len(bound.arguments) < len(bound.signature.parameters)
+
+
+def _call_shape(args, kwargs) -> str:
+    suffix = ", " if args and kwargs else ""
+    return f"({', '.join(type(arg).__name__ for arg in args)}{suffix}{', '.join(kwargs)})"
 
 
 DEFAULT_DSL_REGISTRY = DSLFunctionRegistry()
@@ -194,12 +253,8 @@ def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry
     def _decorator(fn: Callable[..., Expr]) -> Callable[..., Expr]:
         fn_name = name or fn.__name__
 
-        def _wrapped(*args, **kwargs):
-            out = fn(*args, **kwargs)
-            return ensure_expr(out)
-
-        target.register(fn_name, _wrapped)
-        return fn
+        target.register(fn_name, fn)
+        return target.get(fn_name) or fn
 
     return _decorator
 
@@ -310,31 +365,19 @@ def _duration_microseconds(value: str | int | float, default_unit: str = "us") -
     return number * _unit_microseconds(text[idx:] or default_unit)
 
 
-def _floor_expr(x: Expr) -> Expr:
-    return call("floor", x)
-
-
-def _ceil_expr(x: Expr) -> Expr:
-    return call("ceil", x)
-
-
-def _round_expr(x: Expr, *args) -> Expr:
-    return call("round", x, *args)
-
-
 def _epoch_days(x: Expr) -> Expr:
-    return _floor_expr(div(x, 86_400_000_000.0))
+    return floor(div(x, 86_400_000_000.0))
 
 
 def _civil_parts(x: Expr) -> tuple[Expr, Expr, Expr, Expr]:
     z = add(_epoch_days(x), 719468.0)
-    era = _floor_expr(div(where(lt(z, 0.0), sub(z, 146096.0), z), 146097.0))
+    era = floor(div(where(lt(z, 0.0), sub(z, 146096.0), z), 146097.0))
     doe = sub(z, mul(era, 146097.0))
-    yoe = _floor_expr(
+    yoe = floor(
         div(
             add(
-                sub(doe, _floor_expr(div(doe, 1460.0))),
-                sub(_floor_expr(div(doe, 36524.0)), _floor_expr(div(doe, 146096.0))),
+                sub(doe, floor(div(doe, 1460.0))),
+                sub(floor(div(doe, 36524.0)), floor(div(doe, 146096.0))),
             ),
             365.0,
         )
@@ -342,10 +385,10 @@ def _civil_parts(x: Expr) -> tuple[Expr, Expr, Expr, Expr]:
     year_march = add(yoe, mul(era, 400.0))
     doy_march = sub(
         doe,
-        add(sub(mul(365.0, yoe), _floor_expr(div(yoe, 100.0))), _floor_expr(div(yoe, 4.0))),
+        add(sub(mul(365.0, yoe), floor(div(yoe, 100.0))), floor(div(yoe, 4.0))),
     )
-    mp = _floor_expr(div(add(mul(5.0, doy_march), 2.0), 153.0))
-    day_value = add(sub(doy_march, _floor_expr(div(add(mul(153.0, mp), 2.0), 5.0))), 1.0)
+    mp = floor(div(add(mul(5.0, doy_march), 2.0), 153.0))
+    day_value = add(sub(doy_march, floor(div(add(mul(153.0, mp), 2.0), 5.0))), 1.0)
     month_value = add(mp, where(lt(mp, 10.0), 3.0, -9.0))
     year_value = add(year_march, where(lt(month_value, 3.0), 1.0, 0.0))
     return year_value, month_value, day_value, doy_march
@@ -370,17 +413,17 @@ def timeofday(x: Expr) -> Expr:
 
 @register_dsl_function("hour")
 def hour(x: Expr) -> Expr:
-    return _floor_expr(div(timeofday(x), 3_600_000_000.0))
+    return floor(div(timeofday(x), 3_600_000_000.0))
 
 
 @register_dsl_function("minute")
 def minute(x: Expr) -> Expr:
-    return mod(_floor_expr(div(timeofday(x), 60_000_000.0)), 60.0)
+    return mod(floor(div(timeofday(x), 60_000_000.0)), 60.0)
 
 
 @register_dsl_function("second")
 def second(x: Expr) -> Expr:
-    return mod(_floor_expr(div(timeofday(x), 1_000_000.0)), 60.0)
+    return mod(floor(div(timeofday(x), 1_000_000.0)), 60.0)
 
 
 @register_dsl_function("year")
@@ -416,30 +459,31 @@ def dayofyear(x: Expr) -> Expr:
     )
 
 
+@register_dsl_function("shift")
+def shift(x: Expr, nlag: int | float = 1) -> Expr:
+    return shift(x, nlag, nlag)
+
+
 @register_dsl_function("floor")
 def floor(x: Expr, freq: str | int | float | None = None) -> Expr:
-    if freq is None:
-        return _floor_expr(x)
     micros = _duration_microseconds(freq)
-    return mul(_floor_expr(div(x, micros)), micros)
+    return mul(floor(div(x, micros)), micros)
 
 
 @register_dsl_function("ceil")
 def ceil(x: Expr, freq: str | int | float | None = None) -> Expr:
-    if freq is None:
-        return _ceil_expr(x)
     micros = _duration_microseconds(freq)
-    return mul(_ceil_expr(div(x, micros)), micros)
+    return mul(ceil(div(x, micros)), micros)
 
 
 @register_dsl_function("round")
 def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
     if freq is None:
-        return _round_expr(x, *args)
+        return round(x, *args)
     if args:
         raise TypeError("round cannot combine decimals with freq")
     micros = _duration_microseconds(freq)
-    return mul(_floor_expr(add(div(x, micros), 0.5)), micros)
+    return mul(floor(add(div(x, micros), 0.5)), micros)
 
 
 def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noqa: N802
