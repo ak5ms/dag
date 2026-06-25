@@ -204,15 +204,23 @@ class EwmOp(Op):
         x = child_values[0]
         span = self.span if self.span is not None else _scalar_value(child_values[1])
         value, weight, initialized = state.value, state.weight, state.initialized
-        alpha = 1.0 - jnp.exp(jnp.log(0.5) / span)
+        alpha = 2.0 / (span + 1.0)
         old_wt_factor = 1.0 - alpha
-        new_wt = 1.0 if self.adjust else alpha
         valid = jnp.isfinite(x)
-        decay = valid | (not self.ignore_na)
-        decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
-        weighted = (decayed_weight * value + new_wt * x) / (decayed_weight + new_wt)
+        if self.adjust:
+            decay = valid | (not self.ignore_na)
+            decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
+            new_wt = 1.0
+            weighted = (decayed_weight * value + new_wt * x) / (decayed_weight + new_wt)
+            next_weight_if_valid = decayed_weight + new_wt
+        else:
+            decay = (~valid) & (not self.ignore_na)
+            decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
+            new_wt = 1.0 - decayed_weight
+            weighted = decayed_weight * value + new_wt * x
+            next_weight_if_valid = jnp.full_like(decayed_weight, old_wt_factor)
         next_value = jnp.where(valid, jnp.where(initialized, weighted, x), value)
-        next_weight = jnp.where(valid, jnp.where(self.adjust, decayed_weight + new_wt, 1.0), decayed_weight)
+        next_weight = jnp.where(valid, next_weight_if_valid, decayed_weight)
         next_initialized = initialized | valid
         next_count = state.count + valid.astype(jnp.int64)
         min_periods = self.min_periods if self.min_periods is not None else None

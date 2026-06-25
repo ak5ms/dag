@@ -91,10 +91,10 @@ def test_ewm_native_min_periods_runtime_beats_ad_hoc_for_1e6_by_9():
     assert np.isfinite(native_s) and np.isfinite(adhoc_s)
 
 
-def _reference_ewm(values, hl, ignore_na, adjust, min_periods=0):
+def _reference_ewm(values, span, ignore_na, adjust, min_periods=0):
     return (
         pd.DataFrame(values)
-        .ewm(halflife=hl, min_periods=int(min_periods), ignore_na=ignore_na, adjust=adjust)
+        .ewm(span=span, min_periods=int(min_periods), ignore_na=ignore_na, adjust=adjust)
         .mean()
         .to_numpy()
     )
@@ -106,7 +106,7 @@ def _reference_ewm(values, hl, ignore_na, adjust, min_periods=0):
 def test_ewm_ignore_na_adjust_combinations_with_nan_runs(nan_run, ignore_na, adjust):
     data = np.asarray([[1.0], *([[np.nan]] * nan_run), [3.0], [4.0], [np.nan], [6.0]])
     actual = _run(ewm(var("x"), 3.0, ignore_na=ignore_na, adjust=adjust), data)
-    expected = _reference_ewm(data, hl=3.0, ignore_na=ignore_na, adjust=adjust)
+    expected = _reference_ewm(data, span=3.0, ignore_na=ignore_na, adjust=adjust)
     np.testing.assert_allclose(actual, expected, equal_nan=True)
 
 
@@ -127,5 +127,5 @@ def test_ewm_ignore_na_adjust_matches_pandas_for_leading_all_nan_and_min_periods
         ]
     )
     actual = _run(ewm(var("x"), 3.0, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust), data)
-    expected = _reference_ewm(data, hl=3.0, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust)
+    expected = _reference_ewm(data, span=3.0, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust)
     np.testing.assert_allclose(actual, expected, equal_nan=True)
