@@ -159,7 +159,7 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "where": _dsl_signature("condition", "true", "false"),
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
-    "ewm": _dsl_signature("x", "hl", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
+    "ewm": _dsl_signature("x", "span", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
     "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
     "ffill": _dsl_signature("x", "limit"),
     "shift": _dsl_signature("x", "lag", "max_lag", defaults={"lag": 1, "max_lag": None}),
