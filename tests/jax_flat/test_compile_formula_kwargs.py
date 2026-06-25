@@ -57,3 +57,12 @@ def test_compile_formula_accepts_kwargs_for_variadic_and_object_ops():
 
     assert out.shape == (3, 1)
     assert np.all(np.isfinite(np.asarray(out)[-1]))
+
+
+def test_shift_defaults_and_le_ge_comparisons():
+    data = {"close": np.asarray([[1.0, 2.0], [3.0, 2.0], [2.0, 4.0]])}
+    shifted = np.asarray(compile_formula("shift(close)", cpp=False).run_batch(data)[1])
+    np.testing.assert_allclose(shifted, [[np.nan, np.nan], [1.0, 2.0], [3.0, 2.0]], equal_nan=True)
+    compared = np.asarray(compile_formula("cat(close <= 2, close >= 3)", cpp=False).run_batch(data)[1])
+    np.testing.assert_allclose(compared[:, :, 0], [[1.0, 1.0], [0.0, 1.0], [1.0, 0.0]])
+    np.testing.assert_allclose(compared[:, :, 1], [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
