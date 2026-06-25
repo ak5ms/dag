@@ -655,7 +655,7 @@ class GroupByOp(Op):
             return False
         allowed_cpp_names = {
             "add", "sub", "mul", "div", "mod", "pow", "floordiv",
-            "eq", "ne", "lt", "gt", "and", "or", "xor", "fillna", "where",
+            "eq", "ne", "lt", "gt", "le", "ge", "and", "or", "xor", "fillna", "where",
             "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
             "isnan", "purify", "fraction",
         }

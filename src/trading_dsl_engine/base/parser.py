@@ -118,6 +118,12 @@ class Expr:
     def __gt__(self, other):
         return self._call("gt", other)
 
+    def __le__(self, other):
+        return self._call("le", other)
+
+    def __ge__(self, other):
+        return self._call("ge", other)
+
     def groupby(self, key):
         from trading_dsl_engine.base.dsl import grouped
 
@@ -181,6 +187,8 @@ _CMP_NAMES: dict[type[ast.cmpop], str] = {
     ast.NotEq: "ne",
     ast.Gt: "gt",
     ast.Lt: "lt",
+    ast.GtE: "ge",
+    ast.LtE: "le",
 }
 
 

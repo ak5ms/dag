@@ -62,6 +62,8 @@ enum class OpCode : int {
     Ne,
     Lt,
     Gt,
+    Le,
+    Ge,
     And,
     Or,
     Xor,
@@ -119,6 +121,8 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "ne") return OpCode::Ne;
     if (name == "lt") return OpCode::Lt;
     if (name == "gt") return OpCode::Gt;
+    if (name == "le") return OpCode::Le;
+    if (name == "ge") return OpCode::Ge;
     if (name == "and") return OpCode::And;
     if (name == "or") return OpCode::Or;
     if (name == "xor") return OpCode::Xor;
@@ -828,6 +832,8 @@ private:
                 case OpCode::Ne:
                 case OpCode::Lt:
                 case OpCode::Gt:
+                case OpCode::Le:
+                case OpCode::Ge:
                 case OpCode::And:
                 case OpCode::Or:
                 case OpCode::Xor:
@@ -857,6 +863,8 @@ private:
                             else if (spec.opcode == OpCode::Ne) out = a != b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Lt) out = a < b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Gt) out = a > b ? 1.0 : 0.0;
+                            else if (spec.opcode == OpCode::Le) out = a <= b ? 1.0 : 0.0;
+                            else if (spec.opcode == OpCode::Ge) out = a >= b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::And) out = (a != 0.0 && b != 0.0) ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Or) out = (a != 0.0 || b != 0.0) ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Xor) out = ((a != 0.0) != (b != 0.0)) ? 1.0 : 0.0;
@@ -1032,7 +1040,7 @@ private:
                 case OpCode::Ewm: {
                     auto& s = value_state(state, spec);
                     const auto& x = child(state, spec, 0);
-                    const double alpha = 2.0 / (spec.param + 1.0);
+                    const double alpha = 1.0 - std::exp(std::log(0.5) / spec.param);
                     const int min_periods = spec.int_param;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
@@ -1147,6 +1155,8 @@ private:
             case OpCode::Ne: return a != b ? 1.0 : 0.0;
             case OpCode::Lt: return a < b ? 1.0 : 0.0;
             case OpCode::Gt: return a > b ? 1.0 : 0.0;
+            case OpCode::Le: return a <= b ? 1.0 : 0.0;
+            case OpCode::Ge: return a >= b ? 1.0 : 0.0;
             case OpCode::And: return (a != 0.0 && b != 0.0) ? 1.0 : 0.0;
             case OpCode::Or: return (a != 0.0 || b != 0.0) ? 1.0 : 0.0;
             case OpCode::Xor: return ((a != 0.0) != (b != 0.0)) ? 1.0 : 0.0;
@@ -1194,7 +1204,7 @@ private:
                 auto& state_v = s.inner_values.at(static_cast<size_t>(node.state_index));
                 auto& init = s.inner_initialized.at(static_cast<size_t>(node.state_index));
                 auto& count = s.inner_streak.at(static_cast<size_t>(node.state_index));
-                const double alpha = 2.0 / (node.param + 1.0);
+                const double alpha = 1.0 - std::exp(std::log(0.5) / node.param);
                 if (finite(v)) {
                     state_v[off] = init[off] ? alpha * v + (1.0 - alpha) * state_v[off] : v;
                     init[off] = 1;
