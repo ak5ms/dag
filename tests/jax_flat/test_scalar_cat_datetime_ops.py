@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import cat, ceil, dayofyear, floor, hour, round, timeofday, to_dt, var
+from trading_dsl_engine.base.dsl import DSLFunctionRegistry, cat, ceil, dayofyear, floor, hour, register_dsl_function, round, shift, timeofday, to_dt, var
+from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
 
@@ -39,6 +40,31 @@ def test_cat_stacks_multiple_alpha_vectors_on_last_axis():
     expected = np.stack([np.asarray(alpha1), np.asarray(alpha2), np.asarray(alpha3)], axis=-1)
     assert out.shape == (2, 2, 3)
     np.testing.assert_allclose(np.asarray(out), expected)
+
+
+def test_dsl_function_overloads_fall_back_to_builtin_ops_by_signature():
+    x = var("x")
+    assert shift(x) == shift(x, 1.0, 1.0)
+    assert shift(x, 2.0) == shift(x, 2.0, 2.0)
+    assert floor(x).fn == "floor"
+    assert len(floor(x).args) == 1
+
+
+def test_dsl_function_overload_annotation_conflicts_raise_loudly():
+    reg = DSLFunctionRegistry()
+
+    @register_dsl_function("custom", registry=reg)
+    def custom_expr(x: Expr) -> Expr:
+        return x
+
+    try:
+        @register_dsl_function("custom", registry=reg)
+        def custom_conflict(x: str) -> Expr:
+            return var(x)
+    except TypeError as exc:
+        assert "Conflicting annotation" in str(exc)
+    else:
+        raise AssertionError("conflicting overload annotation did not raise")
 
 
 def test_datetime_calendar_and_rounding_ops_from_microsecond_timestamps():

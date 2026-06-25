@@ -230,15 +230,6 @@ class EwmOp(Op):
         out = jnp.where(next_initialized & enough, next_value, jnp.nan)
         return EwmState(value=next_value, weight=next_weight, initialized=next_initialized, count=next_count), out
 
-    def scan_batch(self, state: EwmState, *child_sequences: jax.Array):
-        def step(carry, x):
-            state_c = EwmState(*carry)
-            next_state, out = self.tick(state_c, x, *child_sequences[1:])
-            return (next_state.value, next_state.weight, next_state.initialized, next_state.count), out
-
-        carry, out = jax.lax.scan(step, (state.value, state.weight, state.initialized, state.count), child_sequences[0], unroll=32)
-        return EwmState(*carry), out
-
 
 @dataclass(frozen=True)
 class RollingMeanOp(Op):
