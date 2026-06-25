@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 import os
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -368,8 +370,8 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
         return None
 
     n_steps, n_instruments = inputs[0].shape
-    extra_inputs = []
-    candidate_programs = []
+    np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+    runnable: list[tuple[int, StreamingProgram, Any, int]] = []
     for node_id in candidates:
         subprogram = _subprogram_for_node(runtime.program, node_id)
         try:
@@ -381,10 +383,26 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
         if core is None:
             core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
             accelerator_cache[key] = core
-        state = core.init_state(n_instruments)
-        raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
-        extra_inputs.append(np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)))
-        candidate_programs.append(node_id)
+        runnable.append((node_id, subprogram, core, n_instruments))
+    if not runnable:
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        return None
+
+    def run_candidate(item):
+        node_id, subprogram, core, candidate_n_instruments = item
+        state = core.init_state(candidate_n_instruments)
+        raw = core.run_batch(state, *np_inputs)
+        value = np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, candidate_n_instruments))
+        return node_id, value
+
+    if len(runnable) == 1:
+        results = (run_candidate(runnable[0]),)
+    else:
+        max_workers = min(len(runnable), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = tuple(executor.map(run_candidate, runnable))
+    candidate_programs = [node_id for node_id, _ in results]
+    extra_inputs = [value for _, value in results]
     if not extra_inputs:
         _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
         return None
@@ -435,12 +453,8 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
     except Exception:
         return None
 
-    residual = _program_with_cpp_inputs(runtime.program, upstream_node_ids)
-    residual = replace(residual, outputs=frontier_ids)
-    residual_runtime = replace(runtime, program=residual, cpp=False)
     residual_inputs = tuple(inputs) + tuple(jnp.asarray(arr) for arr in upstream_values)
-    _, frontier_out = residual_runtime._run_batch_once(residual_inputs, None, False)
-    frontier_values = _split_frontier_outputs(frontier_out, len(frontier_ids))
+    frontier_values = _run_jax_frontiers(runtime, upstream_node_ids, frontier_ids, residual_inputs)
 
     n_steps, n_instruments = inputs[0].shape
     key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
@@ -455,14 +469,21 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
     return state, _reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)
 
 
-def _split_frontier_outputs(frontier_out, n_frontiers: int) -> tuple[np.ndarray, ...]:
-    if n_frontiers == 1:
-        return (np.asarray(frontier_out),)
-    arr = np.asarray(frontier_out)
-    if arr.ndim >= 1 and arr.shape[0] == n_frontiers:
-        return tuple(np.asarray(arr[i]) for i in range(n_frontiers))
-    return tuple(np.asarray(x) for x in frontier_out)
+def _run_jax_frontiers(runtime, upstream_node_ids: tuple[int, ...], frontier_ids: tuple[int, ...], residual_inputs) -> tuple[np.ndarray, ...]:
+    residual = _program_with_cpp_inputs(runtime.program, upstream_node_ids)
 
+    def run_frontier(frontier_id: int) -> np.ndarray:
+        frontier_program = replace(residual, outputs=(frontier_id,))
+        frontier_runtime = replace(runtime, program=frontier_program, cpp=False)
+        _, frontier_out = frontier_runtime._run_batch_once(residual_inputs, None, False)
+        frontier_out = jax.block_until_ready(frontier_out)
+        return np.asarray(frontier_out)
+
+    if len(frontier_ids) == 1:
+        return (run_frontier(frontier_ids[0]),)
+    max_workers = min(len(frontier_ids), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return tuple(executor.map(run_frontier, frontier_ids))
 
 def _is_cpp_boundary_op(op: Op) -> bool:
     return (
@@ -544,15 +565,24 @@ def _cpp_hybrid_candidates(program: StreamingProgram) -> tuple[int, ...]:
         )
         if not (is_projection or is_supported_stateless or isinstance(op, (GroupByOp, CumsumOp, EwmOp, FFillOp, RollingMeanOp, ShiftOp))):
             continue
-        if ancestors & covered:
+        conflict_ids = _cpp_candidate_conflict_ids(program, ancestors)
+        if conflict_ids & covered:
             continue
         try:
             _cpp_node_specs(_subprogram_for_node(program, node_id))
         except Exception:
             continue
         selected.append(node_id)
-        covered.update(ancestors)
+        covered.update(conflict_ids)
     return tuple(sorted(selected))
+
+
+def _cpp_candidate_conflict_ids(program: StreamingProgram, node_ids: set[int]) -> set[int]:
+    return {
+        node_id
+        for node_id in node_ids
+        if not isinstance(program.nodes[node_id].op, (InputOp, LiteralOp))
+    }
 
 
 def _ancestor_ids(program: StreamingProgram, node_id: int) -> set[int]:
