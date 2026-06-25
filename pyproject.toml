@@ -6,12 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "trading_dsl_engine"
 version = "0.1.0"
 description = "Numba-compiled streaming DSL engine for trading features"
-requires-python = ">=3.10"
+requires-python = ">=3.11.0"
 dependencies = [
     "numpy",
     "numba",
     "scipy",
     "jax[cpu]",
+    "jax2onnx",
+    "onnx2torch",
+    "auto_LiRPA @ git+https://github.com/Verified-Intelligence/auto_LiRPA.git",
     "equinox",
     "pytest",
     "pytest-xdist",
