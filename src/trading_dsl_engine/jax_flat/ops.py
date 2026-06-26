@@ -186,8 +186,8 @@ class NaryOp(Op):
 class EwmOp(Op):
     span: float | None = None
     min_periods: float | None = None
-    ignore_na: bool = True
-    adjust: bool = False
+    ignore_na: bool = False
+    adjust: bool = True
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
@@ -214,11 +214,13 @@ class EwmOp(Op):
             weighted = (decayed_weight * value + new_wt * x) / (decayed_weight + new_wt)
             next_weight_if_valid = decayed_weight + new_wt
         else:
-            decay = (~valid) & (not self.ignore_na)
+            decay = valid | (not self.ignore_na)
             decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
-            new_wt = 1.0 - decayed_weight
-            weighted = decayed_weight * value + new_wt * x
-            next_weight_if_valid = jnp.full_like(decayed_weight, old_wt_factor)
+            normalized = (decayed_weight * value + alpha * x) / (decayed_weight + alpha)
+            alpha_half = jnp.isclose(alpha, 0.5)
+            half_alpha_weighted = decayed_weight * value + (1.0 - decayed_weight) * x
+            weighted = jnp.where(alpha_half, half_alpha_weighted, normalized)
+            next_weight_if_valid = jnp.ones_like(decayed_weight)
         next_value = jnp.where(valid, jnp.where(initialized, weighted, x), value)
         next_weight = jnp.where(valid, next_weight_if_valid, decayed_weight)
         next_initialized = initialized | valid
