@@ -1040,7 +1040,7 @@ private:
                 case OpCode::Ewm: {
                     auto& s = value_state(state, spec);
                     const auto& x = child(state, spec, 0);
-                    const double alpha = 2.0 / (spec.param + 1.0);
+                    const double alpha = 1.0 - std::exp(std::log(0.5) / spec.param);
                     const int min_periods = spec.int_param;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
@@ -1204,7 +1204,7 @@ private:
                 auto& state_v = s.inner_values.at(static_cast<size_t>(node.state_index));
                 auto& init = s.inner_initialized.at(static_cast<size_t>(node.state_index));
                 auto& count = s.inner_streak.at(static_cast<size_t>(node.state_index));
-                const double alpha = 2.0 / (node.param + 1.0);
+                const double alpha = 1.0 - std::exp(std::log(0.5) / node.param);
                 if (finite(v)) {
                     state_v[off] = init[off] ? alpha * v + (1.0 - alpha) * state_v[off] : v;
                     init[off] = 1;
