@@ -186,8 +186,8 @@ class NaryOp(Op):
 class EwmOp(Op):
     span: float | None = None
     min_periods: float | None = None
-    ignore_na: bool = True
-    adjust: bool = False
+    ignore_na: bool = False
+    adjust: bool = True
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
