@@ -312,6 +312,27 @@ def test_cpp_staged_subprogram_compacts_frontier_only_input_indices():
     assert node_specs[0][2] == 0
 
 
+def test_cpp_full_batch_compacts_sparse_input_index_before_native_run():
+    from trading_dsl_engine.jax_flat.engine import DagNode, JaxFlatRuntime, StateFieldRef, StateLayout, StreamingProgram
+    from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_full_batch
+    from trading_dsl_engine.jax_flat.ops import InputOp
+
+    runtime = JaxFlatRuntime(
+        program=StreamingProgram(
+            nodes=(DagNode(InputOp(1), ()),),
+            outputs=(0,),
+            input_names=("only_available_input",),
+            state_layout=StateLayout((StateFieldRef(-1),), 0),
+            metadata=None,
+            cache_nodes=(),
+        )
+    )
+    inputs = (np.arange(6, dtype=np.float64).reshape(3, 2),)
+
+    _, out = _try_cpp_full_batch(runtime, inputs, {}, lambda *_: None, emit_warning=False)
+    np.testing.assert_allclose(out, inputs[0])
+
+
 def test_cpp_hybrid_batch_can_stage_cpp_before_and_after_jax_lambda():
     from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, var
     from trading_dsl_engine.jax_flat import stateless

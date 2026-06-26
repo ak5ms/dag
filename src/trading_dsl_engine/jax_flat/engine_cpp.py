@@ -378,6 +378,8 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
             node_specs, _, state_count = _cpp_node_specs(subprogram)
         except NotImplementedError:
             continue
+        if any(i >= len(inputs) for i in source_input_indices):
+            continue
         key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
         core = accelerator_cache.get(key)
         if core is None:
@@ -405,21 +407,23 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
 def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], *, emit_warning: bool):
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
-        node_specs, _, state_count = _cpp_node_specs(runtime.program)
+        cpp_program, source_input_indices = _compact_input_indices_for_cpp(runtime.program)
+        node_specs, _, state_count = _cpp_node_specs(cpp_program)
     except Exception as exc:
         if emit_warning:
             warn_callback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
         return None
 
     n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
+    key = (node_specs, cpp_program.outputs[0], state_count, n_instruments)
     core = accelerator_cache.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
+        core = _cpp_flat.make_runtime(node_specs, cpp_program.outputs[0], state_count)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
-    raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
-    return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
+    cpp_inputs = tuple(np.asarray(inputs[i], dtype=np.float64) for i in source_input_indices)
+    raw = core.run_batch(state, *cpp_inputs)
+    return state, _reshape_cpp_batch_output(cpp_program, raw, n_steps, n_instruments)
 
 
 def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, ...], upstream_values: tuple[np.ndarray, ...], accelerator_cache: dict[tuple[Any, ...], Any]):
@@ -444,6 +448,8 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
     residual_inputs = tuple(inputs) + tuple(jnp.asarray(arr) for arr in upstream_values)
     _, frontier_out = residual_runtime._run_batch_once(residual_inputs, None, False)
     frontier_values = _split_frontier_outputs(frontier_out, len(frontier_ids))
+    if len(frontier_values) != len(frontier_ids):
+        return None
 
     n_steps, n_instruments = inputs[0].shape
     key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
@@ -452,6 +458,8 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
         core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
+    if any(kind == "input" and idx >= len(inputs) for kind, idx in input_sources):
+        return None
     frontier_by_id = dict(zip(frontier_ids, frontier_values, strict=True))
     cpp_inputs = tuple(
         np.asarray(inputs[idx] if kind == "input" else frontier_by_id[idx], dtype=np.float64)
@@ -468,6 +476,38 @@ def _split_frontier_outputs(frontier_out, n_frontiers: int) -> tuple[np.ndarray,
     if arr.ndim >= 1 and arr.shape[0] == n_frontiers:
         return tuple(np.asarray(arr[i]) for i in range(n_frontiers))
     return tuple(np.asarray(x) for x in frontier_out)
+
+
+def _compact_input_indices_for_cpp(program: StreamingProgram) -> tuple[StreamingProgram, tuple[int, ...]]:
+    used_input_indices: list[int] = []
+    for node in program.nodes:
+        op = node.op
+        if isinstance(op, InputOp) and op.input_index not in used_input_indices:
+            used_input_indices.append(op.input_index)
+    input_remap = {old: new for new, old in enumerate(used_input_indices)}
+    if not input_remap:
+        return program, ()
+
+    nodes = []
+    for node in program.nodes:
+        op = node.op
+        if isinstance(op, InputOp):
+            op = InputOp(input_remap[op.input_index], output_kind=op.output_kind, output_width=op.output_width)
+        nodes.append(DagNode(op, node.child_ids))
+
+    if all(i < len(program.input_names) for i in used_input_indices):
+        input_names = tuple(program.input_names[i] for i in used_input_indices)
+        source_input_indices = tuple(used_input_indices)
+    elif len(used_input_indices) == len(program.input_names):
+        input_names = program.input_names
+        source_input_indices = tuple(range(len(program.input_names)))
+    else:
+        raise ValueError(
+            "C++ jax_flat input indices are not compatible with normalized batch inputs: "
+            f"indices={tuple(used_input_indices)}, input_names={program.input_names}"
+        )
+
+    return replace(program, nodes=tuple(nodes), input_names=input_names, state_layout=_state_layout_for_nodes(tuple(nodes))), source_input_indices
 
 
 def _is_cpp_boundary_op(op: Op) -> bool:
@@ -615,8 +655,18 @@ def _subprogram_for_node(program: StreamingProgram, node_id: int) -> tuple[Strea
             op = InputOp(input_remap[op.input_index], output_kind=op.output_kind, output_width=op.output_width)
         nodes.append(DagNode(op, tuple(remap[c] for c in program.nodes[old].child_ids)))
     compact_nodes = tuple(nodes)
-    input_names = tuple(program.input_names[i] for i, _ in sorted(input_remap.items(), key=lambda item: item[1]))
-    source_input_indices = tuple(i for i, _ in sorted(input_remap.items(), key=lambda item: item[1]))
+    used_input_indices = tuple(i for i, _ in sorted(input_remap.items(), key=lambda item: item[1]))
+    if all(i < len(program.input_names) for i in used_input_indices):
+        input_names = tuple(program.input_names[i] for i in used_input_indices)
+        source_input_indices = used_input_indices
+    elif len(used_input_indices) == len(program.input_names):
+        input_names = program.input_names
+        source_input_indices = tuple(range(len(program.input_names)))
+    else:
+        raise ValueError(
+            "C++ jax_flat subprogram input indices are not compatible with normalized batch inputs: "
+            f"indices={used_input_indices}, input_names={program.input_names}"
+        )
     return StreamingProgram(nodes=compact_nodes, outputs=(remap[node_id],), input_names=input_names, state_layout=_state_layout_for_nodes(compact_nodes), metadata=None, cache_nodes=()), source_input_indices
 
 
