@@ -62,6 +62,8 @@ enum class OpCode : int {
     Ne,
     Lt,
     Gt,
+    Le,
+    Ge,
     And,
     Or,
     Xor,
@@ -119,6 +121,8 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "ne") return OpCode::Ne;
     if (name == "lt") return OpCode::Lt;
     if (name == "gt") return OpCode::Gt;
+    if (name == "le") return OpCode::Le;
+    if (name == "ge") return OpCode::Ge;
     if (name == "and") return OpCode::And;
     if (name == "or") return OpCode::Or;
     if (name == "xor") return OpCode::Xor;
@@ -314,12 +318,14 @@ struct NodeValue {
 
 struct ValueState {
     Vec value;
+    Vec weight;
     ByteVec initialized;
     I64Vec streak;
     ByteVec seen;
 
     explicit ValueState(int size = 0)
         : value(Vec::Zero(size)),
+          weight(Vec::Zero(size)),
           initialized(ByteVec::Zero(size)),
           streak(I64Vec::Zero(size)),
           seen(ByteVec::Zero(size)) {}
@@ -405,6 +411,7 @@ struct GroupState {
     int cached_group_universe = -1;
     uint8_t cached_group_valid = 0;
     std::vector<Vec> inner_values;
+    std::vector<Vec> inner_weights;
     std::vector<ByteVec> inner_initialized;
     std::vector<I64Vec> inner_streak;
     std::vector<ByteVec> inner_seen;
@@ -416,11 +423,13 @@ struct GroupState {
           occupied(ByteVec::Zero(slot_count)),
           cached_group_key(Vec::Constant(std::max(key_count, 1), NaN)) {
         inner_values.reserve(static_cast<size_t>(inner_state_count));
+        inner_weights.reserve(static_cast<size_t>(inner_state_count));
         inner_initialized.reserve(static_cast<size_t>(inner_state_count));
         inner_streak.reserve(static_cast<size_t>(inner_state_count));
         inner_seen.reserve(static_cast<size_t>(inner_state_count));
         for (int i = 0; i < inner_state_count; ++i) {
             inner_values.emplace_back(Vec::Zero(slot_count * instruments));
+            inner_weights.emplace_back(Vec::Zero(slot_count * instruments));
             inner_initialized.emplace_back(ByteVec::Zero(slot_count * instruments));
             inner_streak.emplace_back(I64Vec::Zero(slot_count * instruments));
             inner_seen.emplace_back(ByteVec::Zero(slot_count * instruments));
@@ -828,6 +837,8 @@ private:
                 case OpCode::Ne:
                 case OpCode::Lt:
                 case OpCode::Gt:
+                case OpCode::Le:
+                case OpCode::Ge:
                 case OpCode::And:
                 case OpCode::Or:
                 case OpCode::Xor:
@@ -857,6 +868,8 @@ private:
                             else if (spec.opcode == OpCode::Ne) out = a != b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Lt) out = a < b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Gt) out = a > b ? 1.0 : 0.0;
+                            else if (spec.opcode == OpCode::Le) out = a <= b ? 1.0 : 0.0;
+                            else if (spec.opcode == OpCode::Ge) out = a >= b ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::And) out = (a != 0.0 && b != 0.0) ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Or) out = (a != 0.0 || b != 0.0) ? 1.0 : 0.0;
                             else if (spec.opcode == OpCode::Xor) out = ((a != 0.0) != (b != 0.0)) ? 1.0 : 0.0;
@@ -1033,14 +1046,29 @@ private:
                     auto& s = value_state(state, spec);
                     const auto& x = child(state, spec, 0);
                     const double alpha = 2.0 / (spec.param + 1.0);
-                    const int min_periods = spec.int_param;
+                    const double old_wt_factor = 1.0 - alpha;
+                    const int min_periods = spec.int_param / 4 - 1;
+                    const bool ignore_na = (spec.int_param & 1) != 0;
+                    const bool adjust = (spec.int_param & 2) != 0;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        if (finite(v)) {
-                            s.value[i] = s.initialized[i] ? alpha * v + (1.0 - alpha) * s.value[i] : v;
-                            s.initialized[i] = 1;
+                        const bool is_observation = finite(v);
+                        double old_wt = s.weight[i];
+                        if (s.initialized[i] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
+                        if (is_observation) {
+                            if (s.initialized[i]) {
+                                double new_wt = adjust ? 1.0 : alpha;
+                                if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
+                                if (s.value[i] != v) s.value[i] = (old_wt * s.value[i] + new_wt * v) / (old_wt + new_wt);
+                                old_wt = adjust ? old_wt + new_wt : 1.0;
+                            } else {
+                                s.value[i] = v;
+                                s.initialized[i] = 1;
+                                old_wt = 1.0;
+                            }
                             s.streak[i] += 1;
                         }
+                        s.weight[i] = old_wt;
                         const bool enough = min_periods < 0 || s.streak[i] >= min_periods;
                         dst[i] = (s.initialized[i] && enough) ? s.value[i] : NaN;
                     }
@@ -1147,6 +1175,8 @@ private:
             case OpCode::Ne: return a != b ? 1.0 : 0.0;
             case OpCode::Lt: return a < b ? 1.0 : 0.0;
             case OpCode::Gt: return a > b ? 1.0 : 0.0;
+            case OpCode::Le: return a <= b ? 1.0 : 0.0;
+            case OpCode::Ge: return a >= b ? 1.0 : 0.0;
             case OpCode::And: return (a != 0.0 && b != 0.0) ? 1.0 : 0.0;
             case OpCode::Or: return (a != 0.0 || b != 0.0) ? 1.0 : 0.0;
             case OpCode::Xor: return ((a != 0.0) != (b != 0.0)) ? 1.0 : 0.0;
@@ -1192,15 +1222,32 @@ private:
             case OpCode::Ewm: {
                 const double v = child_value(0);
                 auto& state_v = s.inner_values.at(static_cast<size_t>(node.state_index));
+                auto& weight = s.inner_weights.at(static_cast<size_t>(node.state_index));
                 auto& init = s.inner_initialized.at(static_cast<size_t>(node.state_index));
                 auto& count = s.inner_streak.at(static_cast<size_t>(node.state_index));
                 const double alpha = 2.0 / (node.param + 1.0);
-                if (finite(v)) {
-                    state_v[off] = init[off] ? alpha * v + (1.0 - alpha) * state_v[off] : v;
-                    init[off] = 1;
+                const double old_wt_factor = 1.0 - alpha;
+                const int min_periods = node.int_param / 4 - 1;
+                const bool ignore_na = (node.int_param & 1) != 0;
+                const bool adjust = (node.int_param & 2) != 0;
+                const bool is_observation = finite(v);
+                double old_wt = weight[off];
+                if (init[off] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
+                if (is_observation) {
+                    if (init[off]) {
+                        double new_wt = adjust ? 1.0 : alpha;
+                        if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
+                        if (state_v[off] != v) state_v[off] = (old_wt * state_v[off] + new_wt * v) / (old_wt + new_wt);
+                        old_wt = adjust ? old_wt + new_wt : 1.0;
+                    } else {
+                        state_v[off] = v;
+                        init[off] = 1;
+                        old_wt = 1.0;
+                    }
                     count[off] += 1;
                 }
-                return (init[off] && (node.int_param < 0 || count[off] >= node.int_param)) ? state_v[off] : NaN;
+                weight[off] = old_wt;
+                return (init[off] && (min_periods < 0 || count[off] >= min_periods)) ? state_v[off] : NaN;
             }
             case OpCode::FFill: {
                 const double v = child_value(0);

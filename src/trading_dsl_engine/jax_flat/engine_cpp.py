@@ -219,7 +219,8 @@ def _cpp_node_specs(program: StreamingProgram):
             continue
         if isinstance(op, EwmOp) and op.span is not None:
             min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
+            ewm_flags = (1 if op.ignore_na else 0) | (2 if op.adjust else 0)
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=(min_periods + 1) * 4 + ewm_flags, width=width))
             supported.append("ewm")
             continue
         if isinstance(op, RollingMeanOp):
@@ -334,7 +335,8 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
             continue
         if isinstance(op, EwmOp) and op.span is not None:
             min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=min_periods, width=width))
+            ewm_flags = (1 if op.ignore_na else 0) | (2 if op.adjust else 0)
+            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=(min_periods + 1) * 4 + ewm_flags, width=width))
             supported.append("inner_ewm")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:

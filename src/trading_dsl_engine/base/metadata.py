@@ -483,7 +483,7 @@ def _literal_width(node: Expr) -> int | None:
 
 
 def _types_for_numeric(fn: str, args: Sequence[FieldSpec], units: UnitInfo) -> frozenset[str]:
-    if fn in {"eq", "ne", "lt", "gt", "and", "and_", "or", "or_", "xor", "isnan"}:
+    if fn in {"eq", "ne", "lt", "gt", "le", "ge", "and", "and_", "or", "or_", "xor", "isnan"}:
         return frozenset({"boolean"})
     if units.as_dict() == {} and not units.is_unknown():
         if fn in {"div", "floordiv"} and len(args) == 2 and args[0].units == args[1].units:
@@ -709,11 +709,11 @@ def analyze_formula_metadata(expr: Expr, config: MetadataConfig | Mapping[str, A
                 units = args[1].units.compatible_or_unknown(args[2].units)
                 types = args[1].types if args[1].types == args[2].types else frozenset()
                 spec = FieldSpec(units, _range_union([args[1].range, args[2].range]), types, args[1].width)
-        if spec is None and fn in {"eq", "ne", "lt", "gt"} and len(args) == 2:
+        if spec is None and fn in {"eq", "ne", "lt", "gt", "le", "ge"} and len(args) == 2:
             if _same_expr(node.args[0], node.args[1]):
                 spec = _constant(1.0 if fn in {"eq"} else 0.0, {"boolean"})
             else:
-                ops = {"eq": lambda a, b: a == b, "ne": lambda a, b: a != b, "lt": lambda a, b: a < b, "gt": lambda a, b: a > b}
+                ops = {"eq": lambda a, b: a == b, "ne": lambda a, b: a != b, "lt": lambda a, b: a < b, "gt": lambda a, b: a > b, "le": lambda a, b: a <= b, "ge": lambda a, b: a >= b}
                 spec = FieldSpec(UnitInfo.dimensionless(), _call_range(ops[fn], [args[0].range, args[1].range]), frozenset({"boolean"}))
         if spec is None and fn in {"and", "and_", "or", "or_", "xor"} and len(args) == 2:
             if fn == "xor" and _same_expr(node.args[0], node.args[1]):

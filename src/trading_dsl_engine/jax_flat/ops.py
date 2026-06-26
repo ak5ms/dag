@@ -35,6 +35,7 @@ class Op:
 @dataclass(frozen=True)
 class EwmState:
     value: jax.Array
+    weight: jax.Array
     initialized: jax.Array
     count: jax.Array
 
@@ -185,6 +186,8 @@ class NaryOp(Op):
 class EwmOp(Op):
     span: float | None = None
     min_periods: float | None = None
+    ignore_na: bool = True
+    adjust: bool = False
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
@@ -192,6 +195,7 @@ class EwmOp(Op):
     def init_state(self, sample: jax.Array):
         return EwmState(
             value=jnp.zeros_like(sample),
+            weight=jnp.zeros_like(sample),
             initialized=jnp.zeros_like(sample, dtype=bool),
             count=jnp.zeros_like(sample, dtype=jnp.int64),
         )
@@ -199,19 +203,43 @@ class EwmOp(Op):
     def tick(self, state: EwmState, *child_values: jax.Array):
         x = child_values[0]
         span = self.span if self.span is not None else _scalar_value(child_values[1])
-        value, initialized = state.value, state.initialized
+        value, weight, initialized = state.value, state.weight, state.initialized
         alpha = 2.0 / (span + 1.0)
+        old_wt_factor = 1.0 - alpha
         valid = jnp.isfinite(x)
-        init_or_valid = initialized | valid
-        blended = alpha * x + (1.0 - alpha) * value
-        next_value = jnp.where(valid, jnp.where(initialized, blended, x), value)
+        if self.adjust:
+            decay = valid | (not self.ignore_na)
+            decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
+            new_wt = 1.0
+            weighted = (decayed_weight * value + new_wt * x) / (decayed_weight + new_wt)
+            next_weight_if_valid = decayed_weight + new_wt
+        else:
+            decay = valid | (not self.ignore_na)
+            decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
+            normalized = (decayed_weight * value + alpha * x) / (decayed_weight + alpha)
+            alpha_half = jnp.isclose(alpha, 0.5)
+            half_alpha_weighted = decayed_weight * value + (1.0 - decayed_weight) * x
+            weighted = jnp.where(alpha_half, half_alpha_weighted, normalized)
+            next_weight_if_valid = jnp.ones_like(decayed_weight)
+        next_value = jnp.where(valid, jnp.where(initialized, weighted, x), value)
+        next_weight = jnp.where(valid, next_weight_if_valid, decayed_weight)
+        next_initialized = initialized | valid
         next_count = state.count + valid.astype(jnp.int64)
         min_periods = self.min_periods if self.min_periods is not None else None
         if min_periods is None and len(child_values) > 2:
             min_periods = _scalar_value(child_values[2])
         enough = True if min_periods is None else next_count >= jnp.rint(min_periods).astype(jnp.int64)
-        out = jnp.where(init_or_valid & enough, next_value, jnp.nan)
-        return EwmState(value=next_value, initialized=init_or_valid, count=next_count), out
+        out = jnp.where(next_initialized & enough, next_value, jnp.nan)
+        return EwmState(value=next_value, weight=next_weight, initialized=next_initialized, count=next_count), out
+
+    def scan_batch(self, state: EwmState, *child_sequences: jax.Array):
+        def step(carry, x):
+            state_c = EwmState(*carry)
+            next_state, out = self.tick(state_c, x, *child_sequences[1:])
+            return (next_state.value, next_state.weight, next_state.initialized, next_state.count), out
+
+        carry, out = jax.lax.scan(step, (state.value, state.weight, state.initialized, state.count), child_sequences[0], unroll=32)
+        return EwmState(*carry), out
 
 
 @dataclass(frozen=True)
@@ -306,6 +334,7 @@ class RollingOp(Op):
 @dataclass(frozen=True)
 class ShiftOp(Op):
     max_size: int
+    default_lag: float = 1.0
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
@@ -320,7 +349,8 @@ class ShiftOp(Op):
         )
 
     def tick(self, state: ShiftState, *child_values: jax.Array):
-        x, lag = child_values[:2]
+        x = child_values[0]
+        lag = child_values[1] if len(child_values) > 1 else jnp.asarray(self.default_lag)
         cap = state.buffer.shape[0]
         lag_values = _lag_vector(lag, x.shape[0])
         finite_lag = jnp.isfinite(lag_values)
@@ -340,7 +370,8 @@ class ShiftOp(Op):
         )
 
     def scan_batch(self, state: ShiftState, *child_sequences: jax.Array):
-        x, lag = child_sequences[:2]
+        x = child_sequences[0]
+        lag = child_sequences[1] if len(child_sequences) > 1 else jnp.asarray(self.default_lag)
         cap = state.buffer.shape[0]
         rows, cols = x.shape[:2]
         history = jnp.concatenate((_chronological_buffer(state), x), axis=0)
@@ -1173,6 +1204,8 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne"),
     ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt"),
     ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt"),
+    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le"),
+    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge"),
     ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
     ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
     ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
