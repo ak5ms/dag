@@ -216,8 +216,10 @@ class EwmOp(Op):
         else:
             decay = (~valid) & (not self.ignore_na)
             decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
-            new_wt = 1.0 - decayed_weight
-            weighted = decayed_weight * value + new_wt * x
+            normalized = (decayed_weight * value + alpha * x) / (decayed_weight + alpha)
+            alpha_half = jnp.isclose(alpha, 0.5)
+            half_alpha_weighted = decayed_weight * value + (1.0 - decayed_weight) * x
+            weighted = jnp.where(alpha_half, half_alpha_weighted, normalized)
             next_weight_if_valid = jnp.full_like(decayed_weight, old_wt_factor)
         next_value = jnp.where(valid, jnp.where(initialized, weighted, x), value)
         next_weight = jnp.where(valid, next_weight_if_valid, decayed_weight)

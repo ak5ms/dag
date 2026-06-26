@@ -27,7 +27,7 @@ def test_compile_formula_accepts_kwargs_for_stateless_ops():
 def test_compile_formula_accepts_kwargs_for_stateful_and_static_arg_ops():
     runtime = compile_formula(
         "cat("
-        "arg0=ewm(x=close, hl=2, min_periods=1), "
+        "arg0=ewm(x=close, span=2, min_periods=1), "
         "arg1=shift(x=close, lag=lag, max_lag=3), "
         "arg2=round(x=open, decimals=0)"
         ")",

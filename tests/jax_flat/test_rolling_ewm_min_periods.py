@@ -129,3 +129,23 @@ def test_ewm_ignore_na_adjust_matches_pandas_for_leading_all_nan_and_min_periods
     actual = _run(ewm(var("x"), 3.0, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust), data)
     expected = _reference_ewm(data, span=3.0, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust)
     np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("ignore_na", [False, True])
+@pytest.mark.parametrize("adjust", [False, True])
+def test_ewm_random_nan_inputs_match_pandas_and_cpp(seed, ignore_na, adjust):
+    rng = np.random.default_rng(seed)
+    data = rng.normal(size=(240, 4))
+    data[rng.random(data.shape) < 0.18] = np.nan
+    span = 5.0
+    actual = _run(ewm(var("x"), span, ignore_na=ignore_na, adjust=adjust), data)
+    expected = _reference_ewm(data, span=span, ignore_na=ignore_na, adjust=adjust)
+    np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+    if ignore_na and not adjust:
+        cpp_runtime = compile_formula(ewm(var("x"), span), cpp=True)
+        cpp_out = cpp_runtime.run_batch({"x": data})
+        if isinstance(cpp_out, tuple):
+            cpp_out = cpp_out[1]
+        np.testing.assert_allclose(np.asarray(cpp_out), expected, equal_nan=True)
