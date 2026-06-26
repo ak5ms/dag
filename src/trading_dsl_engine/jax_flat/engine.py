@@ -386,19 +386,22 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
     else:
         user_inputs = tuple(inputs)
         if external_cache_inputs:
-            user_iter = iter(user_inputs)
-            ordered = []
-            for name in runtime.program.input_names:
-                if name in external_cache_inputs:
-                    ordered.append(external_cache_inputs[name])
-                else:
-                    ordered.append(next(user_iter))
-            remaining = tuple(user_iter)
-            if remaining:
-                raise ValueError(
-                    "run_batch received more positional input array(s) than non-cached formula inputs"
-                )
-            inputs = tuple(ordered)
+            if len(user_inputs) == len(runtime.program.input_names):
+                inputs = user_inputs
+            else:
+                user_iter = iter(user_inputs)
+                ordered = []
+                for name in runtime.program.input_names:
+                    if name in external_cache_inputs:
+                        ordered.append(external_cache_inputs[name])
+                    else:
+                        ordered.append(next(user_iter))
+                remaining = tuple(user_iter)
+                if remaining:
+                    raise ValueError(
+                        "run_batch received more positional input array(s) than non-cached formula inputs"
+                    )
+                inputs = tuple(ordered)
         else:
             inputs = user_inputs
 
