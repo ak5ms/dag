@@ -40,9 +40,15 @@ class DSLFunctionRegistry:
         def _dispatch(*args, **kwargs) -> Expr:
             op_sig = _DSL_OP_SIGNATURES.get(name)
             op_matches = _signature_matches(op_sig, *args, **kwargs)
+            explicit_arg_count = len(args) + len(kwargs)
+            op_param_count = len(op_sig.parameters) if op_sig is not None else 0
             for sig, fn in overloads:
                 match = _signature_match(sig, *args, **kwargs)
-                if match is None or (op_matches and _uses_only_defaults(match)):
+                if match is None:
+                    continue
+                if op_matches and _uses_only_defaults(match):
+                    if explicit_arg_count < op_param_count:
+                        return ensure_expr(fn(*args, **kwargs))
                     continue
                 return ensure_expr(fn(*args, **kwargs))
             if op_matches:

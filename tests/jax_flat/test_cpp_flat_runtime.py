@@ -72,6 +72,29 @@ def test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat():
     _assert_cpp_matches_jax("add(cumsum(close), shift(ewm(ffill(close, 1), 3.0), lag, 5))", data)
 
 
+def test_cpp_flat_default_lag_shift_matches_jax_flat():
+    rows = 24
+    cols = 3
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.1
+    close[4, 1] = np.nan
+    data = {"close": close}
+    for formula in ("shift(close)", "shift(cumsum(close))", "shift(isnan(close))"):
+        _assert_cpp_matches_jax(formula, data)
+
+
+def test_cpp_flat_default_lag_shift_with_runtime_cache_matches_jax_flat():
+    x = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, np.nan], [7.0, 8.0]], dtype=np.float64)
+    cache_runtime = compile_formula("cache(x)", cpp=False)
+    cache_runtime.run_batch({"x": x})
+    data = {"x": x}
+    formula = "shift(isnan(x))"
+    cpp_runtime = compile_formula(formula, runtimes=cache_runtime, cpp=True)
+    jax_runtime = compile_formula(formula, runtimes=cache_runtime, cpp=False)
+    _, cpp_out = cpp_runtime.run_batch(data)
+    _, jax_out = jax_runtime.run_batch(data)
+    np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
 def test_cpp_flat_ridge_projections_match_jax_flat():
     rows = 16
     cols = 5
