@@ -282,6 +282,36 @@ def test_cpp_hybrid_batch_runs_supported_subgraph_before_jax_lambda():
     assert any(name.startswith("__cpp_subgraph_") for name in runtime_cpp.program.input_names) is False
 
 
+def test_cpp_staged_subprogram_compacts_frontier_only_input_indices():
+    from trading_dsl_engine.jax_flat.engine import DagNode, StateFieldRef, StateLayout, StreamingProgram
+    from trading_dsl_engine.jax_flat.engine_cpp import _cpp_node_specs, _subprogram_for_node_with_frontier
+    from trading_dsl_engine.jax_flat.ops import InputOp, LiteralOp, NaryOp
+
+    jax_only = NaryOp(lambda x: x + 1.0)
+    root = NaryOp(lambda x, y: x + y, cpp_name="add")
+    program = StreamingProgram(
+        nodes=(
+            DagNode(InputOp(0), ()),
+            DagNode(jax_only, (0,)),
+            DagNode(LiteralOp(2.0), ()),
+            DagNode(root, (1, 2)),
+        ),
+        outputs=(3,),
+        input_names=("close",),
+        state_layout=StateLayout((StateFieldRef(-1),) * 4, 0),
+        metadata=None,
+        cache_nodes=(),
+    )
+
+    subprogram, frontier_ids, input_sources = _subprogram_for_node_with_frontier(program, 3)
+    node_specs, _, _ = _cpp_node_specs(subprogram)
+
+    assert frontier_ids == (1,)
+    assert input_sources == (("frontier", 1),)
+    assert node_specs[0][0] == "input"
+    assert node_specs[0][2] == 0
+
+
 def test_cpp_hybrid_batch_can_stage_cpp_before_and_after_jax_lambda():
     from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, var
     from trading_dsl_engine.jax_flat import stateless
