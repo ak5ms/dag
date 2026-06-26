@@ -27,7 +27,7 @@ def test_compile_formula_accepts_kwargs_for_stateless_ops():
 def test_compile_formula_accepts_kwargs_for_stateful_and_static_arg_ops():
     runtime = compile_formula(
         "cat("
-        "arg0=ewm(x=close, hl=2, min_periods=1), "
+        "arg0=ewm(x=close, span=2, min_periods=1), "
         "arg1=shift(x=close, lag=lag, max_lag=3), "
         "arg2=round(x=open, decimals=0)"
         ")",
@@ -57,3 +57,12 @@ def test_compile_formula_accepts_kwargs_for_variadic_and_object_ops():
 
     assert out.shape == (3, 1)
     assert np.all(np.isfinite(np.asarray(out)[-1]))
+
+
+def test_shift_defaults_and_le_ge_comparisons():
+    data = {"close": np.asarray([[1.0, 2.0], [3.0, 2.0], [2.0, 4.0]])}
+    shifted = np.asarray(compile_formula("shift(close)", cpp=False).run_batch(data)[1])
+    np.testing.assert_allclose(shifted, [[np.nan, np.nan], [1.0, 2.0], [3.0, 2.0]], equal_nan=True)
+    compared = np.asarray(compile_formula("cat(close <= 2, close >= 3)", cpp=False).run_batch(data)[1])
+    np.testing.assert_allclose(compared[:, :, 0], [[1.0, 1.0], [0.0, 1.0], [1.0, 0.0]])
+    np.testing.assert_allclose(compared[:, :, 1], [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
