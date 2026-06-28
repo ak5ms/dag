@@ -2,6 +2,8 @@ from dataclasses import replace
 from itertools import product
 import os
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.jax_flat import compile_formula
@@ -9,6 +11,7 @@ from trading_dsl_engine.jax_flat import engine as jax_flat_engine
 from trading_dsl_engine.jax_flat.engine import _build_state_layout
 from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
 from trading_dsl_engine.jax_flat.ops import RidgeOp
+from trading_dsl_engine.jax_ffi.nnqp import nnqp, solve_direct
 
 
 def _run(formula, **data):
@@ -313,3 +316,61 @@ def test_cpp_flat_new_stateless_ops_match_jax_flat():
         _, jax_out = jax_runtime.run_batch({"x": x})
         _, cpp_out = cpp_runtime.run_batch({"x": x})
         np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=1e-7, atol=1e-7, equal_nan=True)
+
+
+def test_ridge_nonneg_keyword_projects_negative_coefficients():
+    x = np.array([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]], dtype=np.float64)
+    y = np.array([[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]], dtype=np.float64)
+
+    unconstrained = _run("get_beta(Ridge(x, y=y, hl=0, lambda_=0.0, nonneg=False))", x=x, y=y)
+    constrained = _run("get_beta(Ridge(x, y=y, hl=0, lambda_=0.0, nonneg=True))", x=x, y=y)
+
+    assert np.any(unconstrained[0] < -1e-9)
+    np.testing.assert_allclose(constrained[0], np.zeros(1), atol=1e-10)
+    assert np.all(constrained >= -1e-10)
+
+
+def test_native_ridge_nonneg_matches_jax_flat():
+    data = {
+        "x": np.array([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]], dtype=np.float64),
+        "y": np.array([[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]], dtype=np.float64),
+    }
+    formula = "get_beta(Ridge(x, y=y, hl=0, lambda_=0.0, nonneg=True))"
+    _, jax_out = compile_formula(formula, cpp=False).run_batch(data)
+    _, native_out = compile_formula_native(formula).run_batch(data)
+    np.testing.assert_allclose(native_out, np.asarray(jax_out), atol=1e-9)
+
+
+def test_nnqp_ffi_forward_and_backward():
+    A = jnp.array([[2.0, 0.0], [0.0, 2.0]], dtype=jnp.float64)
+    c = jnp.array([2.0, -1.0], dtype=jnp.float64)
+
+    beta = jax.jit(nnqp)(A, c)
+    np.testing.assert_allclose(np.asarray(beta), np.asarray(solve_direct(np.asarray(A), np.asarray(c))), atol=1e-10)
+    np.testing.assert_allclose(np.asarray(beta), np.array([1.0, 0.0]), atol=1e-10)
+
+    def loss(lhs, rhs):
+        b = nnqp(lhs, rhs)
+        return 0.5 * jnp.sum(b * b)
+
+    dA, dc = jax.jit(jax.grad(loss, argnums=(0, 1)))(A, c)
+    np.testing.assert_allclose(np.asarray(dc), np.array([0.5, 0.0]), atol=1e-10)
+    np.testing.assert_allclose(np.asarray(dA), np.array([[-0.5, 0.0], [0.0, 0.0]]), atol=1e-10)
+
+
+def test_native_ridge_nonneg_large_random_nan_panel_matches_jax_flat():
+    rng = np.random.default_rng(20260627)
+    data = {
+        name: rng.normal(size=(100, 9)).astype(np.float64)
+        for name in ("x1", "x2", "x3", "y")
+    }
+    for name, arr in data.items():
+        arr[rng.random(arr.shape) < (0.12 if name != "y" else 0.08)] = np.nan
+
+    formula = "get_beta(Ridge(x1, x2, x3, y=y, hl=0, lambda_=0.05, nonneg=True))"
+    _, jax_out = compile_formula(formula, cpp=False).run_batch(data)
+    _, native_out = compile_formula_native(formula).run_batch(data)
+
+    np.testing.assert_allclose(native_out, np.asarray(jax_out), rtol=1e-8, atol=1e-8)
+    assert native_out.shape == (100, 3)
+    assert np.all(native_out >= -1e-10)

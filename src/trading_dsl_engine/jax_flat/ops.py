@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import jax.scipy.special as jsp_special
 
+from trading_dsl_engine.jax_ffi.nnqp import nnqp
+
 jax.config.update("jax_enable_x64", True)
 
 
@@ -805,6 +807,7 @@ class FutureRbfBasisSumOp(Op):
 class RidgeOp(Op):
     feature_widths: tuple[int, ...]
     has_weights: bool
+    nonneg: bool = False
     output_kind: str = "object"
     output_width: int | None = None
     is_stateful: bool = True
@@ -869,7 +872,7 @@ class RidgeOp(Op):
         has_xx = has_xx | has_xx.T
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
         beta_fallback = jnp.where(instant, jnp.zeros_like(state.beta), state.beta)
-        beta = self._solve_with_pinv_fallback(system, xy, beta_fallback)
+        beta = self._solve_system(system, xy, beta_fallback)
         preds = jnp.where(instant, jnp.where(row_valid, xmat @ beta, jnp.nan), prior_preds)
         next_state = RidgeState(
             xx=xx,
@@ -890,7 +893,7 @@ class RidgeOp(Op):
 
         xx = 0.5 * (xx_new + xx_new.T)
         system = xx + lam_value * jnp.diag(jnp.diag(xx))
-        beta = self._solve_with_pinv_fallback(system, xy_new, jnp.zeros_like(xy_new))
+        beta = self._solve_system(system, xy_new, jnp.zeros_like(xy_new))
         preds = jnp.where(row_valid, xmat @ beta, jnp.nan)
         return None, RidgeValue(beta=beta, preds=preds)
 
@@ -960,7 +963,7 @@ class RidgeOp(Op):
         )(lam_seq)
         diag_seq = jax.vmap(lambda xx: jnp.diag(jnp.diag(xx)))(xx_seq)
         systems = xx_seq + lam_values[:, None, None] * diag_seq
-        beta_candidates = jax.vmap(jnp.linalg.solve)(systems, xy_seq)
+        beta_candidates = jax.vmap(lambda system, xy: self._solve_system(system, xy, jnp.zeros_like(xy)))(systems, xy_seq)
         finite_beta = jnp.all(jnp.isfinite(beta_candidates), axis=1)
 
         def beta_step(beta_prev, values):
@@ -968,7 +971,7 @@ class RidgeOp(Op):
             row_valid = jnp.isfinite(y_vec) & jnp.all(jnp.isfinite(xmat), axis=1)
             instant = (_scalar_value(hl) <= 0.0) | jnp.isnan(_scalar_value(hl))
             beta_fallback = jnp.where(instant, jnp.zeros_like(beta_prev), beta_prev)
-            beta = self._finish_solve_with_pinv_fallback(beta_candidate, finite, system, xy, beta_fallback)
+            beta = self._finish_solve(beta_candidate, finite, system, xy, beta_fallback)
             emit_beta = jnp.where(instant, beta, beta_prev)
             preds = jnp.where(row_valid, xmat @ emit_beta, jnp.nan)
             return beta, (beta, preds)
@@ -998,14 +1001,19 @@ class RidgeOp(Op):
         )
         return next_state, RidgeValue(beta=beta_seq, preds=preds_seq)
 
+    def _solve_system(self, system, rhs, fallback):
+        if self.nonneg:
+            return self._solve_nonnegative(system, rhs, fallback)
+        return self._solve_with_pinv_fallback(system, rhs, fallback)
+
     @staticmethod
     def _solve_with_pinv_fallback(system, rhs, fallback):
         beta_candidate = jnp.linalg.solve(system, rhs)
         finite = jnp.all(jnp.isfinite(beta_candidate))
-        return RidgeOp._finish_solve_with_pinv_fallback(beta_candidate, finite, system, rhs, fallback)
+        return RidgeOp._finish_solve(beta_candidate, finite, system, rhs, fallback)
 
     @staticmethod
-    def _finish_solve_with_pinv_fallback(beta_candidate, finite, system, rhs, fallback):
+    def _finish_solve(beta_candidate, finite, system, rhs, fallback):
         beta = jax.lax.cond(
             finite,
             lambda _: beta_candidate,
@@ -1013,6 +1021,13 @@ class RidgeOp(Op):
             operand=None,
         )
         return jnp.where(jnp.all(jnp.isfinite(beta)), beta, fallback)
+
+    @staticmethod
+    def _solve_nonnegative(system, rhs, fallback):
+        valid = jnp.all(jnp.isfinite(system)) & jnp.all(jnp.isfinite(rhs))
+        beta_candidate = nnqp(system, rhs)
+        beta = jnp.where(jnp.all(jnp.isfinite(beta_candidate)), beta_candidate, jnp.maximum(fallback, 0.0))
+        return jnp.where(valid, beta, jnp.maximum(fallback, 0.0))
 
     @staticmethod
     def _as_feature_matrix(value):
