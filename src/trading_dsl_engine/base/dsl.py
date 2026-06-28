@@ -505,15 +505,15 @@ def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noq
     return call("InstrumentBasisMean", features, y, weights, hl)
 
 
-def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None) -> Expr:  # noqa: N802
+def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonneg=False) -> Expr:  # noqa: N802
     ridge_lambda = lambda_ if lambda_ is not None else lam
     if y is None or hl is None or ridge_lambda is None:
         if weights is not None:
             raise TypeError("Ridge positional form cannot combine positional y/hl/lambda with keyword weights")
-        return call("Ridge", *features)
+        return call("Ridge", *features, 3.0 if nonneg else 2.0)
     if weights is None:
-        return call("Ridge", *features, y, 1.0, hl, ridge_lambda)
-    return call("Ridge", *features, y, weights, hl, ridge_lambda)
+        return call("Ridge", *features, y, 1.0, hl, ridge_lambda, 3.0 if nonneg else 2.0)
+    return call("Ridge", *features, y, weights, hl, ridge_lambda, 3.0 if nonneg else 2.0)
 
 
 get_beta = op("get_beta")

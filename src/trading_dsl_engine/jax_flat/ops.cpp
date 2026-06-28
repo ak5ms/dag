@@ -5,6 +5,8 @@
 #include <Eigen/Dense>
 #include <unsupported/Eigen/SpecialFunctions>
 
+#include "trading_dsl_engine/jax_ffi/nnqp/nnqp_eigen_impl.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1461,7 +1463,7 @@ private:
         const double lam_raw = at(lamv, n, 0, 0);
         const double lam = std::max(finite(lam_raw) ? lam_raw : 0.0, 0.0);
         Vec fallback = instant ? Vec::Zero(k) : s.beta;
-        s.beta = solve_ridge(s.xx, s.xy, lam, fallback);
+        s.beta = (spec.int_param != 0) ? solve_nonnegative_ridge(s.xx, s.xy, lam, fallback) : solve_ridge(s.xx, s.xy, lam, fallback);
         if (instant) {
             for (int row = 0; row < n; ++row) {
                 double pred = 0.0;
@@ -1474,6 +1476,16 @@ private:
         }
         ++s.t;
         std::copy(s.preds.data(), s.preds.data() + s.preds.size(), dst_v.data.begin());
+    }
+
+
+    static Vec solve_nonnegative_ridge(const RowMatrix& xx, const Vec& xy, double lam, const Vec& fallback) {
+        RowMatrix lhs = xx;
+        lhs.diagonal().array() += lam * xx.diagonal().array();
+        if (!lhs.allFinite() || !xy.allFinite()) return fallback.cwiseMax(0.0);
+        Vec beta = Vec::Zero(static_cast<int>(xy.size()));
+        nnqp_eigen::active_set_impl(lhs.data(), xy.data(), beta.data(), static_cast<int>(xy.size()), std::max(64, 4 * static_cast<int>(xy.size())));
+        return beta.allFinite() ? beta.cwiseMax(0.0) : fallback.cwiseMax(0.0);
     }
 
     static void update_ew_stat(double& current, uint8_t& has, int64_t& last, double fresh, int64_t t, double hl) {

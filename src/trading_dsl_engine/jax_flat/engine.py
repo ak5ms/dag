@@ -714,7 +714,7 @@ def _normalize_variadic_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tu
 def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
     values: dict[str, Expr] = {}
     for name, value in kwargs:
-        if name not in {"y", "weights", "hl", "lambda_"}:
+        if name not in {"y", "weights", "hl", "lambda_", "nonneg"}:
             raise ValueError(f"Unsupported Ridge keyword argument(s): {[name]}")
         if name in values:
             raise ValueError(f"Ridge got multiple values for argument {name!r}")
@@ -724,8 +724,13 @@ def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Exp
     hl = values.get("hl")
     lambda_value = values.get("lambda_")
     weights = values.get("weights")
-    tail = (y, weights, hl, lambda_value) if weights is not None else (y, hl, lambda_value)
-    if any(value is None for value in tail):
+    nonneg = values.get("nonneg", Number(2.0))
+    if isinstance(nonneg, Identifier) and nonneg.name in {"True", "False"}:
+        nonneg = Number(3.0 if nonneg.name == "True" else 2.0)
+    elif isinstance(nonneg, Number):
+        nonneg = Number(3.0 if bool(nonneg.value) else 2.0)
+    tail = (y, weights if weights is not None else Number(1.0), hl, lambda_value, nonneg)
+    if any(value is None for value in tail[:-1]):
         raise ValueError("Ridge keyword form requires y, hl, and lambda_")
     return args + tail
 
@@ -1124,14 +1129,18 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         feature_op = child_ops[0]
         return InstrumentBasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
     if expr.fn == "Ridge" and len(expr.args) >= 4:
-        has_weights = len(expr.args) >= 5
-        feature_ops = child_ops[:-4] if has_weights else child_ops[:-3]
+        has_nonneg = len(expr.args) >= 5 and isinstance(expr.args[-1], Number) and float(expr.args[-1].value) in (2.0, 3.0)
+        nonneg = bool(_literal_int_arg(expr.args[-1], "Ridge", len(expr.args)) - 2) if has_nonneg else False
+        data_child_ops = child_ops[:-1] if has_nonneg else child_ops
+        data_args = expr.args[:-1] if has_nonneg else expr.args
+        has_weights = len(data_args) >= 5
+        feature_ops = data_child_ops[:-4] if has_weights else data_child_ops[:-3]
         if not feature_ops:
             raise ValueError("Ridge expects at least one feature arg")
         feature_widths = tuple(_op_width(op) for op in feature_ops)
-        hl_arg = expr.args[-2]
+        hl_arg = data_args[-2]
         is_stateful = not (isinstance(hl_arg, Number) and float(hl_arg.value) == 0.0)
-        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights, is_stateful=is_stateful), None
+        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights, nonneg=nonneg, is_stateful=is_stateful), ((len(expr.args) - 1,) if has_nonneg else None)
     builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
     if builder is None:
         raise ValueError(f"Unsupported function {expr.fn}/{len(expr.args)} in jax_flat")

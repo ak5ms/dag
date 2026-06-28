@@ -261,7 +261,7 @@ def _cpp_node_specs(program: StreamingProgram):
             if state_index < 0:
                 state_index = state_count
                 state_count += 1
-            specs.append(spec_tuple("ridge", node.child_ids, state_index=state_index, width=1, feature_widths=op.feature_widths))
+            specs.append(spec_tuple("ridge", node.child_ids, state_index=state_index, int_param=1 if op.nonneg else 0, width=1, feature_widths=op.feature_widths))
             supported.append("ridge")
             continue
         raise NotImplementedError(f"C++ jax_flat does not yet support node {idx}: {type(op).__name__}")
