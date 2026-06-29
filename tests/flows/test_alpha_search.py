@@ -3,7 +3,7 @@ from math import isfinite
 import pytest
 from deap import gp
 
-from trading_dsl_engine.base.alpha_search import (
+from flows.alpha_search import (
     PositiveScalar,
     PositiveIntScalar,
     default_alpha_pnl,
