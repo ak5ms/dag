@@ -112,7 +112,6 @@ class StreamingProgram:
     metadata: FormulaMetadata | None = None
     cache_nodes: tuple[int, ...] = ()
     cache_expr_keys: tuple[tuple[Any, ...], ...] = ()
-    cache_call_targets: tuple[Call | None, ...] = ()
     external_cache_inputs: dict[str, np.ndarray] | None = None
 
 
@@ -541,11 +540,8 @@ def _cache_output_array(runtime: JaxFlatRuntime, node_id: int, n_steps: int, n_i
 
 def _store_cache_arrays(runtime: JaxFlatRuntime, values) -> None:
     runtime.cached_values.clear()
-    targets = runtime.program.cache_call_targets or (None,) * len(runtime.program.cache_nodes)
-    for node_id, value, target in zip(runtime.program.cache_nodes, values, targets):
+    for node_id, value in zip(runtime.program.cache_nodes, values):
         runtime.cached_values[int(node_id)] = value
-        if target is not None:
-            object.__setattr__(target, "_jax_flat_cached_value", value)
 
 
 def _finalize_batch_result(runtime: JaxFlatRuntime, result):
@@ -989,25 +985,15 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
     projection = _object_projection_op(expr, child_ops)
     if projection is not None:
         return projection
-    if expr.fn == "cache" and len(expr.args) in (1, 2, 3):
+    if expr.fn == "cache" and len(expr.args) in (1, 2):
         storage = "ram"
-        save = "runtime"
-        if len(expr.args) >= 2:
+        if len(expr.args) == 2:
             if not isinstance(expr.args[1], String):
                 raise ValueError("cache storage must be a string literal")
             storage = expr.args[1].value
-        if len(expr.args) >= 3:
-            if not isinstance(expr.args[2], String):
-                raise ValueError("cache save target must be a string literal")
-            save = expr.args[2].value
         if storage not in {"ram", "disk"}:
             raise ValueError("cache storage must be 'ram' or 'disk'")
-        if save not in {"runtime", "call"}:
-            raise ValueError("cache save target must be 'runtime' or 'call'")
-        return (
-            CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width),
-            tuple(range(1, len(expr.args))) if len(expr.args) > 1 else None,
-        )
+        return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
@@ -1491,15 +1477,9 @@ def _normalize_runtime_tuple(runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime]
 
 def _external_cache_inputs(
     runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None,
-    call_values_by_key: dict[tuple[Any, ...], np.ndarray] | None = None,
 ) -> tuple[dict[tuple[Any, ...], str], dict[str, np.ndarray]]:
     names_by_key: dict[tuple[Any, ...], str] = {}
     values_by_name: dict[str, np.ndarray] = {}
-    call_values_by_key = call_values_by_key or {}
-    for call_idx, (expr_key, value) in enumerate(call_values_by_key.items()):
-        name = f"__cache_call_{call_idx}"
-        names_by_key[expr_key] = name
-        values_by_name[name] = value
     for runtime_idx, runtime in enumerate(_normalize_runtime_tuple(runtimes)):
         cached_values = runtime.get_cached_values()
         missing = [node_id for node_id in runtime.program.cache_nodes if node_id not in cached_values]
@@ -1516,39 +1496,6 @@ def _external_cache_inputs(
             values_by_name[name] = cached_values[node_id]
     return names_by_key, values_by_name
 
-def _cache_call_targets_by_key(node: Expr) -> dict[tuple[Any, ...], Call]:
-    targets: dict[tuple[Any, ...], Call] = {}
-
-    def visit(expr: Expr) -> None:
-        if isinstance(expr, Call):
-            if expr.fn == "cache":
-                normalized = _normalize_static_jax_flat_kwargs(expr)
-                save_arg = normalized.args[2] if len(normalized.args) >= 3 else String("runtime")
-                if isinstance(save_arg, String) and save_arg.value == "call":
-                    targets[_expr_key(normalized)] = expr
-            for arg in expr.args:
-                visit(arg)
-            for _, value in expr.kwargs:
-                visit(value)
-        elif isinstance(expr, (RollingJaxCall, StatelessJaxCall)):
-            for arg in expr.args:
-                visit(arg)
-        elif isinstance(expr, KeyTuple):
-            for item in expr.items:
-                visit(item)
-
-    visit(node)
-    return targets
-
-
-def _cache_call_values_by_key(targets: dict[tuple[Any, ...], Call]) -> dict[tuple[Any, ...], np.ndarray]:
-    return {
-        key: getattr(call, "_jax_flat_cached_value")
-        for key, call in targets.items()
-        if hasattr(call, "_jax_flat_cached_value")
-    }
-
-
 def compile_formula(
     formula: str | Expr,
     dsl_registry: DSLFunctionRegistry | None = None,
@@ -1557,16 +1504,13 @@ def compile_formula(
     type_relations=(),
     runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None = None,
 ) -> JaxFlatRuntime:
-    raw_expr = parse_formula(formula) if isinstance(formula, str) else formula
-    call_targets_by_key = _cache_call_targets_by_key(raw_expr)
-    expr = _normalize_static_jax_flat_kwargs(raw_expr)
+    expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
     metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
     formula_metadata = analyze_formula_metadata(expr, metadata_config)
-    external_cache_names, external_cache_values = _external_cache_inputs(
-        runtimes, _cache_call_values_by_key(call_targets_by_key)
-    )
+    external_cache_names, external_cache_values = _external_cache_inputs(runtimes)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
@@ -1576,7 +1520,6 @@ def compile_formula(
     cache_nodes = tuple(idx for idx, node in enumerate(node_tuple) if isinstance(node.op, CacheOp))
     cache_key_by_node = {node_id: key for key, node_id in memo.items() if key[0] == "call" and key[1] == "cache"}
     cache_expr_keys = tuple(cache_key_by_node[idx][2][0] for idx in cache_nodes)
-    cache_call_targets = tuple(call_targets_by_key.get(cache_key_by_node[idx]) for idx in cache_nodes)
     return JaxFlatRuntime(
         program=StreamingProgram(
             nodes=node_tuple,
@@ -1586,7 +1529,6 @@ def compile_formula(
             metadata=formula_metadata,
             cache_nodes=cache_nodes,
             cache_expr_keys=cache_expr_keys,
-            cache_call_targets=cache_call_targets,
             external_cache_inputs=external_cache_values or None,
         ),
         cpp=cpp,

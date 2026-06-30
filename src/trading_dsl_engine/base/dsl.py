@@ -229,7 +229,7 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "ffill": _dsl_signature("x", "limit"),
     "shift": _dsl_signature("x", "lag", "max_lag", defaults={"lag": 1, "max_lag": None}),
     "buffer": _dsl_signature("shift_expr", "min", "max"),
-    "cache": _dsl_signature("x", "storage", "save", defaults={"storage": "ram", "save": "runtime"}),
+    "cache": _dsl_signature("x", "where"),
     "bspline": _dsl_signature("x", "n_basis"),
     "rbf_basis": _dsl_signature("ev_ts", "session_start", "session_end", "n_basis"),
     "future_rbf_basis_sum": _dsl_signature("ev_ts", "session_start", "session_end", "n_basis", "n_steps"),
