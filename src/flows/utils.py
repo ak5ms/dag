@@ -26,8 +26,8 @@ def ewm_var(x: Expr, span: Expr, min_periods: Expr = None, replace_0: bool = Tru
     out = (ewm(x**2, span, min_periods) - (ewm(x, span, min_periods) ** 2))
     return out
 
-def ewm_std(**kwargs) -> Expr:
-    return ewm_var(**kwargs) ** 0.5
+def ewm_std(x: Expr, span: Expr, min_periods: Expr = None, replace_0: bool = True) -> Expr:
+    return ewm_var(x, span, min_periods, replace_0) ** 0.5
 
 
 def ewm_mean(x: Expr, span: Expr, min_periods: Expr = None, replace_0: bool = True) -> Expr:

@@ -58,10 +58,10 @@ pct_seen = stateless(
 )
 
 PovFields = SimpleNamespace(
-    ts = var("ev_ts"),
-    session_start = var("session_start"),
-    session_end = var("session_end"),
-    volume = var("volume"),
+    ts = var("_ev_ts"),
+    session_start = var("session_start0"),
+    session_end = var("session_end0"),
+    volume = var("volume_out0"),
     is_tradable = var("is_tradable_out0"),
 )
 
@@ -82,9 +82,9 @@ def pov(n_basis: int = 6, h: int = 1440, f: SimpleNamespace = PovFields):
 
 
 RollRetsFields = SimpleNamespace(
-    wdte=var("wdte"),
-    px0=var("vwap0"),
-    px1 = var("vwap1"),
+    wdte=var("wdte_out0"),
+    px0=var("mp_out0.close"),
+    px1 = var("mp_out1.close"),
     is_tradable_out0 = var("is_tradable_out0"),
     is_tradable_out1 = var("is_tradable_out1"),
 )
@@ -160,7 +160,7 @@ _DIV_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^volume_out\d+$"),
 )
 
-def mapper(key: str):
+def _mapper(key: str):
     if any(p.match(key) for p in _MUL_PATTERNS):
         return mul
     elif any(p.match(key) for p in _DIV_PATTERNS):
@@ -175,6 +175,15 @@ def adj(x: Expr, adj_factor: Expr = None, **kwargs):
         k = x.name
     else:
         raise NotImplementedError
-    op = mapper(k)
+    op = _mapper(k)
     return op(var(k), adj_factor)
 
+if __name__ == "__main__":
+    from flows.load import InputData
+
+    in_data = InputData(nrows=1E6)
+    import time
+    start = time.perf_counter()
+    in_data.run(pov())
+    end = time.perf_counter()
+    print(end-start)

@@ -95,7 +95,6 @@ def make_alpha_pset(
     pset.addPrimitive(div, [Expr, Expr], Expr, name="div")
     pset.addPrimitive(dsl_abs, [Expr], Expr, name="abs")
     pset.addPrimitive(xs_rank, [Expr], Expr, name="xs_rank")
-    pset.addPrimitive(lambda x: clip(xs_rank(x), -3.0, 3.0), [Expr], Expr, name="clipped_xs_rank")
     pset.addPrimitive(lambda x, hl: ewm(x, hl.expr), [Expr, PositiveScalar], Expr, name="ewm")
     pset.addPrimitive(lambda x, n: shift(x, n.expr, n.expr), [Expr, PositiveIntScalar], Expr, name="shift")
     pset.addPrimitive(lambda hl: hl, [PositiveScalar], PositiveScalar, name="same_hl")
