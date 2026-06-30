@@ -22,6 +22,22 @@ def test_grouped_expr_apply_lowers_to_canonical_groupby_call():
     assert isinstance(expr.args[0], KeyTuple)
 
 
+def test_expr_method_chaining_lowers_ops_and_inline_groupby_apply():
+    expr = tde.var("a").add(tde.var("b")).groupby(tde.var("key"), tde.cumsum(tde.self_)).xs_rank()
+    assert isinstance(expr, Call)
+    assert expr.fn == "xs_rank"
+
+    grouped = expr.args[0]
+    assert isinstance(grouped, Call)
+    assert grouped.fn == "groupby"
+    assert len(grouped.args) == 3
+    assert isinstance(grouped.args[0], KeyTuple)
+
+    lhs = grouped.args[1]
+    assert isinstance(lhs, Call)
+    assert lhs.fn == "add"
+
+
 def test_jax_flat_rejects_noncanonical_groupby_arity():
     with pytest.raises(ValueError, match="canonical form"):
         compile_formula("groupby(ts, x)")
