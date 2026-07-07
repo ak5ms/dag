@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 import random
 import re
+
 from typing import Any
 
 from deap import algorithms, base as deap_base, creator, gp, tools
@@ -206,6 +207,65 @@ def _terminal_name(prefix: str, idx: int, value: Expr | str | int | float) -> st
         name = re.sub(r"\W|^(?=\d)", "_", value)
         return name if name and name != "_" else f"{prefix}_{idx}"
     return f"{prefix}_{idx}"
+
+
+
+def _example_alpha_search_on_random_data() -> list[Candidate]:
+    import numpy as np
+
+    from flows.random_data import matrix_inputs_from_long_fields, simulate_requested_fields
+    from flows.utils import pct_change
+    from trading_dsl_engine.jax_flat.engine import compile_formula
+
+    fields = simulate_requested_fields(n_minutes=6 * 60, seed=42)
+    px = matrix_inputs_from_long_fields(fields, ("mp_out0.close",))["mp_out0.close"]
+    realized_rets = px[1:] / px[:-1] - 1.0
+    tradable = matrix_inputs_from_long_fields(fields, ("is_tradable_out0",))["is_tradable_out0"][1:] == 1.0
+
+    returns = pct_change(var("mp_out0.close"))
+    spread_bps = 1e4 * (var("ap_out0.close") - var("bp_out0.close")) / var("mp_out0.close")
+    features = (
+        ewm(returns, 15),
+        ewm(returns, 60),
+        xs_rank(returns),
+        xs_rank(spread_bps),
+        xs_rank(var("volume_out0")),
+    )
+    pset = make_alpha_pset(features, halflives=(5, 30), shift_lags=(1,))
+    compiled: dict[str, Any] = {}
+
+    def score(candidate: Expr, pool: Sequence[Expr]) -> float:
+        key = repr(candidate)
+        runtime = compiled.get(key)
+        if runtime is None:
+            runtime = compile_formula(candidate, cpp=False)
+            compiled[key] = runtime
+        inputs = matrix_inputs_from_long_fields(fields, runtime.program.input_names)
+        _, alpha_path = runtime.run_batch(inputs)
+        alpha = np.asarray(alpha_path, dtype=float)[:-1]
+        pnl = np.where(tradable & np.isfinite(alpha), alpha * realized_rets, np.nan)
+        pnl = pnl[np.isfinite(pnl)]
+        if pnl.size < 2 or np.nanstd(pnl) == 0.0:
+            return float("-inf")
+        return float(np.nanmean(pnl) / np.nanstd(pnl))
+
+    selected = search_formulas(
+        pset,
+        score,
+        max_depth=1,
+        filters=(lambda expr: "is_tradable_out0" not in repr(expr),),
+        additive=lambda candidate, pool, fitness: np.isfinite(fitness) and len(pool) < 3,
+        population_size=4,
+        generations_per_depth=1,
+        seed=7,
+    )
+    for expr, fitness, depth in selected:
+        print(f"depth={depth} fitness={fitness:.6g} expr={expr!r}")
+    return selected
+
+
+if __name__ == "__main__":
+    _example_alpha_search_on_random_data()
 
 
 __all__ = [
