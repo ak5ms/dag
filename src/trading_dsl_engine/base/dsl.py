@@ -221,6 +221,8 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "fillna",
         }
     },
+    "sum": _dsl_signature("x", "axis", "keepdims", defaults={"axis": None, "keepdims": False}),
+    "prod": _dsl_signature("x", "axis", "keepdims", defaults={"axis": None, "keepdims": False}),
     "where": _dsl_signature("condition", "true", "false"),
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
@@ -520,6 +522,8 @@ get_beta = op("get_beta")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")
 mean = op("mean")
+sum = op("sum")
+prod = op("prod")
 
 
 @register_dsl_function("ratio")

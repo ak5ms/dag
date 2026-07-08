@@ -238,7 +238,7 @@ class _AstParser:
         if isinstance(node, ast.BinOp):
             op_name = self._binop_name(node.op)
             return Call(op_name, (self._expr(node.left), self._expr(node.right)))
-        if isinstance(node, ast.Tuple):
+        if isinstance(node, (ast.Tuple, ast.List)):
             if len(node.elts) == 0:
                 raise FormulaParseError("Key tuples cannot be empty")
             return KeyTuple(tuple(self._expr(item) for item in node.elts))
