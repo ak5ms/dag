@@ -10,7 +10,7 @@ from trading_dsl_engine.jax_flat import compile_formula
 from trading_dsl_engine.jax_flat import engine as jax_flat_engine
 from trading_dsl_engine.jax_flat.engine import _build_state_layout
 from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
-from trading_dsl_engine.jax_flat.ops import RidgeOp
+from trading_dsl_engine.jax_flat.ops import CacheOp, EwmOp, RidgeOp
 from trading_dsl_engine.jax_ffi.nnqp import nnqp, solve_direct
 
 
@@ -55,6 +55,52 @@ def test_cache_clip_norm_and_invert_magic():
     np.testing.assert_allclose(_run("~x", x=x), 1.0 - x, equal_nan=True)
 
 
+
+
+def test_cache_can_save_materialized_values_on_python_call_object():
+    from trading_dsl_engine.base.dsl import cache, ewm, var
+
+    a = var("a")
+    b = var("b")
+    data = {
+        "a": np.array([[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]], dtype=np.float64),
+        "b": np.array([[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]], dtype=np.float64),
+    }
+    cached = cache(ewm(a + b, 5), storage="disk", save="call")
+    expr1 = 3.0 + cached
+
+    runtime1 = compile_formula(expr1, cpp=False)
+    _, out1 = runtime1.run_batch(data)
+    call_value = getattr(cached, "_jax_flat_cached_value")
+
+    assert isinstance(call_value, np.memmap)
+    np.testing.assert_allclose(out1, np.asarray(call_value) + 3.0)
+
+    expr2 = expr1 + 4.0
+    runtime2 = compile_formula(expr2, cpp=False)
+
+    assert runtime2.program.cache_nodes == ()
+    assert not any(isinstance(node.op, (CacheOp, EwmOp)) for node in runtime2.program.nodes)
+    assert "a" not in runtime2.program.input_names
+    assert "b" not in runtime2.program.input_names
+    assert any(name.startswith("__cache_call_") for name in runtime2.program.input_names)
+
+    poisoned_data = {name: np.full_like(value, 1_000_000.0) for name, value in data.items()}
+    _, out2 = runtime2.run_batch(poisoned_data)
+
+    np.testing.assert_allclose(out2, np.asarray(call_value) + 7.0)
+
+
+def test_cache_call_save_is_opt_in_and_runtime_default_does_not_modify_call():
+    from trading_dsl_engine.base.dsl import cache, var
+
+    x = var("x")
+    expr = cache(x)
+    data = {"x": np.array([[1.0, 2.0]], dtype=np.float64)}
+
+    compile_formula(expr, cpp=False).run_batch(data)
+
+    assert not hasattr(expr, "_jax_flat_cached_value")
 
 
 def test_cached_runtime_values_feed_matching_subgraphs_and_tuples():
