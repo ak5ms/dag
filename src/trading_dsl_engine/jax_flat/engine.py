@@ -40,6 +40,7 @@ from trading_dsl_engine.jax_flat.ops import (
     ShiftOp,
     _bspline,
     _cat,
+    _cat_batch,
     _col,
     _einsum,
 )
@@ -995,7 +996,7 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
             raise ValueError("cache storage must be 'ram' or 'disk'")
         return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
     if expr.fn == "cat" and len(expr.args) >= 1:
-        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
+        return NaryOp(_cat, batch_fn=_cat_batch, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
         static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
         if len(static_args) != 1:

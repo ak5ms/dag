@@ -89,34 +89,46 @@ def test_perf_levelized_wide_python_dsl_cat_saturates_cpu_and_reports_runtime(mo
     formula = cat(*[sub(y_expr, i) for i in range(1, 20)])
     y = (jnp.arange(t_rows * n_assets, dtype=jnp.float64).reshape(t_rows, n_assets) % 1000) / 1000.0
 
-    def run_case(disable_levelized: bool):
+    def run_case(disable_levelized: bool, disable_vectorized_nary: bool):
         if disable_levelized:
             monkeypatch.setenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", "1")
         else:
             monkeypatch.delenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", raising=False)
+        if disable_vectorized_nary:
+            monkeypatch.setenv("TRADING_DSL_ENGINE_DISABLE_VECTORIZED_NARY_BATCH", "1")
+        else:
+            monkeypatch.delenv("TRADING_DSL_ENGINE_DISABLE_VECTORIZED_NARY_BATCH", raising=False)
         runtime = compile_flat(formula, cpp=False)
         jax.block_until_ready(runtime.run_batch({"y": y})[1])
         return _timed_with_process_cpu(lambda: runtime.run_batch({"y": y})[1])
 
-    depth_first_out, depth_first = run_case(disable_levelized=True)
-    levelized_out, levelized = run_case(disable_levelized=False)
+    depth_first_out, depth_first = run_case(disable_levelized=True, disable_vectorized_nary=True)
+    levelized_vmap_out, levelized_vmap = run_case(disable_levelized=False, disable_vectorized_nary=True)
+    vectorized_out, vectorized = run_case(disable_levelized=False, disable_vectorized_nary=False)
     cpu_quota = _cpu_quota_cores()
     saturation_floor_pct = 85.0 * cpu_quota
 
     print(
-        "wide_python_dsl_cat::depth_first "
+        "wide_python_dsl_cat::depth_first_vmap "
         f"{depth_first} cpu_quota_cores={cpu_quota:.2f} shape={tuple(depth_first_out.shape)}"
     )
     print(
-        "wide_python_dsl_cat::levelized "
-        f"{levelized} cpu_quota_cores={cpu_quota:.2f} shape={tuple(levelized_out.shape)}"
+        "wide_python_dsl_cat::levelized_vmap "
+        f"{levelized_vmap} cpu_quota_cores={cpu_quota:.2f} shape={tuple(levelized_vmap_out.shape)}"
+    )
+    print(
+        "wide_python_dsl_cat::levelized_vectorized_nary "
+        f"{vectorized} cpu_quota_cores={cpu_quota:.2f} shape={tuple(vectorized_out.shape)}"
     )
 
     assert depth_first_out.shape == (t_rows, n_assets, 19)
-    assert levelized_out.shape == (t_rows, n_assets, 19)
+    assert levelized_vmap_out.shape == (t_rows, n_assets, 19)
+    assert vectorized_out.shape == (t_rows, n_assets, 19)
     np.testing.assert_allclose(np.asarray(depth_first_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
-    np.testing.assert_allclose(np.asarray(levelized_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
-    assert levelized["cpu_util_pct"] >= saturation_floor_pct
+    np.testing.assert_allclose(np.asarray(levelized_vmap_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
+    np.testing.assert_allclose(np.asarray(vectorized_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
+    assert vectorized["cpu_util_pct"] >= saturation_floor_pct
+    assert vectorized["elapsed_s"] <= depth_first["elapsed_s"] * 1.05
 
 
 def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1: int):
