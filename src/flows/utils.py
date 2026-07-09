@@ -2,7 +2,7 @@ from trading_dsl_engine.base.dsl import *
 
 
 def pct_change(x):
-    return x / shift(x, 1, 1) - 1.0
+    return x / shift(x) - 1.0
 
 
 def mask(w, tradable_mask=var("is_tradable_out0"), fill=ffill):
@@ -46,6 +46,12 @@ def dszl(x: Expr, span: Expr, grouping: Expr = timeofday, time: str = var("_ev_t
         **kwargs
     )
     return out
+
+def ts_zscore(x: Expr, span: Expr, **kwargs):
+    return (x - ewm_mean(x, span=span, **kwargs)) / ewm_std(x, span=span, **kwargs)
+
+def map(func: Callable, xs: list[Expr], *args, **kwargs):
+    return [func(x, *args, **kwargs) for x in xs]
 
 def streak(cond):
     "# rows since last true"
