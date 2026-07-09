@@ -42,6 +42,22 @@ def test_cat_stacks_multiple_alpha_vectors_on_last_axis():
     np.testing.assert_allclose(np.asarray(out), expected)
 
 
+def test_compiled_dag_is_levelized_across_independent_cat_branches(monkeypatch):
+    formula = "cat(add(x, 1), sub(y, 2))"
+    monkeypatch.delenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", raising=False)
+    runtime = compile_formula(formula, cpp=False)
+    node_names = [type(node.op).__name__ for node in runtime.program.nodes]
+    child_ids = [node.child_ids for node in runtime.program.nodes]
+
+    assert node_names == ["InputOp", "LiteralOp", "InputOp", "LiteralOp", "NaryOp", "NaryOp", "NaryOp"]
+    assert child_ids == [(), (), (), (), (0, 1), (2, 3), (4, 5)]
+
+    monkeypatch.setenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", "1")
+    depth_first_runtime = compile_formula(formula, cpp=False)
+    depth_first_child_ids = [node.child_ids for node in depth_first_runtime.program.nodes]
+    assert depth_first_child_ids == [(), (), (0, 1), (), (), (3, 4), (2, 5)]
+
+
 def test_dsl_function_overloads_fall_back_to_builtin_ops_by_signature():
     x = var("x")
     assert shift(x) == shift(x, 1.0, 1.0)

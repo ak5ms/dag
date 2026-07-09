@@ -1160,6 +1160,46 @@ def _build_state_layout(nodes: tuple[DagNode, ...], sample: jax.Array | None = N
     return StateLayout(node_fields=tuple(refs), total_leaves=offset)
 
 
+def _levelized_nodes(
+    nodes: tuple[DagNode, ...],
+    outputs: tuple[int, ...],
+    cache_nodes: tuple[int, ...] = (),
+) -> tuple[tuple[DagNode, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return a dependency-depth topological ordering of a compiled DAG.
+
+    The compiler naturally emits a depth-first postorder. That order is valid,
+    but wide formulas such as ``cat(alpha1, alpha2, ...)`` place each alpha
+    branch contiguously in the jitted Python trace. Reordering by topological
+    depth keeps every child before its parents while exposing same-depth,
+    independent work from different branches next to each other in the JAX/XLA
+    program. Stateful semantics are preserved because dependencies, not textual
+    branch order, define the streaming dataflow.
+    """
+
+    if os.getenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", "0") == "1":
+        return nodes, outputs, cache_nodes, tuple(range(len(nodes)))
+
+    depths: list[int] = []
+    for node in nodes:
+        depths.append(0 if not node.child_ids else 1 + max(depths[cid] for cid in node.child_ids))
+
+    old_order = tuple(sorted(range(len(nodes)), key=lambda idx: (depths[idx], idx)))
+    old_to_new = {old_id: new_id for new_id, old_id in enumerate(old_order)}
+    if all(old_to_new[idx] == idx for idx in range(len(nodes))):
+        return nodes, outputs, cache_nodes, old_order
+
+    new_nodes = tuple(
+        DagNode(op=nodes[old_id].op, child_ids=tuple(old_to_new[cid] for cid in nodes[old_id].child_ids))
+        for old_id in old_order
+    )
+    return (
+        new_nodes,
+        tuple(old_to_new[idx] for idx in outputs),
+        tuple(old_to_new[idx] for idx in cache_nodes),
+        old_order,
+    )
+
+
 def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple[Expr, ...]]:
     if not isinstance(rhs, Call):
         raise ValueError("groupby rhs must be a call expression")
@@ -1242,7 +1282,7 @@ def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple
         raise ValueError(f"Unsupported groupby rhs node: {node}")
 
     output_id = build(rhs)
-    node_tuple = tuple(nodes)
+    node_tuple, (output_id,), _, _ = _levelized_nodes(tuple(nodes), (output_id,))
     state_layout = _build_state_layout(node_tuple)
     return (
         InnerGraphOp(
@@ -1516,10 +1556,13 @@ def compile_formula(
     input_names: list[str] = []
     out = _compile_node(expr, memo, nodes, input_names, external_cache_names)
     node_tuple = tuple(nodes)
-    layout = _build_state_layout(node_tuple)
     cache_nodes = tuple(idx for idx, node in enumerate(node_tuple) if isinstance(node.op, CacheOp))
     cache_key_by_node = {node_id: key for key, node_id in memo.items() if key[0] == "call" and key[1] == "cache"}
-    cache_expr_keys = tuple(cache_key_by_node[idx][2][0] for idx in cache_nodes)
+    cache_expr_keys_by_node = {idx: cache_key_by_node[idx][2][0] for idx in cache_nodes}
+    node_tuple, (out,), cache_nodes, old_order = _levelized_nodes(node_tuple, (out,), cache_nodes)
+    layout = _build_state_layout(node_tuple)
+    new_to_old = {new_id: old_id for new_id, old_id in enumerate(old_order)}
+    cache_expr_keys = tuple(cache_expr_keys_by_node[new_to_old[idx]] for idx in cache_nodes)
     return JaxFlatRuntime(
         program=StreamingProgram(
             nodes=node_tuple,

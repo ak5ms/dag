@@ -1,5 +1,6 @@
 import json
 import os
+import resource
 import subprocess
 import sys
 import time
@@ -15,8 +16,8 @@ try:
 except Exception:
     pl = None
 
+from trading_dsl_engine.base.dsl import cat, sub, var
 from trading_dsl_engine.jax_flat.engine import compile_formula as compile_flat
-from trading_dsl_engine.jax_new.engine import compile_formula as compile_new
 from trading_dsl_engine import build_engine, run_batch_from_mapping
 
 RUN_PERF = os.getenv("RUN_PERF_TESTS", "0") == "1"
@@ -46,6 +47,27 @@ def _bench(fn: Callable, *args, warmup_runs: int = 1) -> dict[str, float]:
     return _stats(samples)
 
 
+def _cpu_quota_cores() -> float:
+    try:
+        quota, period = open("/sys/fs/cgroup/cpu.max", encoding="utf-8").read().split()[:2]
+    except OSError:
+        return float(os.cpu_count() or 1)
+    if quota == "max":
+        return float(os.cpu_count() or 1)
+    return max(float(quota) / float(period), 1.0)
+
+
+def _timed_with_process_cpu(fn: Callable):
+    r0 = resource.getrusage(resource.RUSAGE_SELF)
+    t0 = time.perf_counter()
+    out = fn()
+    jax.block_until_ready(out)
+    elapsed = time.perf_counter() - t0
+    r1 = resource.getrusage(resource.RUSAGE_SELF)
+    cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
+    return out, {"elapsed_s": elapsed, "cpu_s": cpu, "cpu_util_pct": 100.0 * cpu / elapsed}
+
+
 def _make_scan_runner(runtime):
 
     def run(state, open_arr, close_arr):
@@ -59,7 +81,46 @@ def _make_scan_runner(runtime):
     return jax.jit(run)
 
 
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_levelized_wide_python_dsl_cat_saturates_cpu_and_reports_runtime(monkeypatch):
+    t_rows = 3_000_000
+    n_assets = 9
+    y_expr = var("y")
+    formula = cat(*[sub(y_expr, i) for i in range(1, 20)])
+    y = (jnp.arange(t_rows * n_assets, dtype=jnp.float64).reshape(t_rows, n_assets) % 1000) / 1000.0
+
+    def run_case(disable_levelized: bool):
+        if disable_levelized:
+            monkeypatch.setenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", "1")
+        else:
+            monkeypatch.delenv("TRADING_DSL_ENGINE_DISABLE_LEVELIZED_DAG", raising=False)
+        runtime = compile_flat(formula, cpp=False)
+        jax.block_until_ready(runtime.run_batch({"y": y})[1])
+        return _timed_with_process_cpu(lambda: runtime.run_batch({"y": y})[1])
+
+    depth_first_out, depth_first = run_case(disable_levelized=True)
+    levelized_out, levelized = run_case(disable_levelized=False)
+    cpu_quota = _cpu_quota_cores()
+    saturation_floor_pct = 85.0 * cpu_quota
+
+    print(
+        "wide_python_dsl_cat::depth_first "
+        f"{depth_first} cpu_quota_cores={cpu_quota:.2f} shape={tuple(depth_first_out.shape)}"
+    )
+    print(
+        "wide_python_dsl_cat::levelized "
+        f"{levelized} cpu_quota_cores={cpu_quota:.2f} shape={tuple(levelized_out.shape)}"
+    )
+
+    assert depth_first_out.shape == (t_rows, n_assets, 19)
+    assert levelized_out.shape == (t_rows, n_assets, 19)
+    np.testing.assert_allclose(np.asarray(depth_first_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
+    np.testing.assert_allclose(np.asarray(levelized_out[0, 0, :3]), np.array([-1.0, -2.0, -3.0]))
+    assert levelized["cpu_util_pct"] >= saturation_floor_pct
+
+
 def _run_case(case_name: str, formula: str, batch_fn: Callable, key0: int, key1: int):
+    compile_new = pytest.importorskip("trading_dsl_engine.jax_new.engine").compile_formula
     open_data = jax.random.normal(jax.random.PRNGKey(key0), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
     close_data = jax.random.normal(jax.random.PRNGKey(key1), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
 
