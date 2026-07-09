@@ -72,6 +72,75 @@ def test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat():
     _assert_cpp_matches_jax("add(cumsum(close), shift(ewm(ffill(close, 1), 3.0), lag, 5))", data)
 
 
+def test_run_batch_sum_reduction_over_time_matches_materialized_output():
+    from trading_dsl_engine.base.dsl import sum as dsl_sum, var
+
+    rows = 40
+    cols = 4
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.01 + 1.0
+    open_ = close + 0.25
+    data = {"close": close, "open": open_}
+
+    materialized_formula = "cat(ewm(close, 3.0), xs_rank(sub(open, close)))"
+    formula = f"sum({materialized_formula}, axis=[0])"
+    jax_runtime = compile_formula(formula, cpp=False)
+    _, materialized = compile_formula(materialized_formula, cpp=False).run_batch(data)
+    _, reduced = jax_runtime.run_batch(data)
+    np.testing.assert_allclose(np.asarray(reduced), np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+
+    python_runtime = compile_formula(dsl_sum(var("close"), axis=[0]), cpp=False)
+    _, python_reduced = python_runtime.run_batch(data)
+    np.testing.assert_allclose(np.asarray(python_reduced), close.sum(axis=0), rtol=1e-10, atol=1e-10)
+
+
+def test_cpp_run_batch_sum_reduction_over_time_matches_materialized_output():
+    rows = 32
+    cols = 5
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.01 + 1.0
+    open_ = close + 0.25
+    data = {"close": close, "open": open_}
+
+    materialized_formula = "cat(add(close, open), xs_rank(close))"
+    formula = f"sum({materialized_formula}, axis=[0])"
+    runtime = compile_formula(formula, cpp=True)
+    _, materialized = compile_formula(materialized_formula, cpp=False).run_batch(data)
+    _, reduced = runtime.run_batch(data)
+    np.testing.assert_allclose(np.asarray(reduced), np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+
+    native_runtime = compile_formula_native(formula)
+    _, native_reduced = native_runtime.run_batch(data)
+    np.testing.assert_allclose(native_reduced, np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+
+
+def test_multiple_dsl_time_reductions_compose_without_materializing_children():
+    rows = 12
+    cols = 3
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.01 + 1.0
+    open_ = close + 0.5
+    data = {"close": close, "open": open_}
+
+    runtime = compile_formula("add(sum(ewm(close, 3.0), axis=[0]), prod(add(open, 1.0), axis=[0]))", cpp=False)
+    _, out = runtime.run_batch(data)
+
+    _, ewm_out = compile_formula("ewm(close, 3.0)", cpp=False).run_batch(data)
+    expected = np.asarray(ewm_out).sum(axis=0) + np.prod(open_ + 1.0, axis=0)
+    np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-10, atol=1e-10)
+
+
+def test_time_reduction_can_feed_time_varying_downstream_formula():
+    rows = 12
+    cols = 3
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.01 + 1.0
+    open_ = close + 0.5
+    data = {"close": close, "open": open_}
+
+    runtime = compile_formula("add(close, sum(open, axis=[0]))", cpp=False)
+    _, out = runtime.run_batch(data)
+
+    expected = close + open_.sum(axis=0)
+    np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-10, atol=1e-10)
+
+
 def test_cpp_flat_default_lag_shift_matches_jax_flat():
     rows = 24
     cols = 3

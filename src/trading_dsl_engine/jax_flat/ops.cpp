@@ -519,6 +519,37 @@ public:
         return out;
     }
 
+    py::array_t<double> run_batch_reduce(State& state, const std::string& reduction, py::args arrays) const {
+        int64_t rows = -1;
+        auto input_arrays = validate_batch(state, arrays, rows);
+        const int64_t width = static_cast<int64_t>(output_size(state));
+        py::array_t<double> out({width});
+        auto out_buf = out.mutable_unchecked<1>();
+        if (reduction == "sum") {
+            for (int64_t i = 0; i < width; ++i) out_buf(i) = 0.0;
+        } else if (reduction == "prod") {
+            for (int64_t i = 0; i < width; ++i) out_buf(i) = 1.0;
+        } else {
+            throw std::invalid_argument("C++ jax_flat reduction must be 'sum' or 'prod'");
+        }
+        const int n = state.n_instruments_;
+        state.row_ptrs_.assign(input_arrays.size(), nullptr);
+        std::vector<const double*> base_ptrs;
+        base_ptrs.reserve(input_arrays.size());
+        for (const auto& arr : input_arrays) base_ptrs.push_back(static_cast<const double*>(arr.request().ptr));
+        std::vector<double> row_out(static_cast<size_t>(width));
+        for (int64_t t = 0; t < rows; ++t) {
+            for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
+            eval_row(state, state.row_ptrs_, row_out.data());
+            if (reduction == "sum") {
+                for (int64_t i = 0; i < width; ++i) out_buf(i) += row_out[static_cast<size_t>(i)];
+            } else {
+                for (int64_t i = 0; i < width; ++i) out_buf(i) *= row_out[static_cast<size_t>(i)];
+            }
+        }
+        return out;
+    }
+
     void run_batch_into(State& state, py::array_t<double> out, py::args arrays) const {
         int64_t rows = -1;
         auto input_arrays = validate_batch(state, arrays, rows);

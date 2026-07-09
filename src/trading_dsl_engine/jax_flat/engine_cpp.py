@@ -19,6 +19,7 @@ from trading_dsl_engine.jax_flat.engine import (
 )
 from trading_dsl_engine.jax_flat.ops import (
     CacheOp,
+    BatchReductionOp,
     CumsumOp,
     EwmOp,
     FFillOp,
@@ -61,6 +62,7 @@ class CppFlatRuntime:
 
     def run_batch(self, inputs, states=None, out=None):
         inputs = _normalize_batch_inputs_for_program(self.program, inputs)
+        reduction_spec = self.program.batch_reduction
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
         n_steps, n_instruments = inputs[0].shape
@@ -69,6 +71,15 @@ class CppFlatRuntime:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
         state = states or self.init_state(n_instruments)
         np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+        if reduction_spec is not None:
+            if out is not None:
+                raise ValueError("C++ jax_flat run_batch reductions do not support out")
+            name, axes = reduction_spec
+            if axes == (0,):
+                raw = self.core.run_batch_reduce(state, name, *np_inputs)
+                return state, _reshape_cpp_reduced_output(self.program, raw, n_instruments)
+            raw = self.core.run_batch(state, *np_inputs)
+            return state, _apply_numpy_reduction(_reshape_cpp_batch_output(self.program, raw, n_steps, n_instruments), reduction_spec)
         if out is None:
             raw = self.core.run_batch(state, *np_inputs)
             return state, _reshape_cpp_batch_output(self.program, raw, n_steps, n_instruments)
@@ -92,9 +103,14 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
     from trading_dsl_engine.jax_flat import _cpp_flat
 
     runtime = compile_formula_jax(formula, dsl_registry=dsl_registry, cpp=False)
-    node_specs, supported, state_count = _cpp_node_specs(runtime.program)
-    core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
-    return CppFlatRuntime(program=runtime.program, core=core, supported_ops=tuple(sorted(set(supported))))
+    program = runtime.program
+    root = program.nodes[program.outputs[0]]
+    if isinstance(root.op, BatchReductionOp) and 0 in root.op.axes:
+        program, _ = _subprogram_for_node(program, root.child_ids[0])
+        program = replace(program, batch_reduction=(root.op.reduction, root.op.axes))
+    node_specs, supported, state_count = _cpp_node_specs(program)
+    core = _cpp_flat.make_runtime(node_specs, program.outputs[0], state_count)
+    return CppFlatRuntime(program=program, core=core, supported_ops=tuple(sorted(set(supported))))
 
 
 def _reshape_cpp_batch_output(program: StreamingProgram, raw, n_steps: int, n_instruments: int):
@@ -117,6 +133,22 @@ def _reshape_cpp_batch_output(program: StreamingProgram, raw, n_steps: int, n_in
     if root.output_kind == "scalar" and arr.ndim == 2 and arr.shape[1] == 1:
         return arr[:, 0]
     return arr
+
+
+def _reshape_cpp_reduced_output(program: StreamingProgram, raw, n_instruments: int):
+    root = program.nodes[program.outputs[0]].op
+    arr = np.asarray(raw)
+    if root.output_kind == "scalar" and arr.shape == (1,):
+        return arr[0]
+    if root.output_kind == "matrix":
+        width = int(root.output_width) if root.output_width is not None else n_instruments
+        return arr.reshape((n_instruments, width))
+    return arr
+
+
+def _apply_numpy_reduction(out, reduction_spec):
+    name, axes = reduction_spec
+    return np.sum(out, axis=axes) if name == "sum" else np.prod(out, axis=axes)
 
 
 def _normalize_batch_inputs_for_program(program: StreamingProgram, inputs):
@@ -350,18 +382,22 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
 
 # --- JAX/C++ island handling for hybrid jax_flat batch execution: start ---
 
-def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None]):
+def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], reduction_spec=None):
     """Run full-native or staged native/JAX/native batch execution when possible."""
+    if reduction_spec is not None and reduction_spec[1] != (0,):
+        return None
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
-    full = _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=False)
+    full = _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, reduction_spec=reduction_spec)
     if full is not None:
         return full
+    if reduction_spec is not None:
+        return None
 
     candidates = _cpp_hybrid_candidates(runtime.program)
     if not candidates:
         if any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
-            _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+            _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True, reduction_spec=reduction_spec)
         return None
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
@@ -389,7 +425,7 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
         extra_inputs.append(np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)))
         candidate_programs.append(node_id)
     if not extra_inputs:
-        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True, reduction_spec=reduction_spec)
         return None
 
     staged = _try_cpp_staged_output_batch(runtime, inputs, tuple(candidate_programs), tuple(extra_inputs), accelerator_cache)
@@ -402,7 +438,7 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
     return residual_runtime._run_batch_once(residual_inputs, None, False)
 
 
-def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], *, emit_warning: bool):
+def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], *, emit_warning: bool, reduction_spec=None):
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
         node_specs, _, state_count = _cpp_node_specs(runtime.program)
@@ -418,7 +454,11 @@ def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...]
         core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
-    raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
+    np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+    if reduction_spec is not None:
+        raw = core.run_batch_reduce(state, reduction_spec[0], *np_inputs)
+        return state, _reshape_cpp_reduced_output(runtime.program, raw, n_instruments)
+    raw = core.run_batch(state, *np_inputs)
     return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
 
 

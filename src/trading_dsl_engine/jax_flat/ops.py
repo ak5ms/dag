@@ -183,6 +183,33 @@ class NaryOp(Op):
         del state
         return None, jax.vmap(self.fn)(*child_sequences)
 
+    def scan_batch_with_flags(self, state: Any, child_has_time: tuple[bool, ...], *child_sequences: jax.Array):
+        del state
+        if any(child_has_time):
+            return None, jax.vmap(self.fn, in_axes=tuple(0 if flag else None for flag in child_has_time))(*child_sequences)
+        return None, self.fn(*child_sequences)
+
+
+@dataclass(frozen=True)
+class BatchReductionOp(Op):
+    reduction: str
+    axes: tuple[int, ...]
+    output_kind: str = "vector"
+    output_width: int | None = 1
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        return None, child_values[0]
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        x = child_sequences[0]
+        if self.reduction == "sum":
+            return None, jnp.sum(x, axis=self.axes)
+        if self.reduction == "prod":
+            return None, jnp.prod(x, axis=self.axes)
+        raise ValueError(f"Unsupported batch reduction {self.reduction!r}")
+
 
 @dataclass(frozen=True)
 class EwmOp(Op):
@@ -1197,6 +1224,8 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
+    ("sum", 1): lambda: NaryOp(lambda x: jnp.sum(x), output_kind="scalar"),
+    ("prod", 1): lambda: NaryOp(lambda x: jnp.prod(x), output_kind="scalar"),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
     ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),

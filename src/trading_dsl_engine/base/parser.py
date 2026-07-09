@@ -242,6 +242,10 @@ class _AstParser:
             if len(node.elts) == 0:
                 raise FormulaParseError("Key tuples cannot be empty")
             return KeyTuple(tuple(self._expr(item) for item in node.elts))
+        if isinstance(node, ast.List):
+            if len(node.elts) == 0:
+                raise FormulaParseError("List literals cannot be empty")
+            return KeyTuple(tuple(self._expr(item) for item in node.elts))
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise FormulaParseError("Chained comparisons are not supported")
