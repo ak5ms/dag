@@ -195,7 +195,6 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "get_preds",
             "xs_sort",
             "xstd",
-            "mean",
             "outer",
             "cumsum",
         }
@@ -227,6 +226,9 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "round": _dsl_signature("x", "decimals"),
     "sum": _dsl_signature("x", "axis", defaults={"axis": None}),
     "prod": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "count": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "mean": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "std": _dsl_signature("x", "axis", defaults={"axis": None}),
     "ewm": _dsl_signature("x", "span", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
     "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
     "ffill": _dsl_signature("x", "limit"),
@@ -523,6 +525,8 @@ get_beta = op("get_beta")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")
 mean = op("mean")
+std = op("std")
+count = op("count")
 sum = op("sum")
 prod = op("prod")
 

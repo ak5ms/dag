@@ -57,7 +57,9 @@ enum class OpCode : int {
     XStd,
     XsRank,
     XsSort,
+    Count,
     Mean,
+    Std,
     Outer,
     Einsum,
     Eq,
@@ -116,7 +118,9 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "xstd") return OpCode::XStd;
     if (name == "xs_rank") return OpCode::XsRank;
     if (name == "xs_sort") return OpCode::XsSort;
+    if (name == "count") return OpCode::Count;
     if (name == "mean") return OpCode::Mean;
+    if (name == "std") return OpCode::Std;
     if (name == "outer") return OpCode::Outer;
     if (name == "einsum") return OpCode::Einsum;
     if (name == "eq") return OpCode::Eq;
@@ -525,12 +529,14 @@ public:
         const int64_t width = static_cast<int64_t>(output_size(state));
         py::array_t<double> out({width});
         auto out_buf = out.mutable_unchecked<1>();
-        if (reduction == "sum") {
+        std::vector<double> counts(static_cast<size_t>(width), 0.0);
+        std::vector<double> sumsqs(static_cast<size_t>(width), 0.0);
+        if (reduction == "sum" || reduction == "nansum" || reduction == "count" || reduction == "mean" || reduction == "std") {
             for (int64_t i = 0; i < width; ++i) out_buf(i) = 0.0;
-        } else if (reduction == "prod") {
+        } else if (reduction == "prod" || reduction == "nanprod") {
             for (int64_t i = 0; i < width; ++i) out_buf(i) = 1.0;
         } else {
-            throw std::invalid_argument("C++ jax_flat reduction must be 'sum' or 'prod'");
+            throw std::invalid_argument("C++ jax_flat reduction must be 'nansum', 'nanprod', 'count', 'mean', or 'std'");
         }
         const int n = state.n_instruments_;
         state.row_ptrs_.assign(input_arrays.size(), nullptr);
@@ -541,10 +547,39 @@ public:
         for (int64_t t = 0; t < rows; ++t) {
             for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
             eval_row(state, state.row_ptrs_, row_out.data());
-            if (reduction == "sum") {
-                for (int64_t i = 0; i < width; ++i) out_buf(i) += row_out[static_cast<size_t>(i)];
+            if (reduction == "sum" || reduction == "nansum") {
+                for (int64_t i = 0; i < width; ++i) {
+                    const double v = row_out[static_cast<size_t>(i)];
+                    if (finite(v)) out_buf(i) += v;
+                }
+            } else if (reduction == "prod" || reduction == "nanprod") {
+                for (int64_t i = 0; i < width; ++i) {
+                    const double v = row_out[static_cast<size_t>(i)];
+                    if (finite(v)) out_buf(i) *= v;
+                }
             } else {
-                for (int64_t i = 0; i < width; ++i) out_buf(i) *= row_out[static_cast<size_t>(i)];
+                for (int64_t i = 0; i < width; ++i) {
+                    const double v = row_out[static_cast<size_t>(i)];
+                    if (finite(v)) {
+                        out_buf(i) += reduction == "count" ? 1.0 : v;
+                        counts[static_cast<size_t>(i)] += 1.0;
+                        sumsqs[static_cast<size_t>(i)] += v * v;
+                    }
+                }
+            }
+        }
+        if (reduction == "mean" || reduction == "std") {
+            for (int64_t i = 0; i < width; ++i) {
+                const double count = counts[static_cast<size_t>(i)];
+                if (count <= 0.0) {
+                    out_buf(i) = NaN;
+                } else if (reduction == "mean") {
+                    out_buf(i) /= count;
+                } else {
+                    const double mean = out_buf(i) / count;
+                    const double var = sumsqs[static_cast<size_t>(i)] / count - mean * mean;
+                    out_buf(i) = std::sqrt(std::max(var, 0.0));
+                }
             }
         }
         return out;
@@ -954,12 +989,27 @@ private:
                     }
                     break;
                 }
-                case OpCode::Mean: {
+                case OpCode::Count:
+                case OpCode::Mean:
+                case OpCode::Std: {
                     const auto& x = child(state, spec, 0);
                     double sum = 0.0;
+                    double sumsq = 0.0;
                     int count = 0;
-                    for (double v : x.data) if (finite(v)) { sum += v; ++count; }
-                    dst[0] = count ? sum / count : NaN;
+                    for (double v : x.data) {
+                        if (finite(v)) {
+                            sum += v;
+                            sumsq += v * v;
+                            ++count;
+                        }
+                    }
+                    if (spec.opcode == OpCode::Count) dst[0] = static_cast<double>(count);
+                    else if (spec.opcode == OpCode::Mean) dst[0] = count ? sum / count : NaN;
+                    else {
+                        const double mean = count ? sum / count : 0.0;
+                        const double var = count ? sumsq / count - mean * mean : NaN;
+                        dst[0] = std::sqrt(std::max(var, 0.0));
+                    }
                     break;
                 }
                 case OpCode::Outer: {
@@ -1606,7 +1656,7 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
                 fixed_einsum_rows = !instrument_rows;
             }
         }
-        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
+        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Count || spec.opcode == OpCode::Mean || spec.opcode == OpCode::Std || fixed_einsum_rows) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);

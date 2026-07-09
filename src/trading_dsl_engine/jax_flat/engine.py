@@ -36,6 +36,7 @@ from trading_dsl_engine.jax_flat.ops import (
     ANY_ARITY,
     BatchReductionOp,
     OP_FACTORIES,
+    REDUCE_OP_FACTORY,
     Op,
     RidgeOp,
     ShiftOp,
@@ -459,7 +460,7 @@ def _literal_axis_tuple(arg: Expr, fn: str) -> tuple[int, ...]:
 
 
 def _extract_root_batch_reduction(expr: Expr) -> tuple[Expr, tuple[str, tuple[int, ...]] | None]:
-    if not isinstance(expr, Call) or expr.fn not in {"sum", "prod"}:
+    if not isinstance(expr, Call) or expr.fn not in {"sum", "prod", "count", "mean", "std"}:
         return expr, None
     if len(expr.args) == 1:
         return expr, None
@@ -481,22 +482,19 @@ def _batch_reduction_nodes(program: StreamingProgram) -> tuple[int, ...]:
     )
 
 
-def _apply_reduction_array(out, reduction_spec):
-    if reduction_spec is None:
-        return out
+def _reduction_op(reduction_spec):
     name, axes = reduction_spec
-    if name == "sum":
-        return jnp.sum(out, axis=axes)
-    if name == "prod":
-        return jnp.prod(out, axis=axes)
-    raise ValueError(f"Unsupported reduction {name!r}")
+    try:
+        return REDUCE_OP_FACTORY[name](axes)
+    except KeyError as exc:
+        raise ValueError(f"Unsupported reduction {name!r}") from exc
 
 
 def _apply_reduction_to_result(result, reduction_spec):
     if reduction_spec is None:
         return result
     states, out = result
-    return states, _apply_reduction_array(out, reduction_spec)
+    return states, _reduction_op(reduction_spec).apply(out)
 
 
 def _fresh_memmap_path(prefix: str) -> str:
@@ -573,10 +571,11 @@ def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: s
 
 def _chunk_reduce_value(accum, chunk_out, reduction_spec):
     name, axes = reduction_spec
-    reduced = _apply_reduction_array(chunk_out, (name, axes))
+    op = _reduction_op((name, axes))
+    chunk_accum = op.reduce_chunk(chunk_out)
     if accum is None:
-        return reduced
-    return accum + reduced if name == "sum" else accum * reduced
+        return chunk_accum
+    return op.combine(accum, chunk_accum)
 
 
 def _run_chunked_batch_reduce(runtime: JaxFlatRuntime, inputs, states=None, reduction_spec=None):
@@ -595,7 +594,7 @@ def _run_chunked_batch_reduce(runtime: JaxFlatRuntime, inputs, states=None, redu
         chunk_inputs = tuple(jnp.asarray(_input_chunk(arr, start, stop)) for arr in inputs)
         states, chunk_out, _ = _scan_batch_chunk(runtime, states, chunk_inputs, start)
         reduced = _chunk_reduce_value(reduced, chunk_out, reduction_spec)
-    return states, jax.block_until_ready(reduced)
+    return states, jax.block_until_ready(_reduction_op(reduction_spec).finalize(reduced))
 
 
 def _run_with_materialized_batch_reductions(runtime: JaxFlatRuntime, inputs, states=None, out_path: str | bool = False, reduction_nodes: tuple[int, ...] = ()):
@@ -1205,7 +1204,7 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if storage not in {"ram", "disk"}:
             raise ValueError("cache storage must be 'ram' or 'disk'")
         return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
-    if expr.fn in {"sum", "prod"} and len(expr.args) == 2:
+    if expr.fn in {"sum", "prod", "count", "mean", "std"} and len(expr.args) == 2:
         axes = tuple(sorted(set(_literal_axis_tuple(expr.args[1], expr.fn))))
         if not axes:
             raise ValueError(f"{expr.fn} axis must contain at least one axis")
@@ -1213,8 +1212,10 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
             raise ValueError(f"{expr.fn} axes must be non-negative")
         child = child_ops[0]
         if 0 in axes:
-            return BatchReductionOp(expr.fn, axes, output_kind=child.output_kind, output_width=child.output_width), None
-        return NaryOp(lambda x, axes=tuple(axis - 1 for axis in axes), fn=expr.fn: jnp.sum(x, axis=axes) if fn == "sum" else jnp.prod(x, axis=axes), output_kind="scalar", output_width=1), None
+            op = REDUCE_OP_FACTORY[expr.fn](axes)
+            return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
+        op = REDUCE_OP_FACTORY[expr.fn](tuple(axis - 1 for axis in axes))
+        return replace(op, output_kind="scalar", output_width=1), None
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
@@ -1640,7 +1641,7 @@ def _compile_node(
         for i, a in enumerate(expr.args)
         if not (
             (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
-            or (expr.fn in {"sum", "prod"} and i == 1)
+            or (expr.fn in {"sum", "prod", "count", "mean", "std"} and i == 1)
         )
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))

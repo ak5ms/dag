@@ -191,24 +191,99 @@ class NaryOp(Op):
 
 
 @dataclass(frozen=True)
-class BatchReductionOp(Op):
-    reduction: str
+class ReduceOp(Op):
+    name: str
+    reduce_fn: Callable[[jax.Array, tuple[int, ...]], Any]
+    combine_fn: Callable[[Any, Any], Any]
+    finalize_fn: Callable[[Any], jax.Array]
     axes: tuple[int, ...]
-    output_kind: str = "vector"
+    output_kind: str = "scalar"
     output_width: int | None = 1
+
+    @property
+    def reduction(self) -> str:
+        return self.name
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
         return None, child_values[0]
 
+    def reduce_chunk(self, x: jax.Array):
+        return self.reduce_fn(x, self.axes)
+
+    def combine(self, left: Any, right: Any):
+        return self.combine_fn(left, right)
+
+    def finalize(self, accum: Any):
+        return self.finalize_fn(accum)
+
+    def apply(self, x: jax.Array):
+        return self.finalize(self.reduce_chunk(x))
+
     def scan_batch(self, state: Any, *child_sequences: jax.Array):
         del state
-        x = child_sequences[0]
-        if self.reduction == "sum":
-            return None, jnp.sum(x, axis=self.axes)
-        if self.reduction == "prod":
-            return None, jnp.prod(x, axis=self.axes)
-        raise ValueError(f"Unsupported batch reduction {self.reduction!r}")
+        return None, self.apply(child_sequences[0])
+
+
+BatchReductionOp = ReduceOp
+
+
+def _axis_arg(axes: tuple[int, ...]):
+    return axes if axes else None
+
+
+def _nansum(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.nansum(x, axis=_axis_arg(axes))
+
+
+def _nanprod(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.nanprod(x, axis=_axis_arg(axes))
+
+
+def _count_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.sum(jnp.isfinite(x), axis=_axis_arg(axes)).astype(jnp.float64)
+
+
+def _mean_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    valid = jnp.isfinite(x)
+    return jnp.sum(jnp.where(valid, x, 0.0), axis=_axis_arg(axes)), jnp.sum(valid, axis=_axis_arg(axes)).astype(jnp.float64)
+
+
+def _std_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    valid = jnp.isfinite(x)
+    safe = jnp.where(valid, x, 0.0)
+    return (
+        jnp.sum(safe, axis=_axis_arg(axes)),
+        jnp.sum(safe * safe, axis=_axis_arg(axes)),
+        jnp.sum(valid, axis=_axis_arg(axes)).astype(jnp.float64),
+    )
+
+
+def _pair_add(left, right):
+    return tuple(l + r for l, r in zip(left, right))
+
+
+def _mean_finalize(accum):
+    total, count = accum
+    return jnp.where(count > 0.0, total / count, jnp.nan)
+
+
+def _std_finalize(accum):
+    total, sumsq, count = accum
+    mean = jnp.where(count > 0.0, total / count, 0.0)
+    var = jnp.where(count > 0.0, sumsq / count - mean * mean, jnp.nan)
+    return jnp.sqrt(jnp.maximum(var, 0.0))
+
+
+REDUCE_OP_FACTORY = {
+    "sum": lambda axes=(): ReduceOp("nansum", _nansum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "prod": lambda axes=(): ReduceOp("nanprod", _nanprod, lambda l, r: l * r, lambda x: x, tuple(axes)),
+    "count": lambda axes=(): ReduceOp("count", _count_accum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "mean": lambda axes=(): ReduceOp("mean", _mean_accum, _pair_add, _mean_finalize, tuple(axes)),
+    "std": lambda axes=(): ReduceOp("std", _std_accum, _pair_add, _std_finalize, tuple(axes)),
+    "nansum": lambda axes=(): ReduceOp("nansum", _nansum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "nanprod": lambda axes=(): ReduceOp("nanprod", _nanprod, lambda l, r: l * r, lambda x: x, tuple(axes)),
+}
 
 
 @dataclass(frozen=True)
@@ -1223,9 +1298,11 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("get_preds", 1): lambda: NaryOp(lambda x: x.preds, cpp_name="get_preds"),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
-    ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
-    ("sum", 1): lambda: NaryOp(lambda x: jnp.sum(x), output_kind="scalar"),
-    ("prod", 1): lambda: NaryOp(lambda x: jnp.prod(x), output_kind="scalar"),
+    ("mean", 1): lambda: REDUCE_OP_FACTORY["mean"](()),
+    ("std", 1): lambda: REDUCE_OP_FACTORY["std"](()),
+    ("count", 1): lambda: REDUCE_OP_FACTORY["count"](()),
+    ("sum", 1): lambda: REDUCE_OP_FACTORY["sum"](()),
+    ("prod", 1): lambda: REDUCE_OP_FACTORY["prod"](()),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
     ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),

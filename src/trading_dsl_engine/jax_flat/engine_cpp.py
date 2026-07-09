@@ -148,7 +148,17 @@ def _reshape_cpp_reduced_output(program: StreamingProgram, raw, n_instruments: i
 
 def _apply_numpy_reduction(out, reduction_spec):
     name, axes = reduction_spec
-    return np.sum(out, axis=axes) if name == "sum" else np.prod(out, axis=axes)
+    if name in {"sum", "nansum"}:
+        return np.nansum(out, axis=axes)
+    if name in {"prod", "nanprod"}:
+        return np.nanprod(out, axis=axes)
+    if name == "count":
+        return np.sum(np.isfinite(out), axis=axes, dtype=np.float64)
+    if name == "mean":
+        return np.nanmean(out, axis=axes)
+    if name == "std":
+        return np.nanstd(out, axis=axes)
+    raise ValueError(f"Unsupported reduction {name!r}")
 
 
 def _normalize_batch_inputs_for_program(program: StreamingProgram, inputs):
@@ -224,6 +234,10 @@ def _cpp_node_specs(program: StreamingProgram):
         if isinstance(op, CacheOp):
             specs.append(spec_tuple("cache", node.child_ids, width=width))
             supported.append("cache")
+            continue
+        if isinstance(op, BatchReductionOp) and not op.axes and op.reduction in {"count", "mean", "std"}:
+            specs.append(spec_tuple(op.reduction, node.child_ids, width=1))
+            supported.append(op.reduction)
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
             cpp_width = width
@@ -353,6 +367,10 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
         if isinstance(op, CacheOp):
             specs.append(spec_tuple("cache", node.child_ids, width=width))
             supported.append("cache")
+            continue
+        if isinstance(op, BatchReductionOp) and not op.axes and op.reduction in {"count", "mean", "std"}:
+            specs.append(spec_tuple(op.reduction, node.child_ids, width=1))
+            supported.append(op.reduction)
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
             cpp_width = 0 if op.cpp_name in {"outer", "einsum"} and op.output_width is None else width
@@ -601,8 +619,7 @@ def _cpp_hybrid_candidates(program: StreamingProgram) -> tuple[int, ...]:
         ancestors = _ancestor_ids(program, node_id)
         is_projection = isinstance(op, NaryOp) and op.cpp_name in {"get_beta", "get_preds"}
         is_supported_stateless = (
-            isinstance(op, NaryOp)
-            and op.cpp_name is not None
+            ((isinstance(op, NaryOp) and op.cpp_name is not None) or (isinstance(op, BatchReductionOp) and not op.axes and op.reduction in {"count", "mean", "std"}))
             and any(program.nodes[cid].op.is_stateful for cid in ancestors if cid != node_id)
         )
         if not (is_projection or is_supported_stateless or isinstance(op, (GroupByOp, CumsumOp, EwmOp, FFillOp, RollingMeanOp, ShiftOp))):

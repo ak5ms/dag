@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import time
 
 import jax
@@ -86,11 +89,11 @@ def test_run_batch_sum_reduction_over_time_matches_materialized_output():
     jax_runtime = compile_formula(formula, cpp=False)
     _, materialized = compile_formula(materialized_formula, cpp=False).run_batch(data)
     _, reduced = jax_runtime.run_batch(data)
-    np.testing.assert_allclose(np.asarray(reduced), np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(reduced), np.nansum(np.asarray(materialized), axis=0), rtol=1e-10, atol=1e-10)
 
     python_runtime = compile_formula(dsl_sum(var("close"), axis=[0]), cpp=False)
     _, python_reduced = python_runtime.run_batch(data)
-    np.testing.assert_allclose(np.asarray(python_reduced), close.sum(axis=0), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(python_reduced), np.nansum(close, axis=0), rtol=1e-10, atol=1e-10)
 
 
 def test_cpp_run_batch_sum_reduction_over_time_matches_materialized_output():
@@ -105,11 +108,11 @@ def test_cpp_run_batch_sum_reduction_over_time_matches_materialized_output():
     runtime = compile_formula(formula, cpp=True)
     _, materialized = compile_formula(materialized_formula, cpp=False).run_batch(data)
     _, reduced = runtime.run_batch(data)
-    np.testing.assert_allclose(np.asarray(reduced), np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(np.asarray(reduced), np.nansum(np.asarray(materialized), axis=0), rtol=1e-10, atol=1e-10)
 
     native_runtime = compile_formula_native(formula)
     _, native_reduced = native_runtime.run_batch(data)
-    np.testing.assert_allclose(native_reduced, np.asarray(materialized).sum(axis=0), rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(native_reduced, np.nansum(np.asarray(materialized), axis=0), rtol=1e-10, atol=1e-10)
 
 
 def test_multiple_dsl_time_reductions_compose_without_materializing_children():
@@ -123,7 +126,7 @@ def test_multiple_dsl_time_reductions_compose_without_materializing_children():
     _, out = runtime.run_batch(data)
 
     _, ewm_out = compile_formula("ewm(close, 3.0)", cpp=False).run_batch(data)
-    expected = np.asarray(ewm_out).sum(axis=0) + np.prod(open_ + 1.0, axis=0)
+    expected = np.nansum(np.asarray(ewm_out), axis=0) + np.nanprod(open_ + 1.0, axis=0)
     np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-10, atol=1e-10)
 
 
@@ -137,8 +140,90 @@ def test_time_reduction_can_feed_time_varying_downstream_formula():
     runtime = compile_formula("add(close, sum(open, axis=[0]))", cpp=False)
     _, out = runtime.run_batch(data)
 
-    expected = close + open_.sum(axis=0)
+    expected = close + np.nansum(open_, axis=0)
     np.testing.assert_allclose(np.asarray(out), expected, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.skipif(os.environ.get("RUN_MEMORY_TESTS") != "1", reason="large memory regression test is opt-in")
+def test_root_time_reduction_lowers_peak_memory_on_large_dataset():
+    script = r"""
+import os
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+import resource
+import sys
+import numpy as np
+from trading_dsl_engine.jax_flat import compile_formula
+formula = sys.argv[1]
+rows = 3_000_000
+cols = 9
+close = np.ones((rows, cols), dtype=np.float64)
+runtime = compile_formula(formula, cpp=False)
+_, out = runtime.run_batch({"close": close})
+np.asarray(out).sum()
+print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+"""
+
+    def peak_kib(formula: str) -> int:
+        env = os.environ.copy()
+        env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        proc = subprocess.run(
+            [sys.executable, "-c", script, formula],
+            check=True,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        return int(proc.stdout.strip().splitlines()[-1])
+
+    materialized_peak = peak_kib("add(close, 1.0)")
+    reduced_peak = peak_kib("sum(add(close, 1.0), axis=[0])")
+    assert reduced_peak < materialized_peak, (materialized_peak, reduced_peak)
+
+
+def test_dsl_count_mean_std_time_reductions_match_nan_numpy():
+    rows = 17
+    cols = 4
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) * 0.25
+    close[1, 2] = np.nan
+    close[5:8, 0] = np.nan
+    close[:, 3] = np.nan
+    data = {"close": close}
+
+    for name, expected in (
+        ("count", np.sum(np.isfinite(close), axis=0, dtype=np.float64)),
+        ("mean", np.nanmean(close, axis=0)),
+        ("std", np.nanstd(close, axis=0)),
+    ):
+        formula = f"{name}(close, axis=[0])"
+        _, jax_out = compile_formula(formula, cpp=False).run_batch(data)
+        np.testing.assert_allclose(np.asarray(jax_out), expected, rtol=1e-10, atol=1e-10, equal_nan=True)
+
+        cpp_runtime = compile_formula(formula, cpp=True)
+        _, cpp_out = cpp_runtime.run_batch(data)
+        np.testing.assert_allclose(np.asarray(cpp_out), expected, rtol=1e-10, atol=1e-10, equal_nan=True)
+
+        native_runtime = compile_formula_native(formula)
+        _, native_out = native_runtime.run_batch(data)
+        np.testing.assert_allclose(native_out, expected, rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+def test_cpp_flat_count_mean_std_row_reductions_are_native():
+    rows = 9
+    cols = 5
+    close = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols) - 4.0
+    close[0, 1] = np.nan
+    close[3, :] = np.nan
+    data = {"close": close}
+
+    for name, expected in (
+        ("count", np.sum(np.isfinite(close), axis=1, dtype=np.float64)),
+        ("mean", np.nanmean(close, axis=1)),
+        ("std", np.nanstd(close, axis=1)),
+    ):
+        runtime = compile_formula_native(f"{name}(close)")
+        assert name in runtime.supported_ops
+        _, out = runtime.run_batch(data)
+        np.testing.assert_allclose(out, expected, rtol=1e-10, atol=1e-10, equal_nan=True)
 
 
 def test_cpp_flat_default_lag_shift_matches_jax_flat():
