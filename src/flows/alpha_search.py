@@ -4,14 +4,20 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 import random
 import re
+
 from typing import Any
 
 from deap import algorithms, base as deap_base, creator, gp, tools
 
-from trading_dsl_engine.base.dsl import abs as dsl_abs
+import os
+os.environ['TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE'] = str(int(6E6))
+
+from trading_dsl_engine.base.dsl import *
+from trading_dsl_engine.base.dsl import abs as dsl_abs, cat
 from trading_dsl_engine.base.dsl import add, and_, clip, cumsum, div, ewm, fillna, ffill, mean, mul, shift, where, xs_rank
 from trading_dsl_engine.base.dsl import einsum, get_beta, Ridge, ensure_expr, var
 from trading_dsl_engine.base.parser import Expr
+from flows.utils import *
 
 Objective = Callable[[Expr, Sequence[Expr]], float]
 ExprPredicate = Callable[[Expr], bool]
@@ -29,28 +35,22 @@ class PositiveIntScalar:
     expr: Expr
 
 
-def ewm_var(x: Expr, span: Expr | float, min_periods: Expr | float | None = None) -> Expr:
-    if min_periods is None:
-        min_periods = 5 * span
-    is_valid = cumsum(fillna(x == x, 0.0)) > (min_periods - 1.0)
-    out = ewm(x * x, span) - ewm(x, span) ** 2
-    return where(and_(is_valid, out > 0.0), out, float("nan"))
-
-
-def ewm_std(x: Expr, span: Expr | float, min_periods: Expr | float | None = None) -> Expr:
-    return ewm_var(x, span, min_periods) ** 0.5
-
 
 def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:
     w = alpha / ewm_var(roll_rets, hl)
     masked = ffill(where(is_tradable, w, float("nan")))
-    return einsum(shift(masked, 1.0, 1.0) * roll_rets, "n->")
-
+    return shift(masked) * roll_rets
 
 def default_sharpe_objective(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:
-    pnl = default_alpha_pnl(alpha, roll_rets=roll_rets, is_tradable=is_tradable, hl=hl)
-    return mean(pnl) / ewm_std(pnl, hl)
-
+    w = candidate / ewm_std(roll_rets, span=hl)
+    masked = ffill(where(is_tradable, w, float("nan")))
+    pnl = shift(masked) * roll_rets
+    return einsum(fillna(pnl, 0), "n->")
+    # runtime = compile_formula()
+    # inputs = matrix_inputs_from_long_fields(fields, runtime.program.input_names)
+    # _, pnl_ = runtime.run_batch(inputs)
+    # pnl_ = pnl_[~np.isclose(pnl_, 0)]
+    # return pnl_.mean()/pnl_.std()
 
 def ridge_pool_alpha_pnl(
     alpha: Expr,
@@ -65,10 +65,10 @@ def ridge_pool_alpha_pnl(
 ) -> Expr:
     alphas = tuple(pool) + (alpha,)
     reg = Ridge(*alphas, roll_rets, fillna(hs**-2.0, 0.0), ridge_hl, ridge_lambda)
-    yhat = einsum(shift(get_beta(reg), 1.0, 1.0), alpha, "f,fn->n")
+    yhat = einsum(shift(get_beta(reg)), alpha, "f,fn->n")
     w = yhat / (ewm_std(roll_rets, hl) ** 2.0)
     masked = ffill(where(is_tradable, w, float("nan")))
-    return einsum(shift(masked, 1.0, 1.0) * roll_rets, "n->")
+    return einsum(shift(masked) * roll_rets, "n->")
 
 
 def dimensionless_filter(config: dict[str, Any] | None = None, *, allow_unknown: bool = False) -> ExprPredicate:
@@ -113,6 +113,13 @@ def individual_to_expr(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped)
     return ensure_expr(out)
 
 
+def eval_multiple(alphas: list[Expr], *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float):
+    w = cat(*alphas) / ewm_std(roll_rets, span=hl)
+    masked = ffill(where(is_tradable, w, float("nan")))
+    pnl = einsum(shift(masked), roll_rets, "nf,n->n")
+    return pnl
+
+
 def search_formulas(
     pset: gp.PrimitiveSetTyped,
     objective: Objective,
@@ -142,8 +149,10 @@ def search_formulas(
         toolbox.register("individual", tools.initIterate, creator.AlphaIndividual, toolbox.expr)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
         toolbox.register("mutate", gp.mutUniform, expr=toolbox.expr, pset=pset)
+        toolbox.register("map", lambda f, x: f(x))
         toolbox.decorate("mate", gp.staticLimit(key=lambda ind: ind.height, max_value=depth))
         toolbox.decorate("mutate", gp.staticLimit(key=lambda ind: ind.height, max_value=depth))
+        # toolbox.register("evaluate", _evaluate_individual, pset=pset, objective=objective, pool=tuple(pool), filters=tuple(filters))
         toolbox.register("evaluate", _evaluate_individual, pset=pset, objective=objective, pool=tuple(pool), filters=tuple(filters))
         pop = toolbox.population(n=population_size)
         algorithms.eaSimple(pop, toolbox, cxpb=cx_prob, mutpb=mut_prob, ngen=generations_per_depth, verbose=False)
@@ -222,3 +231,55 @@ __all__ = [
     "ridge_pool_alpha_pnl",
     "search_formulas",
 ]
+
+if __name__ == "__main__":
+    import numpy as np
+
+    from flows.random_data import matrix_inputs_from_long_fields, simulate_requested_fields
+    from flows.utils import pct_change
+    from trading_dsl_engine.jax_flat.engine import compile_formula
+
+    fields = simulate_requested_fields(n_minutes=6 * 60, seed=42)
+    px = matrix_inputs_from_long_fields(fields, ("mp_out0.close",))["mp_out0.close"]
+    realized_rets = px[1:] / px[:-1] - 1.0
+    tradable = matrix_inputs_from_long_fields(fields, ("is_tradable_out0",))["is_tradable_out0"][1:] == 1.0
+
+    returns = pct_change(var("mp_out0.close"))
+    spread_bps = 1e4 * (var("ap_out0.close") - var("bp_out0.close")) / var("mp_out0.close")
+    features = (
+        ewm(returns, 15),
+        ewm(returns, 60),
+        xs_rank(returns),
+        xs_rank(spread_bps),
+        xs_rank(var("volume_out0")),
+    )
+    pset = make_alpha_pset(features, halflives=(5, 30), shift_lags=(1,))
+    compiled: dict[str, Any] = {}
+
+    def score(candidate: Expr, pool: Sequence[Expr]) -> float:
+        key = repr(candidate)
+        runtime = compiled.get(key)
+        if runtime is None:
+            runtime = compile_formula(candidate, cpp=False)
+            compiled[key] = runtime
+        inputs = matrix_inputs_from_long_fields(fields, runtime.program.input_names)
+        _, alpha_path = runtime.run_batch(inputs)
+        alpha = np.asarray(alpha_path, dtype=float)[:-1]
+        pnl = np.where(tradable & np.isfinite(alpha), alpha * realized_rets, np.nan)
+        pnl = pnl[np.isfinite(pnl)]
+        if pnl.size < 2 or np.nanstd(pnl) == 0.0:
+            return float("-inf")
+        return float(np.nanmean(pnl) / np.nanstd(pnl))
+
+    selected = search_formulas(
+        pset,
+        score,
+        max_depth=1,
+        filters=(lambda expr: "is_tradable_out0" not in repr(expr),),
+        additive=lambda candidate, pool, fitness: np.isfinite(fitness) and len(pool) < 3,
+        population_size=4,
+        generations_per_depth=1,
+        seed=7,
+    )
+    for expr, fitness, depth in selected:
+        print(f"depth={depth} fitness={fitness:.6g} expr={expr!r}")

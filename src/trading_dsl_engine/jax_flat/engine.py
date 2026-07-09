@@ -1508,8 +1508,8 @@ def compile_formula(
     expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
-    metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
-    formula_metadata = analyze_formula_metadata(expr, metadata_config)
+    # metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
+    # formula_metadata = analyze_formula_metadata(expr, metadata_config)
     external_cache_names, external_cache_values = _external_cache_inputs(runtimes)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
@@ -1526,7 +1526,7 @@ def compile_formula(
             outputs=(out,),
             input_names=tuple(input_names),
             state_layout=layout,
-            metadata=formula_metadata,
+            metadata=None,
             cache_nodes=cache_nodes,
             cache_expr_keys=cache_expr_keys,
             external_cache_inputs=external_cache_values or None,

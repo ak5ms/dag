@@ -7,6 +7,14 @@ import pandas as pd
 
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
+_DATA_CACHE: dict[tuple[str, int | None], dict[str, np.ndarray]] = {}
+
+
+def _close_memmap(arr: np.ndarray) -> None:
+    base = getattr(arr, "base", None)
+    if base is not None and getattr(base, "_mmap", None) is not None:
+        base._mmap.close()
+
 
 @dataclass
 class InputData:
@@ -21,19 +29,34 @@ class InputData:
 
 
     def _load_memmap(self, fps: list[str]) -> dict[str, np.ndarray]:
-        numba_data = {
-            fp.split('/')[-1].removesuffix('.npy'): np.load(fp, mmap_mode='r')[:self.nrows]
-            for fp in fps
-        }
+        cache_key = (self.fp, self.nrows)
+        cached = _DATA_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        numba_data: dict[str, np.ndarray] = {}
+        for fp in fps:
+            key = fp.split("/")[-1].removesuffix(".npy")
+            mmap = np.load(fp, mmap_mode="r")
+            view = mmap if self.nrows is None else mmap[: self.nrows]
+            if self.nrows is None:
+                numba_data[key] = view
+            else:
+                numba_data[key] = np.array(view, copy=True)
+                _close_memmap(mmap)
+        _DATA_CACHE[cache_key] = numba_data
         return numba_data
 
     def get_data(self):
         fps = sorted(glob.glob(self.fp))
-        if not self.data:
-            data = self._load_memmap(fps)
-        self.idx = pd.to_datetime(pd.Series(data=data[self.idx][:, 0]).interpolate(), unit='us')
-        self.data = data
-        return data
+        if self.data is None:
+            self.data = self._load_memmap(fps)
+        if isinstance(self.idx, str):
+            self.idx = pd.to_datetime(
+                pd.Series(data=self.data[self.idx][:, 0]).interpolate(),
+                unit="us",
+            )
+        return self.data
 
     def run(self, formula, cpp=True, runtimes=None) -> pd.DataFrame | np.ndarray:
         # TODO: attach cached values to call objects directly (careful about tracking memory)?
