@@ -10,14 +10,32 @@ import numpy as np
 import jax.scipy.special as jsp_special
 
 from trading_dsl_engine.jax_ffi.nnqp import nnqp
+from trading_dsl_engine.jax_flat.parallel import (
+    affine_prefix,
+    prefix_max,
+    prefix_or,
+    prefix_sum,
+    segmented_product_prefix,
+    shared_affine_prefix,
+)
 
 jax.config.update("jax_enable_x64", True)
+
+# Pairwise ranking fuses well for small cross-sections and is substantially
+# faster than launching one tiny sort per row. Above this measured crossover,
+# sort/search has better asymptotic cost and bounded temporary storage.
+_XS_RANK_PAIRWISE_MAX_WIDTH = 128
 
 
 class Op:
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = False
+    # Set by operators whose scan_batch implementation has no sequential
+    # timestep loop. The engine uses this common contract to choose one
+    # batch-wide graph or bounded chunks; new operators need no other scheduler
+    # integration.
+    batch_parallel: bool = False
 
     def init_state(self, sample: jax.Array):
         return None
@@ -143,6 +161,7 @@ class CacheOp(Op):
     output_width: int | None = 1
     cpp_name: str | None = "cache"
     cache_write_target: Any = None
+    batch_parallel = True
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
@@ -174,6 +193,7 @@ class NaryOp(Op):
     cpp_param: float = 0.0
     cpp_int_param: int = 0
     cpp_str_param: str = ""
+    batch_parallel = True
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state
@@ -182,6 +202,109 @@ class NaryOp(Op):
     def scan_batch(self, state: Any, *child_sequences: jax.Array):
         del state
         return None, jax.vmap(self.fn)(*child_sequences)
+
+    def scan_batch_with_flags(self, state: Any, child_has_time: tuple[bool, ...], *child_sequences: jax.Array):
+        del state
+        if any(child_has_time):
+            return None, jax.vmap(self.fn, in_axes=tuple(0 if flag else None for flag in child_has_time))(*child_sequences)
+        return None, self.fn(*child_sequences)
+
+
+@dataclass(frozen=True)
+class ReduceOp(Op):
+    name: str
+    reduce_fn: Callable[[jax.Array, tuple[int, ...]], Any]
+    combine_fn: Callable[[Any, Any], Any]
+    finalize_fn: Callable[[Any], jax.Array]
+    axes: tuple[int, ...]
+    output_kind: str = "scalar"
+    output_width: int | None = 1
+    batch_parallel = True
+
+    @property
+    def reduction(self) -> str:
+        return self.name
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        return None, child_values[0]
+
+    def reduce_chunk(self, x: jax.Array):
+        return self.reduce_fn(x, self.axes)
+
+    def combine(self, left: Any, right: Any):
+        return self.combine_fn(left, right)
+
+    def finalize(self, accum: Any):
+        return self.finalize_fn(accum)
+
+    def apply(self, x: jax.Array):
+        return self.finalize(self.reduce_chunk(x))
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        return None, self.apply(child_sequences[0])
+
+
+BatchReductionOp = ReduceOp
+
+
+def _axis_arg(axes: tuple[int, ...]):
+    return axes if axes else None
+
+
+def _nansum(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.nansum(x, axis=_axis_arg(axes))
+
+
+def _nanprod(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.nanprod(x, axis=_axis_arg(axes))
+
+
+def _count_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    return jnp.sum(jnp.isfinite(x), axis=_axis_arg(axes)).astype(jnp.float64)
+
+
+def _mean_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    valid = jnp.isfinite(x)
+    return jnp.sum(jnp.where(valid, x, 0.0), axis=_axis_arg(axes)), jnp.sum(valid, axis=_axis_arg(axes)).astype(jnp.float64)
+
+
+def _std_accum(x: jax.Array, axes: tuple[int, ...] = ()):
+    valid = jnp.isfinite(x)
+    safe = jnp.where(valid, x, 0.0)
+    return (
+        jnp.sum(safe, axis=_axis_arg(axes)),
+        jnp.sum(safe * safe, axis=_axis_arg(axes)),
+        jnp.sum(valid, axis=_axis_arg(axes)).astype(jnp.float64),
+    )
+
+
+def _pair_add(left, right):
+    return tuple(l + r for l, r in zip(left, right))
+
+
+def _mean_finalize(accum):
+    total, count = accum
+    return jnp.where(count > 0.0, total / count, jnp.nan)
+
+
+def _std_finalize(accum):
+    total, sumsq, count = accum
+    mean = jnp.where(count > 0.0, total / count, 0.0)
+    var = jnp.where(count > 0.0, sumsq / count - mean * mean, jnp.nan)
+    return jnp.sqrt(jnp.maximum(var, 0.0))
+
+
+REDUCE_OP_FACTORY = {
+    "sum": lambda axes=(): ReduceOp("nansum", _nansum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "prod": lambda axes=(): ReduceOp("nanprod", _nanprod, lambda l, r: l * r, lambda x: x, tuple(axes)),
+    "count": lambda axes=(): ReduceOp("count", _count_accum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "mean": lambda axes=(): ReduceOp("mean", _mean_accum, _pair_add, _mean_finalize, tuple(axes)),
+    "std": lambda axes=(): ReduceOp("std", _std_accum, _pair_add, _std_finalize, tuple(axes)),
+    "nansum": lambda axes=(): ReduceOp("nansum", _nansum, lambda l, r: l + r, lambda x: x, tuple(axes)),
+    "nanprod": lambda axes=(): ReduceOp("nanprod", _nanprod, lambda l, r: l * r, lambda x: x, tuple(axes)),
+}
 
 
 @dataclass(frozen=True)
@@ -193,6 +316,7 @@ class EwmOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
+    batch_parallel = True
 
     def init_state(self, sample: jax.Array):
         return EwmState(
@@ -218,10 +342,9 @@ class EwmOp(Op):
         else:
             decay = valid | (not self.ignore_na)
             decayed_weight = jnp.where(initialized & decay, weight * old_wt_factor, weight)
-            normalized = (decayed_weight * value + alpha * x) / (decayed_weight + alpha)
-            alpha_half = jnp.isclose(alpha, 0.5)
-            half_alpha_weighted = decayed_weight * value + (1.0 - decayed_weight) * x
-            weighted = jnp.where(alpha_half, half_alpha_weighted, normalized)
+            # The normalized rule also handles alpha=0.5; changing its new
+            # weight after a NaN gap would diverge from pandas.
+            weighted = (decayed_weight * value + alpha * x) / (decayed_weight + alpha)
             next_weight_if_valid = jnp.ones_like(decayed_weight)
         next_value = jnp.where(valid, jnp.where(initialized, weighted, x), value)
         next_weight = jnp.where(valid, next_weight_if_valid, decayed_weight)
@@ -234,6 +357,88 @@ class EwmOp(Op):
         out = jnp.where(next_initialized & enough, next_value, jnp.nan)
         return EwmState(value=next_value, weight=next_weight, initialized=next_initialized, count=next_count), out
 
+    @staticmethod
+    def _batch_scalar(value: jax.Array, x: jax.Array) -> jax.Array:
+        value = jnp.asarray(value, dtype=x.dtype)
+        if value.ndim == 0:
+            return value
+        per_row = value.reshape((value.shape[0], -1))[:, 0]
+        return per_row.reshape((value.shape[0],) + (1,) * (x.ndim - 1))
+
+    def scan_batch(self, state: EwmState, *child_sequences: jax.Array):
+        x = jnp.asarray(child_sequences[0])
+        span = self.span if self.span is not None else self._batch_scalar(child_sequences[1], x)
+        alpha = jnp.broadcast_to(2.0 / (span + 1.0), x.shape)
+        old_wt_factor = 1.0 - alpha
+        valid = jnp.isfinite(x)
+        valid_int = valid.astype(jnp.int64)
+        observed = prefix_or(valid)
+        prior_valid = jnp.concatenate((jnp.zeros_like(observed[:1]), observed[:-1]), axis=0)
+        initialized = state.initialized | observed
+
+        if self.adjust:
+            # Adjusted EWM is two affine recurrences with a shared decay:
+            # numerator <- decay*numerator + x, weight <- decay*weight + 1.
+            decay = valid | (not self.ignore_na)
+            scale = jnp.where(decay, old_wt_factor, 1.0)
+            numerator, weight = shared_affine_prefix(
+                scale,
+                (jnp.where(valid, x, 0.0), valid.astype(x.dtype)),
+                (state.weight * state.value, state.weight),
+            )
+            value = jnp.where(initialized, numerator / jnp.where(weight != 0.0, weight, 1.0), state.value)
+            final_weight = weight[-1]
+        else:
+            initialized_before = state.initialized | prior_valid
+            if self.ignore_na:
+                valid_scale = jnp.where(initialized_before, old_wt_factor, 0.0)
+                valid_bias = jnp.where(initialized_before, alpha * x, x)
+            else:
+                # Between observations, pandas decays the stored weight. A
+                # segmented product gives that gap decay before the value's
+                # affine prefix is composed.
+                reset_before = jnp.concatenate((jnp.zeros_like(valid[:1]), valid[:-1]), axis=0)
+                has_reset, gap_decay = segmented_product_prefix(old_wt_factor, reset_before)
+                previous_weight = jnp.where(has_reset, 1.0, state.weight)
+                decayed_weight = jnp.where(initialized_before, gap_decay * previous_weight, 0.0)
+                denominator = decayed_weight + alpha
+                valid_scale = decayed_weight / denominator
+                valid_bias = alpha * jnp.where(valid, x, 0.0) / denominator
+            value = affine_prefix(
+                jnp.where(valid, valid_scale, 1.0),
+                jnp.where(valid, valid_bias, 0.0),
+                state.value,
+            )
+            if self.ignore_na:
+                final_weight = jnp.where(jnp.any(valid, axis=0), 1.0, state.weight)
+            else:
+                weight = affine_prefix(
+                    jnp.where(valid, 0.0, old_wt_factor),
+                    valid.astype(x.dtype),
+                    state.weight,
+                )
+                final_weight = weight[-1]
+
+        min_periods = self.min_periods
+        if min_periods is None and len(child_sequences) > 2:
+            min_periods = self._batch_scalar(child_sequences[2], x)
+        if min_periods is None:
+            count = None
+            enough = True
+        else:
+            count = state.count + prefix_sum(valid_int)
+            enough = count >= jnp.rint(min_periods).astype(jnp.int64)
+        out = jnp.where(initialized & enough, value, jnp.nan)
+        return (
+            EwmState(
+                value=value[-1],
+                weight=final_weight,
+                initialized=initialized[-1],
+                count=state.count + jnp.sum(valid_int, axis=0) if count is None else count[-1],
+            ),
+            out,
+        )
+
 
 @dataclass(frozen=True)
 class RollingMeanOp(Op):
@@ -242,6 +447,7 @@ class RollingMeanOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
+    batch_parallel = True
 
     def init_state(self, sample: jax.Array):
         sample = jnp.asarray(sample)
@@ -273,18 +479,42 @@ class RollingMeanOp(Op):
         return next_state, out
 
     def scan_batch(self, state: RollingMeanState, *child_sequences: jax.Array):
-        def step(carry, x):
-            state_c = RollingMeanState(*carry)
-            next_state, out = self.tick(state_c, x)
-            return (next_state.buffer, next_state.pos, next_state.count, next_state.total, next_state.valid_count), out
+        x = jnp.asarray(child_sequences[0])
+        history = self._chronological_buffer(state)
+        combined = jnp.concatenate((history, x), axis=0)
+        outgoing = combined[: x.shape[0]]
+        valid = jnp.isfinite(x)
+        old_valid = jnp.isfinite(outgoing)
 
-        carry, out = jax.lax.scan(
-            step,
-            (state.buffer, state.pos, state.count, state.total, state.valid_count),
-            child_sequences[0],
-            unroll=32,
+        # Each row adds x and removes the value one lookback behind it. Prefix
+        # sums of those independent deltas produce every rolling window and the
+        # exact state needed by the next batch.
+        total = state.total + prefix_sum(
+            jnp.where(valid, x, 0.0) - jnp.where(old_valid, outgoing, 0.0)
         )
-        return RollingMeanState(*carry), out
+        valid_count = state.valid_count + prefix_sum(valid.astype(jnp.int64) - old_valid.astype(jnp.int64))
+        count = jnp.minimum(
+            state.count + jnp.arange(1, x.shape[0] + 1, dtype=jnp.int32),
+            jnp.asarray(self.lookback, dtype=jnp.int32),
+        )
+        count_mask = count.reshape((x.shape[0],) + (1,) * (x.ndim - 1))
+        out = total / jnp.where(valid_count > 0, valid_count, jnp.nan)
+        out = jnp.where((count_mask >= self.min_periods) & (valid_count >= self.min_periods), out, jnp.nan)
+        return (
+            RollingMeanState(
+                buffer=combined[-self.lookback :],
+                pos=jnp.asarray(0, dtype=jnp.int32),
+                count=count[-1],
+                total=total[-1],
+                valid_count=valid_count[-1],
+            ),
+            out,
+        )
+
+    @staticmethod
+    def _chronological_buffer(state: RollingMeanState) -> jax.Array:
+        positions = jnp.mod(state.pos + jnp.arange(state.buffer.shape[0], dtype=jnp.int32), state.buffer.shape[0])
+        return state.buffer[positions]
 
 
 @dataclass(frozen=True)
@@ -331,6 +561,7 @@ class ShiftOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
+    batch_parallel = True
 
     def init_state(self, sample: jax.Array):
         shape = (self.max_size + 1,) + jnp.asarray(sample).shape
@@ -387,6 +618,7 @@ class BufferShiftOp(Op):
     output_kind: str = "matrix"
     output_width: int | None = None
     is_stateful: bool = True
+    batch_parallel = True
 
     def __post_init__(self):
         object.__setattr__(self, "output_width", self.max_lag)
@@ -509,6 +741,7 @@ class CumsumOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
+    batch_parallel = True
 
     def init_state(self, sample: jax.Array):
         return CumsumState(value=jnp.zeros_like(sample), initialized=jnp.zeros_like(sample, dtype=bool))
@@ -524,7 +757,7 @@ class CumsumOp(Op):
     def scan_batch(self, state: CumsumState, *child_sequences: jax.Array):
         x = _broadcast_sequence_to_state(child_sequences[0], state.value)
         valid = jnp.isfinite(x)
-        cumulative = state.value + jnp.cumsum(jnp.where(valid, x, 0.0), axis=0)
+        cumulative = state.value + prefix_sum(jnp.where(valid, x, 0.0))
         out = jnp.where(valid, cumulative, jnp.nan)
         next_value = cumulative[-1]
         next_initialized = state.initialized | jnp.any(valid, axis=0)
@@ -539,6 +772,10 @@ class FFillOp(Op):
     output_kind: str = "vector"
     output_width: int | None = 1
     is_stateful: bool = True
+
+    @property
+    def batch_parallel(self) -> bool:
+        return not self.dynamic_limit
 
     def init_state(self, sample: jax.Array):
         sample = jnp.asarray(sample)
@@ -609,8 +846,8 @@ class FFillOp(Op):
         valid = jnp.concatenate((state.seen[None], valid_x), axis=0)
         time_shape = (values.shape[0],) + (1,) * (values.ndim - 1)
         time = jnp.arange(values.shape[0], dtype=jnp.int64).reshape(time_shape)
-        last_idx = jnp.maximum.accumulate(jnp.where(valid, time, 0), axis=0)
-        seen = jnp.maximum.accumulate(valid, axis=0)
+        last_idx = prefix_max(jnp.where(valid, time, 0))
+        seen = prefix_or(valid)
         filled = jnp.take_along_axis(values, last_idx, axis=0)
 
         if limit is None:
@@ -699,6 +936,7 @@ class RbfBasisOp(Op):
     n_basis: int
     output_kind: str = "matrix"
     output_width: int | None = None
+    batch_parallel = True
 
     def __post_init__(self):
         object.__setattr__(self, "output_width", self.n_basis)
@@ -766,6 +1004,7 @@ class FutureRbfBasisSumOp(Op):
     n_steps: int
     output_kind: str = "matrix"
     output_width: int | None = None
+    batch_parallel = True
 
     def __post_init__(self):
         object.__setattr__(self, "output_width", self.n_basis)
@@ -811,6 +1050,12 @@ class RidgeOp(Op):
     output_kind: str = "object"
     output_width: int | None = None
     is_stateful: bool = True
+
+    @property
+    def batch_parallel(self) -> bool:
+        # hl=0 Ridge is a per-row vmap; stateful Ridge carries fitted moments
+        # through time and benefits from the engine's bounded working set.
+        return not self.is_stateful
 
     def init_state(self, sample: jax.Array):
         n = jnp.asarray(sample).shape[0]
@@ -1085,9 +1330,7 @@ def _as_tick_matrix(value, rows: int | None = None):
 
 
 def _cat(*values):
-    arrays = tuple(jnp.asarray(value) for value in values)
-    rows = next((array.shape[0] for array in arrays if array.ndim >= 1), None)
-    return jnp.concatenate(tuple(_as_tick_matrix(array, rows) for array in arrays), axis=-1)
+    return jnp.stack(values, axis=-1)
 
 
 def _einsum(subscripts, *child_values):
@@ -1145,6 +1388,14 @@ def _xs_norm(x):
 def _xs_rank(x):
     valid = jnp.isfinite(x)
     n_valid = jnp.sum(valid).astype(jnp.int32)
+    if x.ndim == 1 and x.shape[0] <= _XS_RANK_PAIRWISE_MAX_WIDTH:
+        le_counts = jnp.sum(
+            valid[None, :] & (x[None, :] <= x[:, None]),
+            axis=1,
+            dtype=jnp.int32,
+        )
+        ranks = le_counts.astype(jnp.float64) / (n_valid.astype(jnp.float64) + 1.0)
+        return _norm_inv(jnp.where(valid, ranks, jnp.nan))
     compact = jnp.where(valid, x, jnp.nan)
     sorted_compact = jnp.sort(compact)
     le_counts = jnp.minimum(jnp.searchsorted(sorted_compact, x, side="right"), n_valid)
@@ -1196,7 +1447,11 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("get_preds", 1): lambda: NaryOp(lambda x: x.preds, cpp_name="get_preds"),
     ("xs_sort", 1): lambda: NaryOp(_xs_sort, cpp_name="xs_sort"),
     ("xstd", 1): lambda: NaryOp(_xstd, cpp_name="xstd"),
-    ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
+    ("mean", 1): lambda: REDUCE_OP_FACTORY["mean"](()),
+    ("std", 1): lambda: REDUCE_OP_FACTORY["std"](()),
+    ("count", 1): lambda: REDUCE_OP_FACTORY["count"](()),
+    ("sum", 1): lambda: REDUCE_OP_FACTORY["sum"](()),
+    ("prod", 1): lambda: REDUCE_OP_FACTORY["prod"](()),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
     ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),

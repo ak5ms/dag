@@ -1,9 +1,14 @@
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+from scipy.special import ndtri
 
-from trading_dsl_engine.base.dsl import DSLFunctionRegistry, cat, ceil, dayofyear, floor, hour, register_dsl_function, round, shift, timeofday, to_dt, var
+from trading_dsl_engine.base.dsl import DSLFunctionRegistry, cat, ceil, dayofyear, floor, hour, register_dsl_function, round, shift, timeofday, to_dt, var, xs_rank
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.jax_flat.engine import compile_formula
 
@@ -29,6 +34,27 @@ def test_cumsum_broadcasts_scalar_literal_to_instrument_array_in_batch():
     np.testing.assert_allclose(np.asarray(out), expected)
 
 
+def test_cumsum_prefix_preserves_nan_and_split_batch_state():
+    rng = np.random.default_rng(331)
+    values = rng.normal(size=(127, 4))
+    values[rng.random(values.shape) < 0.2] = np.nan
+    runtime = compile_formula("cumsum(x)", cpp=False)
+
+    one_state, one_shot = runtime.run_batch({"x": jnp.asarray(values)})
+    split_state, first = runtime.run_batch({"x": jnp.asarray(values[:53])})
+    split_state, second = runtime.run_batch({"x": jnp.asarray(values[53:])}, states=split_state)
+
+    np.testing.assert_allclose(
+        np.concatenate((np.asarray(first), np.asarray(second))),
+        np.asarray(one_shot),
+        rtol=1e-12,
+        atol=1e-12,
+        equal_nan=True,
+    )
+    for one_leaf, split_leaf in zip(jax.tree.leaves(one_state), jax.tree.leaves(split_state), strict=True):
+        np.testing.assert_allclose(np.asarray(split_leaf), np.asarray(one_leaf), rtol=1e-12, atol=1e-12)
+
+
 def test_cat_stacks_multiple_alpha_vectors_on_last_axis():
     runtime = compile_formula("cat(alpha1, alpha2, alpha3)")
     alpha1 = jnp.array([[1.0, 2.0], [3.0, 4.0]])
@@ -40,6 +66,50 @@ def test_cat_stacks_multiple_alpha_vectors_on_last_axis():
     expected = np.stack([np.asarray(alpha1), np.asarray(alpha2), np.asarray(alpha3)], axis=-1)
     assert out.shape == (2, 2, 3)
     np.testing.assert_allclose(np.asarray(out), expected)
+
+
+def test_xs_rank_shape_selected_kernels_preserve_ties_and_nans():
+    rng = np.random.default_rng(884)
+    for width in (9, 129):
+        values = rng.normal(size=(17, width))
+        values[::3, 0] = np.nan
+        values[::4, 2] = values[::4, 1]
+        _, actual = compile_formula(xs_rank(var("x")), cpp=False).run_batch({"x": jnp.asarray(values)})
+
+        expected = np.full_like(values, np.nan)
+        for row_idx, row in enumerate(values):
+            valid = np.isfinite(row)
+            sorted_valid = np.sort(row[valid])
+            right_ranks = np.searchsorted(sorted_valid, row[valid], side="right")
+            expected[row_idx, valid] = ndtri(right_ranks / (sorted_valid.size + 1.0))
+
+        np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
+
+
+def test_stateless_dag_cpu_sharding_preserves_rank_padding():
+    script = r"""
+import numpy as np
+import jax.numpy as jnp
+from scipy.special import ndtri
+from trading_dsl_engine.base.dsl import var, xs_rank
+from trading_dsl_engine.jax_flat.engine import compile_formula
+
+rng = np.random.default_rng(722)
+values = rng.normal(size=(35, 129))
+values[::3, 0] = np.nan
+_, actual = compile_formula(xs_rank(var("x")), cpp=False).run_batch({"x": jnp.asarray(values)})
+expected = np.full_like(values, np.nan)
+for row_idx, row in enumerate(values):
+    valid = np.isfinite(row)
+    sorted_valid = np.sort(row[valid])
+    right_ranks = np.searchsorted(sorted_valid, row[valid], side="right")
+    expected[row_idx, valid] = ndtri(right_ranks / (sorted_valid.size + 1.0))
+np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
+"""
+    env = os.environ.copy()
+    env["JAX_NUM_CPU_DEVICES"] = "4"
+    env["PYTHONPATH"] = os.path.abspath("src") + os.pathsep + env.get("PYTHONPATH", "")
+    subprocess.run([sys.executable, "-c", script], check=True, env=env, timeout=60)
 
 
 def test_dsl_function_overloads_fall_back_to_builtin_ops_by_signature():

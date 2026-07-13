@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Callable, Sequence
 from inspect import Parameter, Signature, signature
 
@@ -90,7 +91,7 @@ DEFAULT_DSL_REGISTRY = DSLFunctionRegistry()
 def ensure_expr(value) -> Expr:
     if isinstance(value, Expr):
         return value
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, list)):
         if len(value) == 0:
             raise TypeError("Key tuples cannot be empty")
         return KeyTuple(tuple(ensure_expr(item) for item in value))
@@ -141,7 +142,7 @@ class GroupedExpr:
         key_expr = ensure_expr(key)
         if not isinstance(key_expr, KeyTuple):
             key_expr = KeyTuple((key_expr,))
-        if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
+        if builtins.sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
             raise TypeError("groupby key tuple may contain at most one univ(...) element")
         self.key = key_expr
 
@@ -194,7 +195,6 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "get_preds",
             "xs_sort",
             "xstd",
-            "mean",
             "outer",
             "cumsum",
         }
@@ -224,6 +224,11 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "where": _dsl_signature("condition", "true", "false"),
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
+    "sum": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "prod": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "count": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "mean": _dsl_signature("x", "axis", defaults={"axis": None}),
+    "std": _dsl_signature("x", "axis", defaults={"axis": None}),
     "ewm": _dsl_signature("x", "span", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
     "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
     "ffill": _dsl_signature("x", "limit"),
@@ -520,6 +525,10 @@ get_beta = op("get_beta")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")
 mean = op("mean")
+std = op("std")
+count = op("count")
+sum = op("sum")
+prod = op("prod")
 
 
 @register_dsl_function("ratio")

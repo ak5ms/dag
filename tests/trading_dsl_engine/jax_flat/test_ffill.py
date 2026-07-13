@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import jax
 import jax.numpy as jnp
 
 from trading_dsl_engine.base.dsl import ffill, var
@@ -57,6 +58,28 @@ def test_ffill_without_limit_fills_indefinitely():
         state, out_row = runtime.tick(state, jnp.asarray(row))
         rows.append(np.asarray(out_row))
     np.testing.assert_allclose(np.vstack(rows), expected, rtol=1e-12, atol=1e-12, equal_nan=True)
+
+
+@pytest.mark.parametrize("formula", ["ffill(close)", "ffill(close, 3)"])
+def test_ffill_prefix_preserves_split_batch_state(formula):
+    rng = np.random.default_rng(922)
+    close = rng.normal(size=(113, 5))
+    close[rng.random(close.shape) < 0.45] = np.nan
+    runtime = compile_formula(formula, cpp=False)
+
+    one_state, one_shot = runtime.run_batch({"close": jnp.asarray(close)})
+    split_state, first = runtime.run_batch({"close": jnp.asarray(close[:37])})
+    split_state, second = runtime.run_batch({"close": jnp.asarray(close[37:])}, states=split_state)
+
+    np.testing.assert_allclose(
+        np.concatenate((np.asarray(first), np.asarray(second))),
+        np.asarray(one_shot),
+        rtol=1e-12,
+        atol=1e-12,
+        equal_nan=True,
+    )
+    for one_leaf, split_leaf in zip(jax.tree.leaves(one_state), jax.tree.leaves(split_state), strict=True):
+        np.testing.assert_allclose(np.asarray(split_leaf), np.asarray(one_leaf), rtol=1e-12, atol=1e-12)
 
 
 def test_ffill_dynamic_nan_limit_suppresses_output_without_updating_state():

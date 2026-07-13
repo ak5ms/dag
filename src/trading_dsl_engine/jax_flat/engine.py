@@ -34,7 +34,9 @@ from trading_dsl_engine.jax_flat.ops import (
     RollingMeanOp,
     RollingOp,
     ANY_ARITY,
+    BatchReductionOp,
     OP_FACTORIES,
+    REDUCE_OP_FACTORY,
     Op,
     RidgeOp,
     ShiftOp,
@@ -113,6 +115,7 @@ class StreamingProgram:
     cache_nodes: tuple[int, ...] = ()
     cache_expr_keys: tuple[tuple[Any, ...], ...] = ()
     external_cache_inputs: dict[str, np.ndarray] | None = None
+    batch_reduction: tuple[str, tuple[int, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -195,7 +198,7 @@ class JaxFlatRuntime(eqx.Module):
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
     cache_memmap_tracker: MemmapPathTracker = eqx.field(default_factory=MemmapPathTracker, static=True)
-    block: bool = True # False disables waiting (for runtime measurement)
+    block: bool = True
 
 
     def get_cached_values(self):
@@ -329,28 +332,39 @@ class JaxFlatRuntime(eqx.Module):
 
     def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
         inputs = _normalize_batch_inputs(self, inputs)
+        reduction_spec = self.program.batch_reduction
+        reduction_nodes = _batch_reduction_nodes(self.program)
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
         n_steps = inputs[0].shape[0]
         n_instruments = inputs[0].shape[1]
-        for arr in inputs[1:]:
+        for name, arr in zip(self.program.input_names[1:], inputs[1:]):
+            if name.startswith("__batch_reduction_"):
+                continue
             if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
         if self.program.cache_nodes:
             self.clear_cached_values()
+        if reduction_nodes:
+            return _run_with_materialized_batch_reductions(self, inputs, states, out_path, reduction_nodes)
         if self.cpp and not self.program.cache_nodes and not states and not out_path:
             try:
                 from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
             except Exception as exc:
                 _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
             else:
-                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback)
+                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback, reduction_spec=reduction_spec)
                 if hybrid is not None:
                     return hybrid
+        if reduction_spec is not None and 0 in reduction_spec[1]:
+            return _run_chunked_batch_reduce(self, inputs, states, reduction_spec)
         if _has_memmap_input(inputs) or out_path or _has_disk_cache_node(self):
+            if reduction_spec is not None:
+                raise ValueError("run_batch reductions over memmap/chunked outputs require axis to include time axis 0")
             return _run_chunked_batch(self, inputs, states, out_path)
         result = _jit_batch_from_initial_state(self, inputs) if not states else _jit_batch(self, states, inputs)
-        return _finalize_batch_result(self, result)
+        finalized = _finalize_batch_result(self, result)
+        return _apply_reduction_to_result(finalized, reduction_spec)
 
 
 
@@ -415,7 +429,7 @@ def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
                 f"({runtime.program.input_names}), got {len(inputs)}"
             )
     for name, arr in zip(runtime.program.input_names, inputs):
-        if arr.ndim != 2 and not name.startswith("__cpp_subgraph_"):
+        if arr.ndim != 2 and not (name.startswith("__cpp_subgraph_") or name.startswith("__batch_reduction_")):
             raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
     return inputs
 
@@ -430,6 +444,57 @@ def _has_disk_cache_node(runtime: JaxFlatRuntime) -> bool:
         and runtime.program.nodes[node_id].op.storage == "disk"
         for node_id in runtime.program.cache_nodes
     )
+
+
+def _literal_axis_tuple(arg: Expr, fn: str) -> tuple[int, ...]:
+    if isinstance(arg, Number):
+        return (int(round(float(arg.value))),)
+    if isinstance(arg, KeyTuple):
+        axes = []
+        for item in arg.items:
+            if not isinstance(item, Number):
+                raise ValueError(f"{fn} axis must contain integer literals")
+            axes.append(int(round(float(item.value))))
+        return tuple(axes)
+    raise ValueError(f"{fn} axis must be an integer or list/tuple of integer literals")
+
+
+def _extract_root_batch_reduction(expr: Expr) -> tuple[Expr, tuple[str, tuple[int, ...]] | None]:
+    if not isinstance(expr, Call) or expr.fn not in {"sum", "prod", "count", "mean", "std"}:
+        return expr, None
+    if len(expr.args) == 1:
+        return expr, None
+    if len(expr.args) != 2 or expr.kwargs:
+        raise ValueError(f"{expr.fn} expects x and optional axis")
+    axes = tuple(sorted(set(_literal_axis_tuple(expr.args[1], expr.fn))))
+    if not axes:
+        raise ValueError(f"{expr.fn} axis must contain at least one axis")
+    if any(axis < 0 for axis in axes):
+        raise ValueError(f"{expr.fn} batch reduction axes must be non-negative")
+    return expr.args[0], (expr.fn, axes)
+
+
+def _batch_reduction_nodes(program: StreamingProgram) -> tuple[int, ...]:
+    return tuple(
+        idx
+        for idx, node in enumerate(program.nodes)
+        if isinstance(node.op, BatchReductionOp) and 0 in node.op.axes
+    )
+
+
+def _reduction_op(reduction_spec):
+    name, axes = reduction_spec
+    try:
+        return REDUCE_OP_FACTORY[name](axes)
+    except KeyError as exc:
+        raise ValueError(f"Unsupported reduction {name!r}") from exc
+
+
+def _apply_reduction_to_result(result, reduction_spec):
+    if reduction_spec is None:
+        return result
+    states, out = result
+    return states, _reduction_op(reduction_spec).apply(out)
 
 
 def _fresh_memmap_path(prefix: str) -> str:
@@ -502,6 +567,143 @@ def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: s
 
     _store_cache_arrays(runtime, cache_outs or ())
     return states, out
+
+
+def _chunk_reduce_value(accum, chunk_out, reduction_spec):
+    name, axes = reduction_spec
+    op = _reduction_op((name, axes))
+    chunk_accum = op.reduce_chunk(chunk_out)
+    if accum is None:
+        return chunk_accum
+    return op.combine(accum, chunk_accum)
+
+
+def _run_chunked_batch_reduce(runtime: JaxFlatRuntime, inputs, states=None, reduction_spec=None):
+    n_steps = inputs[0].shape[0]
+    n_instruments = inputs[0].shape[1]
+    chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    states = runtime.init_state(n_instruments) if not states else states
+    axes = reduction_spec[1]
+    if any(axis < 0 for axis in axes):
+        raise ValueError("run_batch chunked reductions do not support negative axes")
+    if runtime.program.cache_nodes:
+        raise ValueError("run_batch reductions do not support cache(...) nodes")
+    reduced = None
+    for start in range(0, n_steps, chunk_size):
+        stop = min(start + chunk_size, n_steps)
+        chunk_inputs = tuple(jnp.asarray(_input_chunk(arr, start, stop)) for arr in inputs)
+        states, chunk_out, _ = _scan_batch_chunk(runtime, states, chunk_inputs, start)
+        reduced = _chunk_reduce_value(reduced, chunk_out, reduction_spec)
+    return states, jax.block_until_ready(_reduction_op(reduction_spec).finalize(reduced))
+
+
+def _run_with_materialized_batch_reductions(runtime: JaxFlatRuntime, inputs, states=None, out_path: str | bool = False, reduction_nodes: tuple[int, ...] = ()):
+    if states:
+        raise ValueError("run_batch states are not supported with batch-reduction DSL nodes")
+    reduced_values = tuple(_compute_batch_reduction_node(runtime, inputs, node_id) for node_id in reduction_nodes)
+    residual = _program_with_batch_reduction_inputs(runtime.program, reduction_nodes)
+    residual_runtime = replace(runtime, program=residual, cpp=False)
+    residual_inputs = tuple(inputs) + tuple(jnp.asarray(value) for value in reduced_values)
+    if _program_output_has_time(residual):
+        return residual_runtime._run_batch_once(residual_inputs, None, out_path)
+    one_row_inputs = tuple(
+        arr if name.startswith("__batch_reduction_") else (arr[:1] if getattr(arr, "ndim", 0) >= 2 else arr)
+        for name, arr in zip(residual.input_names, residual_inputs)
+    )
+    state0 = residual_runtime.init_state(inputs[0].shape[1])
+    states_out, out, _ = _scan_batch_chunk(residual_runtime, state0, one_row_inputs, 0)
+    return states_out, out
+
+
+def _compute_batch_reduction_node(runtime: JaxFlatRuntime, inputs, node_id: int):
+    node = runtime.program.nodes[node_id]
+    op = node.op
+    if not isinstance(op, BatchReductionOp):
+        raise TypeError(f"node {node_id} is not a batch reduction")
+    child_program, source_input_indices = _subprogram_for_node(runtime.program, node.child_ids[0])
+    child_runtime = replace(runtime, program=replace(child_program, batch_reduction=None), cpp=False)
+    child_inputs = tuple(inputs[i] for i in source_input_indices)
+    if runtime.cpp:
+        try:
+            from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_full_batch
+        except Exception:
+            pass
+        else:
+            native = _try_cpp_full_batch(
+                replace(child_runtime, cpp=True),
+                child_inputs,
+                _CPP_ACCELERATOR_CACHE,
+                _warn_cpp_fallback,
+                emit_warning=False,
+                reduction_spec=(op.reduction, op.axes),
+            )
+            if native is not None:
+                return native[1]
+    _, reduced = _run_chunked_batch_reduce(child_runtime, child_inputs, None, (op.reduction, op.axes))
+    return reduced
+
+
+def _ancestor_ids(program: StreamingProgram, node_id: int) -> set[int]:
+    seen: set[int] = set()
+    stack = [node_id]
+    while stack:
+        idx = stack.pop()
+        if idx in seen:
+            continue
+        seen.add(idx)
+        stack.extend(program.nodes[idx].child_ids)
+    return seen
+
+
+def _subprogram_for_node(program: StreamingProgram, node_id: int) -> tuple[StreamingProgram, tuple[int, ...]]:
+    ids = sorted(_ancestor_ids(program, node_id))
+    remap = {old: new for new, old in enumerate(ids)}
+    input_remap: dict[int, int] = {}
+    nodes = []
+    for old in ids:
+        op = program.nodes[old].op
+        if isinstance(op, InputOp):
+            if op.input_index not in input_remap:
+                input_remap[op.input_index] = len(input_remap)
+            op = InputOp(input_remap[op.input_index], output_kind=op.output_kind, output_width=op.output_width)
+        nodes.append(DagNode(op, tuple(remap[c] for c in program.nodes[old].child_ids)))
+    compact_nodes = tuple(nodes)
+    input_names = tuple(program.input_names[i] for i, _ in sorted(input_remap.items(), key=lambda item: item[1]))
+    source_input_indices = tuple(i for i, _ in sorted(input_remap.items(), key=lambda item: item[1]))
+    return StreamingProgram(nodes=compact_nodes, outputs=(remap[node_id],), input_names=input_names, state_layout=_build_state_layout(compact_nodes)), source_input_indices
+
+
+def _program_with_batch_reduction_inputs(program: StreamingProgram, node_ids: tuple[int, ...]) -> StreamingProgram:
+    replacements = {node_id: len(program.input_names) + i for i, node_id in enumerate(node_ids)}
+    nodes = []
+    for idx, node in enumerate(program.nodes):
+        if idx in replacements:
+            op = node.op
+            nodes.append(DagNode(InputOp(replacements[idx], output_kind=op.output_kind, output_width=op.output_width), ()))
+        else:
+            nodes.append(node)
+    return replace(
+        program,
+        nodes=tuple(nodes),
+        input_names=program.input_names + tuple(f"__batch_reduction_{i}" for i in node_ids),
+        state_layout=_build_state_layout(tuple(nodes)),
+    )
+
+
+def _program_output_has_time(program: StreamingProgram) -> bool:
+    has_time = []
+    for node in program.nodes:
+        op = node.op
+        if isinstance(op, InputOp):
+            name = program.input_names[op.input_index]
+            has_time.append(not name.startswith("__batch_reduction_"))
+        elif isinstance(op, LiteralOp):
+            has_time.append(True)
+        elif isinstance(op, BatchReductionOp) and 0 in op.axes:
+            has_time.append(False)
+        else:
+            has_time.append(any(has_time[cid] for cid in node.child_ids))
+    return any(has_time[idx] for idx in program.outputs)
 
 
 
@@ -604,6 +806,58 @@ _CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
 
 @jax.jit
 def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    # With logical CPU devices configured, a wholly stateless formula can be
+    # time-sharded once around the complete DAG. This keeps operator authoring
+    # unchanged and avoids a pmap barrier or tuning flag on every NaryOp.
+    stateless = (
+        not runtime.program.cache_nodes
+        and len(runtime.program.outputs) == 1
+        and not any(name.startswith("__batch_reduction_") for name in runtime.program.input_names)
+        and all(not node.op.is_stateful for node in runtime.program.nodes)
+        and not any(isinstance(node.op, BatchReductionOp) and 0 in node.op.axes for node in runtime.program.nodes)
+    )
+    if stateless and jax.default_backend() == "cpu":
+        devices = tuple(jax.local_devices(backend="cpu"))
+        if len(devices) > 1 and inputs[0].shape[0] >= len(devices):
+            return _scan_stateless_batch_across_cpu_devices(runtime, state0, inputs, devices)
+
+    # A formula made entirely from batch-parallel operators benefits from one
+    # full-time-axis XLA graph. If any operator reports a sequential batch scan,
+    # bounded chunks keep its intermediates cache-sized (notably Ridge) without
+    # requiring scheduler special cases for individual operator classes.
+    batch_parallel = all(
+        isinstance(node.op, (InputOp, LiteralOp)) or node.op.batch_parallel
+        for node in runtime.program.nodes
+    )
+    if batch_parallel:
+        return _scan_batch_chunk(runtime, state0, inputs, 0)
+    return _scan_batch_in_chunks(runtime, state0, inputs)
+
+
+def _scan_stateless_batch_across_cpu_devices(runtime: JaxFlatRuntime, state0, inputs, devices):
+    n_steps = inputs[0].shape[0]
+    n_devices = len(devices)
+    padding = (-n_steps) % n_devices
+
+    def time_blocks(value):
+        value = jnp.asarray(value)
+        pad_width = ((0, padding),) + ((0, 0),) * (value.ndim - 1)
+        return jnp.pad(value, pad_width).reshape((n_devices, -1) + value.shape[1:])
+
+    # pmap encloses the whole topological program, so all stateless operations
+    # within a shard remain available to XLA fusion.
+    _, mapped_out, _ = jax.pmap(
+        lambda block_inputs: _scan_batch_chunk(runtime, state0, block_inputs, 0),
+        devices=devices,
+    )(tuple(time_blocks(value) for value in inputs))
+    out = jax.tree_util.tree_map(
+        lambda value: value.reshape((-1,) + value.shape[2:])[:n_steps],
+        mapped_out,
+    )
+    return state0, out, ()
+
+
+def _scan_batch_in_chunks(runtime: JaxFlatRuntime, state0, inputs):
     n_steps = inputs[0].shape[0]
     chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
     n_full_chunks = n_steps // chunk_size
@@ -611,8 +865,8 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
 
     def scan_chunk(states, start, size: int):
         chunk_inputs = tuple(
-            jax.lax.dynamic_slice_in_dim(arr, start, size, axis=0)
-            for arr in inputs
+            arr if name.startswith("__batch_reduction_") else jax.lax.dynamic_slice_in_dim(arr, start, size, axis=0)
+            for name, arr in zip(runtime.program.input_names, inputs)
         )
         return _scan_batch_chunk(runtime, states, chunk_inputs, start)
 
@@ -633,8 +887,8 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         leaf = jnp.asarray(leaf)
         return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
 
-    out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
-    cache0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
+    out = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
+    cache_out = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
 
     def body(chunk_i, carry):
         states_c, out_c, cache_c = carry
@@ -646,7 +900,7 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         1,
         n_full_chunks,
         body,
-        (states, out0, cache0),
+        (states, out, cache_out),
     )
 
     if remainder:
@@ -654,7 +908,6 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         states, tail_out, tail_cache = scan_chunk(states, start, remainder)
         out = set_chunk(out, start, tail_out)
         cache_out = set_chunk(cache_out, start, tail_cache)
-
     return states, out, cache_out
 
 
@@ -662,28 +915,36 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
 def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs, batch_start: int = 0):
     n_steps = inputs[0].shape[0]
     values: list[Any] = [jnp.array(0.0)] * len(runtime.program.nodes)
+    has_time: list[bool] = [True] * len(runtime.program.nodes)
     new_state = list(state_leaves)
 
     for idx, node in enumerate(runtime.program.nodes):
         op = node.op
         if isinstance(op, InputOp):
             values[idx] = inputs[op.input_index]
+            has_time[idx] = not runtime.program.input_names[op.input_index].startswith("__batch_reduction_")
             continue
         if isinstance(op, LiteralOp):
             values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+            has_time[idx] = True
             continue
 
         child_values = tuple(values[cid] for cid in node.child_ids)
+        child_has_time = tuple(has_time[cid] for cid in node.child_ids)
         field = runtime.program.state_layout.node_fields[idx]
         node_state = None if field.index < 0 else state_leaves[field.index]
-        next_state, value = (
-            op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
-            if isinstance(op, CacheOp)
-            else op.scan_batch(node_state, *child_values)
-        )
+        if isinstance(op, CacheOp):
+            next_state, value = op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
+        elif isinstance(op, NaryOp):
+            next_state, value = op.scan_batch_with_flags(node_state, child_has_time, *child_values)
+        else:
+            if not all(child_has_time):
+                raise ValueError(f"{type(op).__name__} does not support batch-reduced inputs")
+            next_state, value = op.scan_batch(node_state, *child_values)
         if field.index >= 0:
             new_state[field.index] = next_state
         values[idx] = value
+        has_time[idx] = any(child_has_time) and not (isinstance(op, BatchReductionOp) and 0 in op.axes)
 
     outs = tuple(values[i] for i in runtime.program.outputs)
     cache_outs = tuple(values[i] for i in runtime.program.cache_nodes)
@@ -994,6 +1255,18 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
         if storage not in {"ram", "disk"}:
             raise ValueError("cache storage must be 'ram' or 'disk'")
         return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
+    if expr.fn in {"sum", "prod", "count", "mean", "std"} and len(expr.args) == 2:
+        axes = tuple(sorted(set(_literal_axis_tuple(expr.args[1], expr.fn))))
+        if not axes:
+            raise ValueError(f"{expr.fn} axis must contain at least one axis")
+        if any(axis < 0 for axis in axes):
+            raise ValueError(f"{expr.fn} axes must be non-negative")
+        child = child_ops[0]
+        if 0 in axes:
+            op = REDUCE_OP_FACTORY[expr.fn](axes)
+            return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
+        op = REDUCE_OP_FACTORY[expr.fn](tuple(axis - 1 for axis in axes))
+        return replace(op, output_kind="scalar", output_width=1), None
     if expr.fn == "cat" and len(expr.args) >= 1:
         return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
     if expr.fn == "einsum":
@@ -1416,8 +1689,11 @@ def _compile_node(
 
     child_ids = tuple(
         _compile_node(a, memo, nodes, input_names, external_cache_names)
-        for a in expr.args
-        if not (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
+        for i, a in enumerate(expr.args)
+        if not (
+            (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
+            or (expr.fn in {"sum", "prod", "count", "mean", "std"} and i == 1)
+        )
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
@@ -1508,6 +1784,7 @@ def compile_formula(
     expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
     expr = _normalize_static_jax_flat_kwargs(expr)
+    batch_reduction = None
     # metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
     # formula_metadata = analyze_formula_metadata(expr, metadata_config)
     external_cache_names, external_cache_values = _external_cache_inputs(runtimes)
@@ -1530,6 +1807,7 @@ def compile_formula(
             cache_nodes=cache_nodes,
             cache_expr_keys=cache_expr_keys,
             external_cache_inputs=external_cache_values or None,
+            batch_reduction=batch_reduction,
         ),
         cpp=cpp,
     )
