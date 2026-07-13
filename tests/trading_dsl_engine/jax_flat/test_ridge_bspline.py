@@ -198,14 +198,22 @@ def test_perf_bspline_ridge_jax_flat_t_rows():
     x = jax.random.uniform(jax.random.PRNGKey(120), (T_ROWS, N_INSTRUMENTS), dtype=jnp.float64)
     y = 0.5 + 2.0 * x + 0.01 * jax.random.normal(jax.random.PRNGKey(121), x.shape, dtype=jnp.float64)
     w = jnp.ones_like(x)
-    runtime = compile_formula("get_preds(Ridge(bspline(x, 6), y, w, 8, 0.1))")
+    runtime = compile_formula("get_preds(Ridge(bspline(x, 6), y, w, 8, 0.1))", cpp=False)
 
+    # Exclude compilation and asynchronous dispatch from the runtime result.
+    _, warm = runtime.run_batch((x, y, w))
+    jax.block_until_ready(warm)
     start = time.perf_counter()
+    cpu_start = time.process_time()
     _, out = runtime.run_batch((x, y, w))
     jax.block_until_ready(out)
     elapsed = time.perf_counter() - start
+    cpu_elapsed = time.process_time() - cpu_start
 
-    print(f"bspline_ridge::jax_flat T_ROWS={T_ROWS} elapsed={elapsed:.3f}s")
+    print(
+        f"bspline_ridge::jax_flat T_ROWS={T_ROWS} elapsed={elapsed:.3f}s "
+        f"rows_per_s={T_ROWS / elapsed:.0f} cpu_cores={cpu_elapsed / elapsed:.2f}"
+    )
     assert out.shape == (T_ROWS, N_INSTRUMENTS)
 
 

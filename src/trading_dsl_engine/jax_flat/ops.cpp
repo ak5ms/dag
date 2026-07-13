@@ -1140,8 +1140,9 @@ private:
                         if (s.initialized[i] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
                         if (is_observation) {
                             if (s.initialized[i]) {
+                                // The normalized update also covers alpha=0.5; changing
+                                // new_wt after a NaN gap disagrees with pandas semantics.
                                 double new_wt = adjust ? 1.0 : alpha;
-                                if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
                                 if (s.value[i] != v) s.value[i] = (old_wt * s.value[i] + new_wt * v) / (old_wt + new_wt);
                                 old_wt = adjust ? old_wt + new_wt : 1.0;
                             } else {
@@ -1318,8 +1319,8 @@ private:
                 if (init[off] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
                 if (is_observation) {
                     if (init[off]) {
+                        // Keep grouped and ungrouped EWM on the same normalized rule.
                         double new_wt = adjust ? 1.0 : alpha;
-                        if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
                         if (state_v[off] != v) state_v[off] = (old_wt * state_v[off] + new_wt * v) / (old_wt + new_wt);
                         old_wt = adjust ? old_wt + new_wt : 1.0;
                     } else {

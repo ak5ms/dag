@@ -198,7 +198,7 @@ class JaxFlatRuntime(eqx.Module):
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
     cache_memmap_tracker: MemmapPathTracker = eqx.field(default_factory=MemmapPathTracker, static=True)
-    block: bool = True # False disables waiting (for runtime measurement)
+    block: bool = True
 
 
     def get_cached_values(self):
@@ -806,6 +806,58 @@ _CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
 
 @jax.jit
 def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    # With logical CPU devices configured, a wholly stateless formula can be
+    # time-sharded once around the complete DAG. This keeps operator authoring
+    # unchanged and avoids a pmap barrier or tuning flag on every NaryOp.
+    stateless = (
+        not runtime.program.cache_nodes
+        and len(runtime.program.outputs) == 1
+        and not any(name.startswith("__batch_reduction_") for name in runtime.program.input_names)
+        and all(not node.op.is_stateful for node in runtime.program.nodes)
+        and not any(isinstance(node.op, BatchReductionOp) and 0 in node.op.axes for node in runtime.program.nodes)
+    )
+    if stateless and jax.default_backend() == "cpu":
+        devices = tuple(jax.local_devices(backend="cpu"))
+        if len(devices) > 1 and inputs[0].shape[0] >= len(devices):
+            return _scan_stateless_batch_across_cpu_devices(runtime, state0, inputs, devices)
+
+    # A formula made entirely from batch-parallel operators benefits from one
+    # full-time-axis XLA graph. If any operator reports a sequential batch scan,
+    # bounded chunks keep its intermediates cache-sized (notably Ridge) without
+    # requiring scheduler special cases for individual operator classes.
+    batch_parallel = all(
+        isinstance(node.op, (InputOp, LiteralOp)) or node.op.batch_parallel
+        for node in runtime.program.nodes
+    )
+    if batch_parallel:
+        return _scan_batch_chunk(runtime, state0, inputs, 0)
+    return _scan_batch_in_chunks(runtime, state0, inputs)
+
+
+def _scan_stateless_batch_across_cpu_devices(runtime: JaxFlatRuntime, state0, inputs, devices):
+    n_steps = inputs[0].shape[0]
+    n_devices = len(devices)
+    padding = (-n_steps) % n_devices
+
+    def time_blocks(value):
+        value = jnp.asarray(value)
+        pad_width = ((0, padding),) + ((0, 0),) * (value.ndim - 1)
+        return jnp.pad(value, pad_width).reshape((n_devices, -1) + value.shape[1:])
+
+    # pmap encloses the whole topological program, so all stateless operations
+    # within a shard remain available to XLA fusion.
+    _, mapped_out, _ = jax.pmap(
+        lambda block_inputs: _scan_batch_chunk(runtime, state0, block_inputs, 0),
+        devices=devices,
+    )(tuple(time_blocks(value) for value in inputs))
+    out = jax.tree_util.tree_map(
+        lambda value: value.reshape((-1,) + value.shape[2:])[:n_steps],
+        mapped_out,
+    )
+    return state0, out, ()
+
+
+def _scan_batch_in_chunks(runtime: JaxFlatRuntime, state0, inputs):
     n_steps = inputs[0].shape[0]
     chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
     n_full_chunks = n_steps // chunk_size
@@ -835,8 +887,8 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         leaf = jnp.asarray(leaf)
         return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
 
-    out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
-    cache0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
+    out = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
+    cache_out = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
 
     def body(chunk_i, carry):
         states_c, out_c, cache_c = carry
@@ -848,7 +900,7 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         1,
         n_full_chunks,
         body,
-        (states, out0, cache0),
+        (states, out, cache_out),
     )
 
     if remainder:
@@ -856,7 +908,6 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         states, tail_out, tail_cache = scan_chunk(states, start, remainder)
         out = set_chunk(out, start, tail_out)
         cache_out = set_chunk(cache_out, start, tail_cache)
-
     return states, out, cache_out
 
 
