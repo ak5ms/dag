@@ -1,0 +1,38 @@
+name: Benchmark optimized JAX-flat runtime
+
+on:
+  push:
+    branches:
+      - optimize-jax-flat-compound-scan
+  workflow_dispatch:
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JAX_ENABLE_X64: "True"
+      BENCH_ROWS: "262144"
+      BENCH_ASSETS: "9"
+      BENCH_RUNS: "5"
+      BENCH_CHUNK: "65536"
+      TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e .
+      - name: Run optimized runtime tests
+        run: pytest -q -n 0 tests/trading_dsl_engine/jax_flat/test_optimized_runtime.py
+      - name: Run benchmark
+        run: python scripts/benchmark_optimized_runtime.py
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimized-runtime-benchmark
+          path: |
+            benchmark_results.json
+            benchmark_results.md
