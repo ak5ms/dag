@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - optimize-jax-flat-compound-scan
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
