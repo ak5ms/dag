@@ -34,20 +34,14 @@ def _choose_cpu_strategy(program, requested: str) -> str:
     if requested != "auto":
         return requested
 
-    depth = _optimized._stateful_depth(program)
-    pad_safe = _node_batch_pad_safe(program)
-
-    # Multiple named roots benefit from one shared DAG/CSE, while specialized
-    # node batch kernels remain faster than one very wide compound scan on CPU.
-    if len(program.outputs) > 1 and pad_safe:
-        return "node_batch"
-
-    # A single dependent chain is where eliminating time-axis intermediates has
-    # the largest payoff.
-    if len(program.outputs) == 1 and depth > 1:
-        return "compound"
-
-    return "node_batch" if pad_safe else "compound"
+    # On the measured 56-core CPU with nine instruments, the compound scan cut
+    # HLO loop count and temporary memory but consistently reduced throughput for
+    # narrow stateful chains by serializing the entire per-tick DAG onto roughly
+    # one effective core. Retain compound as an explicit memory-first option;
+    # default to specialized node-batch kernels whenever padded chunks preserve
+    # semantics. Multi-root formulas still share one DAG and receive graph-level
+    # CSE under node_batch.
+    return "node_batch" if _node_batch_pad_safe(program) else "compound"
 
 
 _optimized._replace_parallel_ops = _replace_parallel_ops_cpu
