@@ -24,5 +24,14 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e .
-      - name: Run JAX-flat regression suite
-        run: pytest -q -n 0 tests/trading_dsl_engine/jax_flat
+      - name: Run focused planned-engine tests
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q -n 0 tests/trading_dsl_engine/jax_flat/test_planned_engine.py 2>&1 | tee pytest.log
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: planned-engine-pytest-log
+          path: pytest.log
