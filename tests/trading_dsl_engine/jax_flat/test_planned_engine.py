@@ -18,7 +18,8 @@ def _legacy_batch(expr, values):
     inputs = (jnp.asarray(values, dtype=jnp.float64),)
     state, output, _ = engine_legacy._jit_batch_from_initial_state(runtime, inputs)
     jax.block_until_ready((state, output))
-    return state, output
+    state = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), state)
+    return state, np.asarray(output).copy()
 
 
 def test_compile_formula_preserves_single_output_behavior(monkeypatch):
