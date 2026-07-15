@@ -32,7 +32,7 @@ def test_ewm_branches_are_detected_and_match_independent_runtimes():
     values = _input()
     runtime = compile_features(formulas, max_in_flight=2)
 
-    assert runtime.execution_strategy() == "ewm_branch_batch"
+    assert runtime.execution_strategy() == "ewm_branch_pair_batch"
     plan = optimized_planner._detect_ewm_branch_plan(runtime.program)
     assert plan is not None
     assert plan.breadth == 4
