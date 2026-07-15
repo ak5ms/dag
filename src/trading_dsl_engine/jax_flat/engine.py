@@ -1,33 +1,31 @@
 from __future__ import annotations
 
-"""JAX-flat compiler and planned batch executor.
-
-The original implementation lives in ``engine_legacy``. This module preserves
-its public/private symbols while replacing the JAX batch fallback with a
-region-aware, cache-tiled executor. Existing ``compile_formula`` and
-``run_batch`` behavior remains the default API.
-"""
-
-from collections import deque
-from collections.abc import Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from enum import Enum
-from functools import partial
-import os
+from dataclasses import dataclass, replace
+from collections.abc import Iterable
 from typing import Any
+from inspect import Parameter
+import mmap
+import os
+import time
+import tempfile
+import warnings
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from trading_dsl_engine.jax_flat import engine_legacy as _legacy
-from trading_dsl_engine.jax_flat.engine_legacy import *  # noqa: F401,F403
+from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, ensure_expr, get_dsl_op_signature
+from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
+from trading_dsl_engine.base.metadata import FormulaMetadata, MetadataConfig, analyze_formula_metadata
+from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
 from trading_dsl_engine.jax_flat.ops import (
+    InstrumentBasisMeanOp,
+    RbfBasisOp,
+    FutureRbfBasisSumOp,
+    BufferShiftOp,
     CacheOp,
-    CumsumOp,
     EwmOp,
-    EwmState,
     FFillOp,
     GroupByOp,
     InputOp,
@@ -35,1015 +33,1503 @@ from trading_dsl_engine.jax_flat.ops import (
     NaryOp,
     RollingMeanOp,
     RollingOp,
+    ANY_ARITY,
+    OP_FACTORIES,
+    Op,
+    RidgeOp,
     ShiftOp,
+    _bspline,
+    _cat,
+    _col,
+    _einsum,
 )
 
 
-class ExecutionKind(str, Enum):
-    STATELESS = "stateless"
-    PREFIX = "prefix"
-    AFFINE = "affine"
-    SEQUENTIAL = "sequential"
-    LOOKBACK = "lookback"
-    BLOCKER = "blocker"
-    HOST_NATIVE = "host_native"
+
+
+class MemmapPathTracker:
+    def __init__(self):
+        self.memmaps: list[np.memmap] = []
+
+    def add(self, memmap: np.memmap) -> None:
+        self.memmaps.append(memmap)
+
+    def cleanup(self) -> None:
+        memmaps = list(self.memmaps)
+        self.memmaps.clear()
+        for memmap in memmaps:
+            path = memmap.filename
+            mapped = getattr(memmap, "_mmap", None)
+            try:
+                memmap.flush()
+                if mapped is not None:
+                    mapped.close()
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def __del__(self):
+        self.cleanup()
+
+
+class CacheWriteTarget:
+    def __init__(self, array: np.ndarray):
+        self.array = array
+
+    def write(self, start, value) -> None:
+        start_i = int(np.asarray(start))
+        value_np = np.asarray(value)
+        self.array[start_i : start_i + value_np.shape[0]] = value_np
+        if isinstance(self.array, np.memmap):
+            self.array.flush()
 
 
 @dataclass(frozen=True)
-class ExecutionRegion:
-    kind: ExecutionKind
-    node_ids: tuple[int, ...]
+class DagNode:
+    op: Any
+    child_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
-class ExecutionPlan:
-    regions: tuple[ExecutionRegion, ...]
-    chunk_size: int
-    strategy: str
-    pad_safe: bool
-    masked_tail: bool
+class StateFieldRef:
+    index: int
 
 
 @dataclass(frozen=True)
-class EwmBranchPlan:
-    base_node_id: int
-    levels: tuple[tuple[int, ...], ...]
-    tail_nodes: frozenset[int]
-
-    @property
-    def breadth(self) -> int:
-        return len(self.levels[0])
-
-    @property
-    def depth(self) -> int:
-        return len(self.levels)
-
-
-def classify_op(op: Any) -> ExecutionKind:
-    if isinstance(op, (InputOp, LiteralOp, NaryOp)):
-        return ExecutionKind.STATELESS
-    if isinstance(op, (CumsumOp, FFillOp)):
-        return ExecutionKind.PREFIX
-    if isinstance(op, EwmOp):
-        if op.span is not None and op.ignore_na and not op.adjust:
-            return ExecutionKind.AFFINE
-        return ExecutionKind.SEQUENTIAL
-    if isinstance(op, (RollingMeanOp, RollingOp, ShiftOp)):
-        return ExecutionKind.LOOKBACK
-    if isinstance(op, GroupByOp):
-        return ExecutionKind.BLOCKER
-    if isinstance(op, CacheOp):
-        return ExecutionKind.HOST_NATIVE
-    return ExecutionKind.SEQUENTIAL if getattr(op, "is_stateful", False) else ExecutionKind.STATELESS
-
-
-def _build_regions(program: StreamingProgram) -> tuple[ExecutionRegion, ...]:
-    regions: list[ExecutionRegion] = []
-    current_kind: ExecutionKind | None = None
-    current_nodes: list[int] = []
-    for node_id, node in enumerate(program.nodes):
-        kind = classify_op(node.op)
-        hard_boundary = kind in {ExecutionKind.BLOCKER, ExecutionKind.HOST_NATIVE}
-        if current_nodes and (hard_boundary or kind != current_kind):
-            assert current_kind is not None
-            regions.append(ExecutionRegion(current_kind, tuple(current_nodes)))
-            current_nodes = []
-        if hard_boundary:
-            regions.append(ExecutionRegion(kind, (node_id,)))
-            current_kind = None
-        else:
-            current_kind = kind
-            current_nodes.append(node_id)
-    if current_nodes:
-        assert current_kind is not None
-        regions.append(ExecutionRegion(current_kind, tuple(current_nodes)))
-    return tuple(regions)
-
-
-def _consumer_lists(program: StreamingProgram):
-    consumers: list[list[int]] = [[] for _ in program.nodes]
-    for consumer_id, node in enumerate(program.nodes):
-        for child_id in node.child_ids:
-            consumers[child_id].append(consumer_id)
-    return tuple(tuple(items) for items in consumers)
-
-
-def _compatible_branch_ewm(node: DagNode) -> bool:
-    op = node.op
-    return (
-        isinstance(op, EwmOp)
-        and len(node.child_ids) == 1
-        and op.span is not None
-        and op.ignore_na
-        and not op.adjust
-        and op.output_kind == "vector"
-    )
-
-
-def _ewm_path(program: StreamingProgram, output_id: int):
-    path_reversed: list[int] = []
-    node_id = output_id
-    while _compatible_branch_ewm(program.nodes[node_id]):
-        path_reversed.append(node_id)
-        node_id = program.nodes[node_id].child_ids[0]
-    return node_id, tuple(reversed(path_reversed))
-
-
-def _detect_ewm_branch_plan(program: StreamingProgram) -> EwmBranchPlan | None:
-    if len(program.outputs) < 2:
-        return None
-    walked = tuple(_ewm_path(program, output_id) for output_id in program.outputs)
-    raw_bases = tuple(item[0] for item in walked)
-    paths = tuple(item[1] for item in walked)
-    if not paths or any(not path for path in paths) or len(set(raw_bases)) != 1:
-        return None
-
-    common = 0
-    shortest = min(map(len, paths))
-    while common < shortest and all(path[common] == paths[0][common] for path in paths[1:]):
-        common += 1
-
-    base_node_id = paths[0][common - 1] if common else raw_bases[0]
-    tails = tuple(path[common:] for path in paths)
-    if any(not tail for tail in tails) or len({len(tail) for tail in tails}) != 1:
-        return None
-
-    levels = tuple(tuple(tail[level] for tail in tails) for level in range(len(tails[0])))
-    if any(len(set(level)) != len(level) for level in levels):
-        return None
-    if tuple(levels[-1]) != tuple(program.outputs):
-        return None
-
-    tail_nodes = frozenset(node_id for level in levels for node_id in level)
-    if tail_nodes.intersection(program.cache_nodes):
-        return None
-
-    consumers = _consumer_lists(program)
-    for branch_i in range(len(program.outputs)):
-        for level_i, level in enumerate(levels):
-            node_id = level[branch_i]
-            expected = () if level_i + 1 == len(levels) else (levels[level_i + 1][branch_i],)
-            if consumers[node_id] != expected:
-                return None
-            expected_child = base_node_id if level_i == 0 else levels[level_i - 1][branch_i]
-            if program.nodes[node_id].child_ids != (expected_child,):
-                return None
-    return EwmBranchPlan(base_node_id, levels, tail_nodes)
-
-
-def _padding_preserves_state(program: StreamingProgram) -> bool:
-    for node in program.nodes:
-        op = node.op
-        if not getattr(op, "is_stateful", False):
-            continue
-        if isinstance(op, CumsumOp):
-            continue
-        if isinstance(op, FFillOp):
-            continue
-        if isinstance(op, EwmOp) and op.ignore_na:
-            continue
-        return False
-    return True
-
-
-def _program_counts(program: StreamingProgram) -> tuple[int, int]:
-    stateful = stateless = 0
-    for node in program.nodes:
-        if isinstance(node.op, (InputOp, LiteralOp, CacheOp)):
-            continue
-        if node.op.is_stateful:
-            stateful += 1
-        else:
-            stateless += 1
-    return stateful, stateless
-
-
-def _stateful_depth(program: StreamingProgram) -> int:
-    depths: list[int] = []
-    for node in program.nodes:
-        parent_depth = max((depths[child_id] for child_id in node.child_ids), default=0)
-        depths.append(parent_depth + int(bool(node.op.is_stateful)))
-    return max((depths[output_id] for output_id in program.outputs), default=0)
-
-
-def _automatic_chunk_size(program: StreamingProgram) -> int:
-    branch_plan = _detect_ewm_branch_plan(program)
-    stateful, stateless = _program_counts(program)
-    if branch_plan is not None:
-        return 8_192 if branch_plan.breadth == 4 and _stateful_depth(program) < 8 else 4_096
-    if stateful == 0:
-        return 32_768
-    if stateless == 0 and all(
-        isinstance(node.op, (InputOp, LiteralOp, CacheOp, EwmOp))
-        for node in program.nodes
-    ):
-        return 4_096
-    return 65_536
-
-
-def build_execution_plan(program: StreamingProgram) -> ExecutionPlan:
-    regions = _build_regions(program)
-    branch_plan = _detect_ewm_branch_plan(program)
-    pad_safe = _padding_preserves_state(program)
-    has_blocker = any(
-        region.kind in {ExecutionKind.BLOCKER, ExecutionKind.HOST_NATIVE}
-        for region in regions
-    )
-    if branch_plan is not None:
-        strategy = "ewm_branch_batch"
-    elif has_blocker:
-        strategy = "legacy_boundary"
-    else:
-        strategy = "node_batch"
-    return ExecutionPlan(
-        regions=regions,
-        chunk_size=_automatic_chunk_size(program),
-        strategy=strategy,
-        pad_safe=pad_safe,
-        masked_tail=not pad_safe,
-    )
-
-
-def _stack_ewm_states(states) -> EwmState:
-    return EwmState(
-        value=jnp.stack(tuple(state.value for state in states), axis=0),
-        weight=jnp.stack(tuple(state.weight for state in states), axis=0),
-        initialized=jnp.stack(tuple(state.initialized for state in states), axis=0),
-        count=jnp.stack(tuple(state.count for state in states), axis=0),
-    )
-
-
-def _unstack_ewm_state(state: EwmState, index: int) -> EwmState:
-    return EwmState(
-        value=state.value[index],
-        weight=state.weight[index],
-        initialized=state.initialized[index],
-        count=state.count[index],
-    )
-
-
-def _scan_batched_ewm_level(ops, state: EwmState, values):
-    spans = jnp.asarray(tuple(float(op.span) for op in ops), dtype=values.dtype)[:, None]
-    alpha = 2.0 / (spans + 1.0)
-    old_wt_factor = 1.0 - alpha
-    min_periods = jnp.asarray(
-        tuple(-1 if op.min_periods is None else int(round(float(op.min_periods))) for op in ops),
-        dtype=jnp.int64,
-    )[:, None]
-
-    def step(carry: EwmState, x_t):
-        value, weight, initialized, count = (
-            carry.value,
-            carry.weight,
-            carry.initialized,
-            carry.count,
-        )
-        valid = jnp.isfinite(x_t)
-        decayed_weight = jnp.where(initialized & valid, weight * old_wt_factor, weight)
-        normalized = (decayed_weight * value + alpha * x_t) / (decayed_weight + alpha)
-        half = decayed_weight * value + (1.0 - decayed_weight) * x_t
-        weighted = jnp.where(jnp.isclose(alpha, 0.5), half, normalized)
-        next_value = jnp.where(valid, jnp.where(initialized, weighted, x_t), value)
-        next_weight = jnp.where(valid, jnp.ones_like(decayed_weight), decayed_weight)
-        next_initialized = initialized | valid
-        next_count = count + valid.astype(jnp.int64)
-        enough = (min_periods < 0) | (next_count >= min_periods)
-        out = jnp.where(next_initialized & enough, next_value, jnp.nan)
-        return EwmState(next_value, next_weight, next_initialized, next_count), out
-
-    return jax.lax.scan(step, state, values, unroll=1)
-
-
-def _scan_affine_ewm_associative(op: EwmOp, state: EwmState, values):
-    alpha = jnp.asarray(2.0 / (float(op.span) + 1.0), dtype=values.dtype)
-    decay = 1.0 - alpha
-    valid = jnp.isfinite(values)
-    has = valid
-    a = jnp.where(valid, decay, 1.0)
-    b = jnp.where(valid, alpha * values, 0.0)
-    uninitialized_value = jnp.where(valid, values, 0.0)
-    counts = valid.astype(jnp.int64)
-
-    def combine(left, right):
-        has1, a1, b1, u1, count1 = left
-        has2, a2, b2, u2, count2 = right
-        return (
-            has1 | has2,
-            a2 * a1,
-            a2 * b1 + b2,
-            jnp.where(has1, a2 * u1 + b2, u2),
-            count1 + count2,
-        )
-
-    has_prefix, a_prefix, b_prefix, u_prefix, count_prefix = jax.lax.associative_scan(
-        combine,
-        (has, a, b, uninitialized_value, counts),
-        axis=0,
-    )
-    initialized0 = state.initialized
-    values_initialized = a_prefix * state.value + b_prefix
-    values_uninitialized = jnp.where(has_prefix, u_prefix, state.value)
-    output_values = jnp.where(initialized0, values_initialized, values_uninitialized)
-    initialized = initialized0 | has_prefix
-    count = state.count + count_prefix
-    enough = True if op.min_periods is None else count >= int(round(float(op.min_periods)))
-    outputs = jnp.where(initialized & enough, output_values, jnp.nan)
-    final_initialized = initialized[-1]
-    final_state = EwmState(
-        value=output_values[-1],
-        weight=jnp.where(final_initialized, jnp.ones_like(state.weight), state.weight),
-        initialized=final_initialized,
-        count=count[-1],
-    )
-    return final_state, outputs
-
-
-def _paired_ewm_consumer(program: StreamingProgram, node_id: int, consumers) -> int | None:
-    node = program.nodes[node_id]
-    if not isinstance(node.op, EwmOp) or len(node.child_ids) != 1:
-        return None
-    if node_id in program.outputs or node_id in program.cache_nodes:
-        return None
-    if len(consumers[node_id]) != 1:
-        return None
-    consumer_id = consumers[node_id][0]
-    consumer = program.nodes[consumer_id]
-    if not isinstance(consumer.op, EwmOp) or consumer.child_ids != (node_id,):
-        return None
-    return consumer_id
-
-
-def _scan_ewm_pair(first_op, second_op, first_state, second_state, values):
-    def step(carry, x_t):
-        state1, state2 = carry
-        state1, first_value = first_op.tick(state1, x_t)
-        state2, second_value = second_op.tick(state2, first_value)
-        return (state1, state2), second_value
-
-    return jax.lax.scan(
-        step,
-        (first_state, second_state),
-        values,
-        unroll=1,
-    )
-
-
-def _scan_node(op, node_state, child_values):
-    associative_min_width = int(
-        os.environ.get("TRADING_DSL_JAX_FLAT_ASSOCIATIVE_EWM_MIN_WIDTH", "512")
-    )
-    if (
-        isinstance(op, EwmOp)
-        and op.span is not None
-        and op.ignore_na
-        and not op.adjust
-        and len(child_values) == 1
-        and child_values[0].shape[-1] >= associative_min_width
-    ):
-        return _scan_affine_ewm_associative(op, node_state, child_values[0])
-    return op.scan_batch(node_state, *child_values)
-
-
-def _evaluate_node_batch(runtime, state_leaves, inputs, batch_start, omitted=frozenset()):
-    n_steps = inputs[0].shape[0]
-    values = [jnp.asarray(0.0)] * len(runtime.program.nodes)
-    new_state = list(state_leaves)
-    consumers = _consumer_lists(runtime.program)
-    skipped: set[int] = set()
-
-    for node_id, node in enumerate(runtime.program.nodes):
-        if node_id in omitted or node_id in skipped:
-            continue
-        op = node.op
-        if isinstance(op, InputOp):
-            values[node_id] = inputs[op.input_index]
-            continue
-        if isinstance(op, LiteralOp):
-            values[node_id] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
-            continue
-
-        pair_id = _paired_ewm_consumer(runtime.program, node_id, consumers)
-        if pair_id is not None and pair_id not in omitted:
-            pair_node = runtime.program.nodes[pair_id]
-            first_field = runtime.program.state_layout.node_fields[node_id]
-            second_field = runtime.program.state_layout.node_fields[pair_id]
-            source = values[node.child_ids[0]]
-            (next_first, next_second), pair_value = _scan_ewm_pair(
-                op,
-                pair_node.op,
-                state_leaves[first_field.index],
-                state_leaves[second_field.index],
-                source,
-            )
-            new_state[first_field.index] = next_first
-            new_state[second_field.index] = next_second
-            values[pair_id] = pair_value
-            skipped.add(pair_id)
-            continue
-
-        child_values = tuple(values[child_id] for child_id in node.child_ids)
-        field = runtime.program.state_layout.node_fields[node_id]
-        node_state = None if field.index < 0 else state_leaves[field.index]
-        next_state, value = (
-            op.scan_batch_with_start(node_state, batch_start, *child_values)
-            if isinstance(op, CacheOp)
-            else _scan_node(op, node_state, child_values)
-        )
-        if field.index >= 0:
-            new_state[field.index] = next_state
-        values[node_id] = value
-    return values, new_state
-
-
-def _node_batch_branch_impl(runtime, plan: EwmBranchPlan, state_leaves, inputs, batch_start):
-    values, new_state = _evaluate_node_batch(
-        runtime,
-        state_leaves,
-        inputs,
-        batch_start,
-        plan.tail_nodes,
-    )
-    breadth = plan.breadth
-    base = values[plan.base_node_id]
-    branch_values = jnp.broadcast_to(
-        base[:, None, :],
-        (base.shape[0], breadth, base.shape[1]),
-    )
-
-    level_index = 0
-    while level_index < len(plan.levels):
-        first_level = plan.levels[level_index]
-        first_fields = tuple(
-            runtime.program.state_layout.node_fields[node_id]
-            for node_id in first_level
-        )
-        first_states = _stack_ewm_states(
-            tuple(state_leaves[field.index] for field in first_fields)
-        )
-        first_ops = tuple(runtime.program.nodes[node_id].op for node_id in first_level)
-
-        if level_index + 1 < len(plan.levels):
-            second_level = plan.levels[level_index + 1]
-            second_fields = tuple(
-                runtime.program.state_layout.node_fields[node_id]
-                for node_id in second_level
-            )
-            second_states = _stack_ewm_states(
-                tuple(state_leaves[field.index] for field in second_fields)
-            )
-            second_ops = tuple(runtime.program.nodes[node_id].op for node_id in second_level)
-
-            def pair_step(carry, x_t):
-                state1, state2 = carry
-                state1, first_values = _batched_ewm_tick(first_ops, state1, x_t)
-                state2, second_values = _batched_ewm_tick(second_ops, state2, first_values)
-                return (state1, state2), second_values
-
-            (next_first, next_second), branch_values = jax.lax.scan(
-                pair_step,
-                (first_states, second_states),
-                branch_values,
-                unroll=1,
-            )
-            for branch_i, field in enumerate(first_fields):
-                new_state[field.index] = _unstack_ewm_state(next_first, branch_i)
-            for branch_i, field in enumerate(second_fields):
-                new_state[field.index] = _unstack_ewm_state(next_second, branch_i)
-            level_index += 2
-        else:
-            next_first, branch_values = _scan_batched_ewm_level(
-                first_ops,
-                first_states,
-                branch_values,
-            )
-            for branch_i, field in enumerate(first_fields):
-                new_state[field.index] = _unstack_ewm_state(next_first, branch_i)
-            level_index += 1
-
-    outputs = tuple(branch_values[:, branch_i, :] for branch_i in range(breadth))
-    cache_outputs = tuple(values[node_id] for node_id in runtime.program.cache_nodes)
-    return tuple(new_state), (outputs, cache_outputs)
-
-
-def _batched_ewm_tick(ops, state: EwmState, values):
-    spans = jnp.asarray(tuple(float(op.span) for op in ops), dtype=values.dtype)[:, None]
-    alpha = 2.0 / (spans + 1.0)
-    old_wt_factor = 1.0 - alpha
-    min_periods = jnp.asarray(
-        tuple(-1 if op.min_periods is None else int(round(float(op.min_periods))) for op in ops),
-        dtype=jnp.int64,
-    )[:, None]
-    valid = jnp.isfinite(values)
-    decayed_weight = jnp.where(
-        state.initialized & valid,
-        state.weight * old_wt_factor,
-        state.weight,
-    )
-    normalized = (decayed_weight * state.value + alpha * values) / (decayed_weight + alpha)
-    half = decayed_weight * state.value + (1.0 - decayed_weight) * values
-    weighted = jnp.where(jnp.isclose(alpha, 0.5), half, normalized)
-    next_value = jnp.where(valid, jnp.where(state.initialized, weighted, values), state.value)
-    next_weight = jnp.where(valid, jnp.ones_like(decayed_weight), decayed_weight)
-    next_initialized = state.initialized | valid
-    next_count = state.count + valid.astype(jnp.int64)
-    enough = (min_periods < 0) | (next_count >= min_periods)
-    output = jnp.where(next_initialized & enough, next_value, jnp.nan)
-    return EwmState(next_value, next_weight, next_initialized, next_count), output
-
-
-def _planned_node_batch_impl(runtime, state_leaves, inputs, batch_start):
-    branch_plan = _detect_ewm_branch_plan(runtime.program)
-    if branch_plan is not None:
-        return _node_batch_branch_impl(
-            runtime,
-            branch_plan,
-            state_leaves,
-            inputs,
-            batch_start,
-        )
-    values, new_state = _evaluate_node_batch(
-        runtime,
-        state_leaves,
-        inputs,
-        batch_start,
-    )
-    outputs = tuple(values[node_id] for node_id in runtime.program.outputs)
-    cache_outputs = tuple(values[node_id] for node_id in runtime.program.cache_nodes)
-    return tuple(new_state), (outputs, cache_outputs)
-
-
-@partial(jax.jit, donate_argnums=(1,))
-def _planned_node_batch_chunk(runtime, state_leaves, inputs, batch_start):
-    return _planned_node_batch_impl(runtime, state_leaves, inputs, batch_start)
-
-
-@jax.jit
-def _planned_node_batch_chunk_nodonate(runtime, state_leaves, inputs, batch_start):
-    return _planned_node_batch_impl(runtime, state_leaves, inputs, batch_start)
-
-
-def _tick_program(runtime, state_leaves, input_rows):
-    values = [jnp.asarray(0.0)] * len(runtime.program.nodes)
-    new_state = list(state_leaves)
-    for node_id, node in enumerate(runtime.program.nodes):
-        op = node.op
-        if isinstance(op, InputOp):
-            values[node_id] = input_rows[op.input_index]
-            continue
-        if isinstance(op, LiteralOp):
-            values[node_id] = jnp.asarray(op.value, dtype=jnp.float64)
-            continue
-        child_values = tuple(values[child_id] for child_id in node.child_ids)
-        field = runtime.program.state_layout.node_fields[node_id]
-        node_state = None if field.index < 0 else state_leaves[field.index]
-        next_state, value = op.tick(node_state, *child_values)
-        if field.index >= 0:
-            new_state[field.index] = next_state
-        values[node_id] = value
-    outputs = tuple(values[node_id] for node_id in runtime.program.outputs)
-    cache_outputs = tuple(values[node_id] for node_id in runtime.program.cache_nodes)
-    return tuple(new_state), (outputs, cache_outputs)
-
-
-@partial(jax.jit, donate_argnums=(1,))
-def _planned_masked_tail_chunk(
-    runtime,
-    state_leaves,
-    inputs,
-    valid_length,
-    invalid_outputs,
-    invalid_caches,
-):
-    row_indices = jnp.arange(inputs[0].shape[0], dtype=jnp.int32)
-
-    def step(state, xs):
-        rows, row_id = xs[:-1], xs[-1]
-        return jax.lax.cond(
-            row_id < valid_length,
-            lambda _: _tick_program(runtime, state, rows),
-            lambda _: (state, (invalid_outputs, invalid_caches)),
-            operand=None,
-        )
-
-    return jax.lax.scan(
-        step,
-        state_leaves,
-        (*inputs, row_indices),
-        unroll=1,
-    )
-
-
-@jax.jit
-def _planned_masked_tail_chunk_nodonate(
-    runtime,
-    state_leaves,
-    inputs,
-    valid_length,
-    invalid_outputs,
-    invalid_caches,
-):
-    row_indices = jnp.arange(inputs[0].shape[0], dtype=jnp.int32)
-
-    def step(state, xs):
-        rows, row_id = xs[:-1], xs[-1]
-        return jax.lax.cond(
-            row_id < valid_length,
-            lambda _: _tick_program(runtime, state, rows),
-            lambda _: (state, (invalid_outputs, invalid_caches)),
-            operand=None,
-        )
-
-    return jax.lax.scan(
-        step,
-        state_leaves,
-        (*inputs, row_indices),
-        unroll=1,
-    )
-
-
-def _value_template(op, n_instruments: int):
-    if op.output_kind == "scalar":
-        return jnp.asarray(0.0, dtype=jnp.float64)
-    if op.output_kind == "vector":
-        return jnp.zeros((n_instruments,), dtype=jnp.float64)
-    if op.output_kind == "matrix" and op.output_width is not None:
-        return jnp.zeros((n_instruments, int(op.output_width)), dtype=jnp.float64)
-    raise ValueError(f"Cannot infer output shape for {op.output_kind!r}")
-
-
-def _invalid_like(value):
-    value = jnp.asarray(value)
-    if jnp.issubdtype(value.dtype, jnp.inexact):
-        return jnp.full_like(value, jnp.nan)
-    if jnp.issubdtype(value.dtype, jnp.bool_):
-        return jnp.zeros_like(value, dtype=bool)
-    return jnp.zeros_like(value)
-
-
-def _pad_chunk(array, start: int, stop: int, chunk_size: int):
-    source = np.asarray(array[start:stop], dtype=np.float64)
-    if source.shape[0] == chunk_size:
-        return source
-    target = np.full((chunk_size,) + source.shape[1:], np.nan, dtype=np.float64)
-    target[: source.shape[0]] = source
-    return target
-
-
-def _prepare_chunk(inputs, start: int, stop: int, chunk_size: int):
-    return tuple(
-        jnp.asarray(_pad_chunk(array, start, stop, chunk_size))
-        for array in inputs
-    )
-
-
-def _output_names(program: StreamingProgram) -> tuple[str, ...]:
-    names = getattr(program, "output_names", ())
-    if names:
-        return tuple(names)
-    return tuple(f"output_{index}" for index in range(len(program.outputs)))
-
-
-def _attach_output_names(program: StreamingProgram, names: Sequence[str]):
-    object.__setattr__(program, "output_names", tuple(names))
-    return program
-
-
-def _allocate_host_outputs(runtime, n_steps: int, n_instruments: int, out_path):
-    templates = tuple(
-        _value_template(runtime.program.nodes[node_id].op, n_instruments)
-        for node_id in runtime.program.outputs
-    )
-    multiple = len(templates) > 1
-    arrays = []
-    for name, template in zip(_output_names(runtime.program), templates, strict=True):
-        shape = (n_steps,) + tuple(np.asarray(template).shape)
-        if out_path is False or out_path is None:
-            arrays.append(np.empty(shape, dtype=np.asarray(template).dtype))
-            continue
-        if out_path is True:
-            path = _legacy._fresh_memmap_path(f"trading_dsl_engine_jax_flat_{name}_")
-        elif isinstance(out_path, str):
-            if not multiple:
-                path = out_path
+class StateLayout:
+    node_fields: tuple[StateFieldRef, ...]
+    total_leaves: int
+
+
+@dataclass(frozen=True)
+class StreamingProgram:
+    nodes: tuple[DagNode, ...]
+    outputs: tuple[int, ...]
+    input_names: tuple[str, ...]
+    state_layout: StateLayout
+    metadata: FormulaMetadata | None = None
+    cache_nodes: tuple[int, ...] = ()
+    cache_expr_keys: tuple[tuple[Any, ...], ...] = ()
+    external_cache_inputs: dict[str, np.ndarray] | None = None
+
+
+@dataclass(frozen=True)
+class InnerGraphOp(Op):
+    """A groupby-local operator DAG.
+
+    The flat runtime normally stores state per top-level DAG node. A groupby RHS,
+    however, must keep any nested stateful operators inside the group bucket. This
+    op wraps the RHS sub-DAG so GroupByOp can allocate one complete RHS state per
+    universe/dynamic-key slot.
+    """
+
+    nodes: tuple[DagNode, ...]
+    output_id: int
+    state_layout: StateLayout
+    n_inputs: int
+    is_stateful: bool = False
+    output_kind: str = "vector"
+
+    def init_state(self, sample: jax.Array):
+        states = []
+        for node in self.nodes:
+            if node.op.is_stateful:
+                states.append(node.op.init_state(sample))
+        return tuple(states)
+
+    def tick(self, state_leaves, *input_values: jax.Array):
+        values: list[jax.Array] = [jnp.array(0.0)] * len(self.nodes)
+        new_state = list(()) if state_leaves is None else list(state_leaves)
+
+        for idx, node in enumerate(self.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = input_values[op.input_index]
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            field = self.state_layout.node_fields[idx]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.tick(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
+            values[idx] = value
+
+        return tuple(new_state), values[self.output_id]
+
+    def scan_batch(self, state_leaves, *input_sequences: jax.Array):
+        n_steps = input_sequences[0].shape[0]
+        values: list[Any] = [jnp.array(0.0)] * len(self.nodes)
+        new_state = list(()) if state_leaves is None else list(state_leaves)
+
+        for idx, node in enumerate(self.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = input_sequences[op.input_index]
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            field = self.state_layout.node_fields[idx]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.scan_batch(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
+            values[idx] = value
+
+        next_states = tuple(new_state) if state_leaves is not None else None
+        return next_states, values[self.output_id]
+
+
+class JaxFlatRuntime(eqx.Module):
+    program: StreamingProgram = eqx.field(static=True)
+    runtimes: list[float] = eqx.field(default_factory=list, static=True)
+    cpp: bool = eqx.field(default=True, static=True)
+    cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
+    cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
+    cache_memmap_tracker: MemmapPathTracker = eqx.field(default_factory=MemmapPathTracker, static=True)
+    block: bool = True # False disables waiting (for runtime measurement)
+
+
+    def get_cached_values(self):
+        """Return batch-materialized values for top-level cache(...) nodes keyed by node id."""
+        return dict(self.cached_values)
+
+    def clear_cached_values(self) -> None:
+        """Drop materialized batch cache values from previous runs and remove disk cache files."""
+        self.cached_values.clear()
+        self.cache_memmap_tracker.cleanup()
+
+    def get_units(self):
+        """Return static unit exponents inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_units()
+
+    def get_range(self):
+        """Return the static domain/range interval inferred for this formula output."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.get_range()
+
+    def get_types(self):
+        """Return semantic output types after applying configured type relations."""
+        if self.program.metadata is None:
+            return frozenset()
+        return self.program.metadata.get_types()
+
+    def get_node_metadata(self, label: str | None = None):
+        """Return static metadata for analyzed formula nodes, optionally filtered by label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_metadata(label)
+
+    def get_node_types(self, label: str):
+        """Return semantic type sets for analyzed formula nodes with the given label."""
+        if self.program.metadata is None:
+            return ()
+        return self.program.metadata.get_node_types(label)
+
+    def get_type_relations(self):
+        """Return the configured semantic type relation graph."""
+        if self.program.metadata is None:
+            return None
+        return self.program.metadata.type_graph
+
+    def init_state(self, n_instruments: int):
+        vector_sample = jnp.zeros((n_instruments,), dtype=jnp.float64)
+        values: list[Any] = [vector_sample] * len(self.program.nodes)
+        states = []
+        for idx, node in enumerate(self.program.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                if op.output_kind == "matrix":
+                    values[idx] = jnp.zeros((n_instruments, op.output_width or n_instruments), dtype=jnp.float64)
+                else:
+                    values[idx] = vector_sample
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            if op.is_stateful:
+                sample = child_values[0] if child_values else vector_sample
+                if jnp.asarray(sample).ndim == 0:
+                    sample = vector_sample
+                state = op.init_state(sample)
+                states.append(state)
+                _, value = op.tick(state, *child_values)
             else:
-                root, extension = os.path.splitext(out_path)
-                path = f"{root}.{name}{extension or '.memmap'}"
+                _, value = op.tick(None, *child_values)
+            values[idx] = value
+        return tuple(states)
+
+    def _tick_impl(self, state_leaves, *input_rows):
+        values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
+        new_state = list(state_leaves)
+
+        for idx, node in enumerate(self.program.nodes):
+            op = node.op
+            if isinstance(op, InputOp):
+                values[idx] = input_rows[op.input_index]
+                continue
+            if isinstance(op, LiteralOp):
+                values[idx] = jnp.asarray(op.value, dtype=jnp.float64)
+                continue
+
+            child_values = tuple(values[cid] for cid in node.child_ids)
+            field = self.program.state_layout.node_fields[idx]
+            node_state = None if field.index < 0 else state_leaves[field.index]
+            next_state, value = op.tick(node_state, *child_values)
+            if field.index >= 0:
+                new_state[field.index] = next_state
+            values[idx] = value
+
+        outs = tuple(values[i] for i in self.program.outputs)
+        return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0)
+
+    @jax.jit
+    def tick(self, state_leaves, *input_rows):
+        return self._tick_impl(state_leaves, *input_rows)
+
+    def run_batch(self, inputs, states=None, out_path: str | bool = False):
+
+        runtime = self
+
+        while True:
+            start = time.perf_counter()
+            try:
+                result = runtime._run_batch_once(inputs, states, out_path)
+                if runtime.block:
+                    jax.block_until_ready(result)
+                end = time.perf_counter()
+                runtime.runtimes.append(end - start)
+                return result
+
+            except Exception as exc:
+                if states or not _is_groupby_capacity_error(exc):
+                    raise
+                next_runtime = _double_groupby_capacities(runtime)
+                if next_runtime is runtime:
+                    raise
+                warnings.warn(
+                    "jax_flat groupby capacity/hash table exhausted; retrying run_batch with 2x group key capacity",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                runtime = next_runtime
+
+    def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
+        inputs = _normalize_batch_inputs(self, inputs)
+        if not inputs:
+            raise ValueError("run_batch requires at least one input array")
+        n_steps = inputs[0].shape[0]
+        n_instruments = inputs[0].shape[1]
+        for arr in inputs[1:]:
+            if arr.shape[0] != n_steps or arr.shape[1] != n_instruments:
+                raise ValueError("All inputs must share aligned shape (time, n_instruments)")
+        if self.program.cache_nodes:
+            self.clear_cached_values()
+        if self.cpp and not self.program.cache_nodes and not states and not out_path:
+            try:
+                from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
+            except Exception as exc:
+                _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
+            else:
+                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback)
+                if hybrid is not None:
+                    return hybrid
+        if _has_memmap_input(inputs) or out_path or _has_disk_cache_node(self):
+            return _run_chunked_batch(self, inputs, states, out_path)
+        result = _jit_batch_from_initial_state(self, inputs) if not states else _jit_batch(self, states, inputs)
+        return _finalize_batch_result(self, result)
+
+
+
+def _is_cpp_flat_state(states) -> bool:
+    return type(states).__name__ == "CppFlatState"
+
+
+
+def _warn_cpp_fallback(runtime: JaxFlatRuntime, message: str) -> None:
+    if message in runtime.cpp_fallback_warnings:
+        return
+    runtime.cpp_fallback_warnings.append(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+def _normalize_batch_inputs(runtime: JaxFlatRuntime, inputs):
+    external_cache_inputs = runtime.program.external_cache_inputs or {}
+    if isinstance(inputs, dict):
+        missing = [
+            name
+            for name in runtime.program.input_names
+            if name not in inputs and name not in external_cache_inputs
+        ]
+        if missing:
+            raise ValueError(f"Missing jax_flat run_batch input(s): {missing}")
+        if len(runtime.program.input_names) == 0:
+            inputs = tuple(inputs.values())
         else:
-            raise ValueError("out_path must be False, True, None, or a filesystem path")
-        arrays.append(
-            np.memmap(
-                path,
-                mode="w+",
-                dtype=np.asarray(template).dtype,
-                shape=shape,
+            inputs = tuple(
+                external_cache_inputs[name] if name in external_cache_inputs else inputs[name]
+                for name in runtime.program.input_names
             )
-        )
-    return tuple(arrays)
+    else:
+        user_inputs = tuple(inputs)
+        if external_cache_inputs:
+            if len(user_inputs) == len(runtime.program.input_names):
+                inputs = user_inputs
+            else:
+                user_iter = iter(user_inputs)
+                ordered = []
+                for name in runtime.program.input_names:
+                    if name in external_cache_inputs:
+                        ordered.append(external_cache_inputs[name])
+                    else:
+                        ordered.append(next(user_iter))
+                remaining = tuple(user_iter)
+                if remaining:
+                    raise ValueError(
+                        "run_batch received more positional input array(s) than non-cached formula inputs"
+                    )
+                inputs = tuple(ordered)
+        else:
+            inputs = user_inputs
+
+    if len(inputs) != len(runtime.program.input_names):
+        if len(runtime.program.input_names) == 0 and len(inputs) == 1:
+            pass
+        else:
+            raise ValueError(
+                "run_batch expected "
+                f"{len(runtime.program.input_names)} input array(s) "
+                f"({runtime.program.input_names}), got {len(inputs)}"
+            )
+    for name, arr in zip(runtime.program.input_names, inputs):
+        if arr.ndim != 2 and not name.startswith("__cpp_subgraph_"):
+            raise ValueError(f"Expected 2D input for '{name}', got shape {arr.shape}")
+    return inputs
 
 
-def _materialize_pending(item, output_arrays):
-    start, valid_length, values = item
-    stop = start + valid_length
-    for target, value in zip(output_arrays, values, strict=True):
-        target[start:stop] = np.asarray(jax.device_get(value))[:valid_length]
-        if isinstance(target, np.memmap):
-            target.flush()
+def _has_memmap_input(inputs) -> bool:
+    return any(isinstance(arr, np.memmap) for arr in inputs)
 
 
-def _format_outputs(runtime, outputs):
-    if len(outputs) == 1:
-        return outputs[0]
-    return dict(zip(_output_names(runtime.program), outputs, strict=True))
-
-
-def _concatenate_device_outputs(runtime, chunks):
-    outputs = tuple(
-        jnp.concatenate(
-            tuple(chunk_values[output_index][:valid_length] for valid_length, chunk_values in chunks),
-            axis=0,
-        )
-        for output_index in range(len(runtime.program.outputs))
-    )
-    return _format_outputs(runtime, outputs)
-
-
-def _run_planned_jax_batch(runtime, inputs, states, out_path):
-    n_steps, n_instruments = inputs[0].shape[:2]
-    state = runtime.init_state(n_instruments) if states is None else states
-    plan = build_execution_plan(runtime.program)
-
-    configured_chunk_size = int(
-        os.environ.get("TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE", "0")
-    )
-    chunk_size = min(n_steps, configured_chunk_size or plan.chunk_size)
-    max_in_flight = max(
-        1,
-        int(os.environ.get("TRADING_DSL_JAX_FLAT_MAX_IN_FLIGHT", "2")),
-    )
-    host_output = (
-        bool(out_path)
-        or _legacy._has_memmap_input(inputs)
-    )
-    output_arrays = (
-        _allocate_host_outputs(runtime, n_steps, n_instruments, out_path)
-        if host_output
-        else ()
-    )
-    pending = deque()
-    device_chunks = []
-    first_chunk = True
-
-    output_templates = tuple(
-        _value_template(runtime.program.nodes[node_id].op, n_instruments)
-        for node_id in runtime.program.outputs
-    )
-    cache_templates = tuple(
-        _value_template(runtime.program.nodes[node_id].op, n_instruments)
+def _has_disk_cache_node(runtime: JaxFlatRuntime) -> bool:
+    return any(
+        isinstance(runtime.program.nodes[node_id].op, CacheOp)
+        and runtime.program.nodes[node_id].op.storage == "disk"
         for node_id in runtime.program.cache_nodes
     )
-    invalid_outputs = tuple(_invalid_like(value) for value in output_templates)
-    invalid_caches = tuple(_invalid_like(value) for value in cache_templates)
 
-    starts = tuple(range(0, n_steps, chunk_size))
-    use_prefetch = _legacy._has_memmap_input(inputs)
-    executor = ThreadPoolExecutor(max_workers=1) if use_prefetch else None
-    future: Future | None = None
-    if executor is not None and starts:
-        first_start = starts[0]
-        future = executor.submit(
-            _prepare_chunk,
-            inputs,
-            first_start,
-            min(first_start + chunk_size, n_steps),
-            chunk_size,
+
+def _fresh_memmap_path(prefix: str) -> str:
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".memmap")
+    os.close(fd)
+    return path
+
+
+def _tracked_cache_memmap(runtime: JaxFlatRuntime, node_id: int, dtype, shape):
+    run_index = len(runtime.runtimes)
+    prefix = f"trading_dsl_engine_jax_flat_cache_pid{os.getpid()}_rt{id(runtime):x}_run{run_index}_node{node_id}_"
+    path = _fresh_memmap_path(prefix)
+    out = np.memmap(path, mode="w+", dtype=dtype, shape=shape)
+    runtime.cache_memmap_tracker.add(out)
+    return out
+
+
+def _input_chunk(arr, start: int, stop: int):
+    chunk = arr[start:stop]
+    if isinstance(chunk, np.memmap) and chunk.dtype == np.float64:
+        return chunk
+    if isinstance(chunk, np.ndarray):
+        return np.asarray(chunk, dtype=np.float64)
+    return chunk
+
+
+def _output_array(out_path: str | bool, n_steps: int, chunk_out: np.ndarray):
+    shape = (n_steps,) + chunk_out.shape[1:]
+    if out_path is False or out_path is None:
+        return np.empty(shape, dtype=chunk_out.dtype)
+    if out_path is True:
+        out_path = _fresh_memmap_path("trading_dsl_engine_jax_flat_out_")
+    if isinstance(out_path, str):
+        return np.memmap(out_path, mode="w+", dtype=chunk_out.dtype, shape=shape)
+    raise ValueError("out_path must be False, True, or a filesystem path string")
+
+
+def _flush_memmap_output(out) -> None:
+    if not isinstance(out, np.memmap):
+        return
+    out.flush()
+    mapped = getattr(out, "_mmap", None)
+    madvise = getattr(mapped, "madvise", None)
+    if madvise is not None and hasattr(mmap, "MADV_DONTNEED"):
+        madvise(mmap.MADV_DONTNEED)
+
+
+def _run_chunked_batch(runtime: JaxFlatRuntime, inputs, states=None, out_path: str | bool = False):
+    n_steps = inputs[0].shape[0]
+    n_instruments = inputs[0].shape[1]
+    chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    states = runtime.init_state(n_instruments) if not states else states
+    cache_outs = tuple(_cache_output_array(runtime, node_id, n_steps, n_instruments) for node_id in runtime.program.cache_nodes)
+    callback_runtime = _runtime_with_cache_write_callbacks(runtime, cache_outs)
+    root_cache_idx = runtime.program.cache_nodes.index(runtime.program.outputs[0]) if runtime.program.outputs[0] in runtime.program.cache_nodes else None
+    out = cache_outs[root_cache_idx] if root_cache_idx is not None and isinstance(cache_outs[root_cache_idx], np.memmap) else None
+    root_cache_output = out is not None
+
+    for start in range(0, n_steps, chunk_size):
+        stop = min(start + chunk_size, n_steps)
+        chunk_inputs = tuple(jnp.asarray(_input_chunk(arr, start, stop)) for arr in inputs)
+        states, chunk_out, _ = _scan_batch_chunk(callback_runtime, states, chunk_inputs, start)
+        if root_cache_output:
+            jax.block_until_ready(chunk_out)
+            continue
+        chunk_out_np = np.asarray(jax.block_until_ready(chunk_out))
+        out = _output_array(out_path, n_steps, chunk_out_np) if out is None else out
+        out[start:stop] = chunk_out_np
+        _flush_memmap_output(out)
+
+    _store_cache_arrays(runtime, cache_outs or ())
+    return states, out
+
+
+
+def _runtime_with_cache_write_callbacks(runtime: JaxFlatRuntime, cache_outs) -> JaxFlatRuntime:
+    if not cache_outs:
+        return runtime
+    targets = dict(zip(runtime.program.cache_nodes, map(CacheWriteTarget, cache_outs)))
+    return replace(
+        runtime,
+        program=replace(
+            runtime.program,
+            nodes=tuple(
+                replace(node, op=replace(node.op, cache_write_target=targets[node_id]))
+                if node_id in targets and isinstance(node.op, CacheOp)
+                else node
+                for node_id, node in enumerate(runtime.program.nodes)
+            ),
+        ),
+    )
+
+
+def _cache_output_array(runtime: JaxFlatRuntime, node_id: int, n_steps: int, n_instruments: int):
+    op = runtime.program.nodes[node_id].op
+    if not isinstance(op, CacheOp):
+        raise TypeError(f"cache node {node_id} is {type(op).__name__}")
+    if op.output_kind == "scalar":
+        shape = (n_steps,)
+    elif op.output_kind == "vector":
+        shape = (n_steps, n_instruments)
+    elif op.output_kind == "matrix" and op.output_width is not None:
+        shape = (n_steps, n_instruments, int(op.output_width))
+    else:
+        raise ValueError(f"Cannot infer cache output shape for cache node {node_id}")
+    return _tracked_cache_memmap(runtime, node_id, np.float64, shape) if op.storage == "disk" else np.empty(shape, dtype=np.float64)
+
+
+def _store_cache_arrays(runtime: JaxFlatRuntime, values) -> None:
+    runtime.cached_values.clear()
+    for node_id, value in zip(runtime.program.cache_nodes, values):
+        runtime.cached_values[int(node_id)] = value
+
+
+def _finalize_batch_result(runtime: JaxFlatRuntime, result):
+    states, out, cache_outs = result
+    materialized = tuple(_materialize_cache_value(runtime, node_id, value) for node_id, value in zip(runtime.program.cache_nodes, cache_outs))
+    _store_cache_arrays(runtime, materialized)
+    return states, out
+
+
+def _materialize_cache_value(runtime: JaxFlatRuntime, node_id: int, value):
+    value_np = np.asarray(jax.block_until_ready(value))
+    op = runtime.program.nodes[node_id].op
+    if isinstance(op, CacheOp) and op.storage == "disk":
+        out = _tracked_cache_memmap(runtime, node_id, value_np.dtype, value_np.shape)
+        out[:] = value_np
+        _flush_memmap_output(out)
+        return out
+    return value_np
+
+def _is_groupby_capacity_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "jax_flat groupby capacity exceeded" in message
+        or "jax_flat groupby hash table exhausted" in message
+    )
+
+
+def _double_groupby_capacities(runtime: JaxFlatRuntime) -> JaxFlatRuntime:
+    changed = False
+    nodes = []
+    for node in runtime.program.nodes:
+        op = node.op
+        if isinstance(op, GroupByOp):
+            op = replace(
+                op,
+                capacity=op.capacity * 2,
+                hash_capacity=max(op.hash_capacity * 2, op.capacity * 4),
+            )
+            changed = True
+        nodes.append(DagNode(op=op, child_ids=node.child_ids))
+    if not changed:
+        return runtime
+    return JaxFlatRuntime(program=replace(runtime.program, nodes=tuple(nodes)))
+
+
+@jax.jit
+def _jit_batch_from_initial_state(runtime: JaxFlatRuntime, inputs):
+    state0 = runtime.init_state(inputs[0].shape[1])
+    return _scan_batch(runtime, state0, inputs)
+
+
+@jax.jit
+def _jit_batch(runtime: JaxFlatRuntime, state0, inputs):
+    return _scan_batch(runtime, state0, inputs)
+
+
+_BATCH_CHUNK_SIZE = int(os.environ.get("TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE", "65536"))
+_CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
+
+
+@jax.jit
+def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
+    n_steps = inputs[0].shape[0]
+    chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    n_full_chunks = n_steps // chunk_size
+    remainder = n_steps - n_full_chunks * chunk_size
+
+    def scan_chunk(states, start, size: int):
+        chunk_inputs = tuple(
+            jax.lax.dynamic_slice_in_dim(arr, start, size, axis=0)
+            for arr in inputs
+        )
+        return _scan_batch_chunk(runtime, states, chunk_inputs, start)
+
+    def set_chunk(out, start, value):
+        return jax.tree_util.tree_map(
+            lambda dst, src: jax.lax.dynamic_update_slice(
+                dst,
+                src,
+                (start,) + (0,) * (jnp.asarray(dst).ndim - 1),
+            ),
+            out,
+            value,
         )
 
-    try:
-        for chunk_index, start in enumerate(starts):
-            stop = min(start + chunk_size, n_steps)
-            valid_length = stop - start
-            if future is not None:
-                chunk_inputs = future.result()
-                next_index = chunk_index + 1
-                if next_index < len(starts):
-                    next_start = starts[next_index]
-                    future = executor.submit(
-                        _prepare_chunk,
-                        inputs,
-                        next_start,
-                        min(next_start + chunk_size, n_steps),
-                        chunk_size,
-                    )
-                else:
-                    future = None
+    states, chunk0_out, chunk0_cache = scan_chunk(state0, 0, chunk_size)
+
+    def alloc(leaf):
+        leaf = jnp.asarray(leaf)
+        return jnp.empty((n_steps,) + leaf.shape[1:], dtype=leaf.dtype)
+
+    out0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_out), 0, chunk0_out)
+    cache0 = set_chunk(jax.tree_util.tree_map(alloc, chunk0_cache), 0, chunk0_cache)
+
+    def body(chunk_i, carry):
+        states_c, out_c, cache_c = carry
+        start = chunk_i * chunk_size
+        states_n, chunk_out, chunk_cache = scan_chunk(states_c, start, chunk_size)
+        return states_n, set_chunk(out_c, start, chunk_out), set_chunk(cache_c, start, chunk_cache)
+
+    states, out, cache_out = jax.lax.fori_loop(
+        1,
+        n_full_chunks,
+        body,
+        (states, out0, cache0),
+    )
+
+    if remainder:
+        start = n_full_chunks * chunk_size
+        states, tail_out, tail_cache = scan_chunk(states, start, remainder)
+        out = set_chunk(out, start, tail_out)
+        cache_out = set_chunk(cache_out, start, tail_cache)
+
+    return states, out, cache_out
+
+
+@jax.jit
+def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs, batch_start: int = 0):
+    n_steps = inputs[0].shape[0]
+    values: list[Any] = [jnp.array(0.0)] * len(runtime.program.nodes)
+    new_state = list(state_leaves)
+
+    for idx, node in enumerate(runtime.program.nodes):
+        op = node.op
+        if isinstance(op, InputOp):
+            values[idx] = inputs[op.input_index]
+            continue
+        if isinstance(op, LiteralOp):
+            values[idx] = jnp.full((n_steps,), op.value, dtype=jnp.float64)
+            continue
+
+        child_values = tuple(values[cid] for cid in node.child_ids)
+        field = runtime.program.state_layout.node_fields[idx]
+        node_state = None if field.index < 0 else state_leaves[field.index]
+        next_state, value = (
+            op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
+            if isinstance(op, CacheOp)
+            else op.scan_batch(node_state, *child_values)
+        )
+        if field.index >= 0:
+            new_state[field.index] = next_state
+        values[idx] = value
+
+    outs = tuple(values[i] for i in runtime.program.outputs)
+    cache_outs = tuple(values[i] for i in runtime.program.cache_nodes)
+    return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0), cache_outs
+
+
+
+
+def _normalize_variadic_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if not name.startswith("arg") or not name[3:].isdigit():
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = int(name[3:])
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+    if any(value is None for value in values):
+        missing_position = next(i for i, value in enumerate(values) if value is None)
+        raise ValueError(f"{fn} missing required argument 'arg{missing_position}' before keyword arguments")
+    return tuple(value for value in values if value is not None)
+
+
+def _normalize_ridge_kwargs(args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    values: dict[str, Expr] = {}
+    for name, value in kwargs:
+        if name not in {"y", "weights", "hl", "lambda_", "nonneg"}:
+            raise ValueError(f"Unsupported Ridge keyword argument(s): {[name]}")
+        if name in values:
+            raise ValueError(f"Ridge got multiple values for argument {name!r}")
+        values[name] = value
+
+    y = values.get("y")
+    hl = values.get("hl")
+    lambda_value = values.get("lambda_")
+    weights = values.get("weights")
+    nonneg = values.get("nonneg", Number(2.0))
+    if isinstance(nonneg, Identifier) and nonneg.name in {"True", "False"}:
+        nonneg = Number(3.0 if nonneg.name == "True" else 2.0)
+    elif isinstance(nonneg, Number):
+        nonneg = Number(3.0 if bool(nonneg.value) else 2.0)
+    tail = (y, weights if weights is not None else Number(1.0), hl, lambda_value, nonneg)
+    if any(value is None for value in tail[:-1]):
+        raise ValueError("Ridge keyword form requires y, hl, and lambda_")
+    return args + tail
+
+
+def _normalize_call_kwargs(fn: str, args: tuple[Expr, ...], kwargs: tuple[tuple[str, Expr], ...]) -> tuple[Expr, ...]:
+    if not kwargs or fn == "groupby":
+        return args
+    if fn == "Ridge":
+        return _normalize_ridge_kwargs(args, kwargs)
+    if fn in {"cat", "einsum"}:
+        return _normalize_variadic_kwargs(fn, args, kwargs)
+
+    signature = get_dsl_op_signature(fn)
+    if signature is None:
+        return args
+    parameter_names = tuple(
+        name for name, param in signature.parameters.items() if param.kind is not param.VAR_POSITIONAL
+    )
+    positions_by_name = {name: idx for idx, name in enumerate(parameter_names)}
+    values: list[Expr | None] = list(args)
+    seen_positions: set[int] = set()
+    for name, value in kwargs:
+        if name not in positions_by_name:
+            raise ValueError(f"Unsupported {fn} keyword argument(s): {[name]}")
+        position = positions_by_name[name]
+        if position < len(args) or position in seen_positions:
+            raise ValueError(f"{fn} got multiple values for argument {name!r}")
+        while len(values) <= position:
+            values.append(None)
+        values[position] = value
+        seen_positions.add(position)
+
+    for idx, value in enumerate(values):
+        if value is None:
+            default = signature.parameters[parameter_names[idx]].default
+            if default is Parameter.empty:
+                expected = parameter_names[idx]
+                raise ValueError(f"{fn} missing required argument {expected!r} before keyword arguments")
+            values[idx] = None if default is None else ensure_expr(default)
+    return tuple(value for value in values if value is not None)
+
+
+def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
+    if isinstance(node, Call):
+        args = tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args)
+        kwargs = tuple((key, _normalize_static_jax_flat_kwargs(value)) for key, value in node.kwargs)
+        if not kwargs:
+            return Call(node.fn, args)
+        return Call(node.fn, _normalize_call_kwargs(node.fn, args, kwargs))
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_normalize_static_jax_flat_kwargs(arg) for arg in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
+    return node
+
+def _expr_key(node: Expr):
+    if isinstance(node, Identifier):
+        return ("id", node.name)
+    if isinstance(node, Number):
+        return ("num", float(node.value))
+    if isinstance(node, String):
+        return ("str", node.value)
+    if isinstance(node, Call):
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(a) for a in node.args),
+            tuple((k, _expr_key(v)) for k, v in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return (
+            "jax_rolling",
+            id(node.fn),
+            node.lookback,
+            node.min_periods,
+            node.output_kind,
+            node.output_width,
+            node.name,
+            tuple(_expr_key(a) for a in node.args),
+        )
+    if isinstance(node, StatelessJaxCall):
+        return (
+            "jax_stateless",
+            id(node.fn),
+            node.output_kind,
+            node.output_width,
+            node.name,
+            tuple(_expr_key(a) for a in node.args),
+        )
+    if isinstance(node, KeyTuple):
+        return ("tuple", tuple(_expr_key(item) for item in node.items))
+    if isinstance(node, Universe):
+        return ("univ", node.groups)
+    raise ValueError(f"Unsupported expression: {node}")
+
+
+def _canonical_groupby_key_items(key: Expr) -> tuple[Expr, ...]:
+    if not isinstance(key, KeyTuple):
+        key = KeyTuple((key,))
+    if sum(1 for item in key.items if isinstance(item, Universe)) > 1:
+        raise ValueError("groupby key tuple may contain at most one univ(...) element")
+    return key.items
+
+
+def _resolve_universe_groups(universe: Universe) -> tuple[tuple[int, ...], ...]:
+    groups = []
+    for g in universe.groups:
+        cols = []
+        for m in g:
+            if not isinstance(m, int):
+                raise ValueError("jax_flat univ currently supports integer column indexes only")
+            cols.append(m)
+        groups.append(tuple(cols))
+    return tuple(groups)
+
+
+def _validate_groupby_canonical_form(expr: Call) -> None:
+    if len(expr.args) != 3:
+        raise ValueError(
+            "groupby only supports canonical form: "
+            "groupby((key1, ..., maybe_univ, ...), lhs, op_using_self_)"
+        )
+    unsupported_kwargs = {name for name, _ in expr.kwargs} - {"capacity", "hash_capacity"}
+    if unsupported_kwargs:
+        raise ValueError(f"Unsupported groupby keyword argument(s): {sorted(unsupported_kwargs)}")
+    for name, value in expr.kwargs:
+        if not isinstance(value, Number):
+            raise ValueError(f"groupby {name} must be a numeric literal")
+    _canonical_groupby_key_items(expr.args[0])
+
+
+def _replace_self(node: Expr, lhs: Expr) -> Expr:
+    if isinstance(node, Identifier) and node.name == "self_":
+        return lhs
+    if isinstance(node, Call):
+        return Call(
+            node.fn,
+            tuple(_replace_self(a, lhs) for a in node.args),
+            tuple((key, _replace_self(value, lhs)) for key, value in node.kwargs),
+        )
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_replace_self(arg, lhs) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_replace_self(a, lhs) for a in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
+    return node
+
+
+def _literal_int_arg(expr: Expr, fn: str, position: int) -> int:
+    if not isinstance(expr, Number):
+        raise ValueError(f"{fn} argument {position} must be a numeric literal")
+    return int(round(float(expr.value)))
+
+
+def _op_width(op: Op) -> int:
+    if op.output_width is None:
+        raise ValueError(f"Cannot infer static output width for {op.output_kind} op in jax_flat")
+    return int(op.output_width)
+
+
+
+def _shape_source_op(child_ops: tuple[Op, ...]) -> Op | None:
+    for child in child_ops:
+        if child.output_kind != "scalar":
+            return child
+    return child_ops[0] if child_ops else None
+
+
+def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
+    if not isinstance(op, NaryOp):
+        return op
+    shape_source = _shape_source_op(child_ops)
+    if shape_source is None:
+        return op
+    shape_preserving = {
+        "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
+        "isnan", "purify", "fraction", "add", "sub", "mul", "mod", "pow",
+        "div", "floordiv", "eq", "ne", "lt", "gt", "le", "ge", "and", "or", "xor",
+        "fillna", "where", "clip", "norm_inv", "xs_norm", "cache",
+    }
+    if op.cpp_name not in shape_preserving:
+        return op
+    return replace(op, output_kind=shape_source.output_kind, output_width=shape_source.output_width)
+
+
+def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
+    if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
+        return None
+    child = child_ops[0]
+    op = OP_FACTORIES[(expr.fn, 1)]()
+    if expr.fn == "get_preds":
+        return replace(op, output_kind="vector", output_width=1), None
+    if isinstance(child, InstrumentBasisMeanOp):
+        return replace(op, output_kind="matrix", output_width=child.feature_width), None
+    if isinstance(child, RidgeOp):
+        return replace(op, output_kind="vector", output_width=sum(child.feature_widths)), None
+    return replace(op, output_kind=child.output_kind, output_width=child.output_width), None
+
+
+def _build_rolling_jax_op(expr: RollingJaxCall, child_ops: tuple[Op, ...]) -> Op:
+    if len(child_ops) != 1:
+        raise ValueError("rolling JAX call expects one child")
+    output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+    output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+    return RollingOp(expr.lookback, expr.min_periods, expr.fn, output_kind=output_kind, output_width=output_width)
+
+
+def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -> Op:
+    if not child_ops:
+        raise ValueError("stateless JAX call expects at least one child")
+    output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+    output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
+
+
+def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
+    if expr.fn == "groupby":
+        raise ValueError("groupby must be compiled with its RHS subgraph")
+    if expr.kwargs:
+        raise ValueError(f"Keyword arguments are not supported for {expr.fn}")
+    projection = _object_projection_op(expr, child_ops)
+    if projection is not None:
+        return projection
+    if expr.fn == "cache" and len(expr.args) in (1, 2):
+        storage = "ram"
+        if len(expr.args) == 2:
+            if not isinstance(expr.args[1], String):
+                raise ValueError("cache storage must be a string literal")
+            storage = expr.args[1].value
+        if storage not in {"ram", "disk"}:
+            raise ValueError("cache storage must be 'ram' or 'disk'")
+        return CacheOp(storage=storage, output_kind=child_ops[0].output_kind, output_width=child_ops[0].output_width), 1 if len(expr.args) == 2 else None
+    if expr.fn == "cat" and len(expr.args) >= 1:
+        return NaryOp(_cat, output_kind="matrix", output_width=sum(_op_width(op) for op in child_ops), cpp_name="cat"), None
+    if expr.fn == "einsum":
+        static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
+        if len(static_args) != 1:
+            raise ValueError("einsum expects one string subscript literal")
+        subscripts = str(static_args[0])
+        output = subscripts.split("->", 1)[1] if "->" in subscripts else ""
+        if output == "":
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="scalar", output_width=1, cpp_name="einsum", cpp_str_param=subscripts), None
+        index_widths = {}
+        input_terms = subscripts.split("->", 1)[0].split(",")
+        for term, op in zip(input_terms, child_ops):
+            compact = term.replace("...", "")
+            if len(compact) >= 1:
+                index_widths.setdefault(compact[0], 1)
+            if len(compact) >= 2 and op.output_width is not None:
+                index_widths[compact[1]] = int(op.output_width)
+        if len(output) == 1:
+            width = index_widths.get(output, 1)
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="vector", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
+        if len(output) == 2:
+            # Matrix width is inferred from the last output index when possible;
+            # dynamic widths (for outer-like i,j output) use None.
+            width = index_widths.get(output[-1])
+            return NaryOp(lambda *child_values, subscripts=subscripts: _einsum(subscripts, *child_values), output_kind="matrix", output_width=width, cpp_name="einsum", cpp_str_param=subscripts), None
+    variadic_builder = OP_FACTORIES.get((expr.fn, ANY_ARITY))
+    if variadic_builder is not None:
+        static_args = tuple(arg.value for arg in expr.args if isinstance(arg, String))
+        return variadic_builder(*static_args), None
+    if expr.fn == "round":
+        if len(expr.args) == 1:
+            return NaryOp(jnp.round, cpp_name="round"), None
+        if len(expr.args) == 2 and isinstance(expr.args[1], Number):
+            decimals = int(round(float(expr.args[1].value)))
+            return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
+    if expr.fn == "ewm" and len(expr.args) in (2, 3, 4, 5):
+        span = float(expr.args[1].value) if isinstance(expr.args[1], Number) else None
+        min_periods = None
+        drop: int | tuple[int, ...] | None = 1 if span is not None else None
+        if len(expr.args) >= 3:
+            if isinstance(expr.args[2], Number):
+                min_periods = float(expr.args[2].value)
+                drop = (1, 2) if span is not None else 2
             else:
-                chunk_inputs = _prepare_chunk(inputs, start, stop, chunk_size)
-
-            donate = not (first_chunk and states is not None)
-            if valid_length < chunk_size and plan.masked_tail:
-                kernel = (
-                    _planned_masked_tail_chunk
-                    if donate
-                    else _planned_masked_tail_chunk_nodonate
-                )
-                state, (chunk_outputs, _) = kernel(
-                    runtime,
-                    state,
-                    chunk_inputs,
-                    jnp.asarray(valid_length, dtype=jnp.int32),
-                    invalid_outputs,
-                    invalid_caches,
-                )
+                drop = 1 if span is not None else None
+        ignore_na = True
+        adjust = False
+        drop_indices = set()
+        if isinstance(drop, tuple):
+            drop_indices.update(drop)
+        elif isinstance(drop, int):
+            drop_indices.add(drop)
+        if len(expr.args) >= 4:
+            ignore_na = bool(_literal_int_arg(expr.args[3], "ewm", 4))
+            drop_indices.add(3)
+        if len(expr.args) >= 5:
+            adjust = bool(_literal_int_arg(expr.args[4], "ewm", 5))
+            drop_indices.add(4)
+        return EwmOp(span=span, min_periods=min_periods, ignore_na=ignore_na, adjust=adjust), tuple(sorted(drop_indices)) if drop_indices else None
+    if expr.fn == "roll_mean" and len(expr.args) in (2, 3):
+        lookback = _literal_int_arg(expr.args[1], "roll_mean", 2)
+        min_periods = lookback if len(expr.args) == 2 else _literal_int_arg(expr.args[2], "roll_mean", 3)
+        if lookback <= 0 or min_periods <= 0 or min_periods > lookback:
+            raise ValueError("roll_mean expects 0 < min_periods <= lookback")
+        return (
+            RollingMeanOp(
+                lookback=lookback,
+                min_periods=min_periods,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            tuple(range(1, len(expr.args))),
+        )
+    if expr.fn == "ffill" and len(expr.args) in (1, 2):
+        limit = None
+        dynamic_limit = False
+        drop_child_idx = None
+        if len(expr.args) == 2:
+            if isinstance(expr.args[1], Number):
+                limit = int(round(float(expr.args[1].value)))
+                if limit < 0:
+                    raise ValueError("ffill limit must be >= 0")
+                drop_child_idx = 1
             else:
-                kernel = (
-                    _planned_node_batch_chunk
-                    if donate
-                    else _planned_node_batch_chunk_nodonate
-                )
-                state, (chunk_outputs, _) = kernel(
-                    runtime,
-                    state,
-                    chunk_inputs,
-                    jnp.asarray(start, dtype=jnp.int64),
-                )
-            first_chunk = False
+                dynamic_limit = True
+        return (
+            FFillOp(
+                limit=limit,
+                dynamic_limit=dynamic_limit,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            drop_child_idx,
+        )
+    if expr.fn == "shift" and len(expr.args) in (1, 2, 3):
+        lag_arg = expr.args[1] if len(expr.args) >= 2 else Number(1.0)
+        max_size_arg = expr.args[2] if len(expr.args) == 3 else lag_arg
+        max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(expr.args) == 3 else 2))
+        return (
+            ShiftOp(
+                max_size=max_size,
+                output_kind=child_ops[0].output_kind,
+                output_width=child_ops[0].output_width,
+            ),
+            2 if len(expr.args) == 3 else None,
+        )
+    if expr.fn == "bspline" and len(expr.args) == 2:
+        n_basis = _literal_int_arg(expr.args[1], "bspline", 2)
+        if n_basis <= 0:
+            raise ValueError("bspline n_basis must be >= 1")
+        return NaryOp(lambda x, n_basis=n_basis: _bspline(x, n_basis), output_kind="matrix", output_width=n_basis, cpp_name="bspline", cpp_int_param=n_basis), 1
+    if expr.fn == "rbf_basis" and len(expr.args) == 4:
+        n_basis = _literal_int_arg(expr.args[3], "rbf_basis", 4)
+        if n_basis <= 0:
+            raise ValueError("rbf_basis n_basis must be >= 1")
+        return RbfBasisOp(n_basis=n_basis), 3
+    if expr.fn == "future_rbf_basis_sum" and len(expr.args) == 5:
+        n_basis = _literal_int_arg(expr.args[3], "future_rbf_basis_sum", 4)
+        n_steps = _literal_int_arg(expr.args[4], "future_rbf_basis_sum", 5)
+        if n_basis <= 0:
+            raise ValueError("future_rbf_basis_sum n_basis must be >= 1")
+        if n_steps <= 0:
+            raise ValueError("future_rbf_basis_sum n_steps must be >= 1")
+        return FutureRbfBasisSumOp(n_basis=n_basis, n_steps=n_steps), (3, 4)
+    if expr.fn == "col" and len(expr.args) == 2:
+        index = _literal_int_arg(expr.args[1], "col", 2)
+        if index < 0:
+            raise ValueError("col index must be >= 0")
+        return NaryOp(lambda x, index=index: _col(x, index), output_kind="vector", output_width=1, cpp_name="col", cpp_int_param=index), 1
+    if expr.fn == "InstrumentBasisMean" and len(expr.args) in (3, 4):
+        has_weights = len(expr.args) == 4
+        feature_op = child_ops[0]
+        return InstrumentBasisMeanOp(feature_width=_op_width(feature_op), has_weights=has_weights), None
+    if expr.fn == "Ridge" and len(expr.args) >= 4:
+        has_nonneg = len(expr.args) >= 5 and isinstance(expr.args[-1], Number) and float(expr.args[-1].value) in (2.0, 3.0)
+        nonneg = bool(_literal_int_arg(expr.args[-1], "Ridge", len(expr.args)) - 2) if has_nonneg else False
+        data_child_ops = child_ops[:-1] if has_nonneg else child_ops
+        data_args = expr.args[:-1] if has_nonneg else expr.args
+        has_weights = len(data_args) >= 5
+        feature_ops = data_child_ops[:-4] if has_weights else data_child_ops[:-3]
+        if not feature_ops:
+            raise ValueError("Ridge expects at least one feature arg")
+        feature_widths = tuple(_op_width(op) for op in feature_ops)
+        hl_arg = data_args[-2]
+        is_stateful = not (isinstance(hl_arg, Number) and float(hl_arg.value) == 0.0)
+        return RidgeOp(feature_widths=feature_widths, has_weights=has_weights, nonneg=nonneg, is_stateful=is_stateful), ((len(expr.args) - 1,) if has_nonneg else None)
+    builder = OP_FACTORIES.get((expr.fn, len(expr.args)))
+    if builder is None:
+        raise ValueError(f"Unsupported function {expr.fn}/{len(expr.args)} in jax_flat")
+    return builder(), None
 
-            if host_output:
-                pending.append((start, valid_length, chunk_outputs))
-                if len(pending) >= max_in_flight:
-                    _materialize_pending(pending.popleft(), output_arrays)
-            else:
-                device_chunks.append((valid_length, chunk_outputs))
-    finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
 
-    if host_output:
-        while pending:
-            _materialize_pending(pending.popleft(), output_arrays)
-        output = _format_outputs(runtime, output_arrays)
-    else:
-        output = _concatenate_device_outputs(runtime, tuple(device_chunks))
-
-    jax.block_until_ready(state)
-    return state, output
-
-
-JaxFlatRuntime = _legacy.JaxFlatRuntime
-StreamingProgram = _legacy.StreamingProgram
-_LEGACY_RUN_BATCH_ONCE = JaxFlatRuntime._run_batch_once
-_LEGACY_DOUBLE_GROUPBY_CAPACITIES = _legacy._double_groupby_capacities
-
-
-def _planned_run_batch_once(self, inputs, states=None, out_path: str | bool = False):
-    inputs = _legacy._normalize_batch_inputs(self, inputs)
-    if not inputs:
-        raise ValueError("run_batch requires at least one input array")
-
-    n_steps, n_instruments = inputs[0].shape[:2]
-    if any(array.shape[:2] != (n_steps, n_instruments) for array in inputs[1:]):
-        raise ValueError("All inputs must share aligned shape (time, n_instruments)")
-
-    plan = build_execution_plan(self.program)
-    if self.program.cache_nodes or plan.strategy == "legacy_boundary":
-        return _LEGACY_RUN_BATCH_ONCE(self, inputs, states, out_path)
-
-    if (
-        self.cpp
-        and len(self.program.outputs) == 1
-        and states is None
-        and not out_path
-    ):
-        try:
-            from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
-        except Exception as exc:
-            _legacy._warn_cpp_fallback(
-                self,
-                "C++ jax_flat accelerator unavailable "
-                f"({type(exc).__name__}: {exc}); falling back to JAX-flat",
-            )
+def _build_state_layout(nodes: tuple[DagNode, ...], sample: jax.Array | None = None) -> StateLayout:
+    del sample
+    refs = []
+    offset = 0
+    for node in nodes:
+        if node.op.is_stateful:
+            refs.append(StateFieldRef(index=offset))
+            offset += 1
         else:
-            hybrid = _try_cpp_hybrid_batch(
-                self,
-                inputs,
-                _legacy._CPP_ACCELERATOR_CACHE,
-                _legacy._warn_cpp_fallback,
+            refs.append(StateFieldRef(index=-1))
+    return StateLayout(node_fields=tuple(refs), total_leaves=offset)
+
+
+def _compile_groupby_inner_op(rhs: Expr, lhs: Expr) -> tuple[InnerGraphOp, tuple[Expr, ...]]:
+    if not isinstance(rhs, Call):
+        raise ValueError("groupby rhs must be a call expression")
+
+    nodes: list[DagNode] = []
+    memo: dict[tuple[Any, ...], int] = {}
+    feed_exprs: list[Expr] = []
+    feed_index_by_key: dict[tuple[Any, ...], int] = {}
+
+    def feed_node(feed_expr: Expr) -> int:
+        feed_key = _expr_key(feed_expr)
+        input_index = feed_index_by_key.get(feed_key)
+        if input_index is None:
+            input_index = len(feed_exprs)
+            feed_index_by_key[feed_key] = input_index
+            feed_exprs.append(feed_expr)
+
+        node_key = ("feed", feed_key)
+        cached = memo.get(node_key)
+        if cached is not None:
+            return cached
+        idx = len(nodes)
+        nodes.append(DagNode(op=InputOp(input_index=input_index), child_ids=()))
+        memo[node_key] = idx
+        return idx
+
+    def build(node: Expr) -> int:
+        if isinstance(node, Identifier):
+            return feed_node(lhs if node.name == "self_" else node)
+
+        key = ("expr", _expr_key(_replace_self(node, lhs)))
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+
+        if isinstance(node, Number):
+            idx = len(nodes)
+            nodes.append(DagNode(op=LiteralOp(float(node.value)), child_ids=()))
+            memo[key] = idx
+            return idx
+        if isinstance(node, String):
+            raise ValueError(f"String literal {node.value!r} is only supported as a static keyword argument")
+
+        if isinstance(node, RollingJaxCall):
+            child_ids = tuple(build(a) for a in node.args)
+            idx = len(nodes)
+            nodes.append(DagNode(op=_build_rolling_jax_op(node, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+            memo[key] = idx
+            return idx
+
+        if isinstance(node, StatelessJaxCall):
+            child_ids = tuple(build(a) for a in node.args)
+            idx = len(nodes)
+            nodes.append(
+                DagNode(
+                    op=_build_stateless_jax_op(node, tuple(nodes[cid].op for cid in child_ids)),
+                    child_ids=child_ids,
+                )
             )
-            if hybrid is not None:
-                return hybrid
+            memo[key] = idx
+            return idx
 
-    return _run_planned_jax_batch(self, inputs, states, out_path)
+        if isinstance(node, Call):
+            if node.fn == "groupby":
+                raise ValueError("nested groupby inside a groupby rhs is not supported in jax_flat")
+            child_ids = tuple(
+                build(a)
+                for a in node.args
+                if not ((node.fn, ANY_ARITY) in OP_FACTORIES and isinstance(a, String))
+            )
+            op, drop_child_idx = _build_op(node, tuple(nodes[cid].op for cid in child_ids))
+            if drop_child_idx is not None:
+                drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+                child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
+            idx = len(nodes)
+            nodes.append(DagNode(op=op, child_ids=child_ids))
+            memo[key] = idx
+            return idx
+
+        raise ValueError(f"Unsupported groupby rhs node: {node}")
+
+    output_id = build(rhs)
+    node_tuple = tuple(nodes)
+    state_layout = _build_state_layout(node_tuple)
+    return (
+        InnerGraphOp(
+            nodes=node_tuple,
+            output_id=output_id,
+            state_layout=state_layout,
+            n_inputs=len(feed_exprs),
+            is_stateful=state_layout.total_leaves > 0,
+            output_kind=node_tuple[output_id].op.output_kind,
+        ),
+        tuple(feed_exprs),
+    )
 
 
-def _planned_double_groupby_capacities(runtime):
-    output_names = _output_names(runtime.program)
-    next_runtime = _LEGACY_DOUBLE_GROUPBY_CAPACITIES(runtime)
-    if next_runtime is not runtime:
-        _attach_output_names(next_runtime.program, output_names)
-    return next_runtime
+def _groupby_capacity_kwargs(expr: Call, has_universe_groups: bool) -> dict[str, int]:
+    capacity = 2048 if has_universe_groups else 4096
+    hash_capacity = None
+    for name, value in expr.kwargs:
+        literal = int(value.value)
+        if literal <= 0:
+            raise ValueError(f"groupby {name} must be positive")
+        if name == "capacity":
+            capacity = literal
+        elif name == "hash_capacity":
+            hash_capacity = literal
+    return {
+        "capacity": capacity,
+        "hash_capacity": max(hash_capacity if hash_capacity is not None else capacity * 2, capacity),
+    }
 
 
-JaxFlatRuntime._run_batch_once = _planned_run_batch_once
-_legacy._double_groupby_capacities = _planned_double_groupby_capacities
+def _typed_groupby_inner_op(inner_op: InnerGraphOp, feed_ops: tuple[Op, ...]) -> InnerGraphOp:
+    typed_nodes = []
+    changed = False
+    for node in inner_op.nodes:
+        op = node.op
+        if isinstance(op, InputOp) and op.input_index < len(feed_ops):
+            feed_op = feed_ops[op.input_index]
+            op = InputOp(op.input_index, output_kind=feed_op.output_kind, output_width=feed_op.output_width)
+            changed = True
+        child_ops = tuple(typed_nodes[cid].op for cid in node.child_ids)
+        shaped_op = _shape_preserving_nary(op, child_ops)
+        changed = changed or shaped_op is not op
+        typed_nodes.append(replace(node, op=shaped_op) if shaped_op is not node.op else node)
+    node_tuple = tuple(typed_nodes)
+    output_kind = node_tuple[inner_op.output_id].op.output_kind
+    return replace(inner_op, nodes=node_tuple, output_kind=output_kind) if changed or output_kind != inner_op.output_kind else inner_op
 
+
+def _compile_groupby_node(
+    expr: Call,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+    external_cache_names: dict[tuple[Any, ...], str] | None = None,
+) -> int:
+    _validate_groupby_canonical_form(expr)
+    key_items = _canonical_groupby_key_items(expr.args[0])
+    universe_items = [item for item in key_items if isinstance(item, Universe)]
+
+    dynamic_items = [item for item in key_items if not isinstance(item, Universe)]
+    inner_op, feed_exprs = _compile_groupby_inner_op(expr.args[2], expr.args[1])
+    universe_groups = _resolve_universe_groups(universe_items[0]) if universe_items else None
+
+    key_child_ids = tuple(_compile_node(k, memo, nodes, input_names, external_cache_names) for k in dynamic_items)
+    feed_child_ids = tuple(_compile_node(feed, memo, nodes, input_names, external_cache_names) for feed in feed_exprs)
+    child_ids = key_child_ids + feed_child_ids
+    inner_op = _typed_groupby_inner_op(inner_op, tuple(nodes[cid].op for cid in feed_child_ids))
+    idx = len(nodes)
+    groupby_kwargs = _groupby_capacity_kwargs(expr, universe_groups is not None)
+    nodes.append(
+        DagNode(
+            op=GroupByOp(
+                inner_op=inner_op,
+                n_keys=len(dynamic_items),
+                universe_groups=universe_groups,
+                **groupby_kwargs,
+            ),
+            child_ids=child_ids,
+        )
+    )
+    memo[_expr_key(expr)] = idx
+    return idx
+
+
+def _compile_buffer_shift_node(
+    expr: Call,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+    external_cache_names: dict[tuple[Any, ...], str] | None = None,
+) -> int:
+    if len(expr.args) != 3:
+        raise ValueError("buffer expects args: shift_expr, min_lag, max_lag")
+    shift_expr = expr.args[0]
+    if not isinstance(shift_expr, Call) or shift_expr.fn != "shift" or len(shift_expr.args) not in (2, 3):
+        raise ValueError("buffer first arg must be a direct shift(...) expression")
+    max_size_arg = shift_expr.args[2] if len(shift_expr.args) == 3 else shift_expr.args[1]
+    max_size = max(0, _literal_int_arg(max_size_arg, "shift", 3 if len(shift_expr.args) == 3 else 2))
+    max_lag = _literal_int_arg(expr.args[2], "buffer", 3)
+    if max_lag < 1:
+        raise ValueError("buffer max_lag must be >= 1")
+    if max_lag > max_size:
+        raise ValueError("buffer max_lag must be <= shift max_size")
+
+    child_ids = (
+        _compile_node(shift_expr.args[0], memo, nodes, input_names, external_cache_names),
+        _compile_node(shift_expr.args[1], memo, nodes, input_names, external_cache_names),
+        _compile_node(expr.args[1], memo, nodes, input_names, external_cache_names),
+    )
+    idx = len(nodes)
+    nodes.append(DagNode(op=BufferShiftOp(max_size=max_size, max_lag=max_lag), child_ids=child_ids))
+    memo[_expr_key(expr)] = idx
+    return idx
+
+def _compile_node(
+    expr: Expr,
+    memo: dict[tuple[Any, ...], int],
+    nodes: list[DagNode],
+    input_names: list[str],
+    external_cache_names: dict[tuple[Any, ...], str] | None = None,
+) -> int:
+    key = _expr_key(expr)
+    if key in memo:
+        return memo[key]
+    if external_cache_names and key in external_cache_names:
+        name = external_cache_names[key]
+        if name not in input_names:
+            input_names.append(name)
+        idx = len(nodes)
+        nodes.append(DagNode(op=InputOp(input_index=input_names.index(name)), child_ids=()))
+        memo[key] = idx
+        return idx
+    if isinstance(expr, Identifier):
+        if expr.name not in input_names:
+            input_names.append(expr.name)
+        idx = len(nodes)
+        nodes.append(DagNode(op=InputOp(input_index=input_names.index(expr.name)), child_ids=()))
+        memo[key] = idx
+        return idx
+    if isinstance(expr, Number):
+        idx = len(nodes)
+        nodes.append(DagNode(op=LiteralOp(float(expr.value)), child_ids=()))
+        memo[key] = idx
+        return idx
+    if isinstance(expr, String):
+        raise ValueError(f"String literal {expr.value!r} is only supported as a static keyword argument")
+    if isinstance(expr, RollingJaxCall):
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names, external_cache_names) for a in expr.args)
+        idx = len(nodes)
+        nodes.append(DagNode(op=_build_rolling_jax_op(expr, tuple(nodes[cid].op for cid in child_ids)), child_ids=child_ids))
+        memo[key] = idx
+        return idx
+    if isinstance(expr, StatelessJaxCall):
+        child_ids = tuple(_compile_node(a, memo, nodes, input_names, external_cache_names) for a in expr.args)
+        idx = len(nodes)
+        nodes.append(
+            DagNode(
+                op=_build_stateless_jax_op(expr, tuple(nodes[cid].op for cid in child_ids)),
+                child_ids=child_ids,
+            )
+        )
+        memo[key] = idx
+        return idx
+    if isinstance(expr, Call) and expr.fn == "groupby":
+        return _compile_groupby_node(expr, memo, nodes, input_names, external_cache_names)
+    if isinstance(expr, Call) and expr.fn == "buffer":
+        return _compile_buffer_shift_node(expr, memo, nodes, input_names, external_cache_names)
+    if not isinstance(expr, Call):
+        raise ValueError(f"Unsupported node {expr}")
+
+    child_ids = tuple(
+        _compile_node(a, memo, nodes, input_names, external_cache_names)
+        for a in expr.args
+        if not (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
+    )
+    op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
+    if drop_child_idx is not None:
+        drop_child_idxs = (drop_child_idx,) if isinstance(drop_child_idx, int) else tuple(drop_child_idx)
+        child_ids = tuple(cid for i, cid in enumerate(child_ids) if i not in drop_child_idxs)
+    idx = len(nodes)
+    nodes.append(DagNode(op=op, child_ids=child_ids))
+    memo[key] = idx
+    return idx
+
+def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -> Expr:
+    if depth > 256:
+        raise ValueError("Exceeded max DSL expansion depth (256)")
+    if isinstance(node, Call):
+        expanded_args = tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args)
+        expanded_kwargs = tuple((key, _expand_dsl(value, dsl_registry, depth)) for key, value in node.kwargs)
+        expanded_node = Call(node.fn, expanded_args, expanded_kwargs)
+        macro = dsl_registry.get(expanded_node.fn)
+        if macro is None:
+            return expanded_node
+        result = macro(*expanded_node.args, **dict(expanded_node.kwargs))
+        if _expr_key(result) == _expr_key(expanded_node):
+            return expanded_node
+        return _expand_dsl(result, dsl_registry, depth + 1)
+    if isinstance(node, RollingJaxCall):
+        return RollingJaxCall(
+            fn=node.fn,
+            args=tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args),
+            lookback=node.lookback,
+            min_periods=node.min_periods,
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, StatelessJaxCall):
+        return StatelessJaxCall(
+            fn=node.fn,
+            args=tuple(_expand_dsl(arg, dsl_registry, depth) for arg in node.args),
+            output_kind=node.output_kind,
+            output_width=node.output_width,
+            name=node.name,
+        )
+    if isinstance(node, KeyTuple):
+        return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+    return node
+
+
+
+
+def _normalize_runtime_tuple(runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None) -> tuple[JaxFlatRuntime, ...]:
+    if runtimes is None:
+        return ()
+    if isinstance(runtimes, JaxFlatRuntime):
+        return (runtimes,)
+    return tuple(runtimes)
+
+
+def _external_cache_inputs(
+    runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None,
+) -> tuple[dict[tuple[Any, ...], str], dict[str, np.ndarray]]:
+    names_by_key: dict[tuple[Any, ...], str] = {}
+    values_by_name: dict[str, np.ndarray] = {}
+    for runtime_idx, runtime in enumerate(_normalize_runtime_tuple(runtimes)):
+        cached_values = runtime.get_cached_values()
+        missing = [node_id for node_id in runtime.program.cache_nodes if node_id not in cached_values]
+        if missing:
+            raise ValueError(
+                "runtimes passed to compile_formula must have materialized cache values; "
+                f"runtime {runtime_idx} is missing cache node(s) {missing}. Run run_batch first."
+            )
+        for node_id, expr_key in zip(runtime.program.cache_nodes, runtime.program.cache_expr_keys):
+            if expr_key in names_by_key:
+                continue
+            name = f"__cache_runtime_{runtime_idx}_node_{node_id}"
+            names_by_key[expr_key] = name
+            values_by_name[name] = cached_values[node_id]
+    return names_by_key, values_by_name
 
 def compile_formula(
-    formula,
-    dsl_registry=None,
+    formula: str | Expr,
+    dsl_registry: DSLFunctionRegistry | None = None,
     cpp: bool = True,
-    metadata=None,
+    metadata: MetadataConfig | dict | None = None,
     type_relations=(),
-    runtimes=None,
-):
-    runtime = _legacy.compile_formula(
-        formula,
-        dsl_registry=dsl_registry,
-        cpp=cpp,
-        metadata=metadata,
-        type_relations=type_relations,
-        runtimes=runtimes,
-    )
-    _attach_output_names(runtime.program, ("output",))
-    return runtime
-
-
-def compile_features(
-    formulas: Mapping[str, Any],
-    *,
-    dsl_registry=None,
-    cpp: bool = False,
-    runtimes=None,
-):
-    if not formulas:
-        raise ValueError("compile_features requires at least one named formula")
-
-    external_cache_names, external_cache_values = _legacy._external_cache_inputs(runtimes)
+    runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None = None,
+) -> JaxFlatRuntime:
+    expr = parse_formula(formula) if isinstance(formula, str) else formula
+    expr = _normalize_static_jax_flat_kwargs(expr)
+    expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
+    expr = _normalize_static_jax_flat_kwargs(expr)
+    # metadata_config = MetadataConfig.from_value(metadata, type_relations=type_relations)
+    # formula_metadata = analyze_formula_metadata(expr, metadata_config)
+    external_cache_names, external_cache_values = _external_cache_inputs(runtimes)
     nodes: list[DagNode] = []
     memo: dict[tuple[Any, ...], int] = {}
     input_names: list[str] = []
-    outputs: list[int] = []
-    names: list[str] = []
-
-    for name, formula in formulas.items():
-        expr = _legacy.parse_formula(formula) if isinstance(formula, str) else formula
-        expr = _legacy._normalize_static_jax_flat_kwargs(expr)
-        expr = _legacy._expand_dsl(
-            expr,
-            dsl_registry or _legacy.DEFAULT_DSL_REGISTRY,
-        )
-        expr = _legacy._normalize_static_jax_flat_kwargs(expr)
-        outputs.append(
-            _legacy._compile_node(
-                expr,
-                memo,
-                nodes,
-                input_names,
-                external_cache_names,
-            )
-        )
-        names.append(str(name))
-
+    out = _compile_node(expr, memo, nodes, input_names, external_cache_names)
     node_tuple = tuple(nodes)
-    cache_nodes = tuple(
-        node_id
-        for node_id, node in enumerate(node_tuple)
-        if isinstance(node.op, CacheOp)
+    layout = _build_state_layout(node_tuple)
+    cache_nodes = tuple(idx for idx, node in enumerate(node_tuple) if isinstance(node.op, CacheOp))
+    cache_key_by_node = {node_id: key for key, node_id in memo.items() if key[0] == "call" and key[1] == "cache"}
+    cache_expr_keys = tuple(cache_key_by_node[idx][2][0] for idx in cache_nodes)
+    return JaxFlatRuntime(
+        program=StreamingProgram(
+            nodes=node_tuple,
+            outputs=(out,),
+            input_names=tuple(input_names),
+            state_layout=layout,
+            metadata=None,
+            cache_nodes=cache_nodes,
+            cache_expr_keys=cache_expr_keys,
+            external_cache_inputs=external_cache_values or None,
+        ),
+        cpp=cpp,
     )
-    cache_key_by_node = {
-        node_id: key
-        for key, node_id in memo.items()
-        if key[0] == "call" and key[1] == "cache"
-    }
-    cache_expr_keys = tuple(
-        cache_key_by_node[node_id][2][0]
-        for node_id in cache_nodes
-    )
-    program = StreamingProgram(
-        nodes=node_tuple,
-        outputs=tuple(outputs),
-        input_names=tuple(input_names),
-        state_layout=_legacy._build_state_layout(node_tuple),
-        metadata=None,
-        cache_nodes=cache_nodes,
-        cache_expr_keys=cache_expr_keys,
-        external_cache_inputs=external_cache_values or None,
-    )
-    _attach_output_names(program, names)
-    return JaxFlatRuntime(program=program, cpp=cpp)
-
-
-for _name in dir(_legacy):
-    if _name.startswith("_") and _name not in globals():
-        globals()[_name] = getattr(_legacy, _name)
-
-
-__all__ = [
-    *getattr(_legacy, "__all__", ()),
-    "ExecutionKind",
-    "ExecutionRegion",
-    "ExecutionPlan",
-    "build_execution_plan",
-    "classify_op",
-    "compile_formula",
-    "compile_features",
-]
