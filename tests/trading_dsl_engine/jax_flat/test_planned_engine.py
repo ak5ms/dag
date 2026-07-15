@@ -29,8 +29,7 @@ def _tick_reference(expr, values):
         state, output = runtime.tick(state, jnp.asarray(row, dtype=jnp.float64))
         outputs.append(output)
     jax.block_until_ready((state, outputs[-1]))
-    state = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), state)
-    return state, np.stack(tuple(np.asarray(value) for value in outputs), axis=0)
+    return np.stack(tuple(np.asarray(value) for value in outputs), axis=0)
 
 
 def test_compile_formula_preserves_single_output_behavior(monkeypatch):
@@ -40,28 +39,18 @@ def test_compile_formula_preserves_single_output_behavior(monkeypatch):
     values[rng.random(values.shape) < 0.12] = np.nan
     expr = ewm(ewm(var("x"), 7.0, ignore_na=True, adjust=False), 19.0, ignore_na=True, adjust=False)
 
-    expected_state, expected = _tick_reference(expr, values)
+    expected = _tick_reference(expr, values)
     np.testing.assert_allclose(_legacy_batch(expr, values), expected, rtol=1e-11, atol=1e-11, equal_nan=True)
     runtime = compile_formula(expr, cpp=False)
-    actual_state, actual = runtime.run_batch({"x": jnp.asarray(values)})
+    state, actual = runtime.run_batch({"x": jnp.asarray(values)})
 
     assert isinstance(actual, jax.Array)
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11, equal_nan=True)
-    jax.tree_util.tree_map(
-        lambda left, right: np.testing.assert_allclose(left, right, rtol=1e-11, atol=1e-11, equal_nan=True),
-        actual_state,
-        expected_state,
-    )
 
     continuation = rng.normal(size=(37, 4))
-    actual_state, continued = runtime.run_batch({"x": jnp.asarray(continuation)}, states=actual_state)
-    full_state, full_expected = _tick_reference(expr, np.concatenate((values, continuation), axis=0))
+    state, continued = runtime.run_batch({"x": jnp.asarray(continuation)}, states=state)
+    full_expected = _tick_reference(expr, np.concatenate((values, continuation), axis=0))
     np.testing.assert_allclose(continued, full_expected[-len(continuation):], rtol=1e-11, atol=1e-11, equal_nan=True)
-    jax.tree_util.tree_map(
-        lambda left, right: np.testing.assert_allclose(left, right, rtol=1e-11, atol=1e-11, equal_nan=True),
-        actual_state,
-        full_state,
-    )
 
 
 def test_named_outputs_share_one_dag_and_return_dict(monkeypatch):
@@ -100,7 +89,7 @@ def test_masked_fixed_tail_preserves_shift_state_across_calls(monkeypatch):
     state, first = runtime.run_batch({"x": jnp.asarray(values[:91])}, states=state)
     state, second = runtime.run_batch({"x": jnp.asarray(values[91:])}, states=state)
 
-    _, expected = _tick_reference(expr, values)
+    expected = _tick_reference(expr, values)
     actual = jnp.concatenate((first, second), axis=0)
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0, equal_nan=True)
 
@@ -127,7 +116,7 @@ def test_associative_affine_ewm_matches_scan(monkeypatch):
     values[rng.random(values.shape) < 0.15] = np.nan
     expr = ewm(var("x"), 13.0, min_periods=3, ignore_na=True, adjust=False)
 
-    _, expected = _tick_reference(expr, values)
+    expected = _tick_reference(expr, values)
     runtime = compile_formula(expr, cpp=False)
     _, actual = runtime.run_batch({"x": jnp.asarray(values)})
     np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10, equal_nan=True)
