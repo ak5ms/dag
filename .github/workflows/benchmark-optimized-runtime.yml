@@ -15,7 +15,6 @@ jobs:
     timeout-minutes: 60
     env:
       JAX_ENABLE_X64: "True"
-      TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
