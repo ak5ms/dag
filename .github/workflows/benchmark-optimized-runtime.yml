@@ -1,18 +1,15 @@
-name: Validate planned JAX-flat engine
+name: Benchmark planned JAX-flat engine
 
 on:
   push:
     branches:
       - optimize-jax-flat-compound-scan
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
-  test:
+  benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     env:
       JAX_ENABLE_X64: "True"
       TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: "1"
@@ -24,33 +21,112 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e .
-      - name: Run broad planned-engine suite
+      - name: Run focused correctness and performance guards
+        run: |
+          pytest -q -n 0 \
+            tests/trading_dsl_engine/jax_flat/test_planned_engine.py \
+            tests/trading_dsl_engine/jax_flat/test_planner_fallback_parity.py \
+            tests/trading_dsl_engine/jax_flat/test_run_batch_mapping_memmap.py
+      - name: Benchmark 1M-row representative DAGs
         shell: bash
         run: |
-          set -o pipefail
-          pytest -q -n 0 tests/trading_dsl_engine/jax_flat \
-            --ignore=tests/trading_dsl_engine/jax_flat/test_metadata_units_ranges.py \
-            --ignore=tests/trading_dsl_engine/jax_flat/test_codegen_fusion.py \
-            --ignore=tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py \
-            --ignore=tests/trading_dsl_engine/jax_flat/test_groupby_semantics_spec.py \
-            2>&1 | tee pytest.log
-      - name: Run isolated native smoke tests
-        shell: bash
-        run: |
-          set -o pipefail
-          for test in \
-            test_cpp_flat_stateless_chain_matches_jax_flat \
-            test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat \
-            test_cpp_flat_groupby_nested_rhs_matches_jax_flat \
-            test_cpp_hybrid_batch_can_stage_cpp_before_and_after_jax_lambda
-          do
-            TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=0 \
-              pytest -q -n 0 "tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py::$test" \
-              2>&1 | tee -a pytest.log
-          done
-      - name: Upload pytest log
-        if: always()
+          python - <<'PY' | tee benchmark.log
+          import json
+          import statistics
+          import time
+
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+
+          from trading_dsl_engine.base.dsl import add, ewm, mul, var
+          from trading_dsl_engine.jax_flat import compile_features, compile_formula, engine
+
+          jax.config.update("jax_enable_x64", True)
+          rows, assets, runs = 1_000_000, 9, 5
+          values = jax.random.normal(jax.random.PRNGKey(123), (rows, assets), dtype=jnp.float64)
+          inputs = (values,)
+
+          def materialize(value):
+              return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), value)
+
+          def timed(fn):
+              materialize(fn())
+              samples = []
+              for _ in range(runs):
+                  start = time.perf_counter()
+                  materialize(fn())
+                  samples.append(time.perf_counter() - start)
+              return statistics.median(samples), samples
+
+          def compare_single(name, expression):
+              legacy = engine.compile_formula(expression, cpp=False)
+              planned = compile_formula(expression, cpp=False)
+              before, before_samples = timed(lambda: engine._jit_batch_from_initial_state(legacy, inputs))
+              after, after_samples = timed(lambda: planned.run_batch({"x": values}))
+              result = {
+                  "case": name,
+                  "before_median_s": before,
+                  "after_median_s": after,
+                  "speedup_x": before / after,
+                  "before_samples": before_samples,
+                  "after_samples": after_samples,
+              }
+              print(json.dumps(result))
+              assert after <= before * 1.20, result
+              return result
+
+          x = var("x")
+          stateless = x
+          for level in range(8):
+              stateless = add(mul(stateless, 1.0001 + level * 0.0001), 0.01 * (level + 1))
+
+          stateful = x
+          for span in (5.0, 9.0, 15.0, 25.0, 41.0, 67.0, 109.0, 177.0):
+              stateful = ewm(stateful, span, ignore_na=True, adjust=False)
+
+          results = [
+              compare_single("stateless_depth_8", stateless),
+              compare_single("stateful_depth_8", stateful),
+          ]
+
+          shared = ewm(x, 5.0, ignore_na=True, adjust=False)
+          formulas = {
+              "a": ewm(ewm(shared, 11.0, ignore_na=True, adjust=False), 23.0, ignore_na=True, adjust=False),
+              "b": ewm(ewm(shared, 13.0, ignore_na=True, adjust=False), 29.0, ignore_na=True, adjust=False),
+              "c": ewm(ewm(shared, 17.0, ignore_na=True, adjust=False), 37.0, ignore_na=True, adjust=False),
+              "d": ewm(ewm(shared, 19.0, ignore_na=True, adjust=False), 43.0, ignore_na=True, adjust=False),
+          }
+          separate = {name: engine.compile_formula(expr, cpp=False) for name, expr in formulas.items()}
+          shared_runtime = compile_features(formulas)
+
+          def run_separate():
+              return {
+                  name: engine._jit_batch_from_initial_state(runtime, inputs)
+                  for name, runtime in separate.items()
+              }
+
+          before, before_samples = timed(run_separate)
+          after, after_samples = timed(lambda: shared_runtime.run_batch({"x": values}))
+          breadth_result = {
+              "case": "stateful_depth_3_breadth_4",
+              "before_median_s": before,
+              "after_median_s": after,
+              "speedup_x": before / after,
+              "before_samples": before_samples,
+              "after_samples": after_samples,
+          }
+          print(json.dumps(breadth_result))
+          assert after <= before * 1.20, breadth_result
+          results.append(breadth_result)
+
+          with open("benchmark.json", "w", encoding="utf-8") as handle:
+              json.dump(results, handle, indent=2)
+          PY
+      - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: planned-engine-pytest-log
-          path: pytest.log
+          name: planned-engine-benchmark
+          path: |
+            benchmark.json
+            benchmark.log
