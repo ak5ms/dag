@@ -15,7 +15,7 @@ def _current(expr, data):
     return np.asarray(jax.block_until_ready(out))
 
 
-def test_nested_stateful_compound_scan_matches_current_with_tail_padding():
+def test_nested_stateful_pair_fusion_matches_current_with_tail_padding():
     rng = np.random.default_rng(42)
     x = rng.normal(size=(257, 4))
     x[rng.random(x.shape) < 0.15] = np.nan
@@ -23,13 +23,13 @@ def test_nested_stateful_compound_scan_matches_current_with_tail_padding():
 
     expected = _current(expr, {"x": jnp.asarray(x)})
     runtime = compile_formula(expr, chunk_size=64, max_in_flight=3)
-    assert runtime.execution_strategy() == "compound"
+    assert runtime.execution_strategy() == "pair_fused_node_batch"
     _, actual = runtime.run_batch({"x": x}, out_path=None)
 
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11, equal_nan=True)
 
 
-def test_associative_ewm_matches_current_and_uses_node_batch():
+def test_single_ewm_matches_current_and_uses_node_batch():
     rng = np.random.default_rng(7)
     x = rng.normal(size=(513, 5))
     x[rng.random(x.shape) < 0.2] = np.nan
