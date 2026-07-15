@@ -15,6 +15,7 @@ from trading_dsl_engine.jax_flat.optimized import (
 # Applies the measured CPU execution policy to the optimized runtime module.
 from trading_dsl_engine.jax_flat import optimized_planner as _optimized_planner
 from trading_dsl_engine.jax_flat import optimized_pair_fusion as _optimized_pair_fusion
+from trading_dsl_engine.jax_flat import optimized_strategy_labels as _optimized_strategy_labels
 
 
 def _load_cpp_flat():
