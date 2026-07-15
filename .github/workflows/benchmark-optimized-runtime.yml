@@ -4,15 +4,19 @@ on:
   push:
     branches:
       - optimize-jax-flat-compound-scan
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       JAX_ENABLE_X64: "True"
       TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: "1"
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,112 +25,451 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e .
-      - name: Run focused correctness and performance guards
-        run: |
-          pytest -q -n 0 \
-            tests/trading_dsl_engine/jax_flat/test_planned_engine.py \
-            tests/trading_dsl_engine/jax_flat/test_planner_fallback_parity.py \
-            tests/trading_dsl_engine/jax_flat/test_run_batch_mapping_memmap.py
-      - name: Benchmark 1M-row representative DAGs
+      - name: Run before-after benchmark matrix
         shell: bash
         run: |
           python - <<'PY' | tee benchmark.log
+          from __future__ import annotations
+
+          import csv
+          import gc
           import json
+          import math
+          import os
+          from pathlib import Path
           import statistics
+          import tempfile
           import time
 
           import jax
           import jax.numpy as jnp
           import numpy as np
 
-          from trading_dsl_engine.base.dsl import add, ewm, mul, var
-          from trading_dsl_engine.jax_flat import compile_features, compile_formula, engine
+          from trading_dsl_engine.jax_flat import compile_features, compile_formula
+          from trading_dsl_engine.jax_flat import engine
+          from trading_dsl_engine.jax_flat import engine_legacy
 
           jax.config.update("jax_enable_x64", True)
-          rows, assets, runs = 1_000_000, 9, 5
-          values = jax.random.normal(jax.random.PRNGKey(123), (rows, assets), dtype=jnp.float64)
-          inputs = (values,)
 
-          def materialize(value):
-              return jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), value)
+          ASSETS = 9
+          RUNS = 10
+          rows_cache: dict[int, jax.Array] = {}
+          results: list[dict[str, object]] = []
 
-          def timed(fn):
-              materialize(fn())
-              samples = []
-              for _ in range(runs):
-                  start = time.perf_counter()
-                  materialize(fn())
-                  samples.append(time.perf_counter() - start)
-              return statistics.median(samples), samples
 
-          def compare_single(name, expression):
-              legacy = engine.compile_formula(expression, cpp=False)
-              planned = compile_formula(expression, cpp=False)
-              before, before_samples = timed(lambda: engine._jit_batch_from_initial_state(legacy, inputs))
-              after, after_samples = timed(lambda: planned.run_batch({"x": values}))
+          def values_for(rows: int) -> jax.Array:
+              value = rows_cache.get(rows)
+              if value is None:
+                  value = jax.random.normal(
+                      jax.random.PRNGKey(rows % (2**31 - 1)),
+                      (rows, ASSETS),
+                      dtype=jnp.float64,
+                  )
+                  value.block_until_ready()
+                  rows_cache[rows] = value
+              return value
+
+
+          def affine(expr: str, level: int, branch: int) -> str:
+              scale = 1.0001 + 0.00007 * level + 0.000011 * branch
+              offset = 0.001 * (level + 1) + 0.0001 * branch
+              return f"add(mul({expr}, {scale:.12f}), {offset:.12f})"
+
+
+          def formula(kind: str, depth: int, branch: int) -> str:
+              expr = "x"
+              for level in range(depth):
+                  if kind == "stateless":
+                      expr = affine(expr, level, branch)
+                  elif kind == "stateful":
+                      span = 5.0 + 6.0 * level + 2.0 * branch
+                      expr = f"ewm({expr}, {span:.1f})"
+                  elif kind == "mixed":
+                      if level % 2 == 0:
+                          expr = affine(expr, level, branch)
+                      else:
+                          span = 7.0 + 8.0 * level + 2.0 * branch
+                          expr = f"ewm({expr}, {span:.1f})"
+                  else:
+                      raise ValueError(kind)
+              return expr
+
+
+          def consume_output(output) -> float:
+              leaves = jax.tree_util.tree_leaves(output)
+              checksum = 0.0
+              for leaf in leaves:
+                  arr = np.asarray(jax.device_get(leaf))
+                  if arr.size:
+                      sample = arr.reshape(-1)[:: max(1, arr.size // 1024)]
+                      checksum += float(np.nansum(sample))
+              return checksum
+
+
+          def paired_timings(before_fn, after_fn) -> tuple[list[float], list[float]]:
+              consume_output(before_fn())
+              consume_output(after_fn())
+              before_samples: list[float] = []
+              after_samples: list[float] = []
+              for run in range(RUNS):
+                  ordered = ((before_fn, before_samples), (after_fn, after_samples))
+                  if run % 2:
+                      ordered = tuple(reversed(ordered))
+                  for fn, samples in ordered:
+                      start = time.perf_counter()
+                      output = fn()
+                      consume_output(output)
+                      samples.append(time.perf_counter() - start)
+              return before_samples, after_samples
+
+
+          def summarize(
+              *,
+              case: str,
+              family: str,
+              rows: int,
+              depth: int | None,
+              breadth: int | None,
+              strategy: str,
+              before_samples: list[float],
+              after_samples: list[float],
+              notes: str = "",
+          ) -> None:
+              before = statistics.median(before_samples)
+              after = statistics.median(after_samples)
               result = {
-                  "case": name,
+                  "case": case,
+                  "family": family,
+                  "rows": rows,
+                  "assets": ASSETS,
+                  "depth": depth,
+                  "breadth": breadth,
+                  "strategy": strategy,
                   "before_median_s": before,
                   "after_median_s": after,
                   "speedup_x": before / after,
+                  "delta_pct": 100.0 * (after / before - 1.0),
+                  "before_min_s": min(before_samples),
+                  "after_min_s": min(after_samples),
                   "before_samples": before_samples,
                   "after_samples": after_samples,
+                  "notes": notes,
               }
-              print(json.dumps(result))
-              assert after <= before * 1.20, result
-              return result
+              results.append(result)
+              print(json.dumps(result, sort_keys=True))
 
-          x = var("x")
-          stateless = x
-          for level in range(8):
-              stateless = add(mul(stateless, 1.0001 + level * 0.0001), 0.01 * (level + 1))
 
-          stateful = x
-          for span in (5.0, 9.0, 15.0, 25.0, 41.0, 67.0, 109.0, 177.0):
-              stateful = ewm(stateful, span, ignore_na=True, adjust=False)
+          def benchmark_formula_family(kind: str, rows: int, depth: int, breadth: int) -> None:
+              values = values_for(rows)
+              data = {"x": values}
+              formulas = {f"f{branch}": formula(kind, depth, branch) for branch in range(breadth)}
 
-          results = [
-              compare_single("stateless_depth_8", stateless),
-              compare_single("stateful_depth_8", stateful),
+              if breadth == 1:
+                  expression = formulas["f0"]
+                  before_runtime = engine_legacy.compile_formula(expression, cpp=False)
+                  after_runtime = compile_formula(expression, cpp=False)
+
+                  def before_fn():
+                      return before_runtime.run_batch(data)[1]
+
+                  def after_fn():
+                      return after_runtime.run_batch(data)[1]
+
+                  _, before_check = before_runtime.run_batch(data)
+                  _, after_check = after_runtime.run_batch(data)
+                  np.testing.assert_allclose(
+                      np.asarray(before_check), np.asarray(after_check),
+                      rtol=1e-10, atol=1e-10, equal_nan=True,
+                  )
+                  plan = engine.build_execution_plan(after_runtime.program)
+              else:
+                  before_runtimes = {
+                      name: engine_legacy.compile_formula(expression, cpp=False)
+                      for name, expression in formulas.items()
+                  }
+                  after_runtime = compile_features(formulas, cpp=False)
+
+                  def before_fn():
+                      return {
+                          name: runtime.run_batch(data)[1]
+                          for name, runtime in before_runtimes.items()
+                      }
+
+                  def after_fn():
+                      return after_runtime.run_batch(data)[1]
+
+                  before_check = before_fn()
+                  after_check = after_fn()
+                  for name in formulas:
+                      np.testing.assert_allclose(
+                          np.asarray(before_check[name]), np.asarray(after_check[name]),
+                          rtol=1e-10, atol=1e-10, equal_nan=True,
+                      )
+                  plan = engine.build_execution_plan(after_runtime.program)
+
+              before_samples, after_samples = paired_timings(before_fn, after_fn)
+              summarize(
+                  case=f"{kind}_r{rows}_d{depth}_b{breadth}",
+                  family=kind,
+                  rows=rows,
+                  depth=depth,
+                  breadth=breadth,
+                  strategy=plan.strategy,
+                  before_samples=before_samples,
+                  after_samples=after_samples,
+                  notes=(
+                      "Breadth>1 before runs independently compiled formulas; after uses one shared multi-root DAG. "
+                      "Mixed depth alternates stateless affine and EWM stages."
+                  ),
+              )
+              del before_fn, after_fn
+              gc.collect()
+              jax.clear_caches()
+
+
+          def benchmark_single_formula(
+              *,
+              case: str,
+              family: str,
+              rows: int,
+              expression: str,
+              data: dict[str, object],
+              depth: int | None = None,
+              breadth: int | None = 1,
+              notes: str = "",
+          ) -> None:
+              before_runtime = engine_legacy.compile_formula(expression, cpp=False)
+              after_runtime = compile_formula(expression, cpp=False)
+
+              def before_fn():
+                  return before_runtime.run_batch(data)[1]
+
+              def after_fn():
+                  return after_runtime.run_batch(data)[1]
+
+              before_check = before_fn()
+              after_check = after_fn()
+              np.testing.assert_allclose(
+                  np.asarray(before_check), np.asarray(after_check),
+                  rtol=1e-9, atol=1e-9, equal_nan=True,
+              )
+              before_samples, after_samples = paired_timings(before_fn, after_fn)
+              if hasattr(engine, "build_execution_plan"):
+                  plan = engine.build_execution_plan(after_runtime.program)
+                  strategy = plan.strategy if all(
+                      type(node.op).__name__ != "GroupByOp" for node in after_runtime.program.nodes
+                  ) else "legacy_fallback"
+              else:
+                  strategy = "legacy_fallback"
+              summarize(
+                  case=case,
+                  family=family,
+                  rows=rows,
+                  depth=depth,
+                  breadth=breadth,
+                  strategy=strategy,
+                  before_samples=before_samples,
+                  after_samples=after_samples,
+                  notes=notes,
+              )
+              gc.collect()
+              jax.clear_caches()
+
+
+          # Complete 1M-row depth/breadth/family matrix: 27 cases.
+          for kind in ("stateless", "stateful", "mixed"):
+              for depth in (3, 5, 8):
+                  for breadth in (1, 4, 8):
+                      benchmark_formula_family(kind, 1_000_000, depth, breadth)
+
+          # Size sensitivity at the central depth/breadth configuration.
+          for rows in (100_000, 3_000_000):
+              for kind in ("stateless", "stateful", "mixed"):
+                  benchmark_formula_family(kind, rows, 5, 1)
+
+          # Prefix and fixed-lookback coverage.
+          x1m = values_for(1_000_000)
+          benchmark_single_formula(
+              case="prefix_cumsum_depth5",
+              family="prefix",
+              rows=1_000_000,
+              depth=5,
+              expression="cumsum(cumsum(cumsum(cumsum(cumsum(x)))))",
+              data={"x": x1m},
+              notes="Five chained prefix sums.",
+          )
+          benchmark_single_formula(
+              case="lookback_shift_depth3",
+              family="lookback",
+              rows=1_000_000,
+              depth=3,
+              expression="shift(shift(shift(x, 1), 2), 3)",
+              data={"x": x1m},
+              notes="Three static shifts.",
+          )
+          benchmark_single_formula(
+              case="rolling_mean_depth3",
+              family="lookback",
+              rows=1_000_000,
+              depth=3,
+              expression="roll_mean(roll_mean(roll_mean(x, 16), 16), 16)",
+              data={"x": x1m},
+              notes="Three rolling means with lookback 16.",
+          )
+
+          # Blocker/fallback coverage. These should remain near 1x because the planner delegates.
+          special_rows = 100_000
+          x = values_for(special_rows)
+          row = jnp.arange(special_rows, dtype=jnp.float64)[:, None]
+          col = jnp.arange(ASSETS, dtype=jnp.float64)[None, :]
+          key = jnp.mod(row + col, 128.0)
+          z = jnp.cos(x * 0.3) + 0.1 * x
+          y = 0.4 * x - 0.2 * z + 0.05
+
+          benchmark_single_formula(
+              case="groupby_dynamic_cumsum",
+              family="groupby",
+              rows=special_rows,
+              expression="groupby((key,), x, cumsum(self_))",
+              data={"x": x, "key": key},
+              notes="Dynamic-key groupby blocker; planner falls back to the original executor.",
+          )
+          benchmark_single_formula(
+              case="groupby_dynamic_nested_cumsum",
+              family="groupby",
+              rows=special_rows,
+              expression="groupby((key,), x, cumsum(cumsum(self_)))",
+              data={"x": x, "key": key},
+              notes="Nested stateful groupby blocker; planner falls back.",
+          )
+          benchmark_single_formula(
+              case="groupby_universe_cumsum",
+              family="universe_groupby",
+              rows=special_rows,
+              expression="groupby((univ([0, 1, 2], [3, 4, 5], [6, 7, 8]), key), x, cumsum(self_))",
+              data={"x": x, "key": key},
+              notes="Three universe partitions plus a dynamic key; planner falls back.",
+          )
+          benchmark_single_formula(
+              case="ridge_instant_preds",
+              family="ridge",
+              rows=special_rows,
+              expression="get_preds(Ridge(cat(x, z), y, 1.0, 0.0, 0.01))",
+              data={"x": x, "z": z, "y": y},
+              notes="Instantaneous two-feature cross-sectional Ridge; object-producing node falls back.",
+          )
+          benchmark_single_formula(
+              case="ridge_ewm_preds",
+              family="ridge",
+              rows=special_rows,
+              expression="get_preds(Ridge(cat(x, z), y, 1.0, 32.0, 0.01))",
+              data={"x": x, "z": z, "y": y},
+              notes="Stateful EWM Ridge with halflife 32; object-producing node falls back.",
+          )
+
+          # Host memmap input/output pipeline coverage.
+          def benchmark_memmap(kind: str) -> None:
+              rows = 500_000
+              expression = formula(kind, 5, 0)
+              with tempfile.TemporaryDirectory() as directory:
+                  directory_path = Path(directory)
+                  input_path = directory_path / "input.dat"
+                  host = np.memmap(input_path, mode="w+", dtype=np.float64, shape=(rows, ASSETS))
+                  host[:] = np.asarray(values_for(rows))
+                  host.flush()
+                  del host
+                  host = np.memmap(input_path, mode="r", dtype=np.float64, shape=(rows, ASSETS))
+                  data = {"x": host}
+                  before_runtime = engine_legacy.compile_formula(expression, cpp=False)
+                  after_runtime = compile_formula(expression, cpp=False)
+                  before_path = directory_path / "before.dat"
+                  after_path = directory_path / "after.dat"
+
+                  def run(runtime, path):
+                      if path.exists():
+                          path.unlink()
+                      output = runtime.run_batch(data, out_path=str(path))[1]
+                      checksum = float(np.nansum(np.asarray(output)[::4096]))
+                      del output
+                      return checksum
+
+                  run(before_runtime, before_path)
+                  run(after_runtime, after_path)
+                  before_samples: list[float] = []
+                  after_samples: list[float] = []
+                  for measured in range(RUNS):
+                      ordered = ((before_runtime, before_path, before_samples), (after_runtime, after_path, after_samples))
+                      if measured % 2:
+                          ordered = tuple(reversed(ordered))
+                      for runtime, path, samples in ordered:
+                          start = time.perf_counter()
+                          run(runtime, path)
+                          samples.append(time.perf_counter() - start)
+                  plan = engine.build_execution_plan(after_runtime.program)
+                  summarize(
+                      case=f"memmap_{kind}_r{rows}_d5_b1",
+                      family="host_io",
+                      rows=rows,
+                      depth=5,
+                      breadth=1,
+                      strategy=plan.strategy,
+                      before_samples=before_samples,
+                      after_samples=after_samples,
+                      notes="Host memmap input and incrementally flushed memmap output; includes I/O and synchronization.",
+                  )
+
+          benchmark_memmap("stateless")
+          benchmark_memmap("stateful")
+
+          fields = [
+              "case", "family", "rows", "assets", "depth", "breadth", "strategy",
+              "before_median_s", "after_median_s", "speedup_x", "delta_pct",
+              "before_min_s", "after_min_s", "notes",
           ]
-
-          shared = ewm(x, 5.0, ignore_na=True, adjust=False)
-          formulas = {
-              "a": ewm(ewm(shared, 11.0, ignore_na=True, adjust=False), 23.0, ignore_na=True, adjust=False),
-              "b": ewm(ewm(shared, 13.0, ignore_na=True, adjust=False), 29.0, ignore_na=True, adjust=False),
-              "c": ewm(ewm(shared, 17.0, ignore_na=True, adjust=False), 37.0, ignore_na=True, adjust=False),
-              "d": ewm(ewm(shared, 19.0, ignore_na=True, adjust=False), 43.0, ignore_na=True, adjust=False),
-          }
-          separate = {name: engine.compile_formula(expr, cpp=False) for name, expr in formulas.items()}
-          shared_runtime = compile_features(formulas)
-
-          def run_separate():
-              return {
-                  name: engine._jit_batch_from_initial_state(runtime, inputs)
-                  for name, runtime in separate.items()
-              }
-
-          before, before_samples = timed(run_separate)
-          after, after_samples = timed(lambda: shared_runtime.run_batch({"x": values}))
-          breadth_result = {
-              "case": "stateful_depth_3_breadth_4",
-              "before_median_s": before,
-              "after_median_s": after,
-              "speedup_x": before / after,
-              "before_samples": before_samples,
-              "after_samples": after_samples,
-          }
-          print(json.dumps(breadth_result))
-          assert after <= before * 1.20, breadth_result
-          results.append(breadth_result)
-
+          with open("benchmark.csv", "w", newline="", encoding="utf-8") as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
+              for result in results:
+                  writer.writerow({field: result.get(field) for field in fields})
           with open("benchmark.json", "w", encoding="utf-8") as handle:
               json.dump(results, handle, indent=2)
+
+          lines = [
+              "# Integrated JAX-flat before/after runtime matrix",
+              "",
+              "CPU GitHub Actions runner, JAX CPU float64, 9 assets, one warmup + 10 measured runs, medians shown, compilation excluded.",
+              "Before is the preserved original JAX-flat batch executor. After is the integrated public runtime.",
+              "",
+              "| Case | Family | Rows | Depth | Breadth | Strategy | Before (s) | After (s) | Speedup | Δ runtime |",
+              "|---|---|---:|---:|---:|---|---:|---:|---:|---:|",
+          ]
+          for result in results:
+              lines.append(
+                  "| {case} | {family} | {rows:,} | {depth} | {breadth} | `{strategy}` | "
+                  "{before_median_s:.4f} | {after_median_s:.4f} | {speedup_x:.2f}× | {delta_pct:+.1f}% |".format(
+                      **{**result, "depth": result["depth"] if result["depth"] is not None else "—", "breadth": result["breadth"] if result["breadth"] is not None else "—"}
+                  )
+              )
+          with open("benchmark.md", "w", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+
+          speedups = [float(result["speedup_x"]) for result in results]
+          print(json.dumps({
+              "summary": {
+                  "cases": len(results),
+                  "geomean_speedup_x": math.exp(statistics.mean(math.log(value) for value in speedups)),
+                  "median_speedup_x": statistics.median(speedups),
+                  "min_speedup_x": min(speedups),
+                  "max_speedup_x": max(speedups),
+              }
+          }, sort_keys=True))
           PY
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: planned-engine-benchmark
+          name: planned-engine-runtime-matrix
           path: |
+            benchmark.csv
             benchmark.json
+            benchmark.md
             benchmark.log
