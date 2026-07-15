@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.jax_flat import engine as jax_flat_engine
+from trading_dsl_engine.jax_flat import execution_policy
 
 
 def _rss_bytes() -> int:
@@ -34,9 +35,6 @@ def test_run_batch_accepts_mapping_by_input_name_not_formula_order():
 
 
 def test_jnp_asarray_memmap_materializes_full_input(tmp_path):
-    # This profiles the tempting simpler approach directly: handing an entire
-    # memmap to JAX. On the CPU backend this creates a JAX buffer for the full
-    # array, so the runtime must keep using bounded input chunks for memmaps.
     shape = (4096, 512)
     path = tmp_path / "direct.memmap"
     mapped = np.memmap(path, mode="w+", shape=shape, dtype=np.float64)
@@ -78,20 +76,19 @@ def test_run_batch_streams_memmap_mapping_inputs_in_chunks(tmp_path, monkeypatch
     runtime = jax_flat_engine.compile_formula("close + open")
     monkeypatch.setattr(jax_flat_engine, "_BATCH_CHUNK_SIZE", chunk_size)
 
-    original_asarray = jax_flat_engine.jnp.asarray
-    memmap_shapes_seen: list[tuple[int, ...]] = []
+    original_prepare = execution_policy._prepare
+    prepared: list[tuple[int, int, int]] = []
 
-    def guarded_asarray(value, *args, **kwargs):
-        if isinstance(value, np.memmap):
-            memmap_shapes_seen.append(value.shape)
-            assert value.shape[0] <= chunk_size
-            assert value.shape != (n_steps, n_instruments)
-        return original_asarray(value, *args, **kwargs)
+    def tracking_prepare(inputs, start, stop, size):
+        prepared.append((start, stop, size))
+        assert size == chunk_size
+        assert 0 < stop - start <= chunk_size
+        return original_prepare(inputs, start, stop, size)
 
-    monkeypatch.setattr(jax_flat_engine.jnp, "asarray", guarded_asarray)
+    monkeypatch.setattr(execution_policy, "_prepare", tracking_prepare)
 
     runtime.run_batch({"open": open_r[:chunk_size], "close": close_r[:chunk_size]})
-    memmap_shapes_seen.clear()
+    prepared.clear()
     baseline = _rss_bytes()
     peak = [baseline]
     stop = threading.Event()
@@ -99,13 +96,16 @@ def test_run_batch_streams_memmap_mapping_inputs_in_chunks(tmp_path, monkeypatch
     sampler.start()
     try:
         _, out = runtime.run_batch({"open": open_r, "close": close_r})
-        np.asarray(out).sum()  # Force host output realization before stopping the sampler.
+        np.asarray(out).sum()
     finally:
         stop.set()
         sampler.join(timeout=1.0)
 
-    assert memmap_shapes_seen
-    assert max(shape[0] for shape in memmap_shapes_seen) <= chunk_size
+    expected = [
+        (start, min(start + chunk_size, n_steps), chunk_size)
+        for start in range(0, n_steps, chunk_size)
+    ]
+    assert sorted(prepared) == expected
     input_bytes = close_r.nbytes + open_r.nbytes
     assert peak[0] - baseline < input_bytes + out.nbytes * 2
     np.testing.assert_allclose(out[0], np.zeros(n_instruments, dtype=np.float64))
