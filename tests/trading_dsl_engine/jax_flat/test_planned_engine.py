@@ -21,7 +21,7 @@ def _legacy_batch(expr, values):
     return np.asarray(output).copy()
 
 
-def _tick_reference(expr, values, return_state=False):
+def _tick_reference(expr, values):
     runtime = engine_legacy.compile_formula(expr, cpp=False)
     state = runtime.init_state(values.shape[1])
     outputs = []
@@ -29,8 +29,7 @@ def _tick_reference(expr, values, return_state=False):
         state, output = runtime.tick(state, jnp.asarray(row, dtype=jnp.float64))
         outputs.append(output)
     jax.block_until_ready((state, outputs[-1]))
-    output = np.stack(tuple(np.asarray(value) for value in outputs), axis=0)
-    return (state, output) if return_state else output
+    return np.stack(tuple(np.asarray(value) for value in outputs), axis=0)
 
 
 def test_compile_formula_preserves_single_output_behavior(monkeypatch):
@@ -40,14 +39,10 @@ def test_compile_formula_preserves_single_output_behavior(monkeypatch):
     values[rng.random(values.shape) < 0.12] = np.nan
     expr = ewm(ewm(var("x"), 7.0, ignore_na=True, adjust=False), 19.0, ignore_na=True, adjust=False)
 
-    tick_state, expected = _tick_reference(expr, values, return_state=True)
+    expected = _tick_reference(expr, values)
     np.testing.assert_allclose(_legacy_batch(expr, values), expected, rtol=1e-11, atol=1e-11, equal_nan=True)
     runtime = compile_formula(expr, cpp=False)
     state, actual = runtime.run_batch({"x": jnp.asarray(values)})
-
-    print("nodes", [(i, type(node.op).__name__, node.child_ids, runtime.program.state_layout.node_fields[i].index) for i, node in enumerate(runtime.program.nodes)])
-    print("tick_state", [np.asarray(item.value) for item in tick_state])
-    print("planned_state", [np.asarray(item.value) for item in state])
 
     assert isinstance(actual, jax.Array)
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11, equal_nan=True)
