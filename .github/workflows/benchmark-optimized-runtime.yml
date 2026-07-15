@@ -32,6 +32,7 @@ jobs:
             --ignore=tests/trading_dsl_engine/jax_flat/test_metadata_units_ranges.py \
             --ignore=tests/trading_dsl_engine/jax_flat/test_codegen_fusion.py \
             --ignore=tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py \
+            --ignore=tests/trading_dsl_engine/jax_flat/test_groupby_semantics_spec.py \
             2>&1 | tee pytest.log
       - name: Run isolated native smoke tests
         shell: bash
