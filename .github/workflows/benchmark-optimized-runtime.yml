@@ -29,7 +29,10 @@ jobs:
       - name: Install package
         run: python -m pip install -e .
       - name: Run optimized runtime tests
-        run: pytest -q -n 0 tests/trading_dsl_engine/jax_flat/test_optimized_runtime.py
+        run: >-
+          pytest -q -n 0
+          tests/trading_dsl_engine/jax_flat/test_optimized_runtime.py
+          tests/trading_dsl_engine/jax_flat/test_optimized_ewm_branch_batch.py
       - name: Run benchmark
         run: python scripts/benchmark_optimized_runtime.py
       - name: Upload benchmark results
