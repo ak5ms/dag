@@ -6,8 +6,8 @@ import sys
 
 from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall, StatelessJaxFunction, rolling, stateless
-from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_features, compile_formula
-from trading_dsl_engine.jax_flat import execution_policy as _execution_policy
+from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
+from trading_dsl_engine.jax_flat.execution_policy import compile_features
 
 
 def _load_cpp_flat():
