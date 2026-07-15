@@ -6,16 +6,7 @@ import sys
 
 from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall, StatelessJaxFunction, rolling, stateless
-from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
-from trading_dsl_engine.jax_flat.optimized import (
-    OptimizedJaxFlatRuntime,
-    compile_features,
-    compile_formula as compile_optimized_formula,
-)
-# Applies the measured CPU execution policy to the optimized runtime module.
-from trading_dsl_engine.jax_flat import optimized_planner as _optimized_planner
-from trading_dsl_engine.jax_flat import optimized_pair_fusion as _optimized_pair_fusion
-from trading_dsl_engine.jax_flat import optimized_strategy_labels as _optimized_strategy_labels
+from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_features, compile_formula
 
 
 def _load_cpp_flat():
@@ -41,11 +32,9 @@ def __getattr__(name: str):
 
 __all__ = [
     "JaxFlatRuntime",
-    "OptimizedJaxFlatRuntime",
     "CppFlatRuntime",
     "_cpp_flat",
     "compile_formula",
-    "compile_optimized_formula",
     "compile_features",
     "StatelessJaxCall",
     "RollingJaxCall",
