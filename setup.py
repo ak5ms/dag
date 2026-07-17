@@ -55,7 +55,7 @@ def _cpp_pgo_args(*, linking: bool) -> list[str]:
     return args
 
 
-def _cpp_compile_args() -> list[str]:
+def _cpp_compile_args(*, pgo: bool = False) -> list[str]:
     """Return aggressive-but-IEEE-safe native extension compile flags."""
     if os.name == "nt":
         args = ["/O2", "/DNDEBUG", "/DEIGEN_NO_DEBUG"]
@@ -75,10 +75,12 @@ def _cpp_compile_args() -> list[str]:
         args.extend(["-march=native", "-mtune=native"])
     if _env_flag("TRADING_DSL_ENGINE_CPP_LTO", default=True):
         args.append("-flto")
-    return args + _cpp_pgo_args(linking=False) + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS")
+    if pgo:
+        args.extend(_cpp_pgo_args(linking=False))
+    return args + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS")
 
 
-def _cpp_link_args() -> list[str]:
+def _cpp_link_args(*, pgo: bool = False) -> list[str]:
     if os.name == "nt":
         args = ["/LTCG"] if _env_flag("TRADING_DSL_ENGINE_CPP_LTO", default=True) else []
         return args + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS")
@@ -86,7 +88,9 @@ def _cpp_link_args() -> list[str]:
     args = ["-Wl,-O3"]
     if _env_flag("TRADING_DSL_ENGINE_CPP_LTO", default=True):
         args.append("-flto")
-    return args + _cpp_pgo_args(linking=True) + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS")
+    if pgo:
+        args.extend(_cpp_pgo_args(linking=True))
+    return args + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS")
 
 
 ext_modules = [
@@ -96,8 +100,8 @@ ext_modules = [
         depends=["src/trading_dsl_engine/jax_flat/ops.cpp"],
         include_dirs=["src", includeigen.get_include(), "/usr/include/eigen3"],
         cxx_std=23,
-        extra_compile_args=_cpp_compile_args(),
-        extra_link_args=_cpp_link_args(),
+        extra_compile_args=_cpp_compile_args(pgo=True),
+        extra_link_args=_cpp_link_args(pgo=True),
     ),
     Pybind11Extension(
         "trading_dsl_engine.jax_ffi.nnqp._eigen_nnqp",
