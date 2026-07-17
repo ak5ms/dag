@@ -13,8 +13,8 @@ RUNS="${RUNS:-6}"
 WARMUPS="${WARMUPS:-1}"
 CPU="${CPU:-}"
 
-if ! "$CXX_BIN" --version 2>&1 | head -n 1 | grep -Eqi 'gcc|g\+\+'; then
-    echo "error: the automated PGO flow currently requires GCC/g++; set CXX to a GCC-compatible compiler" >&2
+if ! printf '' | "$CXX_BIN" -dM -E -x c++ - 2>/dev/null | grep -q '^#define __GNUC__ '; then
+    echo "error: the automated PGO flow currently requires a GCC-compatible compiler; set CXX accordingly" >&2
     exit 2
 fi
 
