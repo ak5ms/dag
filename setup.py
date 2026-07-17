@@ -44,9 +44,9 @@ def _cpp_pgo_args(*, linking: bool) -> list[str]:
         profile_dir.mkdir(parents=True, exist_ok=True)
         return [f"-fprofile-generate={profile_dir}"]
 
-    if not profile_dir.is_dir():
+    if not profile_dir.is_dir() or not any(profile_dir.rglob("*.gcda")):
         raise RuntimeError(
-            f"PGO profile directory does not exist: {profile_dir}. "
+            f"PGO profile data does not exist under: {profile_dir}. "
             "Build with TRADING_DSL_ENGINE_CPP_PGO=generate and run the training workload first."
         )
     args = [f"-fprofile-use={profile_dir}"]
