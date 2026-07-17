@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shlex
 
 import includeigen
 import jax
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import find_packages, setup
+
+
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -18,6 +22,37 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 def _split_env_flags(name: str) -> list[str]:
     return shlex.split(os.environ.get(name, ""))
+
+
+def _cpp_pgo_args(*, linking: bool) -> list[str]:
+    """Return opt-in GCC-compatible profile-guided optimization flags."""
+    mode = os.environ.get("TRADING_DSL_ENGINE_CPP_PGO", "off").strip().lower()
+    if mode in {"", "0", "false", "no", "off"}:
+        return []
+    if mode not in {"generate", "use"}:
+        raise ValueError("TRADING_DSL_ENGINE_CPP_PGO must be one of: off, generate, use")
+    if os.name == "nt":
+        raise RuntimeError("TRADING_DSL_ENGINE_CPP_PGO currently supports Unix-like GCC-compatible toolchains only")
+
+    raw_dir = os.environ.get("TRADING_DSL_ENGINE_CPP_PGO_DIR", ".pgo-data")
+    profile_dir = Path(raw_dir).expanduser()
+    if not profile_dir.is_absolute():
+        profile_dir = _REPO_ROOT / profile_dir
+    profile_dir = profile_dir.resolve()
+
+    if mode == "generate":
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return [f"-fprofile-generate={profile_dir}"]
+
+    if not profile_dir.is_dir():
+        raise RuntimeError(
+            f"PGO profile directory does not exist: {profile_dir}. "
+            "Build with TRADING_DSL_ENGINE_CPP_PGO=generate and run the training workload first."
+        )
+    args = [f"-fprofile-use={profile_dir}"]
+    if not linking:
+        args.append("-fprofile-correction")
+    return args
 
 
 def _cpp_compile_args() -> list[str]:
@@ -40,7 +75,7 @@ def _cpp_compile_args() -> list[str]:
         args.extend(["-march=native", "-mtune=native"])
     if _env_flag("TRADING_DSL_ENGINE_CPP_LTO", default=True):
         args.append("-flto")
-    return args + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS")
+    return args + _cpp_pgo_args(linking=False) + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS")
 
 
 def _cpp_link_args() -> list[str]:
@@ -51,7 +86,7 @@ def _cpp_link_args() -> list[str]:
     args = ["-Wl,-O3"]
     if _env_flag("TRADING_DSL_ENGINE_CPP_LTO", default=True):
         args.append("-flto")
-    return args + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS")
+    return args + _cpp_pgo_args(linking=True) + _split_env_flags("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS")
 
 
 ext_modules = [
