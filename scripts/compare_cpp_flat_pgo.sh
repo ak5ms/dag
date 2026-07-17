@@ -13,6 +13,18 @@ RUNS="${RUNS:-6}"
 WARMUPS="${WARMUPS:-1}"
 CPU="${CPU:-}"
 
+PROFILE_DIR="$("$PYTHON" - "$PROFILE_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+if [[ "$PROFILE_DIR" == "/" || "$PROFILE_DIR" == "$ROOT" ]]; then
+    echo "error: refusing to use unsafe PGO profile directory: $PROFILE_DIR" >&2
+    exit 2
+fi
+
 if ! printf '' | "$CXX_BIN" -dM -E -x c++ - 2>/dev/null | grep -q '^#define __GNUC__ '; then
     echo "error: the automated PGO flow currently requires a GCC-compatible compiler; set CXX accordingly" >&2
     exit 2
