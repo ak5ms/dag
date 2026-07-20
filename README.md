@@ -48,6 +48,10 @@ out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d},
 
 Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
 
+### Profiling compiled JAX-flat formulas
+
+Use `runtime.profile_batch(inputs, trace_dir)` to record one normal, fully compiled batch execution as a JAX Perfetto/TensorBoard trace. `runtime.get_execution_plan()` maps `jax_flat/node_<id>/<operation>` trace scopes to lowered formula nodes and their dependencies, so hotspots can be inspected without running and timing each subformula separately. XLA may fuse neighbouring operations; in that case the trace correctly attributes the fused kernel to its nested node scopes rather than reporting artificial per-node wall times. The in-memory single-chunk batch path also avoids the former full-size output/cache allocation and dynamic-update copy.
+
 Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
 
 ## DSL composition

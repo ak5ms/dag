@@ -115,6 +115,15 @@ class StreamingProgram:
     external_cache_inputs: dict[str, np.ndarray] | None = None
 
 
+def _node_profile_label(idx: int, op: Op) -> str:
+    """Return a stable, readable JAX scope name for a lowered formula node."""
+    if isinstance(op, NaryOp):
+        name = op.cpp_name or getattr(op.fn, "__name__", None) or "nary"
+    else:
+        name = type(op).__name__.removesuffix("Op")
+    return f"jax_flat/node_{idx}/{name}"
+
+
 @dataclass(frozen=True)
 class InnerGraphOp(Op):
     """A groupby-local operator DAG.
@@ -155,7 +164,8 @@ class InnerGraphOp(Op):
             child_values = tuple(values[cid] for cid in node.child_ids)
             field = self.state_layout.node_fields[idx]
             node_state = None if field.index < 0 else state_leaves[field.index]
-            next_state, value = op.tick(node_state, *child_values)
+            with jax.named_scope(_node_profile_label(idx, op)):
+                next_state, value = op.tick(node_state, *child_values)
             if field.index >= 0:
                 new_state[field.index] = next_state
             values[idx] = value
@@ -230,6 +240,39 @@ class JaxFlatRuntime(eqx.Module):
         if self.program.metadata is None:
             return ()
         return self.program.metadata.get_node_metadata(label)
+
+    def get_execution_plan(self) -> tuple[dict[str, Any], ...]:
+        """Describe the labelled nodes emitted into a JAX profiler trace.
+
+        The labels identify work in the *single compiled execution graph*; they
+        do not execute or time subformulas independently.  XLA is still free to
+        fuse adjacent nodes, so a fused kernel may carry more than one label.
+        """
+        return tuple(
+            {
+                "node_id": idx,
+                "label": _node_profile_label(idx, node.op),
+                "children": node.child_ids,
+                "stateful": bool(node.op.is_stateful),
+                "output_kind": node.op.output_kind,
+            }
+            for idx, node in enumerate(self.program.nodes)
+        )
+
+    def profile_batch(self, inputs, trace_dir: str, states=None, out_path: str | bool = False):
+        """Run one batch while writing a Perfetto/TensorBoard JAX trace.
+
+        Open ``trace_dir`` with TensorBoard's profile plugin or Perfetto.  The
+        ``jax_flat/node_<id>/...`` scopes correspond to
+        :meth:`get_execution_plan`, letting a trace attribute compiled work to
+        formula nodes without changing the formula into separately timed runs.
+        This intentionally includes one normal ``run_batch`` execution.
+        """
+        os.makedirs(trace_dir, exist_ok=True)
+        with jax.profiler.trace(trace_dir):
+            result = self.run_batch(inputs, states=states, out_path=out_path)
+            jax.block_until_ready(result)
+        return result
 
     def get_node_types(self, label: str):
         """Return semantic type sets for analyzed formula nodes with the given label."""
@@ -606,6 +649,11 @@ _CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
 def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
     n_steps = inputs[0].shape[0]
     chunk_size = min(n_steps, _BATCH_CHUNK_SIZE)
+    # Avoid allocating a second full batch result merely to dynamic-update the
+    # only chunk into it.  Besides reducing peak memory, this saves a complete
+    # output/cache copy for the common in-memory batch case.
+    if n_steps == chunk_size:
+        return _scan_batch_chunk(runtime, state0, inputs)
     n_full_chunks = n_steps // chunk_size
     remainder = n_steps - n_full_chunks * chunk_size
 
@@ -676,11 +724,12 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs, batch_start
         child_values = tuple(values[cid] for cid in node.child_ids)
         field = runtime.program.state_layout.node_fields[idx]
         node_state = None if field.index < 0 else state_leaves[field.index]
-        next_state, value = (
-            op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
-            if isinstance(op, CacheOp)
-            else op.scan_batch(node_state, *child_values)
-        )
+        with jax.named_scope(_node_profile_label(idx, op)):
+            next_state, value = (
+                op.scan_batch_with_start(node_state, jnp.asarray(batch_start, dtype=jnp.int64), *child_values)
+                if isinstance(op, CacheOp)
+                else op.scan_batch(node_state, *child_values)
+            )
         if field.index >= 0:
             new_state[field.index] = next_state
         values[idx] = value
