@@ -27,3 +27,15 @@ def test_jax_flat_streaming_jaxpr_has_compact_state_abi():
     txt = str(jaxpr)
     assert "searchsorted" not in txt
     assert "concatenate" not in txt
+
+
+def test_jax_flat_execution_plan_labels_compiled_formula_nodes():
+    runtime = compile_formula("ewm(add(close, open), 3)", cpp=False)
+
+    plan = runtime.get_execution_plan()
+
+    assert [entry["node_id"] for entry in plan] == list(range(len(plan)))
+    assert [entry["children"] for entry in plan] == [(), (), (0, 1), (), (2,)]
+    assert plan[2]["label"].endswith("/add")
+    assert plan[4]["label"].endswith("/Ewm")
+    assert plan[4]["stateful"] is True
