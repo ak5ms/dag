@@ -133,6 +133,8 @@ The active `trading_dsl_engine.jax_flat` backend additionally supports `buffer(s
 
 `jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis:
 
+For JIT diagnostics, a compiled JAX-flat runtime exposes `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)`, with `get_jaxpr`/`get_compiled_hlo` aliases. The arguments follow `tick`'s state-and-row ABI; the latter helper returns the compiled executable's optimized HLO text. `jit_compile_count` tracks observed tick-transition JAX traces (a per-runtime proxy for JIT compilation cache misses) across live ticks, compiled-HLO inspection, and batch scans, and `reset_jit_compile_count()` clears it. JAXPR inspection itself does not change the counter because it does not compile.
+
 ```python
 import jax.numpy as jnp
 from trading_dsl_engine.base.dsl import buffer, shift, var

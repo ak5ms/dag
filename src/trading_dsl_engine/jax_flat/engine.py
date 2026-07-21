@@ -86,6 +86,19 @@ class CacheWriteTarget:
             self.array.flush()
 
 
+class JitCompileTracker:
+    """Mutable, identity-hashable runtime-only JIT trace counter."""
+
+    def __init__(self):
+        self.count = 0
+
+    def record(self) -> None:
+        self.count += 1
+
+    def reset(self) -> None:
+        self.count = 0
+
+
 @dataclass(frozen=True)
 class DagNode:
     op: Any
@@ -191,12 +204,67 @@ class InnerGraphOp(Op):
 class JaxFlatRuntime(eqx.Module):
     program: StreamingProgram = eqx.field(static=True)
     runtimes: list[float] = eqx.field(default_factory=list, static=True)
+    _jit_compile_tracker: JitCompileTracker = eqx.field(default_factory=JitCompileTracker, static=True)
     cpp: bool = eqx.field(default=True, static=True)
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
     cache_memmap_tracker: MemmapPathTracker = eqx.field(default_factory=MemmapPathTracker, static=True)
     block: bool = True # False disables waiting (for runtime measurement)
 
+    @property
+    def jit_compile_count(self) -> int:
+        """Return the number of observed JIT traces for this runtime.
+
+        A trace is recorded when the tick transition receives a JAX tracer. This
+        is a lightweight per-runtime proxy for JIT cache misses/compilations;
+        it covers live ``tick`` calls, compiled-HLO inspection, and the
+        transition used by batch scans. JAXPR inspection does not affect this
+        count because it traces without compiling.
+        """
+        return self._jit_compile_tracker.count
+
+    def reset_jit_compile_count(self) -> None:
+        """Clear this runtime's observed JIT compilation counter."""
+        self._jit_compile_tracker.reset()
+
+    def inspect_jaxpr(self, state_leaves, *input_rows):
+        """Return the closed JAXPR for one streaming tick transition.
+
+        ``state_leaves`` and ``input_rows`` use the same ABI as :meth:`tick`.
+        This is intended for diagnostics and does not execute a live update.
+        """
+        transition = lambda state, *rows: self._tick_impl(state, *rows)
+        return self._inspect_without_count(lambda: jax.make_jaxpr(transition)(state_leaves, *input_rows))
+
+    def inspect_compiled_hlo(self, state_leaves, *input_rows) -> str:
+        """Compile one tick specialization and return its optimized HLO text.
+
+        ``state_leaves`` and ``input_rows`` use the same ABI as :meth:`tick`.
+        The returned text is XLA's compiled executable representation, rather
+        than the pre-compilation HLO emitted by ``compiler_ir``.
+        """
+        transition = lambda state, *rows: self._tick_impl(state, *rows)
+        return jax.jit(transition).lower(state_leaves, *input_rows).compile().as_text()
+
+    # ``get_*`` aliases make these diagnostics convenient in notebooks and
+    # preserve a conventional runtime-inspection spelling.
+    get_jaxpr = inspect_jaxpr
+    get_compiled_hlo = inspect_compiled_hlo
+
+    def _inspect_without_count(self, inspect):
+        """Run a non-compiling tracing diagnostic without recording its trace."""
+        count_before = self._jit_compile_tracker.count
+        try:
+            return inspect()
+        finally:
+            self._jit_compile_tracker.count = count_before
+
+    def _record_jit_trace(self, state_leaves, input_rows) -> None:
+        if any(
+            isinstance(value, jax.core.Tracer)
+            for value in jax.tree.leaves((state_leaves, input_rows))
+        ):
+            self._jit_compile_tracker.record()
 
     def get_cached_values(self):
         """Return batch-materialized values for top-level cache(...) nodes keyed by node id."""
@@ -273,6 +341,7 @@ class JaxFlatRuntime(eqx.Module):
         return tuple(states)
 
     def _tick_impl(self, state_leaves, *input_rows):
+        self._record_jit_trace(state_leaves, input_rows)
         values: list[jax.Array] = [jnp.array(0.0)] * len(self.program.nodes)
         new_state = list(state_leaves)
 

@@ -27,3 +27,24 @@ def test_jax_flat_streaming_jaxpr_has_compact_state_abi():
     txt = str(jaxpr)
     assert "searchsorted" not in txt
     assert "concatenate" not in txt
+
+
+def test_runtime_compilation_diagnostics_expose_tick_jaxpr_hlo_and_counter():
+    runtime = compile_formula("cumsum(open + close)", cpp=False)
+    state0 = runtime.init_state(3)
+    open_row = jnp.array([1.0, 2.0, 3.0])
+    close_row = jnp.array([2.0, 3.0, 4.0])
+
+    jaxpr = runtime.inspect_jaxpr(state0, open_row, close_row)
+    hlo_text = runtime.inspect_compiled_hlo(state0, open_row, close_row)
+
+    assert "add" in str(jaxpr)
+    assert "HloModule" in hlo_text
+    assert runtime.jit_compile_count == 1
+
+    runtime.tick(state0, open_row, close_row)
+    assert runtime.jit_compile_count == 2
+    runtime.tick(state0, open_row, close_row)
+    assert runtime.jit_compile_count == 2
+    runtime.reset_jit_compile_count()
+    assert runtime.jit_compile_count == 0
