@@ -1,0 +1,120 @@
+-            )
+-            updated_state, local_out = self.inner_op.tick(selected_state, *member_args)
+-            inner_state_next = (
+-                _tree_set_slot_member(inner_state_c, slot, member_pos, updated_state)
+-                if inner_state_c is not None and updated_state is not None
+-                else inner_state_c
+-            )
+-            group_out_next = _set_member_output(group_out_c, member_pos, local_out)
+-            return table_next, inner_state_next, group_out_next
+-
+-        table_next, inner_state_next, group_out = jax.lax.fori_loop(
+-            0,
+-            group_width,
+-            body,
+-            (runtime.table, runtime.inner_state, group_out0),
++        source_widths = tuple(self._row_arg_source_width(arg, idx) for arg in args)
++        group_args = tuple(
++            _slice_group_arg(arg, idx, source_width)
++            for arg, source_width in zip(args, source_widths)
++        )
++        arg_axes = tuple(
++            0
++            if jnp.asarray(group_arg).ndim > 0 and _is_group_aligned_arg(arg, source_width)
++            else None
++            for group_arg, arg, source_width in zip(group_args, args, source_widths)
++        )
++        updated_state, group_out = jax.vmap(
++            self.inner_op.tick,
++            in_axes=(0,) + arg_axes,
++            out_axes=(0, 0),
++        )(selected_state, *group_args)
++        inner_state_next = _tree_set_slot_members(inner_state, slots, updated_state)
++        cache_next = GroupCacheState(
++            runtime.cache.key,
++            runtime.cache.slot,
++            jnp.asarray(False),
++            runtime.cache.inner_state,
+         )
+-        return GroupRuntimeState(table_next, runtime.cache, inner_state_next), group_out
++        return GroupRuntimeState(table_next, cache_next, inner_state_next), group_out
+ 
+     def _tick_group_cached_single_key(
+         self,
+--- a/src/trading_dsl_engine/jax_flat/ops.py
++++ b/src/trading_dsl_engine/jax_flat/ops.py
+@@ -18,6 +18,7 @@
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     is_stateful: bool = False
++    group_memberwise: bool = False
+ 
+     def init_state(self, sample: jax.Array):
+         return None
+@@ -124,6 +125,7 @@
+ 
+ @dataclass(frozen=True)
+ class InputOp(Op):
++    group_memberwise = True
+     input_index: int
+     output_kind: str = "vector"
+     output_width: int | None = 1
+@@ -131,6 +133,7 @@
+ 
+ @dataclass(frozen=True)
+ class LiteralOp(Op):
++    group_memberwise = True
+     value: float
+     output_kind: str = "scalar"
+     output_width: int | None = 1
+@@ -171,6 +174,7 @@
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     cpp_name: str | None = None
++    group_memberwise: bool = False
+     cpp_param: float = 0.0
+     cpp_int_param: int = 0
+     cpp_str_param: str = ""
+@@ -186,6 +190,7 @@
+ 
+ @dataclass(frozen=True)
+ class EwmOp(Op):
++    group_memberwise = True
+     span: float | None = None
+     min_periods: float | None = None
+     ignore_na: bool = False
+@@ -506,6 +511,7 @@
+ 
+ @dataclass(frozen=True)
+ class CumsumOp(Op):
++    group_memberwise = True
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     is_stateful: bool = True
+@@ -534,6 +540,7 @@
+ 
+ @dataclass(frozen=True)
+ class FFillOp(Op):
++    group_memberwise = True
+     limit: int | None = None
+     dynamic_limit: bool = False
+     output_kind: str = "vector"
+@@ -1178,18 +1185,18 @@
+ 
+ 
+ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
+-    ("abs", 1): lambda: NaryOp(jnp.abs, cpp_name="abs"),
+-    ("ln", 1): lambda: NaryOp(jnp.log, cpp_name="ln"),
+-    ("ceil", 1): lambda: NaryOp(jnp.ceil, cpp_name="ceil"),
+-    ("floor", 1): lambda: NaryOp(jnp.floor, cpp_name="floor"),
+-    ("round", 1): lambda: NaryOp(jnp.round, cpp_name="round"),
+-    ("exp", 1): lambda: NaryOp(jnp.exp, cpp_name="exp"),
+-    ("sign", 1): lambda: NaryOp(jnp.sign, cpp_name="sign"),
+-    ("arctan", 1): lambda: NaryOp(jnp.arctan, cpp_name="arctan"),
+-    ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan"),
+-    ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify"),
+-    ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction"),
+-    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
++    ("abs", 1): lambda: NaryOp(jnp.abs, cpp_name="abs", group_memberwise=True),
++    ("ln", 1): lambda: NaryOp(jnp.log, cpp_name="ln", group_memberwise=True),
++    ("ceil", 1): lambda: NaryOp(jnp.ceil, cpp_name="ceil", group_memberwise=True),
