@@ -23,12 +23,15 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Prepare baseline and optimized worktrees
+      - name: Create baseline worktree
+        run: git worktree add --detach /tmp/dag-baseline origin/main
+      - name: Create optimized worktree
+        run: git worktree add --detach /tmp/dag-optimized origin/main
+      - name: Validate and apply optimization patch
+        working-directory: /tmp/dag-optimized
         run: |
-          git worktree add --detach /tmp/dag-baseline origin/main
-          git worktree add --detach /tmp/dag-optimized origin/main
-          cd /tmp/dag-optimized
-          git apply --check "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
+          wc -l "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
+          git apply --check --verbose "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
           git apply "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
       - name: Install dependencies and build baseline
         run: |
