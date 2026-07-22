@@ -28,3 +28,5 @@ jobs:
           path: dag-source.zip
           if-no-files-found: error
           retention-days: 1
+
+# Temporary workflow; this branch and PR will be closed after integration testing.
