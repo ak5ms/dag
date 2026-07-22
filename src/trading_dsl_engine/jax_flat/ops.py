@@ -185,6 +185,49 @@ class NaryOp(Op):
 
 
 @dataclass(frozen=True)
+class ReduceOp(Op):
+    reducer: Callable[..., jax.Array]
+    combine_partials: Callable[[jax.Array, jax.Array], jax.Array]
+    axes: tuple[int, ...] | None = None
+    keepdims: bool = False
+    output_kind: str = "scalar"
+    output_width: int | None = 1
+
+    @property
+    def reduces_time(self) -> bool:
+        return self.axes is None or 0 in self.axes
+
+    def _reduce(self, x: jax.Array, axes: tuple[int, ...] | None):
+        value = self.reducer(x, axis=axes, keepdims=self.keepdims)
+        if self.keepdims and axes is not None:
+            value = jnp.broadcast_to(value, jnp.asarray(x).shape)
+        return value
+
+    def tick(self, state: Any, *child_values: jax.Array):
+        del state
+        tick_axes = None if self.axes is None else tuple(axis - 1 for axis in self.axes if axis > 0)
+        return None, self._reduce(child_values[0], tick_axes)
+
+    def scan_batch(self, state: Any, *child_sequences: jax.Array):
+        del state
+        x = child_sequences[0]
+        if self.reduces_time:
+            return None, self._reduce(x, self.axes)
+        tick_axes = tuple(axis - 1 for axis in self.axes) if self.axes is not None else None
+        return None, jax.vmap(lambda row: self._reduce(row, tick_axes))(x)
+
+
+REDUCE_OP_FACTORIES: dict[str, Callable[..., ReduceOp]] = {
+    "sum": lambda axes, keepdims, output_kind, output_width: ReduceOp(
+        jnp.sum, lambda left, right: left + right, axes=axes, keepdims=keepdims, output_kind=output_kind, output_width=output_width
+    ),
+    "prod": lambda axes, keepdims, output_kind, output_width: ReduceOp(
+        jnp.prod, lambda left, right: left * right, axes=axes, keepdims=keepdims, output_kind=output_kind, output_width=output_width
+    ),
+}
+
+
+@dataclass(frozen=True)
 class EwmOp(Op):
     span: float | None = None
     min_periods: float | None = None

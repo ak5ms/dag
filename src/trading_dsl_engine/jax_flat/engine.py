@@ -31,6 +31,8 @@ from trading_dsl_engine.jax_flat.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    ReduceOp,
+    REDUCE_OP_FACTORIES,
     RollingMeanOp,
     RollingOp,
     ANY_ARITY,
@@ -671,6 +673,17 @@ _BATCH_CHUNK_SIZE = int(os.environ.get("TRADING_DSL_JAX_FLAT_BATCH_CHUNK_SIZE", 
 _CPP_ACCELERATOR_CACHE: dict[tuple[Any, ...], Any] = {}
 
 
+def _root_time_reduce_op(runtime: JaxFlatRuntime) -> ReduceOp | None:
+    if len(runtime.program.outputs) != 1 or runtime.program.cache_nodes:
+        return None
+    op = runtime.program.nodes[runtime.program.outputs[0]].op
+    return op if isinstance(op, ReduceOp) and op.reduces_time and not op.keepdims else None
+
+
+def _combine_reduce_partials(op: ReduceOp, left, right):
+    return op.combine_partials(left, right)
+
+
 @jax.jit
 def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
     n_steps = inputs[0].shape[0]
@@ -697,6 +710,25 @@ def _scan_batch(runtime: JaxFlatRuntime, state0, inputs):
         )
 
     states, chunk0_out, chunk0_cache = scan_chunk(state0, 0, chunk_size)
+    time_reduce_op = _root_time_reduce_op(runtime)
+    if time_reduce_op is not None:
+        def reduce_body(chunk_i, carry):
+            states_c, out_c = carry
+            start = chunk_i * chunk_size
+            states_n, chunk_out, _ = scan_chunk(states_c, start, chunk_size)
+            return states_n, _combine_reduce_partials(time_reduce_op, out_c, chunk_out)
+
+        states, out = jax.lax.fori_loop(
+            1,
+            n_full_chunks,
+            reduce_body,
+            (states, chunk0_out),
+        )
+        if remainder:
+            start = n_full_chunks * chunk_size
+            states, tail_out, _ = scan_chunk(states, start, remainder)
+            out = _combine_reduce_partials(time_reduce_op, out, tail_out)
+        return states, out, chunk0_cache
 
     def alloc(leaf):
         leaf = jnp.asarray(leaf)
@@ -1016,6 +1048,68 @@ def _shape_preserving_nary(op: Op, child_ops: tuple[Op, ...]) -> Op:
     return replace(op, output_kind=shape_source.output_kind, output_width=shape_source.output_width)
 
 
+
+def _literal_bool_arg(expr: Expr, fn: str, position: int) -> bool:
+    if isinstance(expr, Identifier) and expr.name in {"True", "False"}:
+        return expr.name == "True"
+    if isinstance(expr, Number):
+        return bool(expr.value)
+    raise ValueError(f"{fn} argument {position} must be a boolean literal")
+
+
+def _literal_axis_arg(expr: Expr | None, fn: str) -> tuple[int, ...] | None:
+    if expr is None:
+        return None
+    if isinstance(expr, Number):
+        return (int(round(float(expr.value))),)
+    if isinstance(expr, KeyTuple):
+        axes = []
+        for item in expr.items:
+            if not isinstance(item, Number):
+                raise ValueError(f"{fn} axis entries must be integer literals")
+            axes.append(int(round(float(item.value))))
+        if len(set(axes)) != len(axes):
+            raise ValueError(f"{fn} axis entries must be unique")
+        return tuple(axes)
+    raise ValueError(f"{fn} axis must be an integer or tuple of integers")
+
+
+def _batch_rank(op: Op) -> int:
+    if op.output_kind == "scalar":
+        return 1
+    if op.output_kind == "vector":
+        return 2
+    if op.output_kind == "matrix":
+        return 3
+    raise ValueError(f"Unsupported reduction input kind {op.output_kind!r}")
+
+
+def _normalize_reduction_axes(child: Op, axes: tuple[int, ...] | None) -> tuple[int, ...] | None:
+    rank = _batch_rank(child)
+    if axes is None:
+        return None
+    normalized = tuple(axis + rank if axis < 0 else axis for axis in axes)
+    if any(axis < 0 or axis >= rank for axis in normalized):
+        raise ValueError(f"reduction axis {axes} out of bounds for {child.output_kind} batch output")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"reduction axis entries must be unique")
+    return normalized
+
+
+def _reduction_shape(child: Op, axes: tuple[int, ...] | None, keepdims: bool) -> tuple[str, int | None]:
+    if keepdims:
+        return child.output_kind, child.output_width
+    rank = _batch_rank(child)
+    normalized = tuple(range(rank)) if axes is None else axes
+    remaining = tuple(axis for axis in range(rank) if axis not in normalized)
+    per_tick = tuple(axis for axis in remaining if axis != 0)
+    if len(per_tick) == 0:
+        return "scalar", 1
+    if len(per_tick) == 1:
+        width = child.output_width if child.output_kind == "matrix" and per_tick[0] == 2 else 1
+        return "vector", width
+    return "matrix", child.output_width
+
 def _object_projection_op(expr: Call, child_ops: tuple[Op, ...]) -> tuple[Op, int | tuple[int, ...] | None] | None:
     if expr.fn not in {"get_beta", "get_preds"} or len(expr.args) != 1 or not child_ops:
         return None
@@ -1054,6 +1148,14 @@ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tup
     projection = _object_projection_op(expr, child_ops)
     if projection is not None:
         return projection
+    reduce_builder = REDUCE_OP_FACTORIES.get(expr.fn)
+    if reduce_builder is not None and len(expr.args) in (1, 2, 3):
+        axes = _normalize_reduction_axes(child_ops[0], _literal_axis_arg(expr.args[1] if len(expr.args) >= 2 else None, expr.fn))
+        keepdims = _literal_bool_arg(expr.args[2], expr.fn, 3) if len(expr.args) >= 3 else False
+        if keepdims and (axes is None or 0 in axes):
+            raise ValueError("time-axis reductions do not support keepdims=True")
+        output_kind, output_width = _reduction_shape(child_ops[0], axes, keepdims)
+        return reduce_builder(axes, keepdims, output_kind, output_width), tuple(range(1, len(expr.args))) or None
     if expr.fn == "cache" and len(expr.args) in (1, 2):
         storage = "ram"
         if len(expr.args) == 2:
@@ -1483,10 +1585,12 @@ def _compile_node(
     if not isinstance(expr, Call):
         raise ValueError(f"Unsupported node {expr}")
 
+    static_arg_idxs = set(range(1, len(expr.args))) if expr.fn in REDUCE_OP_FACTORIES else set()
     child_ids = tuple(
         _compile_node(a, memo, nodes, input_names, external_cache_names)
-        for a in expr.args
-        if not (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
+        for i, a in enumerate(expr.args)
+        if i not in static_arg_idxs
+        and not (((expr.fn, ANY_ARITY) in OP_FACTORIES or expr.fn == "cache") and isinstance(a, String))
     )
     op, drop_child_idx = _build_op(expr, tuple(nodes[cid].op for cid in child_ids))
     if drop_child_idx is not None:
