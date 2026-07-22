@@ -516,7 +516,15 @@ def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonn
     return call("Ridge", *features, y, weights, hl, ridge_lambda, 3.0 if nonneg else 2.0)
 
 
+def RegXS(*features, lambda_=None, lam=None) -> Expr:  # noqa: N802
+    reg_lambda = lambda_ if lambda_ is not None else lam
+    if reg_lambda is None:
+        return call("RegXS", *features)
+    return call("RegXS", *features, reg_lambda)
+
+
 get_beta = op("get_beta")
+get_fp = op("get_fp")
 get_preds = op("get_preds")
 rolling_quantile = op("rolling_quantile")
 mean = op("mean")
