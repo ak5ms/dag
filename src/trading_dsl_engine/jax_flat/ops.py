@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Callable
 
 import jax
@@ -168,6 +169,7 @@ class CacheOp(Op):
 @dataclass(frozen=True)
 class NaryOp(Op):
     fn: Callable[..., jax.Array]
+    batch_fn: Callable[..., jax.Array] | None = None
     output_kind: str = "vector"
     output_width: int | None = 1
     cpp_name: str | None = None
@@ -181,6 +183,8 @@ class NaryOp(Op):
 
     def scan_batch(self, state: Any, *child_sequences: jax.Array):
         del state
+        if self.batch_fn is not None:
+            return None, self.batch_fn(*child_sequences)
         return None, jax.vmap(self.fn)(*child_sequences)
 
 
@@ -1090,6 +1094,46 @@ def _cat(*values):
     return jnp.concatenate(tuple(_as_tick_matrix(array, rows) for array in arrays), axis=-1)
 
 
+def _elementwise_batch(fn: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+    def batch_fn(*values):
+        if os.getenv("TRADING_DSL_ENGINE_DISABLE_VECTORIZED_NARY_BATCH", "0") == "1":
+            return jax.vmap(fn)(*values)
+        arrays = tuple(jnp.asarray(value) for value in values)
+        has_non_scalar_tick = any(array.ndim >= 2 for array in arrays)
+        if has_non_scalar_tick:
+            arrays = tuple(array[:, None] if array.ndim == 1 else array for array in arrays)
+        return fn(*arrays)
+
+    return batch_fn
+
+
+def _cat_batch(*values):
+    if os.getenv("TRADING_DSL_ENGINE_DISABLE_VECTORIZED_NARY_BATCH", "0") == "1":
+        return jax.vmap(_cat)(*values)
+    arrays = tuple(jnp.asarray(value) for value in values)
+    rows = next((array.shape[0] for array in arrays if array.ndim >= 1), None)
+    cols = next((array.shape[1] for array in arrays if array.ndim >= 2), None)
+    normalized = []
+    for array in arrays:
+        if array.ndim == 0:
+            if rows is None:
+                normalized.append(array[None])
+            elif cols is None:
+                normalized.append(jnp.broadcast_to(array, (rows, 1)))
+            else:
+                normalized.append(jnp.broadcast_to(array, (rows, cols, 1)))
+        elif array.ndim == 1:
+            if cols is None:
+                normalized.append(array[:, None])
+            else:
+                normalized.append(jnp.broadcast_to(array[:, None, None], (array.shape[0], cols, 1)))
+        elif array.ndim == 2:
+            normalized.append(array[:, :, None] if cols is not None else array)
+        else:
+            normalized.append(array)
+    return jnp.concatenate(tuple(normalized), axis=-1)
+
+
 def _einsum(subscripts, *child_values):
     return jnp.einsum(subscripts, *child_values)
 
@@ -1177,19 +1221,23 @@ def _col(matrix, index: int):
 ANY_ARITY = -1
 
 
+def _elementwise_op(fn: Callable[..., jax.Array], **kwargs) -> NaryOp:
+    return NaryOp(fn, batch_fn=_elementwise_batch(fn), **kwargs)
+
+
 OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
-    ("abs", 1): lambda: NaryOp(jnp.abs, cpp_name="abs"),
-    ("ln", 1): lambda: NaryOp(jnp.log, cpp_name="ln"),
-    ("ceil", 1): lambda: NaryOp(jnp.ceil, cpp_name="ceil"),
-    ("floor", 1): lambda: NaryOp(jnp.floor, cpp_name="floor"),
-    ("round", 1): lambda: NaryOp(jnp.round, cpp_name="round"),
-    ("exp", 1): lambda: NaryOp(jnp.exp, cpp_name="exp"),
-    ("sign", 1): lambda: NaryOp(jnp.sign, cpp_name="sign"),
-    ("arctan", 1): lambda: NaryOp(jnp.arctan, cpp_name="arctan"),
-    ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan"),
-    ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify"),
-    ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction"),
-    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
+    ("abs", 1): lambda: _elementwise_op(jnp.abs, cpp_name="abs"),
+    ("ln", 1): lambda: _elementwise_op(jnp.log, cpp_name="ln"),
+    ("ceil", 1): lambda: _elementwise_op(jnp.ceil, cpp_name="ceil"),
+    ("floor", 1): lambda: _elementwise_op(jnp.floor, cpp_name="floor"),
+    ("round", 1): lambda: _elementwise_op(jnp.round, cpp_name="round"),
+    ("exp", 1): lambda: _elementwise_op(jnp.exp, cpp_name="exp"),
+    ("sign", 1): lambda: _elementwise_op(jnp.sign, cpp_name="sign"),
+    ("arctan", 1): lambda: _elementwise_op(jnp.arctan, cpp_name="arctan"),
+    ("isnan", 1): lambda: _elementwise_op(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan"),
+    ("purify", 1): lambda: _elementwise_op(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify"),
+    ("fraction", 1): lambda: _elementwise_op(lambda x: x - jnp.floor(x), cpp_name="fraction"),
+    ("norm_inv", 1): lambda: _elementwise_op(_norm_inv, cpp_name="norm_inv"),
     ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
     ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
@@ -1199,27 +1247,27 @@ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
     ("cumsum", 1): lambda: CumsumOp(),
-    ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),
-    ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub"),
-    ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul"),
-    ("mod", 2): lambda: NaryOp(lambda l, r: jnp.mod(l, r), cpp_name="mod"),
-    ("pow", 2): lambda: NaryOp(lambda l, r: l**r, cpp_name="pow"),
-    ("div", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div"),
-    ("floordiv", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv"),
-    ("eq", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq"),
-    ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne"),
-    ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt"),
-    ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt"),
-    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le"),
-    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge"),
-    ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
-    ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
-    ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
-    ("or_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
-    ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
-    ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
-    ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
-    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
+    ("add", 2): lambda: _elementwise_op(lambda l, r: l + r, cpp_name="add"),
+    ("sub", 2): lambda: _elementwise_op(lambda l, r: l - r, cpp_name="sub"),
+    ("mul", 2): lambda: _elementwise_op(lambda l, r: l * r, cpp_name="mul"),
+    ("mod", 2): lambda: _elementwise_op(lambda l, r: jnp.mod(l, r), cpp_name="mod"),
+    ("pow", 2): lambda: _elementwise_op(lambda l, r: l**r, cpp_name="pow"),
+    ("div", 2): lambda: _elementwise_op(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div"),
+    ("floordiv", 2): lambda: _elementwise_op(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv"),
+    ("eq", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq"),
+    ("ne", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne"),
+    ("lt", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt"),
+    ("gt", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt"),
+    ("le", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le"),
+    ("ge", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge"),
+    ("and", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+    ("and_", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+    ("or", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+    ("or_", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+    ("xor", 2): lambda: _elementwise_op(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
+    ("fillna", 2): lambda: _elementwise_op(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
+    ("where", 3): lambda: _elementwise_op(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
+    ("clip", 3): lambda: _elementwise_op(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
     ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
 }
 
