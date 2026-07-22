@@ -1,0 +1,120 @@
+--- a/src/trading_dsl_engine/jax_flat/ops_groupby.py
++++ b/src/trading_dsl_engine/jax_flat/ops_groupby.py
+@@ -156,6 +156,32 @@
+     return jax.tree_util.tree_map(set_leaf, tree, value)
+ 
+ 
++def _tree_take_slot_members(tree: Any, slots: jax.Array):
++    """Gather one independent member state from each keyed slot.
++
++    Memberwise formula graphs currently store every state leaf as
++    ``(capacity, group_width, ...)``.  Advanced indexing therefore lifts the
++    complete inner graph state for all members in one operation, so the RHS can
++    be evaluated with a single ``vmap`` instead of a sequential member loop.
++    """
++    tree = _ensure_dataclass_pytree(tree)
++    members = jnp.arange(slots.shape[0], dtype=jnp.int32)
++
++    def take_leaf(leaf):
++        leaf = jnp.asarray(leaf)
++        return leaf[slots, members]
++
++    return jax.tree_util.tree_map(take_leaf, tree)
++
++
++def _tree_set_slot_members(tree: Any, slots: jax.Array, value: Any):
++    """Scatter a batched memberwise inner state back to keyed slots."""
++    tree = _ensure_dataclass_pytree(tree)
++    value = _ensure_dataclass_pytree(value)
++    members = jnp.arange(slots.shape[0], dtype=jnp.int32)
++    return jax.tree_util.tree_map(lambda dst, src: dst.at[slots, members].set(src), tree, value)
++
++
+ def _hash_mix(value: jax.Array) -> jax.Array:
+     value = value ^ (value >> jnp.uint64(33))
+     value = value * jnp.uint64(0xff51afd7ed558ccd)
+@@ -256,6 +282,23 @@
+     return slot, GroupTableState(keys_next, occupied_next, table_next, count_next)
+ 
+ 
++def _lookup_or_insert_slots(
++    table: GroupTableState,
++    key_matrix: jax.Array,
++) -> tuple[jax.Array, GroupTableState]:
++    """Resolve one keyed slot per member while keeping RHS work vectorized."""
++    width = key_matrix.shape[0]
++    slots0 = jnp.empty((width,), dtype=jnp.int32)
++
++    def body(member_pos, carry):
++        table_c, slots_c = carry
++        slot, table_n = _lookup_or_insert_slot(table_c, key_matrix[member_pos])
++        return table_n, slots_c.at[member_pos].set(slot)
++
++    table_next, slots = jax.lax.fori_loop(0, width, body, (table, slots0))
++    return slots, table_next
++
++
+ def _empty_output_like(template: Any, width: int):
+     template = _ensure_dataclass_pytree(template)
+ 
+@@ -651,29 +694,7 @@
+ 
+     def _inner_graph_is_memberwise(self) -> bool:
+         nodes = getattr(self.inner_op, "nodes", None)
+-        if nodes is None:
+-            return False
+-        allowed_cpp_names = {
+-            "add", "sub", "mul", "div", "mod", "pow", "floordiv",
+-            "eq", "ne", "lt", "gt", "le", "ge", "and", "or", "xor", "fillna", "where",
+-            "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
+-            "isnan", "purify", "fraction",
+-        }
+-        allowed_stateful = {"CumsumOp", "EwmOp", "FFillOp"}
+-        for node in nodes:
+-            op = node.op
+-            name = type(op).__name__
+-            if name in {"InputOp", "LiteralOp"}:
+-                continue
+-            if name in allowed_stateful:
+-                if op.output_width not in (None, 1):
+-                    return False
+-                continue
+-            cpp_name = getattr(op, "cpp_name", None)
+-            if cpp_name in allowed_cpp_names and op.output_width in (None, 1):
+-                continue
+-            return False
+-        return True
++        return bool(nodes) and all(getattr(node.op, "group_memberwise", False) for node in nodes)
+ 
+     def _tick_group_memberwise(
+         self,
+@@ -682,42 +703,39 @@
+         key_matrix: jax.Array,
+         args: tuple[jax.Array, ...],
+     ):
+-        group_width = idx.shape[0]
+-        sample_state = (
+-            _tree_take_slot_member(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+-            if runtime.inner_state is not None
+-            else None
++        inner_state = _flush_cached_inner_state(
++            runtime.inner_state,
++            runtime.cache.inner_state,
++            runtime.cache.slot,
++            runtime.cache.valid,
+         )
+-        sample_args = tuple(_slice_member_arg(arg, idx, jnp.asarray(0, dtype=jnp.int32), self._row_arg_source_width(arg, idx)) for arg in args)
+-        _, template = self.inner_op.tick(sample_state, *sample_args)
+-        group_out0 = _group_output_like(template, group_width)
++        slots, table_next = _lookup_or_insert_slots(runtime.table, key_matrix)
++        selected_state = _tree_take_slot_members(inner_state, slots)
+ 
+-        def body(member_pos, carry):
+-            table_c, inner_state_c, group_out_c = carry
+-            key = key_matrix[member_pos]
+-            slot, table_next = _lookup_or_insert_slot(table_c, key)
+-            member_args = tuple(_slice_member_arg(arg, idx, member_pos, self._row_arg_source_width(arg, idx)) for arg in args)
+-            selected_state = (
+-                _tree_take_slot_member(inner_state_c, slot, member_pos)
+-                if inner_state_c is not None
+-                else None
