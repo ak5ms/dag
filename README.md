@@ -135,6 +135,8 @@ The active `trading_dsl_engine.jax_flat` backend additionally supports `buffer(s
 
 For JIT diagnostics, a compiled JAX-flat runtime exposes `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)`, with `get_jaxpr`/`get_compiled_hlo` aliases. The arguments follow `tick`'s state-and-row ABI; the latter helper returns the compiled executable's optimized HLO text. `jit_compile_count` tracks observed tick-transition JAX traces (a per-runtime proxy for JIT compilation cache misses) across live ticks, compiled-HLO inspection, and batch scans, and `reset_jit_compile_count()` clears it. JAXPR inspection itself does not change the counter because it does not compile.
 
+These diagnostics describe one streaming tick, not the separate operator-wise batch schedule. Batch lowering releases chunk sequences after their final DAG consumer (while retaining roots and `cache(...)` values), and the remaining region-planning work is documented with 1M x 9 measurements in [`docs/jax_flat_batch_lowering_1m_x_9.md`](docs/jax_flat_batch_lowering_1m_x_9.md).
+
 ```python
 import jax.numpy as jnp
 from trading_dsl_engine.base.dsl import buffer, shift, var

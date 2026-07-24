@@ -16,13 +16,13 @@ except Exception:
     pl = None
 
 from trading_dsl_engine.jax_flat.engine import compile_formula as compile_flat
-from trading_dsl_engine.jax_new.engine import compile_formula as compile_new
+from trading_dsl_engine.jax.engine import compile_formula as compile_new
 from trading_dsl_engine import build_engine, run_batch_from_mapping
 
 RUN_PERF = os.getenv("RUN_PERF_TESTS", "0") == "1"
 T_ROWS = 1440 * 365 * 3
 N_INSTRUMENTS = 9
-N_RUNS = 10
+N_RUNS = int(os.getenv("TRADING_DSL_JAX_FLAT_PERF_RUNS", "10"))
 
 
 def _stats(samples: list[float]) -> dict[str, float]:
@@ -159,6 +159,58 @@ def test_perf_nary_chain_jax_flat_scan_batch_vs_tick_scan():
     tick_out = jit_tick_scan(state, open_data, close_data)[1]
     batch_out = scan_batch(open_data, close_data)
     np.testing.assert_allclose(np.asarray(tick_out), np.asarray(batch_out), rtol=1e-10, atol=1e-10, equal_nan=True)
+
+
+@pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
+def test_perf_batch_lowering_strategies_1m_by_9_assets():
+    """Report the operator-wise batch plan cost against a fused tick-scan baseline.
+
+    This deliberately covers a prefix scan, a dependent stateful chain, and a
+    cross-sectional producer.  The comparison is diagnostic rather than a
+    wall-clock guardrail: the preferred lowering is formula and backend
+    dependent, but the cases expose regressions in either general strategy.
+    """
+    t_rows = int(1e6)
+    n_assets = 9
+    close_data = (
+        jnp.arange(t_rows, dtype=jnp.float64)[:, None]
+        + jnp.arange(n_assets, dtype=jnp.float64)[None, :] / n_assets
+    )
+
+    for formula in (
+        "cumsum(close)",
+        "ewm(cumsum(close), 21)",
+        "cumsum(xs_sort(close))",
+    ):
+        runtime = compile_flat(formula, cpp=False)
+        state = runtime.init_state(n_assets)
+
+        @jax.jit
+        def tick_scan(state0, sequence):
+            return jax.lax.scan(
+                lambda carry, row: runtime.tick(carry, row),
+                state0,
+                sequence,
+                unroll=32,
+            )
+
+        # Compile and synchronize both candidates before recording execution.
+        batch_out = runtime.run_batch({"close": close_data})[1]
+        tick_out = tick_scan(state, close_data)[1]
+        jax.block_until_ready((batch_out, tick_out))
+
+        batch_stats = _bench(lambda values: runtime.run_batch({"close": values})[1], close_data)
+        tick_stats = _bench(lambda state0, values: tick_scan(state0, values)[1], state, close_data)
+        print(f"batch_lowering::{formula}::operator_wise {batch_stats}")
+        print(f"batch_lowering::{formula}::fused_tick_scan {tick_stats}")
+
+        np.testing.assert_allclose(
+            np.asarray(batch_out),
+            np.asarray(tick_out),
+            rtol=1e-10,
+            atol=1e-10,
+            equal_nan=True,
+        )
 
 
 @pytest.mark.skipif(not RUN_PERF, reason="set RUN_PERF_TESTS=1 to enable perf tests")
