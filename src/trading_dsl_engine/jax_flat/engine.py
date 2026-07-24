@@ -179,6 +179,7 @@ class InnerGraphOp(Op):
         n_steps = input_sequences[0].shape[0]
         values: list[Any] = [jnp.array(0.0)] * len(self.nodes)
         new_state = list(()) if state_leaves is None else list(state_leaves)
+        remaining_uses = _node_use_counts(self.nodes, (self.output_id,))
 
         for idx, node in enumerate(self.nodes):
             op = node.op
@@ -196,6 +197,7 @@ class InnerGraphOp(Op):
             if field.index >= 0:
                 new_state[field.index] = next_state
             values[idx] = value
+            _release_consumed_values(values, remaining_uses, node.child_ids)
 
         next_states = tuple(new_state) if state_leaves is not None else None
         return next_states, values[self.output_id]
@@ -732,6 +734,10 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs, batch_start
     n_steps = inputs[0].shape[0]
     values: list[Any] = [jnp.array(0.0)] * len(runtime.program.nodes)
     new_state = list(state_leaves)
+    remaining_uses = _node_use_counts(
+        runtime.program.nodes,
+        runtime.program.outputs + runtime.program.cache_nodes,
+    )
 
     for idx, node in enumerate(runtime.program.nodes):
         op = node.op
@@ -753,10 +759,36 @@ def _scan_batch_chunk(runtime: JaxFlatRuntime, state_leaves, inputs, batch_start
         if field.index >= 0:
             new_state[field.index] = next_state
         values[idx] = value
+        _release_consumed_values(values, remaining_uses, node.child_ids)
 
     outs = tuple(values[i] for i in runtime.program.outputs)
     cache_outs = tuple(values[i] for i in runtime.program.cache_nodes)
     return tuple(new_state), outs[0] if len(outs) == 1 else jnp.stack(outs, axis=0), cache_outs
+
+
+def _node_use_counts(nodes: tuple[DagNode, ...], retained_nodes: tuple[int, ...]) -> list[int]:
+    """Return static sequence-value use counts for a DAG execution region.
+
+    Batch lowering emits whole time-axis arrays.  Releasing a child immediately
+    after its final consumer removes it from the traced Python graph, allowing
+    XLA's buffer assignment to reuse the associated chunk storage.  Outputs and
+    cache materializations are explicit terminal consumers, so they remain live
+    until the region returns.
+    """
+    counts = [0] * len(nodes)
+    for node in nodes:
+        for child_id in node.child_ids:
+            counts[child_id] += 1
+    for node_id in retained_nodes:
+        counts[node_id] += 1
+    return counts
+
+
+def _release_consumed_values(values: list[Any], remaining_uses: list[int], child_ids: tuple[int, ...]) -> None:
+    for child_id in child_ids:
+        remaining_uses[child_id] -= 1
+        if remaining_uses[child_id] == 0:
+            values[child_id] = None
 
 
 
