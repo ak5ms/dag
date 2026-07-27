@@ -21,6 +21,7 @@ class StatelessJaxCall(Expr):
     output_kind: OutputKind | None = None
     output_width: int | None = None
     name: str | None = None
+    cpp_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class StatelessJaxFunction:
     output_kind: OutputKind | None = None
     output_width: int | None = None
     name: str | None = None
+    cpp_name: str | None = None
 
     def __call__(self, *args) -> StatelessJaxCall:
         if not args:
@@ -41,6 +43,7 @@ class StatelessJaxFunction:
             output_kind=self.output_kind,
             output_width=self.output_width,
             name=self.name or getattr(self.fn, "__name__", None),
+            cpp_name=self.cpp_name,
         )
 
 
@@ -85,6 +88,7 @@ def stateless(
     output_kind: OutputKind | None = None,
     output_width: int | None = None,
     name: str | None = None,
+    cpp_name: str | None = None,
 ):
     """Build a jax_flat Expr wrapper around a stateless JAX callable.
 
@@ -100,6 +104,7 @@ def stateless(
             output_kind=output_kind,
             output_width=output_width,
             name=name or getattr(target, "__name__", None),
+            cpp_name=cpp_name,
         )
 
     if fn is None:
