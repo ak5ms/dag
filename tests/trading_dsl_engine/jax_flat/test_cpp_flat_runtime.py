@@ -4,7 +4,12 @@ import jax
 import pytest
 import numpy as np
 from trading_dsl_engine.jax_flat import compile_formula
-from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
+from trading_dsl_engine.jax_flat.engine_cpp import (
+    BroadcastMode,
+    compile_formula as compile_formula_native,
+    inspect_hybrid_partition,
+    lower_native_plan,
+)
 
 
 def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -57,6 +62,18 @@ def test_cpp_flat_more_stateless_and_matrix_ops_match_jax_flat():
         "add(add(and(gt(open, close), lt(close, open)), or(eq(open, close), ne(open, close))), xor(gt(open, close), lt(open, close)))",
     ):
         _assert_cpp_matches_jax(formula, data)
+
+
+def test_cpp_flat_xs_rank_preserves_upper_ties_and_nonfinite_masking():
+    values = np.array(
+        [
+            [3.0, 1.0, 1.0, 2.0, np.nan, np.inf],
+            [-0.0, 0.0, 4.0, 4.0, -np.inf, np.nan],
+            [7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
+        ],
+        dtype=np.float64,
+    )
+    _assert_cpp_matches_pure_jax("xs_rank(close)", {"close": values})
 
 
 def test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat():
@@ -166,6 +183,23 @@ def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     )
 
 
+def test_cpp_flat_groupby_hash_index_preserves_nan_signed_zero_and_key_churn():
+    rows, cols = 48, 6
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    close = row * 0.1 + col
+    key0 = np.mod(row + 7.0 * col, 31.0)
+    key1 = np.mod(3.0 * row + col, 11.0)
+    key0[2, 0] = np.nan
+    key0[3, 0] = np.nan
+    key1[5, 1] = -0.0
+    key1[6, 1] = 0.0
+    _assert_cpp_matches_pure_jax(
+        "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
+        {"close": close, "key0": key0, "key1": key1},
+    )
+
+
 def test_cpp_flat_tick_into_reuses_output_buffer():
     runtime = compile_formula_native("add(close, open)")
     state = runtime.init_state(3)
@@ -178,6 +212,106 @@ def test_cpp_flat_tick_into_reuses_output_buffer():
     runtime.tick_into(state, out, close + 1.0, open_)
     assert id(out) == out_id
     np.testing.assert_allclose(out, [12.0, 23.0, 34.0])
+
+
+def test_cpp_flat_tick_into_keeps_force_cast_input_alive_during_native_compute():
+    runtime = compile_formula_native("add(close, open)")
+    state = runtime.init_state(3)
+    out = np.empty(3, dtype=np.float64)
+    runtime.tick_into(
+        state,
+        out,
+        np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        np.array([10, 20, 30], dtype=np.int32),
+    )
+    np.testing.assert_allclose(out, [11.0, 22.0, 33.0])
+
+
+def test_cpp_flat_typed_plan_exposes_resolved_liveness_and_state():
+    runtime = compile_formula_native("add(cumsum(close), mul(open, 2.0))")
+    plan = runtime.native_plan
+    diagnostic = runtime.inspect_native_plan()
+
+    assert plan.output_id == len(plan.nodes) - 1
+    assert diagnostic["version"] == 1
+    assert diagnostic["dtype"] == "float64"
+    assert diagnostic["nodes"][plan.output_id]["liveness"][1] == len(plan.nodes)
+    cumsum_node = next(node for node in plan.nodes if node.opcode == "cumsum")
+    assert cumsum_node.stateful and not cumsum_node.pure
+    assert cumsum_node.state_index >= 0
+    assert cumsum_node.value_type.broadcast is BroadcastMode.ELEMENTWISE
+    assert all(node.live_until >= node.live_from for node in plan.nodes)
+
+
+def test_cpp_flat_typed_plan_rejects_unknown_dtype_without_touching_runtime():
+    runtime = compile_formula("add(close, 1.0)", cpp=False)
+    with pytest.raises(ValueError, match="unsupported native dtype"):
+        lower_native_plan(runtime.program, dtype="complex128")
+
+
+def test_cpp_flat_plan_optimization_folds_literals_cses_and_preserves_ticks():
+    formula = "add(add(close, mul(2.0, 3.0)), add(close, mul(2.0, 3.0)))"
+    jax_runtime = compile_formula(formula, cpp=False)
+    optimized, _ = lower_native_plan(jax_runtime.program)
+    reference, _ = lower_native_plan(jax_runtime.program, optimize=False)
+
+    assert len(optimized.nodes) < len(reference.nodes)
+    assert dict(optimized.optimizations)["constant_folds"] >= 1
+    assert dict(optimized.optimizations)["dead_nodes"] >= 1
+
+    native = compile_formula_native(formula)
+    state = native.init_state(4)
+    jax_state = jax_runtime.init_state(4)
+    rows = (
+        np.array([1.0, np.nan, np.inf, -np.inf]),
+        np.array([-2.0, 0.0, 5.0, np.nan]),
+    )
+    for row in rows:
+        native_out = native.tick(state, row)
+        jax_state, jax_out = jax_runtime.tick(jax_state, row)
+        np.testing.assert_allclose(native_out, np.asarray(jax_out), equal_nan=True)
+
+
+def test_cpp_flat_hybrid_partition_diagnostic_reports_cost_inputs():
+    from trading_dsl_engine.base.dsl import cumsum, var
+    from trading_dsl_engine.jax_flat import stateless
+
+    unsupported = stateless(lambda x: x + 1, name="diagnostic_only")
+    runtime = compile_formula(unsupported(cumsum(var("close"))) + 2.0, cpp=False)
+    diagnostic = inspect_hybrid_partition(runtime.program, 1024, 150)
+    assert diagnostic["version"] == 1
+    candidate = diagnostic["candidates"][0]
+    assert candidate["estimated_work"] > 0
+    assert candidate["frontier_bytes"] == 1024 * 150 * 8
+    assert candidate["conversion_copy"] is True
+    assert isinstance(candidate["accelerate"], bool)
+
+
+def test_cpp_flat_stateful_cse_shares_identical_alpha_denominator_transitions():
+    from flows.alpha_search import default_alpha_pnl
+    from flows.utils import pct_change
+    from trading_dsl_engine.base.dsl import cat, ewm, var, xs_rank
+
+    returns = pct_change(var("close"))
+    features = [xs_rank(ewm(returns, span)) for span in range(1, 5)]
+    formula = cat(
+        *(
+            default_alpha_pnl(
+                feature, roll_rets=returns, is_tradable=var("tradable"), hl=32
+            )
+            for feature in features
+        )
+    )
+    jax_runtime = compile_formula(formula, cpp=False)
+    plan, _ = lower_native_plan(jax_runtime.program)
+    assert dict(plan.optimizations)["stateful_common_subexpressions"] > 0
+
+    rng = np.random.default_rng(43)
+    data = {
+        "close": 100.0 + np.cumsum(rng.normal(size=(16, 6)), axis=0),
+        "tradable": (rng.random((16, 6)) > 0.1).astype(np.float64),
+    }
+    _assert_cpp_matches_pure_jax(formula, data)
 
 
 def test_cpp_flat_micro_runtime_comparison_smoke(capsys):

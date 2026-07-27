@@ -237,14 +237,18 @@ class JaxFlatRuntime(eqx.Module):
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
         if self.program.cache_nodes:
             self.clear_cached_values()
-        if self.cpp and not self.program.cache_nodes and not states and not out_path:
+        if self.cpp and not self.program.cache_nodes and not states:
             try:
                 from trading_dsl_engine.jax_flat.engine_cpp import _try_cpp_hybrid_batch
             except Exception as exc:
                 _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
             else:
-                hybrid = _try_cpp_hybrid_batch(self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback)
+                hybrid = _try_cpp_hybrid_batch(
+                    self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback, out_path=out_path
+                )
                 if hybrid is not None:
+                    if isinstance(hybrid[1], np.memmap):
+                        hybrid[1].flush()
                     return hybrid
         if _has_memmap_input(inputs) or out_path or _has_disk_cache_node(self):
             return _run_chunked_batch(self, inputs, states, out_path)
