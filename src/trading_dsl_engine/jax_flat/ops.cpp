@@ -86,6 +86,10 @@ enum class OpCode : int {
     Ridge,
     GetBeta,
     GetPreds,
+    VolumeForFitSession,
+    VolumeForSeenSession,
+    Nonnegative,
+    PctSeenSessionVolume,
     Group,
 };
 
@@ -145,6 +149,10 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "ridge") return OpCode::Ridge;
     if (name == "get_beta") return OpCode::GetBeta;
     if (name == "get_preds") return OpCode::GetPreds;
+    if (name == "volume_for_fit_session") return OpCode::VolumeForFitSession;
+    if (name == "volume_for_seen_session") return OpCode::VolumeForSeenSession;
+    if (name == "nonnegative") return OpCode::Nonnegative;
+    if (name == "pct_seen_session_volume") return OpCode::PctSeenSessionVolume;
     if (name == "group") return OpCode::Group;
     throw std::invalid_argument("unsupported C++ jax_flat opcode: " + name);
 }
@@ -490,6 +498,8 @@ private:
     std::vector<double> full_rank_scores_;
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
+    std::vector<const double*> batch_base_ptrs_;
+    std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> tick_input_owners_;
 };
 
 class Runtime {
@@ -501,9 +511,11 @@ public:
         }
         assign_native_state_indices();
         einsum_plans_.reserve(nodes_.size());
+        future_basis_tables_.reserve(nodes_.size());
         for (const auto& spec : nodes_) {
             has_xs_rank_ = has_xs_rank_ || spec.opcode == OpCode::XsRank;
             einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
+            future_basis_tables_.push_back(spec.opcode == OpCode::FutureRbfBasisSum ? make_future_basis_table(spec) : std::vector<double>{});
         }
     }
 
@@ -523,7 +535,7 @@ public:
         // Keep force-cast owners alive until native evaluation completes.  The
         // previous helper retained only their raw pointers, which could dangle
         // as soon as validation returned for non-float64/non-contiguous input.
-        auto input_arrays = bind_tick_rows(state, rows);
+        bind_tick_rows(state, rows);
         if (state.n_instruments_ >= 1024) {
             py::gil_scoped_release release;
             eval_row(state, state.row_ptrs_, &out_buf(0));
@@ -553,13 +565,19 @@ public:
         auto* __restrict output_ptr = static_cast<double*>(out_info.ptr);
         const int n = state.n_instruments_;
         state.row_ptrs_.assign(input_arrays.size(), nullptr);
-        std::vector<const double*> base_ptrs;
-        base_ptrs.reserve(input_arrays.size());
-        for (const auto& arr : input_arrays) base_ptrs.push_back(static_cast<const double*>(arr.request().ptr));
+        state.batch_base_ptrs_.resize(input_arrays.size());
+        for (size_t i = 0; i < input_arrays.size(); ++i) {
+            state.batch_base_ptrs_[i] = static_cast<const double*>(input_arrays[i].request().ptr);
+        }
         {
             py::gil_scoped_release release;
             for (int64_t t = 0; t < rows; ++t) {
-                for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
+                for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
+                    state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
+#if defined(__GNUC__) || defined(__clang__)
+                    if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
+#endif
+                }
                 eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
             }
         }
@@ -571,15 +589,16 @@ private:
     int output_id_;
     int n_states_;
     std::vector<EinsumExecPlan> einsum_plans_;
+    std::vector<std::vector<double>> future_basis_tables_;
     bool has_xs_rank_ = false;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
-    std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> bind_tick_rows(
+    void bind_tick_rows(
         State& state, py::args rows) const {
         if (rows.size() != state.row_ptrs_.size()) throw std::invalid_argument("wrong number of C++ jax_flat tick inputs");
-        std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> owners;
-        owners.reserve(rows.size());
+        state.tick_input_owners_.clear();
+        state.tick_input_owners_.reserve(rows.size());
         for (size_t i = 0; i < rows.size(); ++i) {
             py::array_t<double, py::array::c_style | py::array::forcecast> arr = py::cast<py::array>(rows[i]);
             auto info = arr.request();
@@ -587,9 +606,8 @@ private:
                 throw std::invalid_argument("C++ jax_flat tick inputs must be 1D float64 arrays matching n_instruments");
             }
             state.row_ptrs_[i] = static_cast<const double*>(info.ptr);
-            owners.push_back(std::move(arr));
+            state.tick_input_owners_.push_back(std::move(arr));
         }
-        return owners;
     }
 
     std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> validate_batch(
@@ -673,7 +691,6 @@ private:
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
-        std::vector<double> row(static_cast<size_t>(k));
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -684,26 +701,29 @@ private:
                 for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = NaN;
                 continue;
             }
-            normalized_rbf_row((ts - s) / len, k, row.data());
-            for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = row[static_cast<size_t>(b)];
+            normalized_rbf_row((ts - s) / len, k, dst_v.data.data() + static_cast<size_t>(i * k));
         }
     }
 
-    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v) {
+    static std::vector<double> make_future_basis_table(const NodeSpec& spec) {
+        const int k = spec.width;
+        const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
+        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
+        std::vector<double> vals(static_cast<size_t>(k));
+        for (int g = steps - 1; g >= 0; --g) {
+            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
+            for (int b = 0; b < k; ++b) suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
+        }
+        return suffix;
+    }
+
+    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v, const std::vector<double>& suffix) {
         const int n = state.n_instruments_;
         const int k = spec.width;
         const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
-        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
-        std::vector<double> vals(static_cast<size_t>(k));
-        for (int g = steps - 1; g >= 0; --g) {
-            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
-            for (int b = 0; b < k; ++b) {
-                suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
-            }
-        }
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -1168,7 +1188,7 @@ private:
                     fill_rbf_basis(state, spec, dst_v);
                     break;
                 case OpCode::FutureRbfBasisSum:
-                    fill_future_rbf_basis_sum(state, spec, dst_v);
+                    fill_future_rbf_basis_sum(state, spec, dst_v, future_basis_tables_[node_i]);
                     break;
                 case OpCode::Col: {
                     const auto& x = child(state, spec, 0);
@@ -1293,6 +1313,40 @@ private:
                 case OpCode::GetPreds: {
                     const auto& r = child(state, spec, 0);
                     std::copy(r.data.begin(), r.data.end(), dst);
+                    break;
+                }
+                case OpCode::VolumeForFitSession:
+                case OpCode::VolumeForSeenSession:
+                case OpCode::Nonnegative:
+                case OpCode::PctSeenSessionVolume: {
+                    const auto& first = child(state, spec, 0);
+                    for (int i = 0; i < n; ++i) {
+                        if (spec.opcode == OpCode::Nonnegative) {
+                            const double x = at(first, n, i);
+                            dst[i] = finite(x) ? std::max(x, 0.0) : 0.0;
+                            continue;
+                        }
+                        if (spec.opcode == OpCode::PctSeenSessionVolume) {
+                            const double seen = at(first, n, i);
+                            const double forecast = at(child(state, spec, 1), n, i);
+                            const double ts = at(child(state, spec, 2), n, i);
+                            const double start = at(child(state, spec, 3), n, i);
+                            dst[i] = finite(ts) && finite(start) && ts >= start && seen + forecast > 0.0
+                                ? seen / (seen + forecast) : NaN;
+                            continue;
+                        }
+                        const double volume = at(first, n, i);
+                        const double ts = at(child(state, spec, 1), n, i);
+                        const double start = at(child(state, spec, 2), n, i);
+                        const double end = at(child(state, spec, 3), n, i);
+                        bool active = finite(ts) && finite(start) && finite(end) && end > start && ts >= start && ts < end;
+                        if (spec.opcode == OpCode::VolumeForSeenSession) {
+                            const double tradable = at(child(state, spec, 4), n, i);
+                            active = active && finite(tradable) && tradable == 1.0;
+                        }
+                        const double clean = finite(volume) ? std::max(volume, 0.0) : 0.0;
+                        dst[i] = active ? clean : (spec.opcode == OpCode::VolumeForFitSession ? NaN : 0.0);
+                    }
                     break;
                 }
                 case OpCode::Group:
@@ -1765,6 +1819,7 @@ State::State(const Runtime* runtime, int n_instruments)
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
     row_ptrs_.assign(count_inputs(runtime->nodes_), nullptr);
+    tick_input_owners_.reserve(row_ptrs_.size());
     for (const NodeSpec& spec : runtime->nodes_) {
         if (spec.state_index < 0) continue;
         const int node_size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
