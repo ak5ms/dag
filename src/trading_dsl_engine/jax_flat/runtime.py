@@ -81,6 +81,18 @@ class JaxFlatRuntime(eqx.Module):
     get_jaxpr = inspect_jaxpr
     get_compiled_hlo = inspect_compiled_hlo
 
+    def explain(self, format: str = "text") -> str:
+        """Explain C++/JAX lowering islands as text, JSON, or Graphviz DOT."""
+        from trading_dsl_engine.jax_flat.engine_cpp import explain_cpp_plan
+
+        return explain_cpp_plan(self.program).format(format)
+
+    def get_lowering_plan(self):
+        """Return the structured, serializable C++/JAX lowering plan."""
+        from trading_dsl_engine.jax_flat.engine_cpp import explain_cpp_plan
+
+        return explain_cpp_plan(self.program)
+
     def _inspect_without_count(self, inspect):
         """Run a non-compiling tracing diagnostic without recording its trace."""
         count_before = self._jit_compile_tracker.count

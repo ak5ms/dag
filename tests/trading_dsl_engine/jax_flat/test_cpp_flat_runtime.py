@@ -326,6 +326,44 @@ def test_compile_formula_cpp_flag_and_unsupported_groupby_fallback_warning():
     np.testing.assert_allclose(np.asarray(fallback_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
 
 
+def test_cpp_lowering_plan_warning_and_visualizations():
+    from trading_dsl_engine.base.dsl import cumsum, var
+    from trading_dsl_engine.jax_flat import stateless
+
+    jax_only = stateless(lambda x: x + 1.0, name="jax_only_feature")
+    with pytest.warns(RuntimeWarning, match="jax_only_feature"):
+        runtime = compile_formula(jax_only(cumsum(var("close"))), cpp=True)
+
+    plan = runtime.get_lowering_plan()
+    assert plan.missing_cpp_functions == ("jax_only_feature",)
+    assert [node.backend for node in plan.nodes] == ["cpp", "cpp", "jax"]
+    assert "JAX-flat lowering plan" in runtime.explain()
+    assert '"backend": "jax"' in runtime.explain("json")
+    dot = runtime.explain("dot")
+    assert dot.startswith("digraph jax_flat_plan")
+    assert "n1 -> n2" in dot
+
+
+def test_cpp_warning_uses_real_spec_lowerer_as_capability_source(monkeypatch):
+    import trading_dsl_engine.jax_flat.engine_cpp as engine_cpp
+
+    lower_specs = engine_cpp._cpp_node_specs
+
+    def reject_add(program):
+        root = program.nodes[program.outputs[0]].op
+        if getattr(root, "cpp_name", None) == "add":
+            raise NotImplementedError("test lowerer rejected add")
+        return lower_specs(program)
+
+    monkeypatch.setattr(engine_cpp, "_cpp_node_specs", reject_add)
+    with pytest.warns(RuntimeWarning, match=r"function\(s\): add"):
+        runtime = compile_formula("add(close, 1.0)", cpp=True)
+
+    add_node = runtime.get_lowering_plan().nodes[-1]
+    assert add_node.backend == "jax"
+    assert add_node.reason == "test lowerer rejected add"
+
+
 def test_cpp_flat_outer_and_einsum_subset_match_jax_flat():
     rows = 10
     cols = 4
