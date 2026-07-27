@@ -15,14 +15,37 @@ baseline measurement.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
+import os
 import resource
+import tempfile
 import time
 import tracemalloc
 
 import numpy as np
 
 from trading_dsl_engine.jax_flat.engine_cpp import compile_formula
+
+
+def _alpha_sharpes_formula():
+    from flows.alpha_search import default_alpha_pnl
+    from flows.utils import pct_change
+    from trading_dsl_engine.base.dsl import cat, ewm, var, xs_rank
+
+    returns = pct_change(var("mp_out0.close"))
+    features = [xs_rank(ewm(returns, span)) for span in range(1, 30)]
+    return cat(
+        *(
+            default_alpha_pnl(
+                feature,
+                roll_rets=returns,
+                is_tradable=var("is_tradable_out0"),
+                hl=1440,
+            )
+            for feature in features
+        )
+    )
 
 
 CASES = {
@@ -35,7 +58,55 @@ CASES = {
     "groupby_churn": "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
     "universe_groupby": "groupby((univ([0, 1], [2, 3]), key0), close, cumsum(self_))",
     "ridge": "get_preds(Ridge(cat(close, open), open, 1.0, 16.0, 0.01))",
+    "alpha_sharpes": None,
 }
+
+
+def benchmark_alpha_sharpes(rows: int, instruments: int, runs: int, *, cpp: bool) -> dict[str, object]:
+    from trading_dsl_engine.jax_flat.engine import compile_formula as compile_formula_auto
+    from trading_dsl_engine.jax_flat.engine_cpp import lower_native_plan
+
+    rng = np.random.default_rng(19)
+    returns = rng.normal(scale=1e-3, size=(rows, instruments))
+    mid = 100.0 * np.exp(np.cumsum(returns, axis=0))
+    inputs = {
+        "mp_out0.close": mid,
+        "is_tradable_out0": (rng.random((rows, instruments)) > 0.02).astype(np.float64),
+    }
+    t0 = time.perf_counter()
+    runtime = compile_formula_auto(_alpha_sharpes_formula(), cpp=cpp)
+    construction_seconds = time.perf_counter() - t0
+    plan, _ = lower_native_plan(runtime.program)
+
+    samples = []
+    output_bytes = rows * instruments * 29 * np.dtype(np.float64).itemsize
+    for run in range(runs + 1):
+        fd, path = tempfile.mkstemp(prefix="alpha_sharpes_", suffix=".memmap")
+        os.close(fd)
+        try:
+            t0 = time.perf_counter()
+            _, out = runtime.run_batch(inputs, out_path=path)
+            elapsed = time.perf_counter() - t0
+            if run:
+                samples.append(rows / elapsed)
+            del out
+        finally:
+            os.unlink(path)
+    return {
+        "case": "alpha_sharpes",
+        "backend": "cpp" if cpp else "jax",
+        "rows": rows,
+        "instruments": instruments,
+        "source_nodes": len(runtime.program.nodes),
+        "optimized_native_nodes": len(plan.nodes),
+        "optimizations": dict(plan.optimizations),
+        "opcodes": dict(Counter(node.opcode for node in plan.nodes)),
+        "construction_seconds": construction_seconds,
+        "output_bytes": output_bytes,
+        "runs": runs,
+        "batch_rows_per_second": float(np.median(samples)),
+        "batch_samples": samples,
+    }
 
 
 def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1) -> dict[str, object]:
@@ -115,10 +186,18 @@ def main() -> None:
     parser.add_argument("--instruments", type=int, choices=(150, 1000, 4000), default=150)
     parser.add_argument("--ticks", type=int, default=2000)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--backend", choices=("cpp", "jax"), default="cpp")
     args = parser.parse_args()
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
-        print(json.dumps(benchmark(case, args.rows, args.instruments, args.ticks, args.runs), sort_keys=True))
+        result = (
+            benchmark_alpha_sharpes(
+                args.rows, args.instruments, args.runs, cpp=args.backend == "cpp"
+            )
+            if case == "alpha_sharpes"
+            else benchmark(case, args.rows, args.instruments, args.ticks, args.runs)
+        )
+        print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

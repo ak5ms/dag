@@ -319,6 +319,11 @@ struct NodeValue {
     int size(int n) const { return rows(n) * width; }
 };
 
+struct RankItem {
+    double value;
+    int instrument;
+};
+
 struct ValueState {
     Vec value;
     Vec weight;
@@ -481,6 +486,8 @@ private:
     std::vector<RidgeState> ridge_states_;
     std::vector<InstrumentBasisMeanState> instrument_basis_mean_states_;
     std::vector<GroupState> group_states_;
+    std::vector<RankItem> rank_items_;
+    std::vector<double> full_rank_scores_;
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
 };
@@ -495,6 +502,7 @@ public:
         assign_native_state_indices();
         einsum_plans_.reserve(nodes_.size());
         for (const auto& spec : nodes_) {
+            has_xs_rank_ = has_xs_rank_ || spec.opcode == OpCode::XsRank;
             einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
         }
     }
@@ -537,10 +545,12 @@ public:
     void run_batch_into(State& state, py::array_t<double> out, py::args arrays) const {
         int64_t rows = -1;
         auto input_arrays = validate_batch(state, arrays, rows);
-        auto out_buf = out.mutable_unchecked<2>();
-        if (out_buf.shape(0) != rows || out_buf.shape(1) != static_cast<py::ssize_t>(output_size(state))) {
+        auto out_info = out.request();
+        const int row_width = output_size(state);
+        if (!(out.flags() & py::array::c_style) || out_info.size != rows * row_width) {
             throw std::invalid_argument("C++ jax_flat batch output shape mismatch");
         }
+        auto* __restrict output_ptr = static_cast<double*>(out_info.ptr);
         const int n = state.n_instruments_;
         state.row_ptrs_.assign(input_arrays.size(), nullptr);
         std::vector<const double*> base_ptrs;
@@ -550,7 +560,7 @@ public:
             py::gil_scoped_release release;
             for (int64_t t = 0; t < rows; ++t) {
                 for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
-                eval_row(state, state.row_ptrs_, &out_buf(t, 0));
+                eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
             }
         }
     }
@@ -561,6 +571,7 @@ private:
     int output_id_;
     int n_states_;
     std::vector<EinsumExecPlan> einsum_plans_;
+    bool has_xs_rank_ = false;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
@@ -842,6 +853,42 @@ private:
         const auto& lhs = child(state, spec, 0);
         const auto& rhs = child(state, spec, 1);
         const int width = dst_v.width;
+        if (width == 1) {
+            const bool lhs_scalar = lhs.rows(n) == 1;
+            const bool rhs_scalar = rhs.rows(n) == 1;
+            const double lhs0 = lhs.data[0];
+            const double rhs0 = rhs.data[0];
+            Eigen::Map<Vec> out(dst, n);
+            Eigen::Map<const Vec> lhs_vec(lhs.data.data(), lhs_scalar ? 1 : n);
+            Eigen::Map<const Vec> rhs_vec(rhs.data.data(), rhs_scalar ? 1 : n);
+            if constexpr (Code == OpCode::Add) {
+                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 + rhs0);
+                else if (lhs_scalar) out.array() = lhs0 + rhs_vec.array();
+                else if (rhs_scalar) out.array() = lhs_vec.array() + rhs0;
+                else out.array() = lhs_vec.array() + rhs_vec.array();
+            } else if constexpr (Code == OpCode::Sub) {
+                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 - rhs0);
+                else if (lhs_scalar) out.array() = lhs0 - rhs_vec.array();
+                else if (rhs_scalar) out.array() = lhs_vec.array() - rhs0;
+                else out.array() = lhs_vec.array() - rhs_vec.array();
+            } else if constexpr (Code == OpCode::Mul) {
+                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 * rhs0);
+                else if (lhs_scalar) out.array() = lhs0 * rhs_vec.array();
+                else if (rhs_scalar) out.array() = lhs_vec.array() * rhs0;
+                else out.array() = lhs_vec.array() * rhs_vec.array();
+            } else if constexpr (Code == OpCode::Div) {
+                if (rhs_scalar) {
+                    if (rhs0 == 0.0) out.setConstant(NaN);
+                    else if (lhs_scalar) out.setConstant(lhs0 / rhs0);
+                    else out.array() = lhs_vec.array() / rhs0;
+                } else if (lhs_scalar) {
+                    out.array() = (rhs_vec.array() == 0.0).select(NaN, lhs0 / rhs_vec.array());
+                } else {
+                    out.array() = (rhs_vec.array() == 0.0).select(NaN, lhs_vec.array() / rhs_vec.array());
+                }
+            }
+            return;
+        }
         for (int i = 0; i < n; ++i) {
             for (int c = 0; c < width; ++c) {
                 const double a = at(lhs, n, i, c);
@@ -949,6 +996,18 @@ private:
                     const auto& tv = child(state, spec, 1);
                     const auto& fv = child(state, spec, 2);
                     const int width = dst_v.width;
+                    if (width == 1) {
+                        const bool cond_scalar = cond.rows(n) == 1;
+                        const bool true_scalar = tv.rows(n) == 1;
+                        const bool false_scalar = fv.rows(n) == 1;
+                        for (int i = 0; i < n; ++i) {
+                            const double c = cond_scalar ? cond.data[0] : cond.data[static_cast<size_t>(i)];
+                            const double t = true_scalar ? tv.data[0] : tv.data[static_cast<size_t>(i)];
+                            const double f = false_scalar ? fv.data[0] : fv.data[static_cast<size_t>(i)];
+                            dst[i] = c != 0.0 ? t : f;
+                        }
+                        break;
+                    }
                     for (int i = 0; i < n; ++i) {
                         for (int c = 0; c < width; ++c) {
                             dst[static_cast<size_t>(i * width + c)] = at(cond, n, i, c) != 0.0 ? at(tv, n, i, c) : at(fv, n, i, c);
@@ -1040,14 +1099,33 @@ private:
                 }
                 case OpCode::XsRank: {
                     const auto& x = child(state, spec, 0);
-                    std::vector<double> compact;
-                    compact.reserve(static_cast<size_t>(n));
-                    for (int i = 0; i < n; ++i) if (finite(x.data[static_cast<size_t>(i)])) compact.push_back(x.data[static_cast<size_t>(i)]);
-                    std::sort(compact.begin(), compact.end());
-                    const double denom = static_cast<double>(compact.size() + 1);
+                    auto& items = state.rank_items_;
+                    int count = 0;
                     for (int i = 0; i < n; ++i) {
-                        const double v = x.data[static_cast<size_t>(i)];
-                        dst[i] = finite(v) ? norm_inv(static_cast<double>(std::upper_bound(compact.begin(), compact.end(), v) - compact.begin()) / denom) : NaN;
+                        const double value = x.data[static_cast<size_t>(i)];
+                        if (finite(value)) {
+                            items[static_cast<size_t>(count++)] = RankItem{value, i};
+                        } else {
+                            dst[i] = NaN;
+                        }
+                    }
+                    std::sort(
+                        items.begin(), items.begin() + count,
+                        [](const RankItem& lhs, const RankItem& rhs) { return lhs.value < rhs.value; });
+                    const double denom = static_cast<double>(count + 1);
+                    int tie_start = 0;
+                    while (tie_start < count) {
+                        int upper = tie_start + 1;
+                        while (upper < count && items[static_cast<size_t>(upper)].value == items[static_cast<size_t>(tie_start)].value) {
+                            ++upper;
+                        }
+                        const double score = count == n
+                            ? state.full_rank_scores_[static_cast<size_t>(upper - 1)]
+                            : norm_inv(static_cast<double>(upper) / denom);
+                        for (int pos = tie_start; pos < upper; ++pos) {
+                            dst[items[static_cast<size_t>(pos)].instrument] = score;
+                        }
+                        tie_start = upper;
                     }
                     break;
                 }
@@ -1641,8 +1719,17 @@ void configure_group_universe(GroupState& group, const NodeSpec& spec, int n_ins
     }
 }
 
-State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instruments) {
+State::State(const Runtime* runtime, int n_instruments)
+    : n_instruments_(n_instruments),
+      rank_items_(runtime->has_xs_rank_ ? static_cast<size_t>(n_instruments) : 0),
+      full_rank_scores_(runtime->has_xs_rank_ ? static_cast<size_t>(n_instruments) : 0) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
+    if (runtime->has_xs_rank_) {
+        for (int rank = 1; rank <= n_instruments; ++rank) {
+            full_rank_scores_[static_cast<size_t>(rank - 1)] =
+                norm_inv(static_cast<double>(rank) / static_cast<double>(n_instruments + 1));
+        }
+    }
     values_.resize(runtime->nodes_.size());
     for (size_t i = 0; i < runtime->nodes_.size(); ++i) {
         const NodeSpec& spec = runtime->nodes_[i];
@@ -1670,7 +1757,10 @@ State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instr
                 fixed_einsum_rows = !instrument_rows;
             }
         }
-        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
+        value.rows_kind = (
+            spec.opcode == OpCode::Literal ||
+            (spec.opcode == OpCode::GetBeta && !instrument_beta) ||
+            spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);

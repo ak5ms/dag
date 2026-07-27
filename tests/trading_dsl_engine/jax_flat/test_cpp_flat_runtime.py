@@ -64,6 +64,18 @@ def test_cpp_flat_more_stateless_and_matrix_ops_match_jax_flat():
         _assert_cpp_matches_jax(formula, data)
 
 
+def test_cpp_flat_xs_rank_preserves_upper_ties_and_nonfinite_masking():
+    values = np.array(
+        [
+            [3.0, 1.0, 1.0, 2.0, np.nan, np.inf],
+            [-0.0, 0.0, 4.0, 4.0, -np.inf, np.nan],
+            [7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
+        ],
+        dtype=np.float64,
+    )
+    _assert_cpp_matches_pure_jax("xs_rank(close)", {"close": values})
+
+
 def test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat():
     rows = 40
     cols = 4
@@ -273,6 +285,33 @@ def test_cpp_flat_hybrid_partition_diagnostic_reports_cost_inputs():
     assert candidate["frontier_bytes"] == 1024 * 150 * 8
     assert candidate["conversion_copy"] is True
     assert isinstance(candidate["accelerate"], bool)
+
+
+def test_cpp_flat_stateful_cse_shares_identical_alpha_denominator_transitions():
+    from flows.alpha_search import default_alpha_pnl
+    from flows.utils import pct_change
+    from trading_dsl_engine.base.dsl import cat, ewm, var, xs_rank
+
+    returns = pct_change(var("close"))
+    features = [xs_rank(ewm(returns, span)) for span in range(1, 5)]
+    formula = cat(
+        *(
+            default_alpha_pnl(
+                feature, roll_rets=returns, is_tradable=var("tradable"), hl=32
+            )
+            for feature in features
+        )
+    )
+    jax_runtime = compile_formula(formula, cpp=False)
+    plan, _ = lower_native_plan(jax_runtime.program)
+    assert dict(plan.optimizations)["stateful_common_subexpressions"] > 0
+
+    rng = np.random.default_rng(43)
+    data = {
+        "close": 100.0 + np.cumsum(rng.normal(size=(16, 6)), axis=0),
+        "tradable": (rng.random((16, 6)) > 0.1).astype(np.float64),
+    }
+    _assert_cpp_matches_pure_jax(formula, data)
 
 
 def test_cpp_flat_micro_runtime_comparison_smoke(capsys):

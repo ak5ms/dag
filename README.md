@@ -202,6 +202,10 @@ The benchmark accepts `--runs` (default 5), reports raw samples plus medians, an
 
 Native group lookup uses a preallocated open-addressed table per universe rather than scanning group capacity. Composite floating keys are hashed canonically: all NaN payloads share the dedicated NaN group and signed zeros compare/hash as the same key. The benchmark includes `groupby_locality` and `groupby_churn` cases to keep both ends of the lookup workload visible.
 
+Fully native formulas remain native when `out_path` is set: validated batch execution writes scalar, vector, or statically-sized matrix roots directly into the disk-backed output. The `alpha_sharpes` benchmark reproduces the 29-feature alpha-PnL graph and reports source/optimized node counts, CSE totals, output bytes, cold construction, and repeated disk-backed throughput for `--backend cpp` or `--backend jax`.
+
+Native `xs_rank` stores reusable `(value, instrument)` scratch in `State`, sorts each cross section once, and linearly scans equal-value runs to scatter the existing upper-rank score. This removes the former binary search for every instrument without changing NaN/nonfinite masking or tie behavior. The next whole-graph redesign target is feature-family lifting: sibling pipelines with identical topology and different static parameters (such as the 29 EWM spans in `alpha_sharpes`) should lower to lane-packed matrix kernels and structure-of-arrays state, reducing row dispatch from hundreds of scalar-vector nodes to a small number of prebound kernel descriptors while retaining the canonical sequential row transition.
+
 Hybrid candidate selection estimates native work, materialized frontier bytes, conversion/copy requirements, and launch count, and rejects islands whose estimated transfer/launch cost exceeds their work. `inspect_hybrid_partition(program, rows, instruments)` returns the decision inputs and result without affecting runtime state or entering the hot path.
 
 ## Development quickstart

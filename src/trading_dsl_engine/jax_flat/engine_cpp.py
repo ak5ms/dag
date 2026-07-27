@@ -5,6 +5,7 @@ from enum import Enum
 import json
 from typing import Any, Callable
 import os
+import tempfile
 
 import jax.numpy as jnp
 import numpy as np
@@ -114,10 +115,6 @@ class CppFlatRuntime:
     core: Any
     supported_ops: tuple[str, ...]
     native_plan: NativeExecutionPlan
-
-    def explain(self, format: str = "text") -> str:
-        """Return the lowered native plan as text, JSON, or Graphviz DOT."""
-        return explain_cpp_plan(self.program).format(format)
 
     def init_state(self, n_instruments: int):
         return self.core.init_state(n_instruments)
@@ -332,7 +329,7 @@ def _optimize_native_specs(specs, output_id: int, program: StreamingProgram):
     key_to_id: dict[Any, int] = {}
     optimized: list[tuple[Any, ...]] = []
     source_ids: list[int] = []
-    folded = aliases = common = 0
+    folded = aliases = common = stateful_common = 0
     literal_values: dict[int, float] = {}
 
     def replace_spec(spec, **changes):
@@ -358,12 +355,20 @@ def _optimize_native_specs(specs, output_id: int, program: StreamingProgram):
             opcode = "literal"
             children = ()
             folded += 1
-        is_pure = not program.nodes[old_id].op.is_stateful and opcode != "group"
+        is_stateful = program.nodes[old_id].op.is_stateful
+        is_shareable = opcode != "group"
+        # Identical deterministic state transitions over identical children can
+        # share one state slot: their on_data/emit sequences are indistinguishable.
+        # Group nodes remain unique because they own keyed routing domains.
+        key_spec = list(spec)
+        if is_stateful:
+            key_spec[3] = -1  # physical state slot is assigned after planning
         # repr canonicalizes nested tuple parameters and gives NaNs a stable key.
-        key = repr(spec) if is_pure else None
+        key = repr(tuple(key_spec)) if is_shareable else None
         if key is not None and key in key_to_id:
             remap[old_id] = key_to_id[key]
             common += 1
+            stateful_common += int(is_stateful)
             continue
         new_id = len(optimized)
         remap[old_id] = new_id
@@ -394,6 +399,7 @@ def _optimize_native_specs(specs, output_id: int, program: StreamingProgram):
         ("constant_folds", folded),
         ("aliases_removed", aliases),
         ("common_subexpressions", common),
+        ("stateful_common_subexpressions", stateful_common),
     )
     return compact_specs, compact_remap[new_output], compact_sources, counts
 
@@ -655,13 +661,24 @@ def _cpp_inner_node_specs(inner: InnerGraphOp, spec_tuple):
 
 # --- JAX/C++ island handling for hybrid jax_flat batch execution: start ---
 
-def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None]):
+def _try_cpp_hybrid_batch(
+    runtime,
+    inputs,
+    accelerator_cache: dict[tuple[Any, ...], Any],
+    warn_callback: Callable[[Any, str], None],
+    out_path=False,
+):
     """Run full-native or staged native/JAX/native batch execution when possible."""
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
-    full = _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=False)
+    full = _try_cpp_full_batch(
+        runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path
+    )
     if full is not None:
         return full
+    if out_path:
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        return None
 
     n_steps, n_instruments = inputs[0].shape
     candidates = _cpp_hybrid_candidates(runtime.program, n_steps, n_instruments)
@@ -680,13 +697,14 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
     for node_id in candidates:
         subprogram, source_input_indices = _subprogram_for_node(runtime.program, node_id)
         try:
-            node_specs, _, state_count = _cpp_node_specs(subprogram)
+            plan, _ = lower_native_plan(subprogram)
         except NotImplementedError:
             continue
-        key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
+        node_specs = plan.reference_specs()
+        key = (node_specs, plan.output_id, plan.state_count, n_instruments)
         core = accelerator_cache.get(key)
         if core is None:
-            core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
+            core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
             accelerator_cache[key] = core
         state = core.init_state(n_instruments)
         source_inputs = tuple(np.asarray(inputs[i], dtype=np.float64) for i in source_input_indices)
@@ -707,24 +725,56 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
     return residual_runtime._run_batch_once(residual_inputs, None, False)
 
 
-def _try_cpp_full_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ...], Any], warn_callback: Callable[[Any, str], None], *, emit_warning: bool):
+def _try_cpp_full_batch(
+    runtime,
+    inputs,
+    accelerator_cache: dict[tuple[Any, ...], Any],
+    warn_callback: Callable[[Any, str], None],
+    *,
+    emit_warning: bool,
+    out_path=False,
+):
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
-        node_specs, _, state_count = _cpp_node_specs(runtime.program)
+        plan, _ = lower_native_plan(runtime.program)
     except Exception as exc:
         if emit_warning:
             warn_callback(runtime, f"C++ jax_flat accelerator unsupported for this formula: {exc}; falling back to JAX-flat")
         return None
 
     n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, runtime.program.outputs[0], state_count, n_instruments)
+    out = _cpp_batch_output(runtime.program, out_path, n_steps, n_instruments) if out_path else None
+    node_specs = plan.reference_specs()
+    key = (node_specs, plan.output_id, plan.state_count, n_instruments)
     core = accelerator_cache.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
+        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
-    raw = core.run_batch(state, *tuple(np.asarray(arr, dtype=np.float64) for arr in inputs))
+    cpp_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
+    if out is not None:
+        core.run_batch_into(state, out, *cpp_inputs)
+        return state, out
+    raw = core.run_batch(state, *cpp_inputs)
     return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
+
+
+def _cpp_batch_output(program: StreamingProgram, out_path, n_steps: int, n_instruments: int):
+    root = program.nodes[program.outputs[0]].op
+    if root.output_kind == "scalar":
+        shape = (n_steps,)
+    elif root.output_kind == "vector":
+        shape = (n_steps, n_instruments)
+    elif root.output_kind == "matrix" and root.output_width is not None:
+        shape = (n_steps, n_instruments, int(root.output_width))
+    else:
+        return None
+    if out_path is True:
+        fd, out_path = tempfile.mkstemp(prefix="trading_dsl_engine_cpp_out_", suffix=".memmap")
+        os.close(fd)
+    if not isinstance(out_path, (str, os.PathLike)):
+        return None
+    return np.memmap(os.fspath(out_path), mode="w+", dtype=np.float64, shape=shape)
 
 
 def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, ...], upstream_values: tuple[np.ndarray, ...], accelerator_cache: dict[tuple[Any, ...], Any]):
@@ -739,7 +789,7 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
         return None
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
-        node_specs, _, state_count = _cpp_node_specs(subprogram)
+        plan, _ = lower_native_plan(subprogram)
     except Exception:
         return None
 
@@ -757,10 +807,11 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
     frontier_values = tuple(frontier_values)
 
     n_steps, n_instruments = inputs[0].shape
-    key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
+    node_specs = plan.reference_specs()
+    key = (node_specs, plan.output_id, plan.state_count, n_instruments)
     core = accelerator_cache.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, subprogram.outputs[0], state_count)
+        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
     frontier_by_id = dict(zip(frontier_ids, frontier_values, strict=True))
