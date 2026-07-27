@@ -162,6 +162,7 @@ def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
             output_kind=node.output_kind,
             output_width=node.output_width,
             name=node.name,
+            cpp_name=node.cpp_name,
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
@@ -202,6 +203,7 @@ def _expr_key(node: Expr):
             node.output_kind,
             node.output_width,
             node.name,
+            node.cpp_name,
             tuple(_expr_key(a) for a in node.args),
         )
     if isinstance(node, KeyTuple):
@@ -272,6 +274,7 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
             output_kind=node.output_kind,
             output_width=node.output_width,
             name=node.name,
+            cpp_name=node.cpp_name,
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
@@ -345,7 +348,13 @@ def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -
         raise ValueError("stateless JAX call expects at least one child")
     output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
     output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
-    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width, diagnostic_name=expr.name)
+    return NaryOp(
+        expr.fn,
+        output_kind=output_kind,
+        output_width=output_width,
+        cpp_name=expr.cpp_name,
+        diagnostic_name=expr.name,
+    )
 
 
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
@@ -837,6 +846,7 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
             output_kind=node.output_kind,
             output_width=node.output_width,
             name=node.name,
+            cpp_name=node.cpp_name,
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))

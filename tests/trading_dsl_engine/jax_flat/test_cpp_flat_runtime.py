@@ -165,6 +165,38 @@ def test_cpp_flat_rbf_and_instrument_basis_mean_match_jax_flat():
     ):
         _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)
 
+
+def test_cpp_flat_roll_returns_pov_helpers_are_fully_native():
+    from flows.pov import RollRets
+
+    rows, cols = 36, 4
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    data = {
+        "wdte_out0": np.where(row < 18, 2.0, 1.0) + np.zeros((rows, cols)),
+        "mp_out0.close": 100.0 + row + col,
+        "mp_out1.close": 102.0 + 0.8 * row + col,
+        "is_tradable_out0": np.ones((rows, cols)),
+        "is_tradable_out1": np.ones((rows, cols)),
+        "_ev_ts": row + np.zeros((rows, cols)),
+        "session_start0": np.zeros((rows, cols)),
+        "session_end0": np.full((rows, cols), 30.0),
+        "volume_out0": 10.0 + row + col,
+    }
+    expr = RollRets().roll_rets(n_basis=3, h=32)
+    native = compile_formula_native(expr)
+    pure_jax = compile_formula(expr, cpp=False)
+    _, native_out = native.run_batch(data)
+    _, jax_out = pure_jax.run_batch(data)
+    np.testing.assert_allclose(native_out, np.asarray(jax_out), rtol=1e-9, atol=1e-9, equal_nan=True)
+    assert {node.opcode for node in native.native_plan.nodes} >= {
+        "volume_for_fit_session",
+        "volume_for_seen_session",
+        "nonnegative",
+        "pct_seen_session_volume",
+        "get_beta",
+    }
+
 def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     rows = 18
     cols = 5
