@@ -3,6 +3,7 @@ import time
 import jax
 import pytest
 import numpy as np
+import trading_dsl_engine._native_build as native_build
 from trading_dsl_engine.jax_flat import compile_formula
 from trading_dsl_engine.jax_flat.engine_cpp import (
     BroadcastMode,
@@ -10,6 +11,7 @@ from trading_dsl_engine.jax_flat.engine_cpp import (
     inspect_hybrid_partition,
     lower_native_plan,
 )
+from trading_dsl_engine._native_build import native_source_fingerprint
 
 
 def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -18,6 +20,59 @@ def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
     _, cpp_out = cpp_runtime.run_batch(data)
     _, jax_out = jax_runtime.run_batch(data)
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
+
+
+def test_cpp_flat_source_fingerprint_tracks_transitive_local_dependencies(tmp_path):
+    source_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
+    source_dir.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# build configuration\n")
+    (tmp_path / "pyproject.toml").write_text("[build-system]\n")
+    (source_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
+    (source_dir / "ops.cpp").write_text('#include "detail.h"\n')
+    detail = source_dir / "detail.h"
+    detail.write_text("constexpr int version = 1;\n")
+
+    initial = native_source_fingerprint(tmp_path)
+    detail.write_text("constexpr int version = 2;\n")
+    assert native_source_fingerprint(tmp_path) != initial
+
+    restored = native_source_fingerprint(tmp_path)
+    (tmp_path / "unrelated.txt").write_text("not a compiler input")
+    assert native_source_fingerprint(tmp_path) == restored
+
+    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
+    nnqp_dir.mkdir(parents=True)
+    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
+    nnqp_header = nnqp_dir / "nnqp_eigen_impl.h"
+    nnqp_header.write_text("constexpr int solver_version = 1;\n")
+    nnqp_initial = native_source_fingerprint(tmp_path, "eigen_nnqp")
+    nnqp_header.write_text("constexpr int solver_version = 2;\n")
+    assert native_source_fingerprint(tmp_path, "eigen_nnqp") != nnqp_initial
+
+
+def test_native_extension_rebuilds_once_for_changed_dependency(tmp_path, monkeypatch):
+    flat_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
+    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
+    flat_dir.mkdir(parents=True)
+    nnqp_dir.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# build configuration\n")
+    (flat_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
+    dependency = flat_dir / "ops.cpp"
+    dependency.write_text("constexpr int version = 1;\n")
+    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
+    (nnqp_dir / "nnqp_eigen_impl.h").write_text("constexpr int solver_version = 1;\n")
+    extension = flat_dir / "_cpp_flat.so"
+    extension.touch()
+    builds = []
+    monkeypatch.setattr(native_build.subprocess, "run", lambda *args, **kwargs: builds.append((args, kwargs)))
+
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    assert len(builds) == 1
+
+    dependency.write_text("constexpr int version = 2;\n")
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    assert len(builds) == 2
 
 
 def _assert_cpp_matches_pure_jax(formula, data, *, rtol=1e-10, atol=1e-10):
