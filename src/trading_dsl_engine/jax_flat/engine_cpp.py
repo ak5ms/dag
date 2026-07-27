@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import json
 from typing import Any, Callable
 import os
 
@@ -32,8 +33,70 @@ from trading_dsl_engine.jax_flat.ops import (
     RbfBasisOp,
     RidgeOp,
     RollingMeanOp,
+    RollingOp,
     ShiftOp,
+    BufferShiftOp,
 )
+
+
+@dataclass(frozen=True)
+class CppPlanNode:
+    """One node in the inspectable JAX-flat/native lowering plan."""
+
+    id: int
+    operation: str
+    backend: str
+    island: int
+    children: tuple[int, ...]
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CppLoweringPlan:
+    """Static explanation of the native/JAX partition selected at compile time."""
+
+    nodes: tuple[CppPlanNode, ...]
+    outputs: tuple[int, ...]
+    input_names: tuple[str, ...]
+    unsupported_functions: tuple[str, ...] = ()
+
+    @property
+    def missing_cpp_functions(self) -> tuple[str, ...]:
+        direct = (
+            node.operation
+            for node in self.nodes
+            if node.backend == "jax" and not (node.operation == "groupby" and node.reason and node.reason.startswith("nested RHS"))
+        )
+        return tuple(sorted({*direct, *self.unsupported_functions}))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"inputs": self.input_names, "outputs": self.outputs, "missing_cpp_functions": self.missing_cpp_functions, "nodes": [asdict(node) for node in self.nodes]}
+
+    def to_dot(self) -> str:
+        lines = ["digraph jax_flat_plan {", '  rankdir="LR";']
+        for node in self.nodes:
+            color = "#59a14f" if node.backend == "cpp" else "#4e79a7"
+            label = f"{node.id}: {node.operation}\\n{node.backend} island {node.island}"
+            lines.append(f'  n{node.id} [label="{label}", style=filled, fillcolor="{color}"];')
+            lines.extend(f"  n{child} -> n{node.id};" for child in node.children)
+        lines.append("}")
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        rows = ["JAX-flat lowering plan:"]
+        for node in self.nodes:
+            reason = f" ({node.reason})" if node.reason else ""
+            rows.append(f"  {node.id:>3}  {node.backend:<3} island={node.island:<2} {node.operation} <- {list(node.children)}{reason}")
+        return "\n".join(rows)
+
+    def format(self, format: str = "text") -> str:
+        if format == "text":
+            return str(self)
+        if format == "dot":
+            return self.to_dot()
+        if format == "json":
+            return json.dumps(self.to_dict(), indent=2)
+        raise ValueError("format must be 'text', 'json', or 'dot'")
 
 
 @dataclass(frozen=True)
@@ -49,6 +112,10 @@ class CppFlatRuntime:
     program: StreamingProgram
     core: Any
     supported_ops: tuple[str, ...]
+
+    def explain(self, format: str = "text") -> str:
+        """Return the lowered native plan as text, JSON, or Graphviz DOT."""
+        return explain_cpp_plan(self.program).format(format)
 
     def init_state(self, n_instruments: int):
         return self.core.init_state(n_instruments)
@@ -135,6 +202,20 @@ def _normalize_batch_inputs_for_program(program: StreamingProgram, inputs):
     return inputs
 
 
+def _cpp_spec_tuple(
+    name, children=(), input_index=-1, state_index=-1, literal=0.0,
+    param=0.0, int_param=0, width=1, feature_widths=(), inner_specs=(),
+    inner_output_id=-1, str_param="",
+):
+    """Canonical Python/native node-spec ABI constructor."""
+    return (
+        name, tuple(children), input_index, state_index, float(literal),
+        float(param), int(int_param), int(1 if width is None else width),
+        tuple(int(w) for w in feature_widths), tuple(inner_specs),
+        int(inner_output_id), str(str_param),
+    )
+
+
 def _cpp_node_specs(program: StreamingProgram):
     if len(program.outputs) != 1:
         raise NotImplementedError("C++ jax_flat currently supports exactly one output")
@@ -142,55 +223,26 @@ def _cpp_node_specs(program: StreamingProgram):
     supported = []
     state_count = program.state_layout.total_leaves
 
-    def spec_tuple(
-        name,
-        children=(),
-        input_index=-1,
-        state_index=-1,
-        literal=0.0,
-        param=0.0,
-        int_param=0,
-        width=1,
-        feature_widths=(),
-        inner_specs=(),
-        inner_output_id=-1,
-        str_param="",
-    ):
-        return (
-            name,
-            tuple(children),
-            input_index,
-            state_index,
-            float(literal),
-            float(param),
-            int(int_param),
-            int(1 if width is None else width),
-            tuple(int(w) for w in feature_widths),
-            tuple(inner_specs),
-            int(inner_output_id),
-            str(str_param),
-        )
-
     for idx, node in enumerate(program.nodes):
         op = node.op
         field = program.state_layout.node_fields[idx]
         state_index = field.index
         width = op.output_width or 1
         if isinstance(op, InputOp):
-            specs.append(spec_tuple("input", input_index=op.input_index, width=1))
+            specs.append(_cpp_spec_tuple("input", input_index=op.input_index, width=1))
             supported.append("input")
             continue
         if isinstance(op, LiteralOp):
-            specs.append(spec_tuple("literal", literal=op.value, width=1))
+            specs.append(_cpp_spec_tuple("literal", literal=op.value, width=1))
             supported.append("literal")
             continue
         if isinstance(op, GroupByOp):
-            group_spec, group_supported = _cpp_groupby_spec(op, node.child_ids, state_index, spec_tuple)
+            group_spec, group_supported = _cpp_groupby_spec(op, node.child_ids, state_index, _cpp_spec_tuple)
             specs.append(group_spec)
             supported.extend(group_supported)
             continue
         if isinstance(op, CacheOp):
-            specs.append(spec_tuple("cache", node.child_ids, width=width))
+            specs.append(_cpp_spec_tuple("cache", node.child_ids, width=width))
             supported.append("cache")
             continue
         if isinstance(op, NaryOp) and op.cpp_name is not None:
@@ -210,43 +262,43 @@ def _cpp_node_specs(program: StreamingProgram):
             feature_widths = ()
             if op.cpp_name == "einsum":
                 feature_widths = tuple(program.nodes[cid].op.output_width or 1 for cid in node.child_ids)
-            specs.append(spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width, feature_widths=feature_widths, str_param=getattr(op, "cpp_str_param", "")))
+            specs.append(_cpp_spec_tuple(op.cpp_name, node.child_ids, int_param=op.cpp_int_param, param=op.cpp_param, width=cpp_width, feature_widths=feature_widths, str_param=getattr(op, "cpp_str_param", "")))
             supported.append(op.cpp_name)
             continue
         if isinstance(op, CumsumOp):
-            specs.append(spec_tuple("cumsum", node.child_ids, state_index=state_index, width=width))
+            specs.append(_cpp_spec_tuple("cumsum", node.child_ids, state_index=state_index, width=width))
             supported.append("cumsum")
             continue
         if isinstance(op, EwmOp) and op.span is not None and op.ignore_na and not op.adjust:
             min_periods = -1 if op.min_periods is None else int(round(float(op.min_periods)))
             ewm_flags = (1 if op.ignore_na else 0) | (2 if op.adjust else 0)
-            specs.append(spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=(min_periods + 1) * 4 + ewm_flags, width=width))
+            specs.append(_cpp_spec_tuple("ewm", node.child_ids, state_index=state_index, param=op.span, int_param=(min_periods + 1) * 4 + ewm_flags, width=width))
             supported.append("ewm")
             continue
         if isinstance(op, RollingMeanOp):
-            specs.append(spec_tuple("roll_mean", node.child_ids, state_index=state_index, param=op.min_periods, int_param=op.lookback, width=width))
+            specs.append(_cpp_spec_tuple("roll_mean", node.child_ids, state_index=state_index, param=op.min_periods, int_param=op.lookback, width=width))
             supported.append("roll_mean")
             continue
         if isinstance(op, FFillOp) and not op.dynamic_limit:
             limit = -1 if op.limit is None else op.limit
-            specs.append(spec_tuple("ffill", node.child_ids, state_index=state_index, int_param=limit, width=width))
+            specs.append(_cpp_spec_tuple("ffill", node.child_ids, state_index=state_index, int_param=limit, width=width))
             supported.append("ffill")
             continue
         if isinstance(op, ShiftOp):
-            specs.append(spec_tuple("shift", node.child_ids, state_index=state_index, int_param=op.max_size, width=width))
+            specs.append(_cpp_spec_tuple("shift", node.child_ids, state_index=state_index, int_param=op.max_size, width=width))
             supported.append("shift")
             continue
         if isinstance(op, RbfBasisOp):
-            specs.append(spec_tuple("rbf_basis", node.child_ids, int_param=op.n_basis, width=op.n_basis))
+            specs.append(_cpp_spec_tuple("rbf_basis", node.child_ids, int_param=op.n_basis, width=op.n_basis))
             supported.append("rbf_basis")
             continue
         if isinstance(op, FutureRbfBasisSumOp):
-            specs.append(spec_tuple("future_rbf_basis_sum", node.child_ids, int_param=op.n_basis, param=op.n_steps, width=op.n_basis))
+            specs.append(_cpp_spec_tuple("future_rbf_basis_sum", node.child_ids, int_param=op.n_basis, param=op.n_steps, width=op.n_basis))
             supported.append("future_rbf_basis_sum")
             continue
         if isinstance(op, InstrumentBasisMeanOp):
             specs.append(
-                spec_tuple(
+                _cpp_spec_tuple(
                     "instrument_basis_mean",
                     node.child_ids,
                     state_index=state_index,
@@ -261,7 +313,7 @@ def _cpp_node_specs(program: StreamingProgram):
             if state_index < 0:
                 state_index = state_count
                 state_count += 1
-            specs.append(spec_tuple("ridge", node.child_ids, state_index=state_index, int_param=1 if op.nonneg else 0, width=1, feature_widths=op.feature_widths))
+            specs.append(_cpp_spec_tuple("ridge", node.child_ids, state_index=state_index, int_param=1 if op.nonneg else 0, width=1, feature_widths=op.feature_widths))
             supported.append("ridge")
             continue
         raise NotImplementedError(f"C++ jax_flat does not yet support node {idx}: {type(op).__name__}")
@@ -636,3 +688,115 @@ def _program_with_cpp_inputs(program: StreamingProgram, node_ids: tuple[int, ...
 def _require_vector_cpp_op(op: Op, name: str) -> None:
     if op.output_kind != "vector" or op.output_width not in (None, 1):
         raise NotImplementedError(f"C++ jax_flat op {name!r} currently supports vector outputs only")
+
+
+def _operation_name(op: Op) -> str:
+    if isinstance(op, NaryOp):
+        return op.cpp_name or op.diagnostic_name or getattr(op.fn, "__name__", "stateless")
+    if isinstance(op, RollingOp):
+        return getattr(op.fn, "__name__", "rolling")
+    names = {
+        InputOp: "input", LiteralOp: "literal", CacheOp: "cache", CumsumOp: "cumsum",
+        EwmOp: "ewm", RollingMeanOp: "roll_mean", ShiftOp: "shift",
+        BufferShiftOp: "buffer", FFillOp: "ffill", RbfBasisOp: "rbf_basis",
+        FutureRbfBasisSumOp: "future_rbf_basis_sum", InstrumentBasisMeanOp: "InstrumentBasisMean",
+        RidgeOp: "Ridge", GroupByOp: "groupby",
+    }
+    return names.get(type(op), type(op).__name__)
+
+
+def _synthetic_node_program(program: StreamingProgram, node_id: int) -> StreamingProgram:
+    """Build a one-op program whose children are typed JAX frontier inputs."""
+    node = program.nodes[node_id]
+    inputs = tuple(
+        DagNode(InputOp(index, output_kind=program.nodes[child_id].op.output_kind, output_width=program.nodes[child_id].op.output_width), ())
+        for index, child_id in enumerate(node.child_ids)
+    )
+    nodes = inputs + (DagNode(node.op, tuple(range(len(inputs)))),)
+    return StreamingProgram(
+        nodes=nodes,
+        outputs=(len(nodes) - 1,),
+        input_names=tuple(f"frontier_{index}" for index in range(len(inputs))),
+        state_layout=_state_layout_for_nodes(nodes),
+    )
+
+
+def _node_cpp_support(program: StreamingProgram, node_id: int) -> tuple[bool, str | None]:
+    """Ask the real native spec lowerer whether a node accepts JAX frontiers."""
+    op = program.nodes[node_id].op
+    try:
+        # Object projections cannot cross a numeric frontier, so validate their
+        # complete ancestry exactly as execution lowering does.
+        if isinstance(op, NaryOp) and op.cpp_name in {"get_beta", "get_preds"}:
+            candidate = _subprogram_for_node(program, node_id)[0]
+        else:
+            candidate = _synthetic_node_program(program, node_id)
+        _cpp_node_specs(candidate)
+    except Exception as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _groupby_cpp_gaps(op: GroupByOp) -> tuple[str, ...]:
+    inner = op.inner_op
+    if not isinstance(inner, InnerGraphOp):
+        return ("groupby",)
+    gaps = []
+    for node_id, node in enumerate(inner.nodes):
+        inputs = tuple(
+            DagNode(InputOp(index, output_kind=inner.nodes[child_id].op.output_kind, output_width=inner.nodes[child_id].op.output_width), ())
+            for index, child_id in enumerate(node.child_ids)
+        )
+        nodes = inputs + (DagNode(node.op, tuple(range(len(inputs)))),)
+        candidate = InnerGraphOp(nodes, len(nodes) - 1, _state_layout_for_nodes(nodes), len(inputs))
+        try:
+            _cpp_inner_node_specs(candidate, _cpp_spec_tuple)
+        except Exception:
+            gaps.append(_operation_name(node.op))
+    return tuple(sorted(set(gaps)))
+
+
+def explain_cpp_plan(program: StreamingProgram) -> CppLoweringPlan:
+    """Partition a lowered program into connected C++ and JAX execution islands.
+
+    This is compile-time-only introspection; it neither imports the extension nor
+    executes/traces JAX.  Consequently it is safe to use in tooling and notebooks.
+    """
+    group_gaps = {node_id: _groupby_cpp_gaps(node.op) for node_id, node in enumerate(program.nodes) if isinstance(node.op, GroupByOp)}
+    support = []
+    for node_id, node in enumerate(program.nodes):
+        supported, reason = _node_cpp_support(program, node_id)
+        if group_gaps.get(node_id):
+            supported, reason = False, "nested RHS requires JAX: " + ", ".join(group_gaps[node_id])
+        support.append((supported, reason))
+    backends = ["cpp" if item[0] else "jax" for item in support]
+    parents = list(range(len(program.nodes)))
+
+    def find(node_id: int) -> int:
+        while parents[node_id] != node_id:
+            parents[node_id] = parents[parents[node_id]]
+            node_id = parents[node_id]
+        return node_id
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for node_id, node in enumerate(program.nodes):
+        for child_id in node.child_ids:
+            if backends[child_id] == backends[node_id]:
+                union(node_id, child_id)
+
+    island_numbers: dict[tuple[str, int], int] = {}
+    plan_nodes = []
+    for node_id, node in enumerate(program.nodes):
+        _, reason = support[node_id]
+        backend = backends[node_id]
+        component = (backend, find(node_id))
+        if component not in island_numbers:
+            island_numbers[component] = sum(key[0] == backend for key in island_numbers)
+        island = island_numbers[component]
+        plan_nodes.append(CppPlanNode(node_id, _operation_name(node.op), backend, island, node.child_ids, reason))
+    nested_gaps = tuple(sorted({name for gaps in group_gaps.values() for name in gaps}))
+    return CppLoweringPlan(tuple(plan_nodes), program.outputs, program.input_names, nested_gaps)
