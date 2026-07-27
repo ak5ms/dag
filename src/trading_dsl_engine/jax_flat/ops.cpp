@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -512,7 +516,12 @@ public:
         assign_native_state_indices();
         einsum_plans_.reserve(nodes_.size());
         future_basis_tables_.reserve(nodes_.size());
-        for (const auto& spec : nodes_) {
+        dependents_.resize(nodes_.size());
+        indegrees_.resize(nodes_.size());
+        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
+            const auto& spec = nodes_[node_i];
+            indegrees_[node_i] = static_cast<int>(spec.children.size());
+            for (int child_id : spec.children) dependents_.at(static_cast<size_t>(child_id)).push_back(static_cast<int>(node_i));
             has_xs_rank_ = has_xs_rank_ || spec.opcode == OpCode::XsRank;
             einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
             future_basis_tables_.push_back(spec.opcode == OpCode::FutureRbfBasisSum ? make_future_basis_table(spec) : std::vector<double>{});
@@ -546,15 +555,15 @@ public:
         }
     }
 
-    py::array_t<double> run_batch(State& state, py::args arrays) const {
+    py::array_t<double> run_batch(State& state, int workers, py::args arrays) const {
         int64_t rows = -1;
         validate_batch(state, arrays, rows);
         py::array_t<double> out({rows, static_cast<int64_t>(output_size(state))});
-        run_batch_into(state, out, arrays);
+        run_batch_into(state, out, workers, arrays);
         return out;
     }
 
-    void run_batch_into(State& state, py::array_t<double> out, py::args arrays) const {
+    void run_batch_into(State& state, py::array_t<double> out, int workers, py::args arrays) const {
         int64_t rows = -1;
         auto input_arrays = validate_batch(state, arrays, rows);
         auto out_info = out.request();
@@ -571,19 +580,75 @@ public:
         }
         {
             py::gil_scoped_release release;
-            for (int64_t t = 0; t < rows; ++t) {
-                for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
-                    state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
-#if defined(__GNUC__) || defined(__clang__)
-                    if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
-#endif
+            const int thread_count = std::max(1, std::min(workers, static_cast<int>(nodes_.size())));
+            if (thread_count == 1) {
+                for (int64_t t = 0; t < rows; ++t) {
+                    bind_batch_row(state, t, rows, n);
+                    eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
                 }
-                eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
+            } else {
+                eval_batch_dag(state, output_ptr, rows, row_width, n, thread_count);
             }
         }
     }
 
 private:
+    void bind_batch_row(State& state, int64_t t, int64_t rows, int n) const {
+        for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
+            state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
+#if defined(__GNUC__) || defined(__clang__)
+            if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
+#endif
+        }
+    }
+
+    void eval_batch_dag(State& state, double* output, int64_t rows, int width, int n, int workers) const {
+        std::mutex mutex;
+        std::condition_variable ready_cv;
+        std::deque<int> ready;
+        std::vector<int> remaining = indegrees_;
+        int completed = 0;
+        int64_t row = 0;
+        bool done = rows == 0;
+        bind_batch_row(state, 0, rows, n);
+        for (size_t i = 0; i < remaining.size(); ++i) if (remaining[i] == 0) ready.push_back(static_cast<int>(i));
+        auto worker = [&] {
+            while (true) {
+                int node;
+                int64_t task_row;
+                {
+                    std::unique_lock lock(mutex);
+                    ready_cv.wait(lock, [&] { return done || !ready.empty(); });
+                    if (done) return;
+                    node = ready.front(); ready.pop_front(); task_row = row;
+                }
+                eval_node(state, state.row_ptrs_, output + task_row * width, static_cast<size_t>(node));
+                {
+                    std::lock_guard lock(mutex);
+                    for (int dependent : dependents_[static_cast<size_t>(node)])
+                        if (--remaining[static_cast<size_t>(dependent)] == 0) ready.push_back(dependent);
+                    if (++completed == static_cast<int>(nodes_.size())) {
+                        if (!supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode)) {
+                            const auto& root = state.values_[static_cast<size_t>(output_id_)];
+                            std::copy(root.data.begin(), root.data.begin() + root.size(n), output + task_row * width);
+                        }
+                        if (++row == rows) done = true;
+                        else {
+                            remaining = indegrees_; completed = 0;
+                            bind_batch_row(state, row, rows, n);
+                            for (size_t i = 0; i < remaining.size(); ++i) if (remaining[i] == 0) ready.push_back(static_cast<int>(i));
+                        }
+                    }
+                }
+                ready_cv.notify_all();
+            }
+        };
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<size_t>(workers));
+        for (int i = 0; i < workers; ++i) threads.emplace_back(worker);
+        for (auto& thread : threads) thread.join();
+    }
+
     friend class State;
     std::vector<NodeSpec> nodes_;
     int output_id_;
@@ -591,6 +656,8 @@ private:
     std::vector<EinsumExecPlan> einsum_plans_;
     std::vector<std::vector<double>> future_basis_tables_;
     bool has_xs_rank_ = false;
+    std::vector<std::vector<int>> dependents_;
+    std::vector<int> indegrees_;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
@@ -947,14 +1014,13 @@ private:
         }
     }
 
-    void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+    void eval_node(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr, size_t node_i) const {
         const int n = state.n_instruments_;
         const bool direct_root = supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode);
-        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
-            const NodeSpec& spec = nodes_[node_i];
-            NodeValue& dst_v = state.values_[node_i];
-            double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
-            switch (spec.opcode) {
+        const NodeSpec& spec = nodes_[node_i];
+        NodeValue& dst_v = state.values_[node_i];
+        double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
+        switch (spec.opcode) {
                 case OpCode::Input: {
                     const double* __restrict src = input_ptrs.at(static_cast<size_t>(spec.input_index));
                     std::copy(src, src + n, dst);
@@ -1352,8 +1418,13 @@ private:
                 case OpCode::Group:
                     eval_group(state, spec, dst_v);
                     break;
-            }
         }
+    }
+
+    void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        const int n = state.n_instruments_;
+        const bool direct_root = supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode);
+        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) eval_node(state, input_ptrs, out_ptr, node_i);
         if (!direct_root) {
             const auto& root = state.values_[static_cast<size_t>(output_id_)];
             std::copy(root.data.begin(), root.data.begin() + root.size(n), out_ptr);

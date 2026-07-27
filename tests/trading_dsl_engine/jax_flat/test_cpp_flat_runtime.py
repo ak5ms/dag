@@ -667,3 +667,13 @@ def test_cpp_hybrid_batch_accepts_memmap_inputs(tmp_path):
 
     np.testing.assert_allclose(np.asarray(cpp_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
     assert type(state).__name__ == "CppFlatState"
+
+
+def test_cpp_flat_batch_workers_match_serial_and_validate():
+    data = {"close": np.arange(2048, dtype=np.float64).reshape(256, 8)}
+    runtime = compile_formula_native("add(cumsum(close), mul(abs(close), 2.0))")
+    _, serial = runtime.run_batch(data, workers=1)
+    _, parallel = runtime.run_batch(data, workers=2)
+    np.testing.assert_allclose(parallel, serial)
+    with pytest.raises(ValueError, match="positive integer"):
+        runtime.run_batch(data, workers=0)

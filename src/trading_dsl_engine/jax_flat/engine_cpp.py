@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 import json
 from typing import Any, Callable
-import os
 import tempfile
 
 import jax.numpy as jnp
@@ -125,7 +126,7 @@ class CppFlatRuntime:
     def tick_into(self, state, out, *input_rows) -> None:
         self.core.tick_into(state, out, *input_rows)
 
-    def run_batch(self, inputs, states=None, out=None):
+    def run_batch(self, inputs, states=None, out=None, workers=None):
         inputs = _normalize_batch_inputs_for_program(self.program, inputs)
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
@@ -134,22 +135,31 @@ class CppFlatRuntime:
             if arr.shape != (n_steps, n_instruments):
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
         state = states or self.init_state(n_instruments)
+        worker_count = _normalize_workers(workers)
         np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
         if out is None:
-            raw = self.core.run_batch(state, *np_inputs)
+            raw = self.core.run_batch(state, worker_count, *np_inputs)
             return state, _reshape_cpp_batch_output(self.program, raw, n_steps, n_instruments)
-        self.core.run_batch_into(state, out, *np_inputs)
+        self.core.run_batch_into(state, out, worker_count, *np_inputs)
         return state, out
 
-    def run_batch_into(self, state, out, inputs):
+    def run_batch_into(self, state, out, inputs, workers=None):
         inputs = _normalize_batch_inputs_for_program(self.program, inputs)
         np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
-        self.core.run_batch_into(state, out, *np_inputs)
+        self.core.run_batch_into(state, out, _normalize_workers(workers), *np_inputs)
         return state, out
 
     def inspect_native_plan(self) -> dict[str, Any]:
         """Return a serialization-friendly plan diagnostic, off the hot path."""
         return self.native_plan.diagnostic()
+
+def _normalize_workers(workers) -> int:
+    if workers is None:
+        return os.cpu_count() or 1
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be None or a positive integer")
+    return workers
+
 
 
 class BroadcastMode(str, Enum):
@@ -667,12 +677,13 @@ def _try_cpp_hybrid_batch(
     accelerator_cache: dict[tuple[Any, ...], Any],
     warn_callback: Callable[[Any, str], None],
     out_path=False,
+    workers=None,
 ):
     """Run full-native or staged native/JAX/native batch execution when possible."""
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
     full = _try_cpp_full_batch(
-        runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path
+        runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path, workers=workers
     )
     if full is not None:
         return full
@@ -708,7 +719,7 @@ def _try_cpp_hybrid_batch(
             accelerator_cache[key] = core
         state = core.init_state(n_instruments)
         source_inputs = tuple(np.asarray(inputs[i], dtype=np.float64) for i in source_input_indices)
-        raw = core.run_batch(state, *source_inputs)
+        raw = core.run_batch(state, _normalize_workers(None), *source_inputs)
         extra_inputs.append(np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)))
         candidate_programs.append(node_id)
     if not extra_inputs:
@@ -733,6 +744,7 @@ def _try_cpp_full_batch(
     *,
     emit_warning: bool,
     out_path=False,
+    workers=None,
 ):
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
@@ -753,9 +765,9 @@ def _try_cpp_full_batch(
     state = core.init_state(n_instruments)
     cpp_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
     if out is not None:
-        core.run_batch_into(state, out, *cpp_inputs)
+        core.run_batch_into(state, out, _normalize_workers(workers), *cpp_inputs)
         return state, out
-    raw = core.run_batch(state, *cpp_inputs)
+    raw = core.run_batch(state, _normalize_workers(workers), *cpp_inputs)
     return state, _reshape_cpp_batch_output(runtime.program, raw, n_steps, n_instruments)
 
 
@@ -819,7 +831,7 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
         np.asarray(inputs[idx] if kind == "input" else frontier_by_id[idx], dtype=np.float64)
         for kind, idx in input_sources
     )
-    raw = core.run_batch(state, *cpp_inputs)
+    raw = core.run_batch(state, _normalize_workers(None), *cpp_inputs)
     return state, _reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)
 
 
