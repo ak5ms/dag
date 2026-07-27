@@ -345,7 +345,7 @@ def _build_stateless_jax_op(expr: StatelessJaxCall, child_ops: tuple[Op, ...]) -
         raise ValueError("stateless JAX call expects at least one child")
     output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
     output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
-    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
+    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width, diagnostic_name=expr.name)
 
 
 def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
@@ -902,7 +902,7 @@ def compile_formula(
     cache_nodes = tuple(idx for idx, node in enumerate(node_tuple) if isinstance(node.op, CacheOp))
     cache_key_by_node = {node_id: key for key, node_id in memo.items() if key[0] == "call" and key[1] == "cache"}
     cache_expr_keys = tuple(cache_key_by_node[idx][2][0] for idx in cache_nodes)
-    return JaxFlatRuntime(
+    runtime = JaxFlatRuntime(
         program=StreamingProgram(
             nodes=node_tuple,
             outputs=(out,),
@@ -915,3 +915,17 @@ def compile_formula(
         ),
         cpp=cpp,
     )
+    if cpp:
+        import warnings
+        from trading_dsl_engine.jax_flat.engine_cpp import explain_cpp_plan
+
+        missing = explain_cpp_plan(runtime.program).missing_cpp_functions
+        if missing:
+            warnings.warn(
+                "C++ jax_flat lowering requires native implementations for DSL function(s): "
+                + ", ".join(missing)
+                + "; those nodes will run as JAX islands. Call runtime.explain() for the lowered plan.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return runtime
