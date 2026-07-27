@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from enum import Enum
 import json
 from typing import Any, Callable
 import os
@@ -112,6 +113,7 @@ class CppFlatRuntime:
     program: StreamingProgram
     core: Any
     supported_ops: tuple[str, ...]
+    native_plan: NativeExecutionPlan
 
     def explain(self, format: str = "text") -> str:
         """Return the lowered native plan as text, JSON, or Graphviz DOT."""
@@ -148,6 +150,89 @@ class CppFlatRuntime:
         self.core.run_batch_into(state, out, *np_inputs)
         return state, out
 
+    def inspect_native_plan(self) -> dict[str, Any]:
+        """Return a serialization-friendly plan diagnostic, off the hot path."""
+        return self.native_plan.diagnostic()
+
+
+class BroadcastMode(str, Enum):
+    SCALAR = "scalar"
+    ELEMENTWISE = "elementwise"
+    MATRIX = "matrix"
+    REDUCTION = "reduction"
+    GROUPED = "grouped"
+
+
+@dataclass(frozen=True)
+class NativeValueType:
+    shape: str
+    width: int
+    dtype: str
+    broadcast: BroadcastMode
+
+
+@dataclass(frozen=True)
+class NativePlanNode:
+    """A fully resolved node in the portable native execution plan."""
+
+    node_id: int
+    opcode: str
+    children: tuple[int, ...]
+    value_type: NativeValueType
+    state_index: int
+    live_from: int
+    live_until: int
+    stateful: bool
+    pure: bool
+    grouping: tuple[int, ...]
+    legacy_spec: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class NativeExecutionPlan:
+    """Typed lowering boundary between ``StreamingProgram`` and C++.
+
+    The tuple ABI remains as the reference evaluator input during the staged
+    migration.  All planning and diagnostics consume this typed form first.
+    """
+
+    nodes: tuple[NativePlanNode, ...]
+    output_id: int
+    state_count: int
+    dtype: str
+    source_node_count: int
+    optimizations: tuple[tuple[str, int], ...]
+
+    def reference_specs(self) -> tuple[tuple[Any, ...], ...]:
+        return tuple(node.legacy_spec for node in self.nodes)
+
+    def diagnostic(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "dtype": self.dtype,
+            "node_count": len(self.nodes),
+            "source_node_count": self.source_node_count,
+            "optimizations": dict(self.optimizations),
+            "state_count": self.state_count,
+            "output_id": self.output_id,
+            "nodes": tuple(
+                {
+                    "id": n.node_id,
+                    "opcode": n.opcode,
+                    "children": n.children,
+                    "shape": n.value_type.shape,
+                    "width": n.value_type.width,
+                    "broadcast": n.value_type.broadcast.value,
+                    "state_index": n.state_index,
+                    "liveness": (n.live_from, n.live_until),
+                    "stateful": n.stateful,
+                    "pure": n.pure,
+                    "grouping": n.grouping,
+                }
+                for n in self.nodes
+            ),
+        }
+
 
 def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> CppFlatRuntime:
     """Compile a supported jax_flat formula to the native C++ tick runtime.
@@ -159,9 +244,177 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
     from trading_dsl_engine.jax_flat import _cpp_flat
 
     runtime = compile_formula_jax(formula, dsl_registry=dsl_registry, cpp=False)
-    node_specs, supported, state_count = _cpp_node_specs(runtime.program)
-    core = _cpp_flat.make_runtime(node_specs, runtime.program.outputs[0], state_count)
-    return CppFlatRuntime(program=runtime.program, core=core, supported_ops=tuple(sorted(set(supported))))
+    plan, supported = lower_native_plan(runtime.program)
+    core = _cpp_flat.make_runtime(plan.reference_specs(), plan.output_id, plan.state_count)
+    return CppFlatRuntime(
+        program=runtime.program,
+        core=core,
+        supported_ops=tuple(sorted(set(supported))),
+        native_plan=plan,
+    )
+
+
+def lower_native_plan(
+    program: StreamingProgram, *, dtype: str = "float64", optimize: bool = True
+) -> tuple[NativeExecutionPlan, list[str]]:
+    """Lower a program to typed native IR with resolved liveness metadata.
+
+    This intentionally retains the old tuple evaluator as an equivalence
+    oracle. Subsequent native stages can consume the typed fields without
+    changing streaming state transitions.
+    """
+    if dtype not in {"float32", "float64"}:
+        raise ValueError(f"unsupported native dtype: {dtype}")
+    specs, supported, state_count = _cpp_node_specs(program)
+    source_node_count = len(specs)
+    if optimize:
+        specs, output_id, source_ids, optimization_counts = _optimize_native_specs(
+            specs, program.outputs[0], program
+        )
+    else:
+        output_id = program.outputs[0]
+        source_ids = tuple(range(len(specs)))
+        optimization_counts = ()
+    last_use = list(range(len(specs)))
+    for parent, spec in enumerate(specs):
+        for child in spec[1]:
+            last_use[child] = max(last_use[child], parent)
+    last_use[output_id] = len(specs)
+    nodes = []
+    reduction_names = {"mean", "xstd", "xs_rank", "xs_sort", "xs_norm"}
+    for node_id, (source_id, spec) in enumerate(zip(source_ids, specs, strict=True)):
+        dag_node = program.nodes[source_id]
+        opcode, children = spec[0], tuple(spec[1])
+        width = int(spec[7])
+        shape = dag_node.op.output_kind
+        if opcode == "group":
+            broadcast = BroadcastMode.GROUPED
+        elif opcode in reduction_names:
+            broadcast = BroadcastMode.REDUCTION
+        elif shape == "scalar":
+            broadcast = BroadcastMode.SCALAR
+        elif shape == "matrix":
+            broadcast = BroadcastMode.MATRIX
+        else:
+            broadcast = BroadcastMode.ELEMENTWISE
+        nodes.append(
+            NativePlanNode(
+                node_id=node_id,
+                opcode=opcode,
+                children=children,
+                value_type=NativeValueType(shape, width, dtype, broadcast),
+                state_index=int(spec[3]),
+                live_from=node_id,
+                live_until=last_use[node_id],
+                stateful=dag_node.op.is_stateful,
+                pure=not dag_node.op.is_stateful,
+                grouping=tuple(spec[8]) if opcode == "group" else (),
+                legacy_spec=spec,
+            )
+        )
+    return NativeExecutionPlan(
+        tuple(nodes), output_id, state_count, dtype, source_node_count, optimization_counts
+    ), supported
+
+
+def _optimize_native_specs(specs, output_id: int, program: StreamingProgram):
+    """Apply semantics-safe DCE, pure CSE, literal folding, and cache aliases."""
+    reachable: set[int] = set()
+    stack = [output_id]
+    while stack:
+        node_id = stack.pop()
+        if node_id in reachable:
+            continue
+        reachable.add(node_id)
+        stack.extend(specs[node_id][1])
+
+    remap: dict[int, int] = {}
+    key_to_id: dict[Any, int] = {}
+    optimized: list[tuple[Any, ...]] = []
+    source_ids: list[int] = []
+    folded = aliases = common = 0
+    literal_values: dict[int, float] = {}
+
+    def replace_spec(spec, **changes):
+        values = list(spec)
+        indexes = {"opcode": 0, "children": 1, "literal": 4, "width": 7}
+        for name, value in changes.items():
+            values[indexes[name]] = value
+        return tuple(values)
+
+    for old_id, spec in enumerate(specs):
+        if old_id not in reachable:
+            continue
+        children = tuple(remap[child] for child in spec[1])
+        spec = replace_spec(spec, children=children)
+        opcode = spec[0]
+        if opcode == "cache" and len(children) == 1:
+            remap[old_id] = children[0]
+            aliases += 1
+            continue
+        folded_value = _fold_native_literal(opcode, children, literal_values)
+        if folded_value is not None:
+            spec = replace_spec(spec, opcode="literal", children=(), literal=folded_value, width=1)
+            opcode = "literal"
+            children = ()
+            folded += 1
+        is_pure = not program.nodes[old_id].op.is_stateful and opcode != "group"
+        # repr canonicalizes nested tuple parameters and gives NaNs a stable key.
+        key = repr(spec) if is_pure else None
+        if key is not None and key in key_to_id:
+            remap[old_id] = key_to_id[key]
+            common += 1
+            continue
+        new_id = len(optimized)
+        remap[old_id] = new_id
+        optimized.append(spec)
+        source_ids.append(old_id)
+        if opcode == "literal":
+            literal_values[new_id] = float(spec[4])
+        if key is not None:
+            key_to_id[key] = new_id
+    new_output = remap[output_id]
+    live_after_folding: set[int] = set()
+    stack = [new_output]
+    while stack:
+        node_id = stack.pop()
+        if node_id in live_after_folding:
+            continue
+        live_after_folding.add(node_id)
+        stack.extend(optimized[node_id][1])
+    compact_remap = {old: new for new, old in enumerate(sorted(live_after_folding))}
+    compact_specs = tuple(
+        replace_spec(optimized[old], children=tuple(compact_remap[c] for c in optimized[old][1]))
+        for old in sorted(live_after_folding)
+    )
+    compact_sources = tuple(source_ids[old] for old in sorted(live_after_folding))
+    dead = len(specs) - len(reachable) + len(optimized) - len(compact_specs)
+    counts = (
+        ("dead_nodes", dead),
+        ("constant_folds", folded),
+        ("aliases_removed", aliases),
+        ("common_subexpressions", common),
+    )
+    return compact_specs, compact_remap[new_output], compact_sources, counts
+
+
+def _fold_native_literal(opcode: str, children: tuple[int, ...], values: dict[int, float]):
+    if not children or any(child not in values for child in children):
+        return None
+    args = tuple(values[child] for child in children)
+    binary = {
+        "add": np.add,
+        "sub": np.subtract,
+        "mul": np.multiply,
+        "div": np.divide,
+        "pow": np.power,
+    }
+    unary = {"abs": np.abs, "exp": np.exp, "ln": np.log, "sign": np.sign}
+    fn = binary.get(opcode) if len(args) == 2 else unary.get(opcode)
+    if fn is None:
+        return None
+    with np.errstate(all="ignore"):
+        return float(fn(*args))
 
 
 def _reshape_cpp_batch_output(program: StreamingProgram, raw, n_steps: int, n_instruments: int):
@@ -410,7 +663,8 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
     if full is not None:
         return full
 
-    candidates = _cpp_hybrid_candidates(runtime.program)
+    n_steps, n_instruments = inputs[0].shape
+    candidates = _cpp_hybrid_candidates(runtime.program, n_steps, n_instruments)
     if not candidates:
         if any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
             _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
@@ -421,7 +675,6 @@ def _try_cpp_hybrid_batch(runtime, inputs, accelerator_cache: dict[tuple[Any, ..
         warn_callback(runtime, f"C++ jax_flat hybrid accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
         return None
 
-    n_steps, n_instruments = inputs[0].shape
     extra_inputs = []
     candidate_programs = []
     for node_id in candidates:
@@ -491,11 +744,17 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
         return None
 
     residual = _program_with_cpp_inputs(runtime.program, upstream_node_ids)
-    residual = replace(residual, outputs=frontier_ids)
-    residual_runtime = replace(runtime, program=residual, cpp=False)
     residual_inputs = tuple(inputs) + tuple(jnp.asarray(arr) for arr in upstream_values)
-    _, frontier_out = residual_runtime._run_batch_once(residual_inputs, None, False)
-    frontier_values = _split_frontier_outputs(frontier_out, len(frontier_ids))
+    # The flat runtime root ABI is singular. Evaluate multiple compile-time
+    # frontiers as independent batch roots rather than coercing them through a
+    # stacked root whose leading dimension is ambiguous with time.
+    frontier_values = []
+    for frontier_id in frontier_ids:
+        frontier_program = replace(residual, outputs=(frontier_id,))
+        residual_runtime = replace(runtime, program=frontier_program, cpp=False)
+        _, frontier_out = residual_runtime._run_batch_once(residual_inputs, None, False)
+        frontier_values.append(np.asarray(frontier_out))
+    frontier_values = tuple(frontier_values)
 
     n_steps, n_instruments = inputs[0].shape
     key = (node_specs, subprogram.outputs[0], state_count, n_instruments)
@@ -511,15 +770,6 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
     )
     raw = core.run_batch(state, *cpp_inputs)
     return state, _reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)
-
-
-def _split_frontier_outputs(frontier_out, n_frontiers: int) -> tuple[np.ndarray, ...]:
-    if n_frontiers == 1:
-        return (np.asarray(frontier_out),)
-    arr = np.asarray(frontier_out)
-    if arr.ndim >= 1 and arr.shape[0] == n_frontiers:
-        return tuple(np.asarray(arr[i]) for i in range(n_frontiers))
-    return tuple(np.asarray(x) for x in frontier_out)
 
 
 def _is_cpp_boundary_op(op: Op) -> bool:
@@ -603,7 +853,43 @@ def _subprogram_for_node_with_frontier(program: StreamingProgram, node_id: int) 
     return subprogram, tuple(frontier), input_sources
 
 
-def _cpp_hybrid_candidates(program: StreamingProgram) -> tuple[int, ...]:
+def inspect_hybrid_partition(
+    program: StreamingProgram, n_rows: int, n_instruments: int, *, itemsize: int = 8
+) -> dict[str, Any]:
+    """Explain cost-aware native-island decisions without entering a hot path."""
+    candidates = _cpp_hybrid_candidates(program, n_rows, n_instruments, apply_cost=False)
+    decisions = []
+    for node_id in candidates:
+        node_count = len(_ancestor_ids(program, node_id))
+        work = node_count * n_rows * n_instruments
+        frontier_bytes = n_rows * n_instruments * itemsize
+        # Descriptor dispatch is deliberately expressed in element-equivalent
+        # work units; measured portable-runtime launches are small because the
+        # extension and state are already cached.
+        launch_cost = 64
+        estimated_cost = 2 * (frontier_bytes // max(itemsize, 1)) + launch_cost
+        decisions.append(
+            {
+                "node_id": node_id,
+                "node_count": node_count,
+                "estimated_work": work,
+                "frontier_bytes": frontier_bytes,
+                "conversion_copy": True,
+                "runtime_launches": 1,
+                "estimated_transfer_cost": estimated_cost,
+                "accelerate": work >= estimated_cost,
+            }
+        )
+    return {"version": 1, "rows": n_rows, "instruments": n_instruments, "candidates": tuple(decisions)}
+
+
+def _cpp_hybrid_candidates(
+    program: StreamingProgram,
+    n_rows: int = 0,
+    n_instruments: int = 0,
+    *,
+    apply_cost: bool = True,
+) -> tuple[int, ...]:
     selected: list[int] = []
     covered: set[int] = set()
     for node_id in range(len(program.nodes) - 1, -1, -1):
@@ -627,7 +913,12 @@ def _cpp_hybrid_candidates(program: StreamingProgram) -> tuple[int, ...]:
             continue
         selected.append(node_id)
         covered.update(ancestors)
-    return tuple(sorted(selected))
+    selected = sorted(selected)
+    if apply_cost and n_rows > 0 and n_instruments > 0:
+        diagnostic = inspect_hybrid_partition(program, n_rows, n_instruments)
+        accepted = {item["node_id"] for item in diagnostic["candidates"] if item["accelerate"]}
+        selected = [node_id for node_id in selected if node_id in accepted]
+    return tuple(selected)
 
 
 def _ancestor_ids(program: StreamingProgram, node_id: int) -> set[int]:

@@ -261,7 +261,11 @@ def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry
         fn_name = name or fn.__name__
 
         target.register(fn_name, fn)
-        return target.get(fn_name) or fn
+        dispatch = target.get(fn_name) or fn
+        op_signature = _DSL_OP_SIGNATURES.get(fn_name)
+        if op_signature is not None:
+            dispatch.__signature__ = op_signature
+        return dispatch
 
     return _decorator
 
@@ -488,7 +492,9 @@ def ceil(x: Expr, freq: str | int | float | None = None) -> Expr:
 @register_dsl_function("round")
 def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
     if freq is None:
-        return round(x, *args)
+        # Construct the builtin call directly. Calling the registered helper
+        # recursively re-enters overload dispatch for the one-argument form.
+        return call("round", x, *args)
     if args:
         raise TypeError("round cannot combine decimals with freq")
     micros = _duration_microseconds(freq)
