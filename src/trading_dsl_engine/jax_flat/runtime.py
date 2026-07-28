@@ -6,21 +6,23 @@ chunked batch scans; disk/memmap inputs or disk ``cache(...)`` nodes fall back
 to a host-side chunked loop. Diagnostics (``inspect_jaxpr``,
 ``inspect_compiled_hlo``) trace the same tick ABI but stay off the hot path.
 """
-
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any
 import mmap
 import os
 import tempfile
 import time
 import warnings
+from dataclasses import replace
+from io import BytesIO
+from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
+from graphviz import Source
 
 from trading_dsl_engine.jax_flat.ops import CacheOp, GroupByOp, InputOp, LiteralOp
 from trading_dsl_engine.jax_flat.program import (
@@ -30,6 +32,7 @@ from trading_dsl_engine.jax_flat.program import (
     MemmapPathTracker,
     StreamingProgram,
 )
+
 
 class JaxFlatRuntime(eqx.Module):
     program: StreamingProgram = eqx.field(static=True)
@@ -86,6 +89,16 @@ class JaxFlatRuntime(eqx.Module):
         from trading_dsl_engine.jax_flat.engine_cpp import explain_cpp_plan
 
         return explain_cpp_plan(self.program).format(format)
+
+    def display(self, figsize=(24,14)):
+        dot = self.explain("dot")
+        png = Source(dot).pipe(format="png")
+        img = plt.imread(BytesIO(png), format="png")
+        plt.figure(figsize=figsize)
+        plt.imshow(img)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
 
     def get_lowering_plan(self):
         """Return the structured, serializable C++/JAX lowering plan."""
