@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#define EIGEN_DONT_PARALLELIZE
 #include <Eigen/Dense>
 #include <unsupported/Eigen/SpecialFunctions>
 
@@ -14,8 +15,14 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -107,6 +114,10 @@ struct OpMetadata {
     StateKind state = StateKind::Value;
     bool direct_root_write = false;
     bool needs_rank_scratch = false;
+    // Scheduler traits live beside all other execution traits. A false value
+    // means that the kernel touches runtime-wide scratch and must own its level.
+    bool dag_parallel_safe = true;
+    uint16_t estimated_cost = 1;
 };
 
 constexpr auto make_op_metadata() {
@@ -123,12 +134,23 @@ constexpr auto make_op_metadata() {
         set_direct(opcode);
     }
     metadata[static_cast<size_t>(OpCode::Literal)].output_rows = OutputRows::Fixed;
+    // Source copies/fills are deliberately kept on the caller: dispatch costs
+    // dominate them and bundling these roots avoids thread-pool startup for a
+    // narrow expression such as add(input, input).
+    metadata[static_cast<size_t>(OpCode::Input)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::Literal)].dag_parallel_safe = false;
     metadata[static_cast<size_t>(OpCode::Mean)].output_rows = OutputRows::Fixed;
     metadata[static_cast<size_t>(OpCode::GetBeta)].output_rows = OutputRows::ModelProjection;
     metadata[static_cast<size_t>(OpCode::Einsum)].output_rows = OutputRows::EinsumDerived;
     metadata[static_cast<size_t>(OpCode::Einsum)].prepare = PrepareKind::Einsum;
     metadata[static_cast<size_t>(OpCode::FutureRbfBasisSum)].prepare = PrepareKind::FutureBasis;
     metadata[static_cast<size_t>(OpCode::XsRank)].needs_rank_scratch = true;
+    metadata[static_cast<size_t>(OpCode::XsRank)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::XsSort)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::Ridge)].estimated_cost = 16;
+    metadata[static_cast<size_t>(OpCode::Einsum)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Outer)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Group)].estimated_cost = 8;
     metadata[static_cast<size_t>(OpCode::RollMean)].state = StateKind::RollingMean;
     metadata[static_cast<size_t>(OpCode::Shift)].state = StateKind::Shift;
     metadata[static_cast<size_t>(OpCode::Ridge)].state = StateKind::Ridge;
@@ -529,6 +551,84 @@ int count_inner_states(const std::vector<NodeSpec>& nodes) {
 class Runtime;
 size_t count_inputs(const std::vector<NodeSpec>& nodes);
 
+class TaskArena {
+public:
+    explicit TaskArena(int workers) : workers_(workers) {
+        threads_.reserve(static_cast<size_t>(workers_ - 1));
+        for (int id = 1; id < workers_; ++id) threads_.emplace_back([this, id] { worker_loop(id); });
+    }
+    TaskArena(const TaskArena&) = delete;
+    TaskArena& operator=(const TaskArena&) = delete;
+    ~TaskArena() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        start_.notify_all();
+        for (auto& thread : threads_) thread.join();
+    }
+
+    void run(int tasks, const std::function<void(int)>& fn) {
+        if (tasks <= 1) { fn(0); return; }
+        {
+            std::lock_guard lock(mutex_);
+            fn_ = &fn;
+            task_count_ = tasks;
+            finished_ = 0;
+            exception_ = nullptr;
+            ++generation_;
+        }
+        start_.notify_all();
+        execute_lane(0, fn, tasks);
+        std::unique_lock lock(mutex_);
+        done_.wait(lock, [&] { return finished_ == workers_ - 1; });
+        fn_ = nullptr;
+        if (exception_) std::rethrow_exception(exception_);
+    }
+
+private:
+    void execute_lane(int id, const std::function<void(int)>& fn, int tasks) noexcept {
+        try {
+            for (int task = id; task < tasks; task += workers_) fn(task);
+        } catch (...) {
+            std::lock_guard lock(mutex_);
+            if (!exception_) exception_ = std::current_exception();
+        }
+    }
+    void worker_loop(int id) {
+        size_t seen = 0;
+        for (;;) {
+            const std::function<void(int)>* fn;
+            int tasks;
+            {
+                std::unique_lock lock(mutex_);
+                start_.wait(lock, [&] { return stopping_ || generation_ != seen; });
+                if (stopping_) return;
+                seen = generation_;
+                fn = fn_;
+                tasks = task_count_;
+            }
+            execute_lane(id, *fn, tasks);
+            {
+                std::lock_guard lock(mutex_);
+                if (++finished_ == workers_ - 1) done_.notify_one();
+            }
+        }
+    }
+
+    int workers_;
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable start_, done_;
+    const std::function<void(int)>* fn_ = nullptr;
+    int task_count_ = 0;
+    int finished_ = 0;
+    size_t generation_ = 0;
+    bool stopping_ = false;
+    std::exception_ptr exception_;
+};
+
 class State {
 public:
     State(const Runtime* runtime, int n_instruments);
@@ -563,8 +663,9 @@ class Runtime {
     };
 
 public:
-    Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states)
-        : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states) {
+    Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states, int workers)
+        : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states), workers_(workers) {
+        if (workers_ <= 0) throw std::invalid_argument("workers must be a positive integer");
         if (output_id_ < 0 || output_id_ >= static_cast<int>(nodes_.size())) {
             throw std::invalid_argument("invalid C++ jax_flat output id");
         }
@@ -575,6 +676,8 @@ public:
             has_rank_scratch_ = has_rank_scratch_ || metadata.needs_rank_scratch;
             prepared_nodes_.push_back(prepare_node(spec, metadata.prepare));
         }
+        build_schedule();
+        if (workers_ > 1 && has_parallel_frontier_) arena_ = std::make_unique<TaskArena>(workers_);
     }
 
     State init_state(int n_instruments) const { return State(this, n_instruments); }
@@ -648,6 +751,29 @@ private:
     int n_states_;
     std::vector<PreparedNode> prepared_nodes_;
     bool has_rank_scratch_ = false;
+    int workers_;
+    std::vector<std::vector<int>> levels_;
+    bool has_parallel_frontier_ = false;
+    std::unique_ptr<TaskArena> arena_;
+
+    void build_schedule() {
+        std::vector<int> depth(nodes_.size(), 0);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            for (int child_id : nodes_[i].children) depth[i] = std::max(depth[i], depth[static_cast<size_t>(child_id)] + 1);
+            if (levels_.size() <= static_cast<size_t>(depth[i])) levels_.resize(static_cast<size_t>(depth[i] + 1));
+            levels_[static_cast<size_t>(depth[i])].push_back(static_cast<int>(i));
+        }
+        for (const auto& level : levels_) {
+            int safe = 0;
+            int cost = 0;
+            for (int id : level) {
+                const auto& metadata = op_metadata(nodes_[static_cast<size_t>(id)].opcode);
+                safe += metadata.dag_parallel_safe;
+                cost += metadata.dag_parallel_safe ? metadata.estimated_cost : 0;
+            }
+            has_parallel_frontier_ = has_parallel_frontier_ || (safe > 1 && cost >= 2);
+        }
+    }
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
@@ -1024,9 +1150,41 @@ private:
     }
 
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        // Preserve the zero-scheduler serial fast path for small rows and DAGs
+        // without a useful frontier. Levels are immutable and every level is a
+        // completion barrier, so timestep state cannot leak into the next row.
+        if (!arena_ || state.n_instruments_ < 256) {
+            eval_node_range(state, input_ptrs, out_ptr, 0, nodes_.size());
+            return;
+        }
+        for (const auto& level : levels_) {
+            std::vector<std::pair<size_t, size_t>> bundles;
+            for (int node_id : level) {
+                const auto& metadata = op_metadata(nodes_[static_cast<size_t>(node_id)].opcode);
+                if (!metadata.dag_parallel_safe) {
+                    eval_node_range(state, input_ptrs, out_ptr, static_cast<size_t>(node_id), static_cast<size_t>(node_id + 1));
+                } else {
+                    bundles.emplace_back(static_cast<size_t>(node_id), static_cast<size_t>(node_id + 1));
+                }
+            }
+            if (bundles.size() <= 1) {
+                if (!bundles.empty()) eval_node_range(state, input_ptrs, out_ptr, bundles[0].first, bundles[0].second);
+                continue;
+            }
+            const int task_count = std::min<int>(workers_, static_cast<int>(bundles.size()));
+            arena_->run(task_count, [&](int task) {
+                // Static bundles avoid queue traffic and atomics in instrument loops.
+                for (size_t i = static_cast<size_t>(task); i < bundles.size(); i += static_cast<size_t>(task_count))
+                    eval_node_range(state, input_ptrs, out_ptr, bundles[i].first, bundles[i].second);
+            });
+        }
+    }
+
+    void eval_node_range(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr,
+                         size_t begin, size_t end) const {
         const int n = state.n_instruments_;
         const bool direct_root = op_metadata(nodes_[static_cast<size_t>(output_id_)].opcode).direct_root_write;
-        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
+        for (size_t node_i = begin; node_i < end; ++node_i) {
             const NodeSpec& spec = nodes_[node_i];
             NodeValue& dst_v = state.values_[node_i];
             double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
@@ -1941,9 +2099,9 @@ NodeSpec parse_node(py::handle item) {
     return spec;
 }
 
-Runtime make_runtime(py::iterable specs, int output_id, int n_states) {
+Runtime make_runtime(py::iterable specs, int output_id, int n_states, int workers) {
     std::vector<NodeSpec> nodes;
     for (py::handle item : specs) nodes.push_back(parse_node(item));
-    return Runtime(std::move(nodes), output_id, n_states);
+    return Runtime(std::move(nodes), output_id, n_states, workers);
 }
 }  // namespace

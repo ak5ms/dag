@@ -176,6 +176,26 @@ Unit metadata is represented as a sparse exponent vector over domain labels such
 
 ## Native C++ tick prototype
 
+Native construction accepts `workers: int | None = None` in both the explicit
+`engine_cpp.compile_formula(...)` API and automatic
+`jax_flat.compile_formula(..., cpp=True, workers=...)` acceleration. `None`
+resolves once to all available logical CPUs (with a one-thread fallback when
+the platform cannot report CPU count), while `workers=1` selects the original
+serial transition exactly. Worker ownership is fixed at runtime construction;
+`run_batch` and `run_batch_into` intentionally have no per-call override, which
+lets each runtime retain and reuse its bounded executor until destruction.
+
+The native executor parallelizes only sufficiently wide, coarse DAG frontiers.
+It retains an immutable dependency-level schedule and a completion barrier
+before consumers and before the next timestep, so batch replay remains the
+same sequential streaming transition. Full-native and every hybrid native
+island inherit the requested worker setting. Small inputs, narrow dependency
+chains, unsafe shared-scratch kernels, and `workers=1` stay on the caller-thread
+fast path. Eigen is forced single-threaded inside DAG tasks to prevent nested
+oversubscription and preserve deterministic reductions. Consequently speedup
+depends on DAG width, instrument count, and kernel granularity; extra workers
+are not expected to accelerate narrow or small formulas.
+
 `trading_dsl_engine.jax_flat.compile_formula(..., cpp=True)` enables the optional native accelerator by default for supported grouped hot paths, while `cpp=False` forces the pure JAX-flat path. `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` lazily imports `trading_dsl_engine.jax_flat.engine_cpp` and exposes an experimental native tick-path runtime for flat formulas where C++ can currently preserve the same streaming semantics as JAX-flat. It now first lowers the shared `StreamingProgram` to a versioned typed `NativeExecutionPlan` containing resolved opcodes, shapes, widths, dtype policy, broadcast modes, state slots, purity/statefulness, grouping data, and liveness intervals. The plan applies dead-node removal, safe literal folding, stateless CSE, and cache-alias removal before recomputing liveness. During migration, the plan retains the flattened tuple table as a reference-evaluator adapter so optimized and unoptimized transitions remain exactly comparable. `runtime.inspect_native_plan()` exposes serialization-friendly plan and optimization diagnostics outside the hot path. `init_state(n_instruments)` preallocates per-node scratch buffers and operator-specific native state, while `tick_into(state, out, *rows)` reuses both the state and caller-owned output row. Validated native tick and batch compute release the Python GIL; force-cast tick input owners remain alive for the complete native call. The native wrapper also mirrors the JAX-flat batch API with `run_batch(...)` and `run_batch_into(...)`; `tick(...)` remains a convenience method that allocates only its returned row.
 
 The native batch helper intentionally stays a repeated tick loop over the same `eval_row` transition rather than a separate vectorized semantic path. It binds contiguous row pointers once, calls the same non-batch evaluator for each row, and uses `__restrict`/flat contiguous buffers so C++ compilers can optimize the row loop without changing streaming state behavior. Native opcode metadata centrally declares output-row policy, preparation strategy, state family, rank scratch, and direct-root eligibility; runtime construction and state layout consume those traits generically instead of maintaining separate operator-specific allowlists. The benchmark script compiles and warms both C++ and JAX-flat runtimes before timing, so printed results exclude extension import, formula compilation, and JAX first-use compilation. When the optional extension is installed, `JaxFlatRuntime.run_batch(...)` may use the same native flat evaluator for fully supported dynamic-key groupby programs (including `univ(...)` column partitions and NumPy memmap-backed batch inputs) with no caller-supplied state. If the whole formula is not native-lowerable but contains coarse supported stateful/grouped subgraphs, batch execution can materialize multiple native islands, compute one or more JAX-only frontier values, and then run a final supported native root when the downstream graph becomes C++-lowerable again; this handles shapes such as `cpp(jax_only(cpp(...)), cpp(...))` while keeping user `jax_flat.stateless(...)` callables on the compiled JAX path. Set `TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=1` to force the pure JAX path for behavior checks. Native groupby lowering uses a nested RHS node table rather than a per-operator grouped-cumsum branch, so additional scalar/vector-width-1 RHS operators can compose without adding a new grouped hot-path case. If a grouped formula is not yet native-supported, `run_batch` emits a one-time `RuntimeWarning` identifying the unsupported node and automatically falls back to the JAX-flat implementation.

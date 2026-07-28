@@ -58,6 +58,7 @@ CASES = {
     "groupby_churn": "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
     "universe_groupby": "groupby((univ([0, 1], [2, 3]), key0), close, cumsum(self_))",
     "ridge": "get_preds(Ridge(cat(close, open), open, 1.0, 16.0, 0.01))",
+    "wide_frontier": "add(add(exp(close), ln(abs(open))), add(xs_rank(high), xs_rank(low)))",
     "alpha_sharpes": None,
 }
 
@@ -109,11 +110,13 @@ def benchmark_alpha_sharpes(rows: int, instruments: int, runs: int, *, cpp: bool
     }
 
 
-def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1) -> dict[str, object]:
+def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1, *, workers: int | None = None) -> dict[str, object]:
     rng = np.random.default_rng(7)
     data = {
         "close": rng.normal(size=(rows, instruments)),
         "open": rng.normal(size=(rows, instruments)),
+        "high": rng.normal(size=(rows, instruments)),
+        "low": rng.normal(size=(rows, instruments)),
         "lag": rng.integers(0, 16, size=(rows, instruments)).astype(np.float64),
         "key0": rng.integers(0, 16, size=(rows, instruments)).astype(np.float64),
         "key1": rng.integers(0, 4, size=(rows, instruments)).astype(np.float64),
@@ -130,7 +133,7 @@ def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1)
     if case == "universe_groupby" and instruments < 4:
         raise ValueError("universe_groupby requires at least four instruments")
     t0 = time.perf_counter()
-    runtime = compile_formula(formula)
+    runtime = compile_formula(formula, workers=workers)
     state = runtime.init_state(instruments)
     cold_seconds = time.perf_counter() - t0
 
@@ -166,6 +169,8 @@ def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1)
         "nodes": len(runtime.native_plan.nodes),
         "rows": rows,
         "instruments": instruments,
+        "workers": runtime.workers,
+        "graph_shape": "wide" if case == "wide_frontier" else "chain_or_specialized",
         "cold_seconds": cold_seconds,
         "runs": runs,
         "ticks_per_second": float(np.median(tick_rates)),
@@ -187,17 +192,24 @@ def main() -> None:
     parser.add_argument("--ticks", type=int, default=2000)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--backend", choices=("cpp", "jax"), default="cpp")
+    parser.add_argument("--workers", default="1,2,4", help="comma-separated native worker counts")
     args = parser.parse_args()
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
-        result = (
+        worker_values = [None] if args.backend == "jax" or case == "alpha_sharpes" else [int(v) for v in args.workers.split(",")]
+        baseline = None
+        for workers in worker_values:
+            result = (
             benchmark_alpha_sharpes(
                 args.rows, args.instruments, args.runs, cpp=args.backend == "cpp"
             )
             if case == "alpha_sharpes"
-            else benchmark(case, args.rows, args.instruments, args.ticks, args.runs)
-        )
-        print(json.dumps(result, sort_keys=True))
+                else benchmark(case, args.rows, args.instruments, args.ticks, args.runs, workers=workers)
+            )
+            rate = result["batch_rows_per_second"]
+            baseline = rate if baseline is None else baseline
+            result["speedup"] = rate / baseline
+            print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
