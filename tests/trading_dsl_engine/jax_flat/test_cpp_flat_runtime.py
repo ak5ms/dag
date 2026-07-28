@@ -38,10 +38,11 @@ def test_cpp_flat_worker_configuration_validation_and_resolution():
 
 
 def test_cpp_flat_parallel_frontier_repeated_streaming_and_runtime_isolation():
-    formula = "add(add(exp(close), abs(open)), add(cumsum(high), xs_rank(low)))"
+    formula = "add(norm_inv(close), norm_inv(open))"
     rng = np.random.default_rng(414)
-    data = {name: rng.normal(size=(24, 512)) for name in ("close", "open", "high", "low")}
-    data["low"][3, 7] = np.nan
+    n_instruments = 300_000
+    data = {name: rng.uniform(0.01, 0.99, size=(3, n_instruments)) for name in ("close", "open")}
+    data["open"][1, 7] = np.nan
 
     serial = compile_formula_native(formula, workers=1)
     parallel = compile_formula_native(formula, workers=4)
@@ -52,10 +53,10 @@ def test_cpp_flat_parallel_frontier_repeated_streaming_and_runtime_isolation():
     # A state remains a sequential transition even when each row's independent
     # DAG frontier is parallel, and separate runtimes own separate executors.
     def replay(runtime):
-        state = runtime.init_state(512)
-        out = np.empty(512)
+        state = runtime.init_state(n_instruments)
+        out = np.empty(n_instruments)
         observed = []
-        for t in range(24):
+        for t in range(3):
             runtime.tick_into(state, out, *(data[name][t] for name in runtime.program.input_names))
             observed.append(out.copy())
         return np.stack(observed)
@@ -64,6 +65,16 @@ def test_cpp_flat_parallel_frontier_repeated_streaming_and_runtime_isolation():
         outputs = list(executor.map(replay, (compile_formula_native(formula, workers=2), compile_formula_native(formula, workers=3))))
     for output in outputs:
         np.testing.assert_allclose(output, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def test_cpp_flat_wide_cat_worker_fallback_matches_serial():
+    formula = "cat(" + ",".join(f"exp(add(close, {i}.0))" for i in range(32)) + ")"
+    close = np.random.default_rng(912).normal(size=(8, 150))
+    serial = compile_formula_native(formula, workers=1)
+    automatic = compile_formula_native(formula, workers=None)
+    _, expected = serial.run_batch({"close": close})
+    _, actual = automatic.run_batch({"close": close})
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_cpp_flat_source_fingerprint_tracks_transitive_local_dependencies(tmp_path):

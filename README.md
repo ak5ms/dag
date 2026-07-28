@@ -191,10 +191,23 @@ before consumers and before the next timestep, so batch replay remains the
 same sequential streaming transition. Full-native and every hybrid native
 island inherit the requested worker setting. Small inputs, narrow dependency
 chains, unsafe shared-scratch kernels, and `workers=1` stay on the caller-thread
-fast path. Eigen is forced single-threaded inside DAG tasks to prevent nested
+fast path. The executor is created lazily only when the initialized instrument
+width and metadata cost clear the parallel-work threshold, and immutable level
+task lists are reused rather than allocated for every row. Eigen is forced
+single-threaded inside DAG tasks to prevent nested
 oversubscription and preserve deterministic reductions. Consequently speedup
 depends on DAG width, instrument count, and kernel granularity; extra workers
 are not expected to accelerate narrow or small formulas.
+
+Profiling the first scheduler on wide `cat(exp(add(...)), ...)` formulas exposed
+two avoidable costs: it rebuilt vectors for every level and timestep, and it
+woke a pool even when dispatch and producer-buffer cache transfer cost more than
+the kernels. The schedule now owns reusable caller/parallel node lists, uses
+cache-line-separated C++20 atomic wait/notify boundaries, limits live threads
+to the widest usable frontier, and does not construct the executor until
+metadata-weighted work at the initialized instrument width is large enough.
+The benchmark includes `cat_frontier` for serial-fallback regression and
+`norm_inv_frontier` for expensive parallel scaling.
 
 `trading_dsl_engine.jax_flat.compile_formula(..., cpp=True)` enables the optional native accelerator by default for supported grouped hot paths, while `cpp=False` forces the pure JAX-flat path. `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` lazily imports `trading_dsl_engine.jax_flat.engine_cpp` and exposes an experimental native tick-path runtime for flat formulas where C++ can currently preserve the same streaming semantics as JAX-flat. It now first lowers the shared `StreamingProgram` to a versioned typed `NativeExecutionPlan` containing resolved opcodes, shapes, widths, dtype policy, broadcast modes, state slots, purity/statefulness, grouping data, and liveness intervals. The plan applies dead-node removal, safe literal folding, stateless CSE, and cache-alias removal before recomputing liveness. During migration, the plan retains the flattened tuple table as a reference-evaluator adapter so optimized and unoptimized transitions remain exactly comparable. `runtime.inspect_native_plan()` exposes serialization-friendly plan and optimization diagnostics outside the hot path. `init_state(n_instruments)` preallocates per-node scratch buffers and operator-specific native state, while `tick_into(state, out, *rows)` reuses both the state and caller-owned output row. Validated native tick and batch compute release the Python GIL; force-cast tick input owners remain alive for the complete native call. The native wrapper also mirrors the JAX-flat batch API with `run_batch(...)` and `run_batch_into(...)`; `tick(...)` remains a convenience method that allocates only its returned row.
 
