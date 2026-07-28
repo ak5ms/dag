@@ -86,8 +86,62 @@ enum class OpCode : int {
     Ridge,
     GetBeta,
     GetPreds,
+    VolumeForFitSession,
+    VolumeForSeenSession,
+    Nonnegative,
+    PctSeenSessionVolume,
     Group,
+    Count,
 };
+
+enum class PrepareKind : uint8_t { None, Einsum, FutureBasis };
+enum class OutputRows : uint8_t { Instruments, Fixed, ModelProjection, EinsumDerived };
+enum class StateKind : uint8_t { Value, RollingMean, Shift, Ridge, InstrumentBasisMean, Group, Count };
+
+struct OpMetadata {
+    // These are construction-time traits, not the implementation of the op.
+    // Think of this as a Python dataclass keyed by OpCode: Runtime reads it once
+    // while building buffers/plans, and eval_row still executes the actual kernel.
+    PrepareKind prepare = PrepareKind::None;
+    OutputRows output_rows = OutputRows::Instruments;
+    StateKind state = StateKind::Value;
+    bool direct_root_write = false;
+    bool needs_rank_scratch = false;
+};
+
+constexpr auto make_op_metadata() {
+    // Every entry starts with the common vector/value-state defaults. An op is
+    // listed below only when it differs from those defaults. OpCode::Count makes
+    // the compiler keep this array aligned when new enum values are appended.
+    std::array<OpMetadata, static_cast<size_t>(OpCode::Count)> metadata{};
+    const auto set_direct = [&](OpCode opcode) { metadata[static_cast<size_t>(opcode)].direct_root_write = true; };
+    for (OpCode opcode : std::array{
+             OpCode::Input, OpCode::Literal, OpCode::Add, OpCode::Sub, OpCode::Mul, OpCode::Div,
+             OpCode::Abs, OpCode::Ln, OpCode::Ceil, OpCode::Floor, OpCode::Round, OpCode::Exp,
+             OpCode::Sign, OpCode::Arctan, OpCode::IsNan, OpCode::Purify, OpCode::Fraction,
+             OpCode::NormInv}) {
+        set_direct(opcode);
+    }
+    metadata[static_cast<size_t>(OpCode::Literal)].output_rows = OutputRows::Fixed;
+    metadata[static_cast<size_t>(OpCode::Mean)].output_rows = OutputRows::Fixed;
+    metadata[static_cast<size_t>(OpCode::GetBeta)].output_rows = OutputRows::ModelProjection;
+    metadata[static_cast<size_t>(OpCode::Einsum)].output_rows = OutputRows::EinsumDerived;
+    metadata[static_cast<size_t>(OpCode::Einsum)].prepare = PrepareKind::Einsum;
+    metadata[static_cast<size_t>(OpCode::FutureRbfBasisSum)].prepare = PrepareKind::FutureBasis;
+    metadata[static_cast<size_t>(OpCode::XsRank)].needs_rank_scratch = true;
+    metadata[static_cast<size_t>(OpCode::RollMean)].state = StateKind::RollingMean;
+    metadata[static_cast<size_t>(OpCode::Shift)].state = StateKind::Shift;
+    metadata[static_cast<size_t>(OpCode::Ridge)].state = StateKind::Ridge;
+    metadata[static_cast<size_t>(OpCode::InstrumentBasisMean)].state = StateKind::InstrumentBasisMean;
+    metadata[static_cast<size_t>(OpCode::Group)].state = StateKind::Group;
+    return metadata;
+}
+
+constexpr auto OP_METADATA = make_op_metadata();
+
+constexpr const OpMetadata& op_metadata(OpCode opcode) {
+    return OP_METADATA[static_cast<size_t>(opcode)];
+}
 
 OpCode parse_opcode(const std::string& name) {
     if (name == "input") return OpCode::Input;
@@ -145,6 +199,10 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "ridge") return OpCode::Ridge;
     if (name == "get_beta") return OpCode::GetBeta;
     if (name == "get_preds") return OpCode::GetPreds;
+    if (name == "volume_for_fit_session") return OpCode::VolumeForFitSession;
+    if (name == "volume_for_seen_session") return OpCode::VolumeForSeenSession;
+    if (name == "nonnegative") return OpCode::Nonnegative;
+    if (name == "pct_seen_session_volume") return OpCode::PctSeenSessionVolume;
     if (name == "group") return OpCode::Group;
     throw std::invalid_argument("unsupported C++ jax_flat opcode: " + name);
 }
@@ -490,9 +548,20 @@ private:
     std::vector<double> full_rank_scores_;
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
+    std::vector<const double*> batch_base_ptrs_;
+    std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> tick_input_owners_;
 };
 
 class Runtime {
+    struct PreparedNode {
+        // PreparedNode is deliberately generic and parallel to nodes_. Only the
+        // field selected by OpMetadata::prepare is populated. This moves parsing
+        // and lookup-table allocation out of eval_row without adding one vector
+        // (and one opcode allowlist) for every future prepared-data type.
+        EinsumExecPlan einsum;
+        std::vector<double> table;
+    };
+
 public:
     Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states)
         : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states) {
@@ -500,10 +569,11 @@ public:
             throw std::invalid_argument("invalid C++ jax_flat output id");
         }
         assign_native_state_indices();
-        einsum_plans_.reserve(nodes_.size());
+        prepared_nodes_.reserve(nodes_.size());
         for (const auto& spec : nodes_) {
-            has_xs_rank_ = has_xs_rank_ || spec.opcode == OpCode::XsRank;
-            einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
+            const OpMetadata& metadata = op_metadata(spec.opcode);
+            has_rank_scratch_ = has_rank_scratch_ || metadata.needs_rank_scratch;
+            prepared_nodes_.push_back(prepare_node(spec, metadata.prepare));
         }
     }
 
@@ -523,7 +593,7 @@ public:
         // Keep force-cast owners alive until native evaluation completes.  The
         // previous helper retained only their raw pointers, which could dangle
         // as soon as validation returned for non-float64/non-contiguous input.
-        auto input_arrays = bind_tick_rows(state, rows);
+        bind_tick_rows(state, rows);
         if (state.n_instruments_ >= 1024) {
             py::gil_scoped_release release;
             eval_row(state, state.row_ptrs_, &out_buf(0));
@@ -553,13 +623,19 @@ public:
         auto* __restrict output_ptr = static_cast<double*>(out_info.ptr);
         const int n = state.n_instruments_;
         state.row_ptrs_.assign(input_arrays.size(), nullptr);
-        std::vector<const double*> base_ptrs;
-        base_ptrs.reserve(input_arrays.size());
-        for (const auto& arr : input_arrays) base_ptrs.push_back(static_cast<const double*>(arr.request().ptr));
+        state.batch_base_ptrs_.resize(input_arrays.size());
+        for (size_t i = 0; i < input_arrays.size(); ++i) {
+            state.batch_base_ptrs_[i] = static_cast<const double*>(input_arrays[i].request().ptr);
+        }
         {
             py::gil_scoped_release release;
             for (int64_t t = 0; t < rows; ++t) {
-                for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
+                for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
+                    state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
+#if defined(__GNUC__) || defined(__clang__)
+                    if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
+#endif
+                }
                 eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
             }
         }
@@ -570,16 +646,72 @@ private:
     std::vector<NodeSpec> nodes_;
     int output_id_;
     int n_states_;
-    std::vector<EinsumExecPlan> einsum_plans_;
-    bool has_xs_rank_ = false;
+    std::vector<PreparedNode> prepared_nodes_;
+    bool has_rank_scratch_ = false;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
-    std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> bind_tick_rows(
+    static PreparedNode prepare_node(const NodeSpec& spec, PrepareKind kind) {
+        PreparedNode prepared;
+        switch (kind) {
+            case PrepareKind::None: break;
+            case PrepareKind::Einsum: prepared.einsum = make_einsum_exec_plan(spec); break;
+            case PrepareKind::FutureBasis: prepared.table = make_future_basis_table(spec); break;
+        }
+        return prepared;
+    }
+
+    static void configure_value_layout(
+        const NodeSpec& spec, const std::vector<NodeSpec>& nodes,
+        const std::vector<NodeValue>& prior_values, int n_instruments, NodeValue& value) {
+        value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
+        value.fixed_rows = 1;
+        // rows_kind answers "what does axis 0 mean?": instruments (n rows) or a
+        // fixed mathematical result (usually one row). Width is axis 1. Most ops
+        // use the first branch; only shape-changing families need another policy.
+        switch (op_metadata(spec.opcode).output_rows) {
+            case OutputRows::Instruments:
+                value.rows_kind = 0;
+                return;
+            case OutputRows::Fixed:
+                value.rows_kind = 1;
+                return;
+            case OutputRows::ModelProjection: {
+                const bool instrument_projection = !spec.children.empty()
+                    && nodes[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
+                value.rows_kind = instrument_projection ? 0 : 1;
+                return;
+            }
+            case OutputRows::EinsumDerived:
+                break;
+        }
+
+        const bool fixed_matrix = spec.str_param.ends_with("->jk") && !spec.feature_widths.empty();
+        value.fixed_rows = fixed_matrix ? spec.feature_widths[0] : 1;
+        bool fixed_rows = spec.str_param.ends_with("->") || fixed_matrix;
+        const size_t arrow = spec.str_param.find("->");
+        const std::string out_text = arrow == std::string::npos ? std::string() : spec.str_param.substr(arrow + 2);
+        const auto out_labels = parse_einsum_term(out_text);
+        if (out_labels.size() == 1) {
+            bool instrument_rows = false;
+            const auto in_terms = split_einsum_csv(spec.str_param.substr(0, arrow));
+            for (size_t child_i = 0; child_i < in_terms.size() && child_i < spec.children.size(); ++child_i) {
+                const auto labels = parse_einsum_term(in_terms[child_i]);
+                if (!labels.empty() && labels[0] == out_labels[0]) {
+                    const NodeValue& child_value = prior_values[static_cast<size_t>(spec.children[child_i])];
+                    if (!(child_value.rows_kind == 1 && child_value.width > 1 && labels.size() == 1)) instrument_rows = true;
+                }
+            }
+            fixed_rows = !instrument_rows;
+        }
+        value.rows_kind = fixed_rows ? 1 : 0;
+    }
+
+    void bind_tick_rows(
         State& state, py::args rows) const {
         if (rows.size() != state.row_ptrs_.size()) throw std::invalid_argument("wrong number of C++ jax_flat tick inputs");
-        std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> owners;
-        owners.reserve(rows.size());
+        state.tick_input_owners_.clear();
+        state.tick_input_owners_.reserve(rows.size());
         for (size_t i = 0; i < rows.size(); ++i) {
             py::array_t<double, py::array::c_style | py::array::forcecast> arr = py::cast<py::array>(rows[i]);
             auto info = arr.request();
@@ -587,9 +719,8 @@ private:
                 throw std::invalid_argument("C++ jax_flat tick inputs must be 1D float64 arrays matching n_instruments");
             }
             state.row_ptrs_[i] = static_cast<const double*>(info.ptr);
-            owners.push_back(std::move(arr));
+            state.tick_input_owners_.push_back(std::move(arr));
         }
-        return owners;
     }
 
     std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> validate_batch(
@@ -617,21 +748,10 @@ private:
     static GroupState& group_state(State& state, const NodeSpec& spec) { return state.group_states_.at(static_cast<size_t>(spec.state_index)); }
 
     void assign_native_state_indices() {
-        std::array<int, 6> next{0, 0, 0, 0, 0, 0};
+        std::array<int, static_cast<size_t>(StateKind::Count)> next{};
         for (NodeSpec& spec : nodes_) {
             if (spec.state_index < 0) continue;
-            spec.state_index = next[static_cast<size_t>(state_bucket(spec.opcode))]++;
-        }
-    }
-
-    static int state_bucket(OpCode opcode) {
-        switch (opcode) {
-            case OpCode::RollMean: return 1;
-            case OpCode::Shift: return 2;
-            case OpCode::Ridge: return 3;
-            case OpCode::InstrumentBasisMean: return 4;
-            case OpCode::Group: return 5;
-            default: return 0;
+            spec.state_index = next[static_cast<size_t>(op_metadata(spec.opcode).state)]++;
         }
     }
     static const NodeValue& child(const State& state, const NodeSpec& spec, size_t i) { return state.values_.at(static_cast<size_t>(spec.children.at(i))); }
@@ -673,7 +793,6 @@ private:
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
-        std::vector<double> row(static_cast<size_t>(k));
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -684,26 +803,29 @@ private:
                 for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = NaN;
                 continue;
             }
-            normalized_rbf_row((ts - s) / len, k, row.data());
-            for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = row[static_cast<size_t>(b)];
+            normalized_rbf_row((ts - s) / len, k, dst_v.data.data() + static_cast<size_t>(i * k));
         }
     }
 
-    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v) {
+    static std::vector<double> make_future_basis_table(const NodeSpec& spec) {
+        const int k = spec.width;
+        const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
+        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
+        std::vector<double> vals(static_cast<size_t>(k));
+        for (int g = steps - 1; g >= 0; --g) {
+            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
+            for (int b = 0; b < k; ++b) suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
+        }
+        return suffix;
+    }
+
+    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v, const std::vector<double>& suffix) {
         const int n = state.n_instruments_;
         const int k = spec.width;
         const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
-        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
-        std::vector<double> vals(static_cast<size_t>(k));
-        for (int g = steps - 1; g >= 0; --g) {
-            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
-            for (int b = 0; b < k; ++b) {
-                suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
-            }
-        }
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -901,35 +1023,9 @@ private:
         }
     }
 
-    static bool supports_direct_root_write(OpCode opcode) {
-        switch (opcode) {
-            case OpCode::Input:
-            case OpCode::Literal:
-            case OpCode::Add:
-            case OpCode::Sub:
-            case OpCode::Mul:
-            case OpCode::Div:
-            case OpCode::Abs:
-            case OpCode::Ln:
-            case OpCode::Ceil:
-            case OpCode::Floor:
-            case OpCode::Round:
-            case OpCode::Exp:
-            case OpCode::Sign:
-            case OpCode::Arctan:
-            case OpCode::IsNan:
-            case OpCode::Purify:
-            case OpCode::Fraction:
-            case OpCode::NormInv:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
         const int n = state.n_instruments_;
-        const bool direct_root = supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode);
+        const bool direct_root = op_metadata(nodes_[static_cast<size_t>(output_id_)].opcode).direct_root_write;
         for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
             const NodeSpec& spec = nodes_[node_i];
             NodeValue& dst_v = state.values_[node_i];
@@ -1062,7 +1158,7 @@ private:
                     break;
                 }
                 case OpCode::Einsum: {
-                    eval_einsum(state, spec, einsum_plans_[node_i], dst_v);
+                    eval_einsum(state, spec, prepared_nodes_[node_i].einsum, dst_v);
                     break;
                 }
                 case OpCode::XsNorm: {
@@ -1168,7 +1264,7 @@ private:
                     fill_rbf_basis(state, spec, dst_v);
                     break;
                 case OpCode::FutureRbfBasisSum:
-                    fill_future_rbf_basis_sum(state, spec, dst_v);
+                    fill_future_rbf_basis_sum(state, spec, dst_v, prepared_nodes_[node_i].table);
                     break;
                 case OpCode::Col: {
                     const auto& x = child(state, spec, 0);
@@ -1293,6 +1389,40 @@ private:
                 case OpCode::GetPreds: {
                     const auto& r = child(state, spec, 0);
                     std::copy(r.data.begin(), r.data.end(), dst);
+                    break;
+                }
+                case OpCode::VolumeForFitSession:
+                case OpCode::VolumeForSeenSession:
+                case OpCode::Nonnegative:
+                case OpCode::PctSeenSessionVolume: {
+                    const auto& first = child(state, spec, 0);
+                    for (int i = 0; i < n; ++i) {
+                        if (spec.opcode == OpCode::Nonnegative) {
+                            const double x = at(first, n, i);
+                            dst[i] = finite(x) ? std::max(x, 0.0) : 0.0;
+                            continue;
+                        }
+                        if (spec.opcode == OpCode::PctSeenSessionVolume) {
+                            const double seen = at(first, n, i);
+                            const double forecast = at(child(state, spec, 1), n, i);
+                            const double ts = at(child(state, spec, 2), n, i);
+                            const double start = at(child(state, spec, 3), n, i);
+                            dst[i] = finite(ts) && finite(start) && ts >= start && seen + forecast > 0.0
+                                ? seen / (seen + forecast) : NaN;
+                            continue;
+                        }
+                        const double volume = at(first, n, i);
+                        const double ts = at(child(state, spec, 1), n, i);
+                        const double start = at(child(state, spec, 2), n, i);
+                        const double end = at(child(state, spec, 3), n, i);
+                        bool active = finite(ts) && finite(start) && finite(end) && end > start && ts >= start && ts < end;
+                        if (spec.opcode == OpCode::VolumeForSeenSession) {
+                            const double tradable = at(child(state, spec, 4), n, i);
+                            active = active && finite(tradable) && tradable == 1.0;
+                        }
+                        const double clean = finite(volume) ? std::max(volume, 0.0) : 0.0;
+                        dst[i] = active ? clean : (spec.opcode == OpCode::VolumeForFitSession ? NaN : 0.0);
+                    }
                     break;
                 }
                 case OpCode::Group:
@@ -1721,10 +1851,10 @@ void configure_group_universe(GroupState& group, const NodeSpec& spec, int n_ins
 
 State::State(const Runtime* runtime, int n_instruments)
     : n_instruments_(n_instruments),
-      rank_items_(runtime->has_xs_rank_ ? static_cast<size_t>(n_instruments) : 0),
-      full_rank_scores_(runtime->has_xs_rank_ ? static_cast<size_t>(n_instruments) : 0) {
+      rank_items_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0),
+      full_rank_scores_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
-    if (runtime->has_xs_rank_) {
+    if (runtime->has_rank_scratch_) {
         for (int rank = 1; rank <= n_instruments; ++rank) {
             full_rank_scores_[static_cast<size_t>(rank - 1)] =
                 norm_inv(static_cast<double>(rank) / static_cast<double>(n_instruments + 1));
@@ -1734,59 +1864,34 @@ State::State(const Runtime* runtime, int n_instruments)
     for (size_t i = 0; i < runtime->nodes_.size(); ++i) {
         const NodeSpec& spec = runtime->nodes_[i];
         NodeValue& value = values_[i];
-        value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
-        value.fixed_rows = (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->jk") && !spec.feature_widths.empty()) ? spec.feature_widths[0] : 1;
-        const bool instrument_beta = spec.opcode == OpCode::GetBeta
-            && !spec.children.empty()
-            && runtime->nodes_[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
-        bool fixed_einsum_rows = spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk"));
-        if (spec.opcode == OpCode::Einsum) {
-            const size_t arrow = spec.str_param.find("->");
-            const std::string out_text = arrow == std::string::npos ? std::string() : spec.str_param.substr(arrow + 2);
-            const auto out_labels = parse_einsum_term(out_text);
-            if (out_labels.size() == 1) {
-                bool instrument_rows = false;
-                const auto in_terms = split_einsum_csv(spec.str_param.substr(0, arrow));
-                for (size_t child_i = 0; child_i < in_terms.size() && child_i < spec.children.size(); ++child_i) {
-                    const auto labels = parse_einsum_term(in_terms[child_i]);
-                    if (!labels.empty() && labels[0] == out_labels[0]) {
-                        const NodeValue& child_value = values_[static_cast<size_t>(spec.children[child_i])];
-                        if (!(child_value.rows_kind == 1 && child_value.width > 1 && labels.size() == 1)) instrument_rows = true;
-                    }
-                }
-                fixed_einsum_rows = !instrument_rows;
-            }
-        }
-        value.rows_kind = (
-            spec.opcode == OpCode::Literal ||
-            (spec.opcode == OpCode::GetBeta && !instrument_beta) ||
-            spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
+        Runtime::configure_value_layout(spec, runtime->nodes_, values_, n_instruments, value);
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
     row_ptrs_.assign(count_inputs(runtime->nodes_), nullptr);
+    tick_input_owners_.reserve(row_ptrs_.size());
     for (const NodeSpec& spec : runtime->nodes_) {
         if (spec.state_index < 0) continue;
         const int node_size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
 
-        switch (spec.opcode) {
-            case OpCode::RollMean:
+        switch (op_metadata(spec.opcode).state) {
+            case StateKind::RollingMean:
                 rolling_mean_states_.emplace_back(spec.int_param, node_size);
                 break;
-            case OpCode::Shift:
+            case StateKind::Shift:
                 shift_states_.emplace_back(spec.int_param + 1, node_size);
                 break;
-            case OpCode::Ridge: {
+            case StateKind::Ridge: {
                 const int feature_count = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
                 ridge_states_.emplace_back(feature_count, n_instruments);
                 break;
             }
-            case OpCode::InstrumentBasisMean: {
+            case StateKind::InstrumentBasisMean: {
                 const int feature_width = spec.feature_widths.empty() ? spec.width : spec.feature_widths.at(0);
                 instrument_basis_mean_states_.emplace_back(feature_width, n_instruments);
                 break;
             }
-            case OpCode::Group: {
+            case StateKind::Group: {
                 const int groups = spec.feature_widths.empty() ? 1 : spec.feature_widths.at(0);
                 const int capacity = static_cast<int>(spec.param);
                 const int total_slots = capacity * groups;
@@ -1797,9 +1902,11 @@ State::State(const Runtime* runtime, int n_instruments)
                 configure_group_universe(group_states_.back(), spec, n_instruments, groups, capacity);
                 break;
             }
-            default:
+            case StateKind::Value:
                 value_states_.emplace_back(node_size);
                 break;
+            case StateKind::Count:
+                throw std::logic_error("invalid native state metadata");
         }
     }
 }

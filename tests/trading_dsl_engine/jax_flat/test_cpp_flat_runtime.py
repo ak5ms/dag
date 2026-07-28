@@ -3,6 +3,7 @@ import time
 import jax
 import pytest
 import numpy as np
+import trading_dsl_engine._native_build as native_build
 from trading_dsl_engine.jax_flat import compile_formula
 from trading_dsl_engine.jax_flat.engine_cpp import (
     BroadcastMode,
@@ -10,6 +11,7 @@ from trading_dsl_engine.jax_flat.engine_cpp import (
     inspect_hybrid_partition,
     lower_native_plan,
 )
+from trading_dsl_engine._native_build import native_source_fingerprint
 
 
 def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -18,6 +20,59 @@ def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
     _, cpp_out = cpp_runtime.run_batch(data)
     _, jax_out = jax_runtime.run_batch(data)
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
+
+
+def test_cpp_flat_source_fingerprint_tracks_transitive_local_dependencies(tmp_path):
+    source_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
+    source_dir.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# build configuration\n")
+    (tmp_path / "pyproject.toml").write_text("[build-system]\n")
+    (source_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
+    (source_dir / "ops.cpp").write_text('#include "detail.h"\n')
+    detail = source_dir / "detail.h"
+    detail.write_text("constexpr int version = 1;\n")
+
+    initial = native_source_fingerprint(tmp_path)
+    detail.write_text("constexpr int version = 2;\n")
+    assert native_source_fingerprint(tmp_path) != initial
+
+    restored = native_source_fingerprint(tmp_path)
+    (tmp_path / "unrelated.txt").write_text("not a compiler input")
+    assert native_source_fingerprint(tmp_path) == restored
+
+    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
+    nnqp_dir.mkdir(parents=True)
+    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
+    nnqp_header = nnqp_dir / "nnqp_eigen_impl.h"
+    nnqp_header.write_text("constexpr int solver_version = 1;\n")
+    nnqp_initial = native_source_fingerprint(tmp_path, "eigen_nnqp")
+    nnqp_header.write_text("constexpr int solver_version = 2;\n")
+    assert native_source_fingerprint(tmp_path, "eigen_nnqp") != nnqp_initial
+
+
+def test_native_extension_rebuilds_once_for_changed_dependency(tmp_path, monkeypatch):
+    flat_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
+    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
+    flat_dir.mkdir(parents=True)
+    nnqp_dir.mkdir(parents=True)
+    (tmp_path / "setup.py").write_text("# build configuration\n")
+    (flat_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
+    dependency = flat_dir / "ops.cpp"
+    dependency.write_text("constexpr int version = 1;\n")
+    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
+    (nnqp_dir / "nnqp_eigen_impl.h").write_text("constexpr int solver_version = 1;\n")
+    extension = flat_dir / "_cpp_flat.so"
+    extension.touch()
+    builds = []
+    monkeypatch.setattr(native_build.subprocess, "run", lambda *args, **kwargs: builds.append((args, kwargs)))
+
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    assert len(builds) == 1
+
+    dependency.write_text("constexpr int version = 2;\n")
+    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
+    assert len(builds) == 2
 
 
 def _assert_cpp_matches_pure_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -164,6 +219,38 @@ def test_cpp_flat_rbf_and_instrument_basis_mean_match_jax_flat():
         'einsum(get_beta(InstrumentBasisMean(rbf_basis(ev_ts, session_start, session_end, 3), volume, 1.0, 4.0)), future_rbf_basis_sum(ev_ts, session_start, session_end, 3, 8), "ij,ij->i")',
     ):
         _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)
+
+
+def test_cpp_flat_roll_returns_pov_helpers_are_fully_native():
+    from flows.pov import RollRets
+
+    rows, cols = 36, 4
+    row = np.arange(rows, dtype=np.float64)[:, None]
+    col = np.arange(cols, dtype=np.float64)[None, :]
+    data = {
+        "wdte_out0": np.where(row < 18, 2.0, 1.0) + np.zeros((rows, cols)),
+        "mp_out0.close": 100.0 + row + col,
+        "mp_out1.close": 102.0 + 0.8 * row + col,
+        "is_tradable_out0": np.ones((rows, cols)),
+        "is_tradable_out1": np.ones((rows, cols)),
+        "_ev_ts": row + np.zeros((rows, cols)),
+        "session_start0": np.zeros((rows, cols)),
+        "session_end0": np.full((rows, cols), 30.0),
+        "volume_out0": 10.0 + row + col,
+    }
+    expr = RollRets().roll_rets(n_basis=3, h=32)
+    native = compile_formula_native(expr)
+    pure_jax = compile_formula(expr, cpp=False)
+    _, native_out = native.run_batch(data)
+    _, jax_out = pure_jax.run_batch(data)
+    np.testing.assert_allclose(native_out, np.asarray(jax_out), rtol=1e-9, atol=1e-9, equal_nan=True)
+    assert {node.opcode for node in native.native_plan.nodes} >= {
+        "volume_for_fit_session",
+        "volume_for_seen_session",
+        "nonnegative",
+        "pct_seen_session_volume",
+        "get_beta",
+    }
 
 def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     rows = 18
