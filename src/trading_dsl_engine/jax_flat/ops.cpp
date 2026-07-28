@@ -640,7 +640,8 @@ private:
                         }
                     }
                 }
-                ready_cv.notify_all();
+                if (done) ready_cv.notify_all();
+                else ready_cv.notify_one();
             }
         };
         std::vector<std::thread> threads;
