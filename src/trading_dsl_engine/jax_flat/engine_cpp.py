@@ -7,6 +7,7 @@ from enum import Enum
 import json
 from typing import Any, Callable
 import tempfile
+import warnings
 
 import jax.numpy as jnp
 import numpy as np
@@ -136,6 +137,7 @@ class CppFlatRuntime:
                 raise ValueError("All inputs must share aligned shape (time, n_instruments)")
         state = states or self.init_state(n_instruments)
         worker_count = _normalize_workers(workers)
+        _warn_non_c_inputs(self.program, inputs)
         np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
         if out is None:
             raw = self.core.run_batch(state, worker_count, *np_inputs)
@@ -145,6 +147,7 @@ class CppFlatRuntime:
 
     def run_batch_into(self, state, out, inputs, workers=None):
         inputs = _normalize_batch_inputs_for_program(self.program, inputs)
+        _warn_non_c_inputs(self.program, inputs)
         np_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
         self.core.run_batch_into(state, out, _normalize_workers(workers), *np_inputs)
         return state, out
@@ -152,6 +155,21 @@ class CppFlatRuntime:
     def inspect_native_plan(self) -> dict[str, Any]:
         """Return a serialization-friendly plan diagnostic, off the hot path."""
         return self.native_plan.diagnostic()
+
+def _warn_non_c_inputs(program: StreamingProgram, inputs) -> None:
+    non_contiguous = [
+        program.input_names[index]
+        for index, value in enumerate(inputs)
+        if isinstance(value, np.ndarray) and not value.flags.c_contiguous
+    ]
+    if non_contiguous:
+        warnings.warn(
+            "C++ jax_flat batch input field(s) are not C-contiguous and will be copied: "
+            + ", ".join(non_contiguous),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
 
 def _normalize_workers(workers) -> int:
     if workers is None:
@@ -682,6 +700,7 @@ def _try_cpp_hybrid_batch(
     """Run full-native or staged native/JAX/native batch execution when possible."""
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
+    _warn_non_c_inputs(runtime.program, inputs)
     full = _try_cpp_full_batch(
         runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path, workers=workers
     )

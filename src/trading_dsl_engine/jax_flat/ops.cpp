@@ -15,9 +15,6 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
 #include <thread>
 #include <numeric>
 #include <stdexcept>
@@ -516,12 +513,8 @@ public:
         assign_native_state_indices();
         einsum_plans_.reserve(nodes_.size());
         future_basis_tables_.reserve(nodes_.size());
-        dependents_.resize(nodes_.size());
-        indegrees_.resize(nodes_.size());
         for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
             const auto& spec = nodes_[node_i];
-            indegrees_[node_i] = static_cast<int>(spec.children.size());
-            for (int child_id : spec.children) dependents_.at(static_cast<size_t>(child_id)).push_back(static_cast<int>(node_i));
             has_xs_rank_ = has_xs_rank_ || spec.opcode == OpCode::XsRank;
             einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
             future_basis_tables_.push_back(spec.opcode == OpCode::FutureRbfBasisSum ? make_future_basis_table(spec) : std::vector<double>{});
@@ -586,8 +579,16 @@ public:
                     bind_batch_row(state, t, rows, n);
                     eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
                 }
+            } else if (is_independent_ewm_cat()) {
+                eval_batch_independent_ewm_cat(state, output_ptr, rows, row_width, n, thread_count);
             } else {
-                eval_batch_dag(state, output_ptr, rows, row_width, n, thread_count);
+                // Fine-grained per-row DAG dispatch costs more than the kernels
+                // for narrow graphs. Keep those serial until they have a
+                // coarse batch-level partition.
+                for (int64_t t = 0; t < rows; ++t) {
+                    bind_batch_row(state, t, rows, n);
+                    eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
+                }
             }
         }
     }
@@ -602,52 +603,85 @@ private:
         }
     }
 
-    void eval_batch_dag(State& state, double* output, int64_t rows, int width, int n, int workers) const {
-        std::mutex mutex;
-        std::condition_variable ready_cv;
-        std::deque<int> ready;
-        std::vector<int> remaining = indegrees_;
-        int completed = 0;
-        int64_t row = 0;
-        bool done = rows == 0;
-        bind_batch_row(state, 0, rows, n);
-        for (size_t i = 0; i < remaining.size(); ++i) if (remaining[i] == 0) ready.push_back(static_cast<int>(i));
-        auto worker = [&] {
-            while (true) {
-                int node;
-                int64_t task_row;
-                {
-                    std::unique_lock lock(mutex);
-                    ready_cv.wait(lock, [&] { return done || !ready.empty(); });
-                    if (done) return;
-                    node = ready.front(); ready.pop_front(); task_row = row;
-                }
-                eval_node(state, state.row_ptrs_, output + task_row * width, static_cast<size_t>(node));
-                {
-                    std::lock_guard lock(mutex);
-                    for (int dependent : dependents_[static_cast<size_t>(node)])
-                        if (--remaining[static_cast<size_t>(dependent)] == 0) ready.push_back(dependent);
-                    if (++completed == static_cast<int>(nodes_.size())) {
-                        if (!supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode)) {
-                            const auto& root = state.values_[static_cast<size_t>(output_id_)];
-                            std::copy(root.data.begin(), root.data.begin() + root.size(n), output + task_row * width);
+    bool is_independent_ewm_cat() const {
+        const auto& root = nodes_[static_cast<size_t>(output_id_)];
+        if (root.opcode != OpCode::Cat || root.children.size() < 2) return false;
+        for (int child_id : root.children) {
+            const auto& ewm = nodes_[static_cast<size_t>(child_id)];
+            if (ewm.opcode != OpCode::Ewm || ewm.children.size() != 1 || ewm.width != 1) return false;
+            if (nodes_[static_cast<size_t>(ewm.children[0])].opcode != OpCode::Input) return false;
+        }
+        return true;
+    }
+
+    void eval_batch_independent_ewm_cat(
+        State& state, double* output, int64_t rows, int row_size, int n, int workers) const {
+        const auto& root = nodes_[static_cast<size_t>(output_id_)];
+        const int lane_count = static_cast<int>(root.children.size());
+        const int active_workers = std::min(workers, n);
+        auto worker = [&](int worker_id) {
+            const int instrument_begin = n * worker_id / active_workers;
+            const int instrument_end = n * (worker_id + 1) / active_workers;
+            for (int64_t t = 0; t < rows; ++t) {
+                double* row_out = output + t * row_size;
+                for (int instrument = instrument_begin; instrument < instrument_end; ++instrument) {
+                    for (int lane = 0; lane < lane_count; ++lane) {
+                        const int node_id = root.children[static_cast<size_t>(lane)];
+                        const NodeSpec& spec = nodes_[static_cast<size_t>(node_id)];
+                        const NodeSpec& input = nodes_[static_cast<size_t>(spec.children[0])];
+                        const double v = state.batch_base_ptrs_[static_cast<size_t>(input.input_index)][t * n + instrument];
+                        ValueState& ewm_state = value_state(state, spec);
+                        const double alpha = 2.0 / (spec.param + 1.0);
+                        const double old_wt_factor = 1.0 - alpha;
+                        const int min_periods = spec.int_param / 4 - 1;
+                        const bool ignore_na = (spec.int_param & 1) != 0;
+                        const bool adjust = (spec.int_param & 2) != 0;
+                        const bool is_observation = finite(v);
+                        double old_wt = ewm_state.weight[instrument];
+                        if (ewm_state.initialized[instrument] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
+                        if (is_observation) {
+                            if (ewm_state.initialized[instrument]) {
+                                double new_wt = adjust ? 1.0 : alpha;
+                                if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
+                                if (ewm_state.value[instrument] != v) {
+                                    ewm_state.value[instrument] =
+                                        (old_wt * ewm_state.value[instrument] + new_wt * v) / (old_wt + new_wt);
+                                }
+                                old_wt = adjust ? old_wt + new_wt : 1.0;
+                            } else {
+                                ewm_state.value[instrument] = v;
+                                ewm_state.initialized[instrument] = 1;
+                                old_wt = 1.0;
+                            }
+                            ewm_state.streak[instrument] += 1;
                         }
-                        if (++row == rows) done = true;
-                        else {
-                            remaining = indegrees_; completed = 0;
-                            bind_batch_row(state, row, rows, n);
-                            for (size_t i = 0; i < remaining.size(); ++i) if (remaining[i] == 0) ready.push_back(static_cast<int>(i));
-                        }
+                        ewm_state.weight[instrument] = old_wt;
+                        const bool enough = min_periods < 0 || ewm_state.streak[instrument] >= min_periods;
+                        const double result = ewm_state.initialized[instrument] && enough
+                            ? ewm_state.value[instrument] : NaN;
+                        row_out[static_cast<size_t>(instrument * lane_count + lane)] = result;
                     }
                 }
-                if (done) ready_cv.notify_all();
-                else ready_cv.notify_one();
+            }
+            if (rows > 0) {
+                const double* last_row = output + (rows - 1) * row_size;
+                for (int instrument = instrument_begin; instrument < instrument_end; ++instrument) {
+                    for (int lane = 0; lane < lane_count; ++lane) {
+                        const int node_id = root.children[static_cast<size_t>(lane)];
+                        state.values_[static_cast<size_t>(node_id)].data[static_cast<size_t>(instrument)] =
+                            last_row[static_cast<size_t>(instrument * lane_count + lane)];
+                    }
+                }
             }
         };
         std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(workers));
-        for (int i = 0; i < workers; ++i) threads.emplace_back(worker);
+        threads.reserve(static_cast<size_t>(active_workers));
+        for (int worker_id = 0; worker_id < active_workers; ++worker_id) threads.emplace_back(worker, worker_id);
         for (auto& thread : threads) thread.join();
+        if (rows > 0) {
+            auto& root_value = state.values_[static_cast<size_t>(output_id_)];
+            std::copy(output + (rows - 1) * row_size, output + rows * row_size, root_value.data.begin());
+        }
     }
 
     friend class State;
@@ -657,8 +691,6 @@ private:
     std::vector<EinsumExecPlan> einsum_plans_;
     std::vector<std::vector<double>> future_basis_tables_;
     bool has_xs_rank_ = false;
-    std::vector<std::vector<int>> dependents_;
-    std::vector<int> indegrees_;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 

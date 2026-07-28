@@ -680,12 +680,22 @@ def test_cpp_flat_batch_workers_match_serial_and_validate():
     np.testing.assert_allclose(default_parallel, serial)
     with pytest.raises(ValueError, match="positive integer"):
         runtime.run_batch(data, workers=0)
+    fortran_data = {"close": np.asfortranarray(data["close"])}
+    with pytest.warns(RuntimeWarning, match="not C-contiguous.*close"):
+        _, copied = runtime.run_batch(fortran_data, workers=1)
+    np.testing.assert_allclose(copied, serial)
 
 
 def test_cpp_flat_default_workers_complete_wide_independent_ewm_dag():
     data = {"mp_out0.close": np.linspace(10.0, 20.0, 64 * 8).reshape(64, 8)}
     formula = cat(*[ewm(var("mp_out0.close"), span) for span in range(1, 20)])
     runtime = compile_formula_native(formula)
-    _, serial = runtime.run_batch(data, workers=1)
-    _, parallel = runtime.run_batch(data)
+    serial_state, serial = runtime.run_batch(data, workers=1)
+    parallel_state, parallel = runtime.run_batch(data)
     np.testing.assert_allclose(parallel, serial, equal_nan=True)
+    next_row = np.linspace(20.0, 21.0, 8)
+    np.testing.assert_allclose(
+        runtime.tick(parallel_state, next_row),
+        runtime.tick(serial_state, next_row),
+        equal_nan=True,
+    )
