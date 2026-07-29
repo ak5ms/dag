@@ -24,6 +24,7 @@ def _parameters(node) -> tuple[tuple[str, str], ...]:
         "literal": repr(spec[4]),
         "param": repr(spec[5]),
         "int_param": str(spec[6]),
+        "width": str(spec[7]),
     }
     if node.opcode == "ewm":
         flags = spec[6] % 4
@@ -101,12 +102,18 @@ def lower(program, *, n_instruments: int | None = None) -> FormulaIR:
             parameters["scratch_offset"] = str(scratch_entry[1].offset)
         nodes.append(KernelNode(node.node_id, (node.node_id,), node.opcode, node.children, _value_type(node.value_type.shape, node.value_type.width), state_by_node.get(node.node_id), None if scratch_entry is None else scratch_entry[0], tuple(sorted(parameters.items())), traits))
     counts = dict(plan.optimizations)
+    lane_families: dict[tuple[str, tuple[int, ...]], list[int]] = {}
+    for node in nodes:
+        if node.opcode == "ewm":
+            lane_families.setdefault((node.opcode, node.children), []).append(node.id)
+    lifted_lanes = tuple(tuple(ids) for ids in lane_families.values() if len(ids) > 1)
     diagnostics = Diagnostics(
         tuple((node.node_id, (node.node_id,)) for node in plan.nodes),
         constant_folds=counts.get("constant_folds", 0),
         stateless_cse=counts.get("common_subexpressions", 0) - counts.get("stateful_common_subexpressions", 0),
         stateful_cse=counts.get("stateful_common_subexpressions", 0),
         dead_nodes=counts.get("dead_nodes", 0), aliases_removed=counts.get("aliases_removed", 0),
+        lifted_lanes=lifted_lanes,
         schedule=tuple(node.traits.parallel for node in nodes),
     )
     inputs = tuple(InputView(name, index, ValueType(ValueKind.INSTRUMENT_VECTOR)) for index, name in enumerate(program.input_names))

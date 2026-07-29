@@ -139,3 +139,6 @@ operators require a descriptor, typed lowering, independently testable native
 kernel, JAX-flat equivalence coverage, and an explicit generic fallback. Never
 claim generated-native performance while execution is using the initial generic
 core bridge; report compilation, cache loading, and execution independently.
+Root `cat` formulas whose children are static-span EWM siblings over one input
+use the fused native lane-family runtime; preserve its independent per-lane
+state and direct instrument-by-lane output layout.

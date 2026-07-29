@@ -56,6 +56,13 @@ def _cpp_link_args() -> list[str]:
 
 ext_modules = [
     Pybind11Extension(
+        "trading_dsl_engine.cpp_new._cpp_new_lanes",
+        ["src/trading_dsl_engine/cpp_new/native/lane_runtime.cpp"],
+        cxx_std=20,
+        extra_compile_args=_cpp_compile_args(),
+        extra_link_args=_cpp_link_args(),
+    ),
+    Pybind11Extension(
         "trading_dsl_engine.jax_flat._cpp_flat",
         ["src/trading_dsl_engine/jax_flat/engine.cpp"],
         depends=["src/trading_dsl_engine/jax_flat/ops.cpp"],

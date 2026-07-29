@@ -248,7 +248,10 @@ arenas—not the C++ call stack—so independently initialized stream states sha
 immutable formula data but never mutable state.
 
 The compile-time descriptor registry currently recognizes `ewm`, `xs_rank`,
-`Ridge`, and the eliminable `get_beta` projection. Unsupported formulas retain
+`cat`, `Ridge`, and the eliminable `get_beta` projection. A root `cat` of EWM
+siblings over the same input is lifted into a fused native parameter-lane
+kernel: it updates independent lane state in one native batch transition and
+writes the instrument-by-lane root directly. Unsupported formulas retain
 the generic flat-native tier as their cold-start/fallback implementation. Modes
 are `generic-only`, `eagerly-specialized`, and `cached-specialized`. The initial
 release publishes generated source into a locked, content-addressed, atomically
@@ -264,11 +267,26 @@ compiler latency, cache space, and instruction-cache pressure; benchmarks must
 therefore report cold compilation and cached loading separately from execution.
 
 The opt-in `benchmark_cpp_new.py` benchmark validates outputs before timing and
-labels execution as `generic-flat-native-bridge` until generated-module loading
-is implemented. On the 2026-07-29 development container (4,096 rows, 150
+reports the selected execution tier: ordinary formulas remain
+`generic-flat-native-bridge`, while lifted EWM `cat` formulas report
+`fused-ewm-lane-native`. On the 2026-07-29 development container (4,096 rows, 150
 instruments, five samples), the EWM-chain baseline measured 548,713 rows/s
 versus 570,547 rows/s through the bridge; `xs_rank` measured 101,199 rows/s
 versus 107,650 rows/s. These differences include ordinary run/order variance,
 **not** a specialization speedup. Cold source materialization was 1.91 ms/1.53
 ms and cached materialization 0.91 ms/0.60 ms for EWM/rank respectively;
 generated sources were 1,217 and 974 bytes.
+
+For the lifted formula `cat(*[ewm(close, span_i) ...])` on 4,096 rows and 150
+instruments, five-sample serial medians were:
+
+| lanes | existing flat C++ | fused cpp_new | speedup |
+| ---: | ---: | ---: | ---: |
+| 4 | 256,406 rows/s | 544,964 rows/s | 2.13x |
+| 16 | 57,735 rows/s | 86,023 rows/s | 1.49x |
+| 32 | 26,800 rows/s | 39,924 rows/s | 1.49x |
+
+The gain comes from eliminating per-node opcode traversal and intermediate
+vector materialization for the sibling EWM family. Each lane retains separate
+value, weight, count, and initialized arrays; the native batch loop releases
+the GIL and allocates only at state/output boundaries, not per timestep.

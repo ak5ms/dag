@@ -27,6 +27,10 @@ _BUILD_ENV = (
     "TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS",
 )
 _EXTENSIONS = {
+    "cpp_new_lanes": (
+        "src/trading_dsl_engine/cpp_new/native/lane_runtime.cpp",
+        "src/trading_dsl_engine/cpp_new/_cpp_new_lanes.build.json",
+    ),
     "cpp_flat": (
         "src/trading_dsl_engine/jax_flat/engine.cpp",
         "src/trading_dsl_engine/jax_flat/_cpp_flat.build.json",

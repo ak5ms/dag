@@ -32,6 +32,12 @@ def _emit_kernel(node: KernelNode, *, direct_root: bool) -> tuple:
         return (Declaration("auto", name, f"ridge_tick(state.ridge_{node.id}, {children}, state.ridge_scratch_{node.id})"),)
     if node.opcode == "get_beta":
         return (Declaration("auto", name, f"v{node.children[0]}.beta", "const"),)
+    if node.opcode == "cat":
+        destination = "output" if direct_root else f"state.scratch.at<double>({_parameter(node, 'scratch_offset')}, input.width * {_parameter(node, 'width', '1')})"
+        return (
+            Statement(f"cat_tick({children}, {destination})"),
+            Declaration("auto", name, "output.span()" if direct_root else destination),
+        )
     if node.opcode in {"add", "sub", "mul", "div"}:
         return (Declaration("auto", name, f"elementwise_{node.opcode}({children})"),)
     raise NotImplementedError(node.opcode)

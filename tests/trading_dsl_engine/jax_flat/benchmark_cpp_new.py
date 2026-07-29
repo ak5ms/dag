@@ -1,8 +1,7 @@
-"""Opt-in cpp_new lowering and execution-bridge benchmark.
+"""Opt-in cpp_new lowering and native lane-family benchmark.
 
-This benchmark labels the current execution path accurately: until generated
-modules are loaded by ``SpecializedRuntime``, cpp_new execution is the generic
-flat-native bridge and is not a specialized-kernel performance claim.
+The EWM ``cat`` case uses the fused native parameter-lane family. Other cases
+remain explicitly labelled as the generic flat-native bridge.
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_ge
 CASES = {
     "ewm_chain": "ewm(ewm(ewm(close, 4.0), 8.0), 16.0)",
     "xs_rank": "xs_rank(close)",
+    "cat_ewm": None,
 }
 
 
@@ -36,11 +36,14 @@ def _measure(runtime, data: np.ndarray, samples: int) -> list[float]:
     return rates
 
 
-def benchmark(case: str, rows: int, instruments: int, samples: int) -> dict:
+def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int = 16) -> dict:
     rng = np.random.default_rng(104729)
     data = rng.normal(size=(rows, instruments))
     data[rng.random(data.shape) < 0.02] = np.nan
     formula = CASES[case]
+    if case == "cat_ewm":
+        spans = (2.0 ** (1.0 + np.arange(lanes) / 4.0)).tolist()
+        formula = "cat(" + ",".join(f"ewm(close, {span!r})" for span in spans) + ")"
     started = time.perf_counter_ns()
     generic = compile_generic(formula)
     generic_compile = (time.perf_counter_ns() - started) * 1e-9
@@ -58,16 +61,16 @@ def benchmark(case: str, rows: int, instruments: int, samples: int) -> dict:
         np.testing.assert_allclose(old_output, new_output, equal_nan=True)
         source_bytes = specialized.artifact.source.stat().st_size
     return {
-        "case": case, "rows": rows, "instruments": instruments,
+        "case": case, "rows": rows, "instruments": instruments, "lanes": lanes if case == "cat_ewm" else None,
         "generic_compile_seconds": generic_compile,
         "cpp_new_cold_materialization_seconds": cold,
         "cpp_new_cached_materialization_seconds": cached_load,
         "generated_source_bytes": source_bytes,
         "generic_rows_per_second_samples": old_samples,
         "generic_rows_per_second_median": statistics.median(old_samples),
-        "cpp_new_generic_bridge_rows_per_second_samples": bridge_samples,
-        "cpp_new_generic_bridge_rows_per_second_median": statistics.median(bridge_samples),
-        "execution_tier": "generic-flat-native-bridge",
+        "cpp_new_rows_per_second_samples": bridge_samples,
+        "cpp_new_rows_per_second_median": statistics.median(bridge_samples),
+        "execution_tier": cached.execution_tier,
     }
 
 
@@ -77,6 +80,7 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=4096)
     parser.add_argument("--instruments", type=int, default=150)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--lanes", type=int, default=16)
     print(json.dumps(benchmark(**vars(parser.parse_args())), indent=2))
 
 
