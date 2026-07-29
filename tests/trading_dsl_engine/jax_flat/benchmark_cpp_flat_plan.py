@@ -52,6 +52,8 @@ CASES = {
     "elementwise": "add(mul(add(mul(add(mul(close, 1.01), open), 0.99), close), 1.001), open)",
     "rank_stateful": "xs_rank(cumsum(close))",
     "ewm_chain": "ewm(ewm(ewm(close, 4.0), 8.0), 16.0)",
+    "ewm_fanout": "cat(" + ",".join(f"ewm(close, {span}.0)" for span in range(1, 30)) + ")",
+    "diverse_fanout": "cat(abs(close), exp(add(open, close)), ewm(close, 8.0), cumsum(mul(open, close)))",
     "rolling_shift": "shift(roll_mean(close, 16), lag, 32)",
     "groupby": "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
     "groupby_locality": "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
@@ -135,7 +137,9 @@ def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1)
     cold_seconds = time.perf_counter() - t0
 
     inputs = tuple(data[name][0] for name in runtime.program.input_names)
-    out = np.empty(instruments, dtype=np.float64)
+    root_type = runtime.native_plan.nodes[runtime.native_plan.output_id].value_type
+    output_rows = 1 if root_type.shape == "scalar" else instruments
+    out = np.empty(output_rows * root_type.width, dtype=np.float64)
     runtime.tick_into(state, out, *inputs)  # warm construction/lazy paths
     tick_rates = []
     batch_rates = []
