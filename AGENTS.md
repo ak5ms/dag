@@ -128,3 +128,14 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ## Future roadmap hints
 
 Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+
+## cpp_new experimental backend
+
+`src/trading_dsl_engine/cpp_new/` is the formula-specialized native tier. It must
+consume `StreamingProgram`, keep descriptors compile-time-only, emit one
+straight-line tick used by batch through the typed `cpp_ast` renderer (not
+incremental source-string concatenation), and use aligned persistent/scratch arenas. New
+operators require a descriptor, typed lowering, independently testable native
+kernel, JAX-flat equivalence coverage, and an explicit generic fallback. Never
+claim generated-native performance while execution is using the initial generic
+core bridge; report compilation, cache loading, and execution independently.

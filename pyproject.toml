@@ -20,6 +20,8 @@ dependencies = [
     "includeigen",
     "unxt>=1.11",
     "deap",
+    "matplotlib",
+    "graphviz",
 ]
 
 [tool.pytest.ini_options]

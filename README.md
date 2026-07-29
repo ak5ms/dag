@@ -233,3 +233,42 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 - Add graph-level IR + CSE for shared subtrees across multi-feature workflows.
 - Expand shape system for richer multi-output model/optimizer nodes.
 - Continue reducing memory movement in batch paths for large memmap workloads.
+
+### Experimental `cpp_new` formula-specialized tier
+
+`trading_dsl_engine.cpp_new` consumes the same typed, topologically ordered
+JAX-flat `StreamingProgram`; it does not add a parser.  Lowering produces an
+immutable and hashable IR, applies the documented semantics-safe pass order,
+plans 64-byte-aligned persistent and lifetime-colored scratch arenas, and emits
+a straight-line formula transition through a typed C++ syntax tree (includes,
+declarations, functions, blocks, and statements), rather than assembling the
+translation unit by appending source fragments. Batch execution is defined as repeated
+calls to that exact ordered row transition. Runtime-sized arrays live in owned
+arenas—not the C++ call stack—so independently initialized stream states share
+immutable formula data but never mutable state.
+
+The compile-time descriptor registry currently recognizes `ewm`, `xs_rank`,
+`Ridge`, and the eliminable `get_beta` projection. Unsupported formulas retain
+the generic flat-native tier as their cold-start/fallback implementation. Modes
+are `generic-only`, `eagerly-specialized`, and `cached-specialized`. The initial
+release publishes generated source into a locked, content-addressed, atomically
+renamed cache; native execution remains on the equivalence-proven generic core
+while the generated-module loader is completed.
+
+Use `runtime.inspect_ir()`, `inspect_layout()`, and
+`inspect_generated_source()` to inspect mappings, optimization counts, arena
+layout, scratch lifetimes, scheduling traits, and source without running the
+formula, tracing JAX, or loading a generated module. Formula specialization
+removes interpretation and enables future fusion/lane lifting, but adds cold
+compiler latency, cache space, and instruction-cache pressure; benchmarks must
+therefore report cold compilation and cached loading separately from execution.
+
+The opt-in `benchmark_cpp_new.py` benchmark validates outputs before timing and
+labels execution as `generic-flat-native-bridge` until generated-module loading
+is implemented. On the 2026-07-29 development container (4,096 rows, 150
+instruments, five samples), the EWM-chain baseline measured 548,713 rows/s
+versus 570,547 rows/s through the bridge; `xs_rank` measured 101,199 rows/s
+versus 107,650 rows/s. These differences include ordinary run/order variance,
+**not** a specialization speedup. Cold source materialization was 1.91 ms/1.53
+ms and cached materialization 0.91 ms/0.60 ms for EWM/rank respectively;
+generated sources were 1,217 and 974 bytes.
