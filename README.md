@@ -340,6 +340,15 @@ state stages and two explicit rank barriers. Preallocated ping-pong row buffers
 carry lane values between barriers without returning to the generic node
 interpreter. Every barrier still observes the complete current timestep.
 
+Pattern discovery itself has no EWM or rank special case. It builds a canonical
+lane graph from operator descriptors, complete child topology, invariant static
+parameters, and source-input identities. Registered native-family factories
+probe that graph and either construct an executor or decline it. The built-in
+EWM/rank factory is therefore an executor plugin, not a conditional in the
+public runtime. New stateless, n-ary, model, or grouped families extend the same
+mechanism by registering descriptors and a capability probe; mismatched branch
+topology is rejected rather than partially fused.
+
 The remaining native operator set, including canonical composite-key groupby,
 continues to use the existing flat-native executor when no specialized family
 matches. Groupby cannot safely be treated as an elementwise lane: its optimized

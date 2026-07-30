@@ -1,12 +1,10 @@
 """Public optimized-tier runtime with generic native execution fallback."""
 from dataclasses import dataclass
-import importlib
-import importlib.util
-from pathlib import Path
 import numpy as np
-from trading_dsl_engine._native_build import ensure_native_extension_current
+import trading_dsl_engine.cpp_new.accelerators  # register built-in capability probes
 from trading_dsl_engine.cpp_new.build import materialize
 from trading_dsl_engine.cpp_new.codegen import emit_source
+from trading_dsl_engine.cpp_new.lanes import build_accelerator
 from trading_dsl_engine.cpp_new.lowering import lower
 from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_generic
 
@@ -33,7 +31,7 @@ class SpecializedRuntime:
     def run_batch(self, inputs, states=None, out=None):
         if not self.accelerator: return self.generic.run_batch(inputs, states, out)
         values = tuple(inputs.values()) if isinstance(inputs, dict) else tuple(inputs)
-        data = np.asarray(values[0], dtype=np.float64, order="C")
+        data = np.asarray(values[self.accelerator.input_indices[0]], dtype=np.float64, order="C")
         state = states or self.init_state(data.shape[1])
         if out is not None:
             self.accelerator.run_batch_into(state, out, data)
@@ -47,7 +45,7 @@ class SpecializedRuntime:
         if not self.accelerator:
             raise ValueError("ablations require a selected native lane accelerator")
         values = tuple(inputs.values()) if isinstance(inputs, dict) else tuple(inputs)
-        data = np.asarray(values[0], dtype=np.float64, order="C")
+        data = np.asarray(values[self.accelerator.input_indices[0]], dtype=np.float64, order="C")
         self.accelerator.run_batch_ablation(state, out, data, variant)
         return state, out
     def inspect_ir(self): return self.ir.inspect()
@@ -56,8 +54,7 @@ class SpecializedRuntime:
     @property
     def execution_tier(self):
         if not self.accelerator: return "generic-flat-native-bridge"
-        if getattr(self.accelerator, "stages", 1) > 1: return "fused-ewm-cross-sectional-pipeline-native"
-        return "fused-ewm-rank-lane-native" if getattr(self.accelerator, "rank_output", False) else "fused-ewm-lane-native"
+        return self.accelerator.tier
 
 
 def compile_formula(formula, dsl_registry=None, *, mode="cached-specialized", cache_dir=None, n_instruments=None):
@@ -65,36 +62,5 @@ def compile_formula(formula, dsl_registry=None, *, mode="cached-specialized", ca
     generic = compile_generic(formula, dsl_registry=dsl_registry)
     ir = lower(generic.program, n_instruments=n_instruments)
     artifact = None if mode == "generic-only" else materialize(ir, cache_dir)
-    accelerator = None if mode == "generic-only" else _ewm_lane_accelerator(ir)
+    accelerator = None if mode == "generic-only" else build_accelerator(ir)
     return SpecializedRuntime(generic, ir, artifact, mode, accelerator)
-
-
-def _ewm_lane_accelerator(ir):
-    root = ir.nodes[ir.outputs[0].node]
-    if root.opcode != "cat" or not root.children:
-        return None
-    branches = []
-    for child in root.children:
-        cursor = ir.nodes[child]
-        stages = []
-        while True:
-            ranked = cursor.opcode == "xs_rank" and len(cursor.children) == 1
-            if ranked: cursor = ir.nodes[cursor.children[0]]
-            if cursor.opcode != "ewm" or len(cursor.children) != 1: break
-            stages.append((float(dict(cursor.parameters)["param"]), ranked))
-            cursor = ir.nodes[cursor.children[0]]
-        if cursor.opcode != "input" or not stages: return None
-        branches.append((cursor.id, tuple(reversed(stages))))
-    if len({source for source, _ in branches}) != 1: return None
-    shapes = {tuple(ranked for _, ranked in stages) for _, stages in branches}
-    if len(shapes) != 1 or len({len(stages) for _, stages in branches}) != 1: return None
-    module_name = "trading_dsl_engine.cpp_new._cpp_new_lanes"
-    spec = importlib.util.find_spec(module_name)
-    extension = Path(spec.origin) if spec is not None and spec.origin is not None else None
-    ensure_native_extension_current(Path(__file__).resolve().parents[3], "cpp_new_lanes", extension)
-    _cpp_new_lanes = importlib.import_module(module_name)
-
-    stage_count = len(branches[0][1])
-    stage_spans = [[stages[stage][0] for _, stages in branches] for stage in range(stage_count)]
-    rank_after = [branches[0][1][stage][1] for stage in range(stage_count)]
-    return _cpp_new_lanes.EwmLaneRuntime(stage_spans, rank_after)

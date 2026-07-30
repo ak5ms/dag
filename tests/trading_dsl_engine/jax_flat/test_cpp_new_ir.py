@@ -35,6 +35,7 @@ def test_cpp_new_scratch_coloring_reuses_nonoverlapping_intervals():
 
 
 def test_cpp_new_cat_lifts_sibling_ewm_parameter_lanes():
+    from trading_dsl_engine.cpp_new.lanes import discover_lane_graph
     program = compile_formula(
         "cat(ewm(close, 4.0), ewm(close, 8.0), ewm(close, 16.0))", cpp=False
     ).program
@@ -42,6 +43,9 @@ def test_cpp_new_cat_lifts_sibling_ewm_parameter_lanes():
     assert ir.nodes[-1].opcode == "cat"
     assert ir.nodes[-1].value_type.width == 3
     assert ir.diagnostics.lifted_lanes == ((1, 2, 3),)
+    graph = discover_lane_graph(ir)
+    assert graph is not None
+    assert graph.source_inputs == (0,)
     source = emit_source(ir)
     assert "cat_tick(v1, v2, v3, output)" in source
 
@@ -119,3 +123,12 @@ def test_cpp_new_lifts_multiple_cross_sectional_transitions(tmp_path):
     _, expected = expected_runtime.run_batch((values,))
     _, actual = actual_runtime.run_batch((values,))
     np.testing.assert_allclose(actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12)
+
+
+def test_lane_discovery_rejects_adversarial_mismatched_topology():
+    from trading_dsl_engine.cpp_new.lanes import discover_lane_graph
+
+    program = compile_formula(
+        "cat(ewm(close, 4.0), xs_rank(ewm(close, 8.0)))", cpp=False
+    ).program
+    assert discover_lane_graph(lower(program, n_instruments=8)) is None

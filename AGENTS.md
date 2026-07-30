@@ -156,3 +156,8 @@ cross-sectional barriers using preallocated ping-pong row buffers; it must
 never reorder or merge barriers. Operators without a measured specialized
 family, especially groupby, remain on the generic flat-native executor rather
 than gaining placeholder cpp_new kernels.
+The public runtime must not contain operator-specific pattern matchers. Generic
+lane-graph discovery compares descriptor-declared semantics, complete child
+topology, invariant parameters, and input identities; executor plugins probe
+the result through the accelerator-factory registry. Adversarially mismatched
+branches must decline specialization and preserve the generic fallback.
