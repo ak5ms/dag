@@ -1,6 +1,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <unsupported/Eigen/SpecialFunctions>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -10,6 +11,7 @@
 namespace py = pybind11;
 
 namespace {
+struct RankItem { double value; std::size_t instrument; };
 struct State {
     std::size_t instruments;
     std::size_t lanes;
@@ -18,14 +20,21 @@ struct State {
     std::vector<std::int64_t> count;
     std::vector<std::uint8_t> initialized;
     std::vector<double> row_scratch;
+    std::vector<RankItem> rank_items;
+    std::vector<double> full_rank_scores;
 
     State(std::size_t n, std::size_t l)
-        : instruments(n), lanes(l), value(n * l), weight(n * l), count(n * l), initialized(n * l), row_scratch(n * l) {}
+        : instruments(n), lanes(l), value(n * l), weight(n * l), count(n * l), initialized(n * l),
+          row_scratch(n * l), rank_items(n), full_rank_scores(n) {
+        for (std::size_t rank = 1; rank <= n; ++rank)
+            full_rank_scores[rank - 1] = Eigen::numext::ndtri(static_cast<double>(rank) / (n + 1.0));
+    }
 };
 
 class EwmLaneRuntime {
 public:
-    explicit EwmLaneRuntime(std::vector<double> spans) : spans_(std::move(spans)) {
+    explicit EwmLaneRuntime(std::vector<double> spans, bool rank_output = false)
+        : spans_(std::move(spans)), rank_output_(rank_output) {
         alpha_.reserve(spans_.size());
         decay_.reserve(spans_.size());
         for (double span : spans_) {
@@ -38,9 +47,39 @@ public:
     std::shared_ptr<State> init_state(std::size_t instruments) const {
         return std::make_shared<State>(instruments, spans_.size());
     }
+    bool rank_output() const noexcept { return rank_output_; }
 
     void row(State& state, const double* input, double* output) const noexcept {
-        row_instrument_major(state, input, output);
+        if (!rank_output_) {
+            row_instrument_major(state, input, output);
+            return;
+        }
+        row_instrument_major(state, input, state.row_scratch.data());
+        for (std::size_t lane = 0; lane < state.lanes; ++lane)
+            rank_lane(state, lane, output);
+    }
+
+    static void rank_lane(State& state, std::size_t lane, double* output) noexcept {
+        const std::size_t n = state.instruments;
+        std::size_t count = 0;
+        for (std::size_t instrument = 0; instrument < n; ++instrument) {
+            const double value = state.row_scratch[instrument * state.lanes + lane];
+            if (std::isfinite(value)) state.rank_items[count++] = {value, instrument};
+            else output[instrument * state.lanes + lane] = NAN;
+        }
+        std::sort(state.rank_items.begin(), state.rank_items.begin() + count,
+                  [](const RankItem& left, const RankItem& right) {
+                      return left.value < right.value || (left.value == right.value && left.instrument < right.instrument);
+                  });
+        for (std::size_t begin = 0; begin < count;) {
+            std::size_t upper = begin + 1;
+            while (upper < count && state.rank_items[upper].value == state.rank_items[begin].value) ++upper;
+            const double score = count == n ? state.full_rank_scores[upper - 1]
+                : Eigen::numext::ndtri(static_cast<double>(upper) / (count + 1.0));
+            for (std::size_t position = begin; position < upper; ++position)
+                output[state.rank_items[position].instrument * state.lanes + lane] = score;
+            begin = upper;
+        }
     }
 
     void row_lane_major(State& state, const double* input, double* output, bool lane_major_output) const noexcept {
@@ -202,14 +241,16 @@ private:
     std::vector<double> spans_;
     std::vector<double> alpha_;
     std::vector<double> decay_;
+    bool rank_output_;
 };
 }  // namespace
 
 PYBIND11_MODULE(_cpp_new_lanes, module) {
     py::class_<State, std::shared_ptr<State>>(module, "State");
     py::class_<EwmLaneRuntime>(module, "EwmLaneRuntime")
-        .def(py::init<std::vector<double>>())
+        .def(py::init<std::vector<double>, bool>(), py::arg("spans"), py::arg("rank_output") = false)
         .def("init_state", &EwmLaneRuntime::init_state)
+        .def_property_readonly("rank_output", &EwmLaneRuntime::rank_output)
         .def("tick_into", &EwmLaneRuntime::tick_into)
         .def("run_batch", &EwmLaneRuntime::run_batch)
         .def("run_batch_into", &EwmLaneRuntime::run_batch_into)

@@ -82,3 +82,22 @@ def test_cpp_new_cat_ewm_native_lane_batch_and_state_isolation(tmp_path):
     actual_runtime.tick_into(state_b, first_b, values[0])
     assert not np.allclose(first_a, first_b, equal_nan=True)
     np.testing.assert_allclose(first_b[0], np.ones(3), equal_nan=True)
+
+
+def test_cpp_new_automatically_lifts_cross_sectional_rank_barrier(tmp_path):
+    import numpy as np
+
+    from trading_dsl_engine.cpp_new import compile_formula as compile_cpp_new
+    from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_generic
+
+    formula = "cat(xs_rank(ewm(close, 4.0)), xs_rank(ewm(close, 8.0)))"
+    values = np.array(
+        [[1.0, 1.0, np.nan, -0.0], [4.0, 2.0, 3.0, np.inf], [2.0, np.nan, 2.0, 2.0]],
+        dtype=np.float64,
+    )
+    expected_runtime = compile_generic(formula)
+    actual_runtime = compile_cpp_new(formula, cache_dir=tmp_path, n_instruments=4)
+    assert actual_runtime.execution_tier == "fused-ewm-rank-lane-native"
+    _, expected = expected_runtime.run_batch((values,))
+    _, actual = actual_runtime.run_batch((values,))
+    np.testing.assert_allclose(actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12)

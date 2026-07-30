@@ -147,3 +147,7 @@ which static parameters vary and group only identical invariant topology.
 Family executors remain distinct for elementwise, cross-sectional-sort, and
 model/reduction barriers. Use instrument-major direct output by default; the
 recorded EWM ablation showed it outperforming lane-major and materialized forms.
+Instrument-major means the inner loop order within a single timestep; it never
+reorders time. Cross-sectional lane families must finish their upstream row
+transition, then execute one explicit preallocated barrier per lane. Compatible
+lane discovery is automatic for ordinary DSL branches under `cat`.

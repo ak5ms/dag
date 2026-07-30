@@ -58,6 +58,7 @@ ext_modules = [
     Pybind11Extension(
         "trading_dsl_engine.cpp_new._cpp_new_lanes",
         ["src/trading_dsl_engine/cpp_new/native/lane_runtime.cpp"],
+        include_dirs=[includeigen.get_include(), "/usr/include/eigen3"],
         cxx_std=20,
         extra_compile_args=_cpp_compile_args(),
         extra_link_args=_cpp_link_args(),

@@ -317,3 +317,18 @@ families can fuse instrument loops, rank families need one preallocated sort
 scratch per active lane, and Ridge families need independent pairwise clocks
 and deterministic reduction/solve state. Cross-sectional and solve barriers
 must not be fused as if they were ordinary elementwise loops.
+
+Lifting is automatic and does not require a lane construct in the DSL. Users
+continue to write ordinary branches under `cat`; lowering recognizes compatible
+siblings from the optimized graph. The first cross-sectional family,
+`cat(xs_rank(ewm(x, p1)), xs_rank(ewm(x, p2)), ...)`, now uses the same fused EWM
+transition followed by one preallocated sort barrier per lane. Time remains the
+outer sequential batch dimension: “instrument-major” describes only loop order
+*within one timestep*. Consequently all instruments for a row have been updated
+before `xs_rank` compacts, sorts, scans ties, and scatters that row's scores.
+
+The “store-only ceiling” is an ablation, not a usable formula result. It repeats
+each input value into every output lane while skipping EWM arithmetic and state;
+it estimates the best achievable output-store rate for the validated memory
+layout. Comparing it with real kernels distinguishes memory-bandwidth limits
+from computation/state-transition limits.

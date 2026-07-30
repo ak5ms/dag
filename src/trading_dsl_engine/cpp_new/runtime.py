@@ -54,7 +54,9 @@ class SpecializedRuntime:
     def inspect_generated_source(self): return emit_source(self.ir)
     def inspect_layout(self): return {"state_bytes": self.ir.state_bytes, "scratch_bytes": self.ir.scratch_bytes, "states": self.ir.inspect()["states"], "scratch": self.ir.inspect()["scratch"]}
     @property
-    def execution_tier(self): return "fused-ewm-lane-native" if self.accelerator else "generic-flat-native-bridge"
+    def execution_tier(self):
+        if not self.accelerator: return "generic-flat-native-bridge"
+        return "fused-ewm-rank-lane-native" if getattr(self.accelerator, "rank_output", False) else "fused-ewm-lane-native"
 
 
 def compile_formula(formula, dsl_registry=None, *, mode="cached-specialized", cache_dir=None, n_instruments=None):
@@ -70,7 +72,9 @@ def _ewm_lane_accelerator(ir):
     root = ir.nodes[ir.outputs[0].node]
     if root.opcode != "cat" or not root.children:
         return None
-    children = tuple(ir.nodes[child] for child in root.children)
+    root_children = tuple(ir.nodes[child] for child in root.children)
+    rank_output = all(node.opcode == "xs_rank" and len(node.children) == 1 for node in root_children)
+    children = tuple(ir.nodes[node.children[0]] for node in root_children) if rank_output else root_children
     if any(node.opcode != "ewm" or len(node.children) != 1 for node in children):
         return None
     if len({node.children for node in children}) != 1:
@@ -85,4 +89,4 @@ def _ewm_lane_accelerator(ir):
     _cpp_new_lanes = importlib.import_module(module_name)
 
     spans = [float(dict(node.parameters)["param"]) for node in children]
-    return _cpp_new_lanes.EwmLaneRuntime(spans)
+    return _cpp_new_lanes.EwmLaneRuntime(spans, rank_output)

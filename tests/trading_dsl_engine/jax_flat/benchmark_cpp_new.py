@@ -21,6 +21,7 @@ CASES = {
     "ewm_chain": "ewm(ewm(ewm(close, 4.0), 8.0), 16.0)",
     "xs_rank": "xs_rank(close)",
     "cat_ewm": None,
+    "cat_rank_ewm": None,
 }
 
 
@@ -74,9 +75,10 @@ def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int =
     data = rng.normal(size=(rows, instruments))
     data[rng.random(data.shape) < 0.02] = np.nan
     formula = CASES[case]
-    if case == "cat_ewm":
+    if case in {"cat_ewm", "cat_rank_ewm"}:
         spans = (2.0 ** (1.0 + np.arange(lanes) / 4.0)).tolist()
-        formula = "cat(" + ",".join(f"ewm(close, {span!r})" for span in spans) + ")"
+        branch = (lambda span: f"ewm(close, {span!r})") if case == "cat_ewm" else (lambda span: f"xs_rank(ewm(close, {span!r}))")
+        formula = "cat(" + ",".join(branch(span) for span in spans) + ")"
     started = time.perf_counter_ns()
     generic = compile_generic(formula)
     generic_compile = (time.perf_counter_ns() - started) * 1e-9
