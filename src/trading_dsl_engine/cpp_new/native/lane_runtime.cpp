@@ -17,9 +17,10 @@ struct State {
     std::vector<double> weight;
     std::vector<std::int64_t> count;
     std::vector<std::uint8_t> initialized;
+    std::vector<double> row_scratch;
 
     State(std::size_t n, std::size_t l)
-        : instruments(n), lanes(l), value(n * l), weight(n * l), count(n * l), initialized(n * l) {}
+        : instruments(n), lanes(l), value(n * l), weight(n * l), count(n * l), initialized(n * l), row_scratch(n * l) {}
 };
 
 class EwmLaneRuntime {
@@ -39,6 +40,10 @@ public:
     }
 
     void row(State& state, const double* input, double* output) const noexcept {
+        row_instrument_major(state, input, output);
+    }
+
+    void row_lane_major(State& state, const double* input, double* output, bool lane_major_output) const noexcept {
         const std::size_t n = state.instruments;
         const std::size_t lanes = state.lanes;
         for (std::size_t lane = 0; lane < lanes; ++lane) {
@@ -47,7 +52,7 @@ public:
             const std::size_t base = lane * n;
             for (std::size_t instrument = 0; instrument < n; ++instrument) {
                 const std::size_t state_index = base + instrument;
-                const std::size_t output_index = instrument * lanes + lane;
+                const std::size_t output_index = lane_major_output ? state_index : instrument * lanes + lane;
                 const double observation = input[instrument];
                 if (!std::isfinite(observation)) {
                     output[output_index] = state.initialized[state_index] ? state.value[state_index] : NAN;
@@ -72,6 +77,50 @@ public:
                 output[output_index] = state.value[state_index];
             }
         }
+    }
+
+    void row_instrument_major(State& state, const double* input, double* output) const noexcept {
+        const std::size_t n = state.instruments;
+        const std::size_t lanes = state.lanes;
+        for (std::size_t instrument = 0; instrument < n; ++instrument) {
+            const double observation = input[instrument];
+            for (std::size_t lane = 0; lane < lanes; ++lane) {
+                const std::size_t index = lane * n + instrument;
+                const std::size_t output_index = instrument * lanes + lane;
+                if (!std::isfinite(observation)) {
+                    output[output_index] = state.initialized[index] ? state.value[index] : NAN;
+                    continue;
+                }
+                double old_weight = state.weight[index];
+                if (state.initialized[index]) {
+                    old_weight *= decay_[lane];
+                    double new_weight = alpha_[lane];
+                    if (std::abs(alpha_[lane] - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
+                    if (state.value[index] != observation)
+                        state.value[index] = (old_weight * state.value[index] + new_weight * observation) /
+                                             (old_weight + new_weight);
+                } else {
+                    state.value[index] = observation;
+                    state.initialized[index] = 1;
+                }
+                state.weight[index] = 1.0;
+                ++state.count[index];
+                output[output_index] = state.value[index];
+            }
+        }
+    }
+
+    void row_materialized(State& state, const double* input, double* output) const noexcept {
+        row_lane_major(state, input, state.row_scratch.data(), true);
+        for (std::size_t instrument = 0; instrument < state.instruments; ++instrument)
+            for (std::size_t lane = 0; lane < state.lanes; ++lane)
+                output[instrument * state.lanes + lane] = state.row_scratch[lane * state.instruments + instrument];
+    }
+
+    void row_store_only(const State& state, const double* input, double* output) const noexcept {
+        for (std::size_t instrument = 0; instrument < state.instruments; ++instrument)
+            for (std::size_t lane = 0; lane < state.lanes; ++lane)
+                output[instrument * state.lanes + lane] = input[instrument];
     }
 
     void tick_into(const std::shared_ptr<State>& state, py::array_t<double, py::array::c_style> output,
@@ -112,6 +161,35 @@ public:
             row(*state, input_data + timestep * input_stride, output_data + timestep * output_stride);
     }
 
+    void run_batch_ablation(const std::shared_ptr<State>& state,
+                            py::array_t<double, py::array::c_style> output,
+                            py::array_t<double, py::array::c_style | py::array::forcecast> input,
+                            const std::string& variant) const {
+        if (input.ndim() != 2 || output.ndim() != 3 || output.shape(0) != input.shape(0) ||
+            output.shape(1) != input.shape(1) || static_cast<std::size_t>(output.shape(2)) != state->lanes)
+            throw std::invalid_argument("ablation arrays have incompatible shapes");
+        enum class Variant { LaneMajor, InstrumentMajor, Materialized, StoreOnly };
+        const Variant selected = variant == "lane-major" ? Variant::LaneMajor :
+            variant == "instrument-major" ? Variant::InstrumentMajor :
+            variant == "materialized" ? Variant::Materialized :
+            variant == "store-only" ? Variant::StoreOnly : throw std::invalid_argument("unknown ablation variant");
+        const std::size_t input_stride = state->instruments;
+        const std::size_t output_stride = state->instruments * state->lanes;
+        const double* input_data = input.data();
+        double* output_data = output.mutable_data();
+        py::gil_scoped_release release;
+        for (py::ssize_t timestep = 0; timestep < input.shape(0); ++timestep) {
+            const double* in = input_data + timestep * input_stride;
+            double* out = output_data + timestep * output_stride;
+            switch (selected) {
+                case Variant::LaneMajor: row_lane_major(*state, in, out, false); break;
+                case Variant::InstrumentMajor: row_instrument_major(*state, in, out); break;
+                case Variant::Materialized: row_materialized(*state, in, out); break;
+                case Variant::StoreOnly: row_store_only(*state, in, out); break;
+            }
+        }
+    }
+
 private:
     void validate_row(const State& state, const py::array& input, const py::array& output) const {
         if (input.ndim() != 1 || static_cast<std::size_t>(input.shape(0)) != state.instruments)
@@ -134,5 +212,6 @@ PYBIND11_MODULE(_cpp_new_lanes, module) {
         .def("init_state", &EwmLaneRuntime::init_state)
         .def("tick_into", &EwmLaneRuntime::tick_into)
         .def("run_batch", &EwmLaneRuntime::run_batch)
-        .def("run_batch_into", &EwmLaneRuntime::run_batch_into);
+        .def("run_batch_into", &EwmLaneRuntime::run_batch_into)
+        .def("run_batch_ablation", &EwmLaneRuntime::run_batch_ablation);
 }

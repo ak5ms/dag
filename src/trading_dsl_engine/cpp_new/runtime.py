@@ -43,6 +43,13 @@ class SpecializedRuntime:
         return state, result
     def run_batch_into(self, state, out, inputs):
         return self.run_batch(inputs, states=state, out=out)
+    def run_batch_ablation(self, state, out, inputs, variant):
+        if not self.accelerator:
+            raise ValueError("ablations require a selected native lane accelerator")
+        values = tuple(inputs.values()) if isinstance(inputs, dict) else tuple(inputs)
+        data = np.asarray(values[0], dtype=np.float64, order="C")
+        self.accelerator.run_batch_ablation(state, out, data, variant)
+        return state, out
     def inspect_ir(self): return self.ir.inspect()
     def inspect_generated_source(self): return emit_source(self.ir)
     def inspect_layout(self): return {"state_bytes": self.ir.state_bytes, "scratch_bytes": self.ir.scratch_bytes, "states": self.ir.inspect()["states"], "scratch": self.ir.inspect()["scratch"]}

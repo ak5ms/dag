@@ -142,3 +142,8 @@ core bridge; report compilation, cache loading, and execution independently.
 Root `cat` formulas whose children are static-span EWM siblings over one input
 use the fused native lane-family runtime; preserve its independent per-lane
 state and direct instrument-by-lane output layout.
+Lane-family discovery belongs in compile-time operator descriptors: declare
+which static parameters vary and group only identical invariant topology.
+Family executors remain distinct for elementwise, cross-sectional-sort, and
+model/reduction barriers. Use instrument-major direct output by default; the
+recorded EWM ablation showed it outperforming lane-major and materialized forms.

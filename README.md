@@ -290,3 +290,30 @@ The gain comes from eliminating per-node opcode traversal and intermediate
 vector materialization for the sibling EWM family. Each lane retains separate
 value, weight, count, and initialized arrays; the native batch loop releases
 the GIL and allocates only at state/output boundaries, not per timestep.
+
+#### Lane ablation and generalization
+
+A CPU-pinned serial 16-lane ablation (4,096 × 150, seven samples) separated the
+sources of the gap. Existing flat C++ improved from 47,822 to 53,415 rows/s
+when given a reusable direct output; cpp_new improved from 79,024 to 107,370
+rows/s. Within cpp_new, lane-major state traversal achieved 79,844 rows/s,
+instrument-major traversal 111,259 rows/s, and a lane-major transition followed
+by a separate transpose/materialization 85,710 rows/s. A store-only kernel
+reached 474,574 rows/s (8.49 GiB/s). Both runtimes were single-threaded.
+
+These results attribute the gap to four effects, in descending importance for
+this workload: generic per-node evaluation/state-container overhead; output
+allocation and first-touch costs; instrument-contiguous loop/output layout; and
+the avoided intermediate `cat` materialization. Multithreading did not cause
+the measured difference. The store-only ceiling is over 4.5 times the optimized
+EWM rate, so raw output bandwidth is not yet the primary limit.
+
+Lane discovery is descriptor-driven rather than EWM-specific: an operator opts
+in with invariant topology and a declared set of lane-varying static parameters.
+The same planner can therefore form lane families for elementwise operators,
+independent `xs_rank` branches, and independent Ridge models. Their executors
+remain operator-family-specific because barriers and state differ: elementwise
+families can fuse instrument loops, rank families need one preallocated sort
+scratch per active lane, and Ridge families need independent pairwise clocks
+and deterministic reduction/solve state. Cross-sectional and solve barriers
+must not be fused as if they were ordinary elementwise loops.

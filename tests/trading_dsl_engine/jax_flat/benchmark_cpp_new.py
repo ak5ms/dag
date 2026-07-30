@@ -36,6 +36,39 @@ def _measure(runtime, data: np.ndarray, samples: int) -> list[float]:
     return rates
 
 
+def _measure_into(runtime, data: np.ndarray, lanes: int, samples: int) -> list[float]:
+    output = np.empty((data.shape[0], data.shape[1], lanes), dtype=np.float64)
+    rates = []
+    for _ in range(samples):
+        state = runtime.init_state(data.shape[1])
+        started = time.perf_counter_ns()
+        runtime.run_batch((data,), states=state, out=output)
+        elapsed = (time.perf_counter_ns() - started) * 1e-9
+        rates.append(data.shape[0] / elapsed)
+    return rates
+
+
+def _ablate(runtime, data: np.ndarray, lanes: int, samples: int) -> dict[str, dict[str, object]]:
+    variants = ("lane-major", "instrument-major", "materialized", "store-only")
+    output = np.empty((data.shape[0], data.shape[1], lanes), dtype=np.float64)
+    results = {}
+    for variant in variants:
+        rates = []
+        for _ in range(samples):
+            state = runtime.init_state(data.shape[1])
+            started = time.perf_counter_ns()
+            runtime.run_batch_ablation(state, output, (data,), variant)
+            elapsed = (time.perf_counter_ns() - started) * 1e-9
+            rates.append(data.shape[0] / elapsed)
+        median = statistics.median(rates)
+        results[variant] = {
+            "rows_per_second_samples": rates,
+            "rows_per_second_median": median,
+            "output_gib_per_second": median * data.shape[1] * lanes * 8 / 2**30,
+        }
+    return results
+
+
 def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int = 16) -> dict:
     rng = np.random.default_rng(104729)
     data = rng.normal(size=(rows, instruments))
@@ -56,10 +89,13 @@ def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int =
         cached_load = (time.perf_counter_ns() - started) * 1e-9
         old_samples = _measure(generic, data, samples)
         bridge_samples = _measure(cached, data, samples)
+        old_into = _measure_into(generic, data, lanes, samples) if case == "cat_ewm" else None
+        cpp_new_into = _measure_into(cached, data, lanes, samples) if case == "cat_ewm" else None
         old_output = generic.run_batch((data,))[1]
         new_output = cached.run_batch((data,))[1]
         np.testing.assert_allclose(old_output, new_output, equal_nan=True)
         source_bytes = specialized.artifact.source.stat().st_size
+        ablations = _ablate(cached, data, lanes, samples) if case == "cat_ewm" else None
     return {
         "case": case, "rows": rows, "instruments": instruments, "lanes": lanes if case == "cat_ewm" else None,
         "generic_compile_seconds": generic_compile,
@@ -71,6 +107,11 @@ def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int =
         "cpp_new_rows_per_second_samples": bridge_samples,
         "cpp_new_rows_per_second_median": statistics.median(bridge_samples),
         "execution_tier": cached.execution_tier,
+        "generic_direct_output_rows_per_second_samples": old_into,
+        "generic_direct_output_rows_per_second_median": statistics.median(old_into) if old_into else None,
+        "cpp_new_direct_output_rows_per_second_samples": cpp_new_into,
+        "cpp_new_direct_output_rows_per_second_median": statistics.median(cpp_new_into) if cpp_new_into else None,
+        "ablations": ablations,
     }
 
 

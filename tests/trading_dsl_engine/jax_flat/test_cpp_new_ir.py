@@ -67,6 +67,12 @@ def test_cpp_new_cat_ewm_native_lane_batch_and_state_isolation(tmp_path):
     _, mapped_result = actual_runtime.run_batch((values,), states=actual_runtime.init_state(3), out=mapped)
     assert mapped_result is mapped
     np.testing.assert_allclose(mapped, expected, equal_nan=True)
+    for variant in ("lane-major", "instrument-major", "materialized"):
+        ablated = np.empty_like(actual)
+        actual_runtime.run_batch_ablation(
+            actual_runtime.init_state(3), ablated, (values,), variant
+        )
+        np.testing.assert_allclose(ablated, expected, equal_nan=True)
 
     # A second state sharing the compiled lane family must start from zero state.
     state_b = actual_runtime.init_state(3)

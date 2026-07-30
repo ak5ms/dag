@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from trading_dsl_engine.cpp_new.ir import Diagnostics, FormulaIR, GraphOutput, InputView, KernelNode, KernelTraits, ScratchSlot, StateSlot, ValueKind, ValueType
-from trading_dsl_engine.cpp_new.registry import descriptor
+from trading_dsl_engine.cpp_new.registry import descriptor, lane_family_key
 from trading_dsl_engine.jax_flat.engine_cpp import lower_native_plan
 
 
@@ -102,10 +102,11 @@ def lower(program, *, n_instruments: int | None = None) -> FormulaIR:
             parameters["scratch_offset"] = str(scratch_entry[1].offset)
         nodes.append(KernelNode(node.node_id, (node.node_id,), node.opcode, node.children, _value_type(node.value_type.shape, node.value_type.width), state_by_node.get(node.node_id), None if scratch_entry is None else scratch_entry[0], tuple(sorted(parameters.items())), traits))
     counts = dict(plan.optimizations)
-    lane_families: dict[tuple[str, tuple[int, ...]], list[int]] = {}
+    lane_families: dict[tuple, list[int]] = {}
     for node in nodes:
-        if node.opcode == "ewm":
-            lane_families.setdefault((node.opcode, node.children), []).append(node.id)
+        key = lane_family_key(node)
+        if key is not None:
+            lane_families.setdefault(key, []).append(node.id)
     lifted_lanes = tuple(tuple(ids) for ids in lane_families.values() if len(ids) > 1)
     diagnostics = Diagnostics(
         tuple((node.node_id, (node.node_id,)) for node in plan.nodes),
