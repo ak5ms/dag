@@ -332,3 +332,19 @@ each input value into every output lane while skipping EWM arithmetic and state;
 it estimates the best achievable output-store rate for the validated memory
 layout. Comparing it with real kernels distinguishes memory-bandwidth limits
 from computation/state-transition limits.
+
+Lane extraction walks each `cat` branch recursively, so optimization is not
+limited to one producer/barrier pair. A branch such as
+`xs_rank(ewm(xs_rank(ewm(x, p)), q))` becomes one native pipeline with two EWM
+state stages and two explicit rank barriers. Preallocated ping-pong row buffers
+carry lane values between barriers without returning to the generic node
+interpreter. Every barrier still observes the complete current timestep.
+
+The remaining native operator set, including canonical composite-key groupby,
+continues to use the existing flat-native executor when no specialized family
+matches. Groupby cannot safely be treated as an elementwise lane: its optimized
+form needs formula-specific inner transitions plus preallocated open-addressing
+tables per universe, canonical NaN/zero hashing, and independently owned bucket
+state. This fallback is deliberate until that executor has equivalence and
+churn/locality profiles; cpp_new does not advertise placeholder kernels as
+specialized support.

@@ -22,6 +22,7 @@ CASES = {
     "xs_rank": "xs_rank(close)",
     "cat_ewm": None,
     "cat_rank_ewm": None,
+    "cat_deep_cross_sectional": None,
 }
 
 
@@ -75,9 +76,11 @@ def benchmark(case: str, rows: int, instruments: int, samples: int, lanes: int =
     data = rng.normal(size=(rows, instruments))
     data[rng.random(data.shape) < 0.02] = np.nan
     formula = CASES[case]
-    if case in {"cat_ewm", "cat_rank_ewm"}:
+    if case in {"cat_ewm", "cat_rank_ewm", "cat_deep_cross_sectional"}:
         spans = (2.0 ** (1.0 + np.arange(lanes) / 4.0)).tolist()
-        branch = (lambda span: f"ewm(close, {span!r})") if case == "cat_ewm" else (lambda span: f"xs_rank(ewm(close, {span!r}))")
+        if case == "cat_ewm": branch = lambda span: f"ewm(close, {span!r})"
+        elif case == "cat_rank_ewm": branch = lambda span: f"xs_rank(ewm(close, {span!r}))"
+        else: branch = lambda span: f"xs_rank(ewm(xs_rank(ewm(close, {span!r})), {2.0 * span!r}))"
         formula = "cat(" + ",".join(branch(span) for span in spans) + ")"
     started = time.perf_counter_ns()
     generic = compile_generic(formula)

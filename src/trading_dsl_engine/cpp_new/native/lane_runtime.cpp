@@ -15,17 +15,19 @@ struct RankItem { double value; std::size_t instrument; };
 struct State {
     std::size_t instruments;
     std::size_t lanes;
+    std::size_t stages;
     std::vector<double> value;
     std::vector<double> weight;
     std::vector<std::int64_t> count;
     std::vector<std::uint8_t> initialized;
     std::vector<double> row_scratch;
+    std::vector<double> row_scratch_2;
     std::vector<RankItem> rank_items;
     std::vector<double> full_rank_scores;
 
-    State(std::size_t n, std::size_t l)
-        : instruments(n), lanes(l), value(n * l), weight(n * l), count(n * l), initialized(n * l),
-          row_scratch(n * l), rank_items(n), full_rank_scores(n) {
+    State(std::size_t n, std::size_t l, std::size_t s)
+        : instruments(n), lanes(l), stages(s), value(n * l * s), weight(n * l * s), count(n * l * s),
+          initialized(n * l * s), row_scratch(n * l), row_scratch_2(n * l), rank_items(n), full_rank_scores(n) {
         for (std::size_t rank = 1; rank <= n; ++rank)
             full_rank_scores[rank - 1] = Eigen::numext::ndtri(static_cast<double>(rank) / (n + 1.0));
     }
@@ -33,37 +35,55 @@ struct State {
 
 class EwmLaneRuntime {
 public:
-    explicit EwmLaneRuntime(std::vector<double> spans, bool rank_output = false)
-        : spans_(std::move(spans)), rank_output_(rank_output) {
-        alpha_.reserve(spans_.size());
-        decay_.reserve(spans_.size());
-        for (double span : spans_) {
-            const double alpha = 2.0 / (span + 1.0);
-            alpha_.push_back(alpha);
-            decay_.push_back(1.0 - alpha);
+    explicit EwmLaneRuntime(std::vector<std::vector<double>> stage_spans, std::vector<bool> rank_after)
+        : stage_spans_(std::move(stage_spans)), rank_after_(std::move(rank_after)) {
+        if (stage_spans_.empty() || stage_spans_.size() != rank_after_.size())
+            throw std::invalid_argument("lane pipeline stages and barriers must be nonempty and aligned");
+        lanes_ = stage_spans_[0].size();
+        for (const auto& spans : stage_spans_) {
+            if (spans.size() != lanes_) throw std::invalid_argument("all lane stages must have equal width");
+            std::vector<double> stage_alpha, stage_decay;
+            stage_alpha.reserve(lanes_); stage_decay.reserve(lanes_);
+            for (double span : spans) {
+                const double alpha = 2.0 / (span + 1.0);
+                stage_alpha.push_back(alpha); stage_decay.push_back(1.0 - alpha);
+            }
+            alpha_.push_back(std::move(stage_alpha)); decay_.push_back(std::move(stage_decay));
         }
     }
 
     std::shared_ptr<State> init_state(std::size_t instruments) const {
-        return std::make_shared<State>(instruments, spans_.size());
+        return std::make_shared<State>(instruments, lanes_, stage_spans_.size());
     }
-    bool rank_output() const noexcept { return rank_output_; }
+    bool rank_output() const noexcept { return rank_after_.back(); }
+    std::size_t stages() const noexcept { return stage_spans_.size(); }
 
     void row(State& state, const double* input, double* output) const noexcept {
-        if (!rank_output_) {
-            row_instrument_major(state, input, output);
-            return;
+        const double* stage_input = input;
+        bool broadcast_input = true;
+        for (std::size_t stage = 0; stage < state.stages; ++stage) {
+            const bool last = stage + 1 == state.stages;
+            double* alternate = stage_input == state.row_scratch.data() ? state.row_scratch_2.data() : state.row_scratch.data();
+            double* transition_output = (!rank_after_[stage] && last) ? output : alternate;
+            row_stage(state, stage, stage_input, broadcast_input, transition_output);
+            if (rank_after_[stage]) {
+                double* ranked_output = last ? output :
+                    (transition_output == state.row_scratch.data() ? state.row_scratch_2.data() : state.row_scratch.data());
+                for (std::size_t lane = 0; lane < state.lanes; ++lane)
+                    rank_lane(state, transition_output, lane, ranked_output);
+                stage_input = ranked_output;
+            } else {
+                stage_input = transition_output;
+            }
+            broadcast_input = false;
         }
-        row_instrument_major(state, input, state.row_scratch.data());
-        for (std::size_t lane = 0; lane < state.lanes; ++lane)
-            rank_lane(state, lane, output);
     }
 
-    static void rank_lane(State& state, std::size_t lane, double* output) noexcept {
+    static void rank_lane(State& state, const double* input, std::size_t lane, double* output) noexcept {
         const std::size_t n = state.instruments;
         std::size_t count = 0;
         for (std::size_t instrument = 0; instrument < n; ++instrument) {
-            const double value = state.row_scratch[instrument * state.lanes + lane];
+            const double value = input[instrument * state.lanes + lane];
             if (std::isfinite(value)) state.rank_items[count++] = {value, instrument};
             else output[instrument * state.lanes + lane] = NAN;
         }
@@ -82,12 +102,33 @@ public:
         }
     }
 
+    void row_stage(State& state, std::size_t stage, const double* input, bool broadcast, double* output) const noexcept {
+        const std::size_t n = state.instruments, lanes = state.lanes;
+        for (std::size_t instrument = 0; instrument < n; ++instrument) {
+            for (std::size_t lane = 0; lane < lanes; ++lane) {
+                const std::size_t index = (stage * lanes + lane) * n + instrument;
+                const double observation = broadcast ? input[instrument] : input[instrument * lanes + lane];
+                const std::size_t out = instrument * lanes + lane;
+                if (!std::isfinite(observation)) { output[out] = state.initialized[index] ? state.value[index] : NAN; continue; }
+                double old_weight = state.weight[index];
+                if (state.initialized[index]) {
+                    old_weight *= decay_[stage][lane];
+                    double new_weight = alpha_[stage][lane];
+                    if (std::abs(new_weight - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
+                    if (state.value[index] != observation)
+                        state.value[index] = (old_weight * state.value[index] + new_weight * observation) / (old_weight + new_weight);
+                } else { state.value[index] = observation; state.initialized[index] = 1; }
+                state.weight[index] = 1.0; ++state.count[index]; output[out] = state.value[index];
+            }
+        }
+    }
+
     void row_lane_major(State& state, const double* input, double* output, bool lane_major_output) const noexcept {
         const std::size_t n = state.instruments;
         const std::size_t lanes = state.lanes;
         for (std::size_t lane = 0; lane < lanes; ++lane) {
-            const double alpha = alpha_[lane];
-            const double decay = decay_[lane];
+        const double alpha = alpha_[0][lane];
+        const double decay = decay_[0][lane];
             const std::size_t base = lane * n;
             for (std::size_t instrument = 0; instrument < n; ++instrument) {
                 const std::size_t state_index = base + instrument;
@@ -132,9 +173,9 @@ public:
                 }
                 double old_weight = state.weight[index];
                 if (state.initialized[index]) {
-                    old_weight *= decay_[lane];
-                    double new_weight = alpha_[lane];
-                    if (std::abs(alpha_[lane] - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
+                    old_weight *= decay_[0][lane];
+                    double new_weight = alpha_[0][lane];
+                    if (std::abs(alpha_[0][lane] - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
                     if (state.value[index] != observation)
                         state.value[index] = (old_weight * state.value[index] + new_weight * observation) /
                                              (old_weight + new_weight);
@@ -172,9 +213,9 @@ public:
                                   py::array_t<double, py::array::c_style | py::array::forcecast> input) const {
         if (input.ndim() != 2 || static_cast<std::size_t>(input.shape(1)) != state->instruments)
             throw std::invalid_argument("input must have shape (rows, n_instruments)");
-        py::array_t<double> output({input.shape(0), input.shape(1), static_cast<py::ssize_t>(spans_.size())});
+        py::array_t<double> output({input.shape(0), input.shape(1), static_cast<py::ssize_t>(lanes_)});
         const std::size_t input_stride = state->instruments;
-        const std::size_t output_stride = state->instruments * spans_.size();
+        const std::size_t output_stride = state->instruments * lanes_;
         const double* input_data = input.data();
         double* output_data = output.mutable_data();
         py::gil_scoped_release release;
@@ -192,7 +233,7 @@ public:
             static_cast<std::size_t>(output.shape(2)) != state->lanes)
             throw std::invalid_argument("output must have shape (rows, n_instruments, lanes)");
         const std::size_t input_stride = state->instruments;
-        const std::size_t output_stride = state->instruments * spans_.size();
+        const std::size_t output_stride = state->instruments * lanes_;
         const double* input_data = input.data();
         double* output_data = output.mutable_data();
         py::gil_scoped_release release;
@@ -238,19 +279,21 @@ private:
             throw std::invalid_argument("output row has wrong shape");
     }
 
-    std::vector<double> spans_;
-    std::vector<double> alpha_;
-    std::vector<double> decay_;
-    bool rank_output_;
+    std::vector<std::vector<double>> stage_spans_;
+    std::vector<std::vector<double>> alpha_;
+    std::vector<std::vector<double>> decay_;
+    std::vector<bool> rank_after_;
+    std::size_t lanes_{};
 };
 }  // namespace
 
 PYBIND11_MODULE(_cpp_new_lanes, module) {
     py::class_<State, std::shared_ptr<State>>(module, "State");
     py::class_<EwmLaneRuntime>(module, "EwmLaneRuntime")
-        .def(py::init<std::vector<double>, bool>(), py::arg("spans"), py::arg("rank_output") = false)
+        .def(py::init<std::vector<std::vector<double>>, std::vector<bool>>())
         .def("init_state", &EwmLaneRuntime::init_state)
         .def_property_readonly("rank_output", &EwmLaneRuntime::rank_output)
+        .def_property_readonly("stages", &EwmLaneRuntime::stages)
         .def("tick_into", &EwmLaneRuntime::tick_into)
         .def("run_batch", &EwmLaneRuntime::run_batch)
         .def("run_batch_into", &EwmLaneRuntime::run_batch_into)

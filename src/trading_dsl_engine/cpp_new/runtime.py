@@ -56,6 +56,7 @@ class SpecializedRuntime:
     @property
     def execution_tier(self):
         if not self.accelerator: return "generic-flat-native-bridge"
+        if getattr(self.accelerator, "stages", 1) > 1: return "fused-ewm-cross-sectional-pipeline-native"
         return "fused-ewm-rank-lane-native" if getattr(self.accelerator, "rank_output", False) else "fused-ewm-lane-native"
 
 
@@ -72,21 +73,28 @@ def _ewm_lane_accelerator(ir):
     root = ir.nodes[ir.outputs[0].node]
     if root.opcode != "cat" or not root.children:
         return None
-    root_children = tuple(ir.nodes[child] for child in root.children)
-    rank_output = all(node.opcode == "xs_rank" and len(node.children) == 1 for node in root_children)
-    children = tuple(ir.nodes[node.children[0]] for node in root_children) if rank_output else root_children
-    if any(node.opcode != "ewm" or len(node.children) != 1 for node in children):
-        return None
-    if len({node.children for node in children}) != 1:
-        return None
-    source = ir.nodes[children[0].children[0]]
-    if source.opcode != "input":
-        return None
+    branches = []
+    for child in root.children:
+        cursor = ir.nodes[child]
+        stages = []
+        while True:
+            ranked = cursor.opcode == "xs_rank" and len(cursor.children) == 1
+            if ranked: cursor = ir.nodes[cursor.children[0]]
+            if cursor.opcode != "ewm" or len(cursor.children) != 1: break
+            stages.append((float(dict(cursor.parameters)["param"]), ranked))
+            cursor = ir.nodes[cursor.children[0]]
+        if cursor.opcode != "input" or not stages: return None
+        branches.append((cursor.id, tuple(reversed(stages))))
+    if len({source for source, _ in branches}) != 1: return None
+    shapes = {tuple(ranked for _, ranked in stages) for _, stages in branches}
+    if len(shapes) != 1 or len({len(stages) for _, stages in branches}) != 1: return None
     module_name = "trading_dsl_engine.cpp_new._cpp_new_lanes"
     spec = importlib.util.find_spec(module_name)
     extension = Path(spec.origin) if spec is not None and spec.origin is not None else None
     ensure_native_extension_current(Path(__file__).resolve().parents[3], "cpp_new_lanes", extension)
     _cpp_new_lanes = importlib.import_module(module_name)
 
-    spans = [float(dict(node.parameters)["param"]) for node in children]
-    return _cpp_new_lanes.EwmLaneRuntime(spans, rank_output)
+    stage_count = len(branches[0][1])
+    stage_spans = [[stages[stage][0] for _, stages in branches] for stage in range(stage_count)]
+    rank_after = [branches[0][1][stage][1] for stage in range(stage_count)]
+    return _cpp_new_lanes.EwmLaneRuntime(stage_spans, rank_after)

@@ -101,3 +101,21 @@ def test_cpp_new_automatically_lifts_cross_sectional_rank_barrier(tmp_path):
     _, expected = expected_runtime.run_batch((values,))
     _, actual = actual_runtime.run_batch((values,))
     np.testing.assert_allclose(actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12)
+
+
+def test_cpp_new_lifts_multiple_cross_sectional_transitions(tmp_path):
+    import numpy as np
+    from trading_dsl_engine.cpp_new import compile_formula as compile_cpp_new
+    from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_generic
+
+    formula = (
+        "cat(ewm(xs_rank(ewm(close, 4.0)), 8.0), "
+        "ewm(xs_rank(ewm(close, 6.0)), 12.0))"
+    )
+    values = np.array([[1., 3., 2., np.nan], [4., 1., 2., 5.], [np.nan, 2., 8., 3.]])
+    expected_runtime = compile_generic(formula)
+    actual_runtime = compile_cpp_new(formula, cache_dir=tmp_path, n_instruments=4)
+    assert actual_runtime.execution_tier == "fused-ewm-cross-sectional-pipeline-native"
+    _, expected = expected_runtime.run_batch((values,))
+    _, actual = actual_runtime.run_batch((values,))
+    np.testing.assert_allclose(actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12)

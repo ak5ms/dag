@@ -151,3 +151,8 @@ Instrument-major means the inner loop order within a single timestep; it never
 reorders time. Cross-sectional lane families must finish their upstream row
 transition, then execute one explicit preallocated barrier per lane. Compatible
 lane discovery is automatic for ordinary DSL branches under `cat`.
+Lane extraction may cross multiple alternating stateful stages and
+cross-sectional barriers using preallocated ping-pong row buffers; it must
+never reorder or merge barriers. Operators without a measured specialized
+family, especially groupby, remain on the generic flat-native executor rather
+than gaining placeholder cpp_new kernels.
