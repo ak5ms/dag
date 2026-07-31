@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -17,57 +18,71 @@ struct DivOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(
 struct ModOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return b == 0.0 ? kNaN : std::fmod(a, b); } };
 struct FloorOp { static constexpr int arity = 1; STACKDSL_HOT static double apply(double a) noexcept { return std::floor(a); } };
 
-template <std::size_t N, class Lhs, class Rhs, class Out, class Op>
+template <
+    std::size_t N,
+    class Lhs,
+    class Rhs,
+    class Out,
+    class Op,
+    class Execution = DirectExecution<N>
+>
 struct BinaryNode {
     static_assert(Op::arity == 2);
     STACKDSL_HOT void setup() noexcept {}
+
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC ivdep
 #endif
-        for (std::size_t lane = 0; lane < N; ++lane) out[lane] = Op::apply(ctx.template read<Lhs>(lane), ctx.template read<Rhs>(lane));
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            out[lane] = Op::apply(ctx.template read<Lhs>(lane), ctx.template read<Rhs>(lane));
+        }
     }
 };
 
-template <std::size_t N, class In, class Out, class Op>
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Op,
+    class Execution = DirectExecution<N>
+>
 struct UnaryNode {
     static_assert(Op::arity == 1);
     STACKDSL_HOT void setup() noexcept {}
+
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC ivdep
 #endif
-        for (std::size_t lane = 0; lane < N; ++lane) out[lane] = Op::apply(ctx.template read<In>(lane));
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            out[lane] = Op::apply(ctx.template read<In>(lane));
+        }
     }
 };
 
-template <std::size_t N, class In, class Out>
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
 struct CopyNode {
     STACKDSL_HOT void setup() noexcept {}
+
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) out[lane] = ctx.template read<In>(lane);
-    }
-};
-
-struct GlobalRankGroup {
-    template <class Context>
-    STACKDSL_HOT static std::uint32_t get(const Context&, std::size_t) noexcept {
-        return 0;
-    }
-};
-
-template <std::size_t Capacity>
-struct ContextRankGroup {
-    template <class Context>
-    STACKDSL_HOT static std::uint32_t get(const Context& ctx, std::size_t lane) noexcept {
-        return static_cast<std::uint32_t>((*ctx.partitions)[lane]) * static_cast<std::uint32_t>(Capacity)
-            + static_cast<std::uint32_t>((*ctx.group_slots)[lane]);
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            out[lane] = ctx.template read<In>(lane);
+        }
     }
 };
 
@@ -77,10 +92,16 @@ struct RankItem {
     std::uint32_t lane;
 };
 
-template <std::size_t N, class In, class Out, class GroupPolicy>
-struct BasicXsRankNode {
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
+struct XsRankNode {
     static constexpr int arity = 1;
     RankScoreTable<N> scores{};
+
     void setup() noexcept { scores.setup(); }
 
     template <class Context>
@@ -101,7 +122,7 @@ private:
 #endif
         for (std::size_t lane = 0; lane < N; ++lane) {
             values[lane] = ctx.template read<In>(lane);
-            groups[lane] = GroupPolicy::get(ctx, lane);
+            groups[lane] = Execution::rank_group(ctx, lane);
             all_finite = all_finite && finite(values[lane]);
         }
 
@@ -150,7 +171,11 @@ private:
         for (std::size_t lane = 0; lane < N; ++lane) {
             const double value = ctx.template read<In>(lane);
             if (finite(value)) {
-                items[count++] = RankItem{GroupPolicy::get(ctx, lane), value, static_cast<std::uint32_t>(lane)};
+                items[count++] = RankItem{
+                    Execution::rank_group(ctx, lane),
+                    value,
+                    static_cast<std::uint32_t>(lane),
+                };
             } else {
                 out[lane] = kNaN;
             }
@@ -179,11 +204,5 @@ private:
         }
     }
 };
-
-template <std::size_t N, class In, class Out>
-using XsRankNode = BasicXsRankNode<N, In, Out, GlobalRankGroup>;
-
-template <std::size_t N, std::size_t Capacity, class In, class Out>
-using GroupedXsRankNode = BasicXsRankNode<N, In, Out, ContextRankGroup<Capacity>>;
 
 }  // namespace stackdsl
