@@ -81,6 +81,7 @@ setup(
         "trading_dsl_engine.cpp_stream": [
             "cpp/stackdsl/*.hpp",
             "cpp/stackdsl/ops/*.hpp",
+            "python/templates/*.j2",
         ],
     },
     include_package_data=True,
