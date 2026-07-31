@@ -1,9 +1,10 @@
+from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
 from trading_dsl_engine.ir import compile_ir
 
 
-def _render(formula: str, *, n: int = 5) -> str:
+def _render(formula, *, n: int = 5) -> str:
     program = compile_ir(formula)
     plan = lower_program(program, n_instruments=n)
     return render_translation_unit(plan, n_instruments=n, prefetch_rows=16).text
@@ -18,10 +19,30 @@ def test_cpp_stream_codegen_uses_packaged_jinja_template():
     assert "{{" not in source
 
 
-def test_grouped_codegen_selects_optimized_group_policies():
+def test_grouped_codegen_uses_generic_grouped_nodes():
     source = _render(
         "groupby((univ([0, 1], [2, 3, 4]), key), close, xs_rank(ewm(cumsum(self_), 21)))"
     )
-    assert "stackdsl::FastGroupedEwmNode<" in source
-    assert "stackdsl::FastGroupedXsRankNode<" in source
+    assert "stackdsl::GroupedCumsumNode<" in source
+    assert "stackdsl::GroupedEwmNode<" in source
+    assert "stackdsl::GroupedXsRankNode<" in source
+    assert "FastGrouped" not in source
     assert "CppStreamInner" in source
+
+
+def test_minute_terminal_expands_from_event_timestamp():
+    formula = groupby(
+        (univ([0], [1, 2], list(range(3, 9))), var("minute")),
+        var("close"),
+        ewm(cumsum(self_), 3),
+    )
+    program = compile_ir(formula)
+    assert program.input_names == ("_ev_ts", "close")
+    source = render_translation_unit(
+        lower_program(program, n_instruments=9),
+        n_instruments=9,
+        prefetch_rows=16,
+    ).text
+    assert "stackdsl::FloorOp" in source
+    assert "stackdsl::ModOp" in source
+    assert "stackdsl::GroupedEwmNode<" in source
