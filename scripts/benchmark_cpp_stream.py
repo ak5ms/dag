@@ -17,6 +17,7 @@ WARMUPS = int(os.environ.get("CPP_STREAM_BENCH_WARMUPS", "1"))
 PREFETCH_ROWS = int(os.environ.get("CPP_STREAM_BENCH_PREFETCH_ROWS", "16"))
 MIN_MROWS = float(os.environ.get("CPP_STREAM_BENCH_MIN_MROWS", "0"))
 CASE = os.environ.get("CPP_STREAM_BENCH_CASE", "minute_groupby")
+OUTPUT_DIR = os.environ.get("CPP_STREAM_BENCH_OUTPUT_DIR")
 
 
 def _write_matrix(path: Path, values, *, chunk_rows: int = 131072) -> None:
@@ -28,6 +29,24 @@ def _write_matrix(path: Path, values, *, chunk_rows: int = 131072) -> None:
     del arr
 
 
+def _minute_formula(key_name: str):
+    if N != 9:
+        raise ValueError("minute groupby benchmarks use the requested 9-column univ partition")
+    return groupby(
+        (univ([0], [1, 2], list(range(3, 9))), var(key_name)),
+        var("close"),
+        ewm(cumsum(self_), 3),
+    )
+
+
+def _write_precomputed_minute(path: Path) -> None:
+    def minutes(start: int, stop: int) -> np.ndarray:
+        values = np.mod(np.arange(start, stop, dtype=np.float64), 60.0)
+        return np.broadcast_to(values[:, None], (stop - start, N))
+
+    _write_matrix(path, minutes)
+
+
 def _build_case(root: Path):
     rng = np.random.default_rng(42)
     close_path = root / "close.bin"
@@ -37,8 +56,6 @@ def _build_case(root: Path):
     )
 
     if CASE == "minute_groupby":
-        if N != 9:
-            raise ValueError("minute_groupby benchmark uses the requested 9-column univ partition")
         timestamp_path = root / "_ev_ts.bin"
         day_us = 86_400_000_000.0
         minute_us = 60_000_000.0
@@ -49,13 +66,25 @@ def _build_case(root: Path):
             return np.broadcast_to(row_ts[:, None], (stop - start, N))
 
         _write_matrix(timestamp_path, timestamps)
-        formula = groupby(
-            (univ([0], [1, 2], list(range(3, 9))), var("minute")),
-            var("close"),
-            ewm(cumsum(self_), 3),
+        return (
+            _minute_formula("minute"),
+            {"_ev_ts": timestamp_path, "close": close_path},
+            {},
         )
-        paths = {"_ev_ts": timestamp_path, "close": close_path}
-        return formula, paths
+
+    if CASE in {"minute_groupby_precomputed_hash", "minute_groupby_precomputed_dense"}:
+        minute_path = root / "minute_key.bin"
+        _write_precomputed_minute(minute_path)
+        compile_kwargs = (
+            {"key_cardinalities": {"minute_key": 60}}
+            if CASE.endswith("_dense")
+            else {}
+        )
+        return (
+            _minute_formula("minute_key"),
+            {"minute_key": minute_path, "close": close_path},
+            compile_kwargs,
+        )
 
     if CASE == "rank":
         open_path = root / "open.bin"
@@ -63,7 +92,11 @@ def _build_case(root: Path):
             open_path,
             lambda start, stop: rng.lognormal(4.0, 0.12, (stop - start, N)),
         )
-        return "xs_rank(ewm(close / open, 21))", {"close": close_path, "open": open_path}
+        return (
+            "xs_rank(ewm(close / open, 21))",
+            {"close": close_path, "open": open_path},
+            {},
+        )
 
     raise ValueError(f"unknown CPP_STREAM_BENCH_CASE={CASE!r}")
 
@@ -71,13 +104,17 @@ def _build_case(root: Path):
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cpp_stream_bench_") as tmp:
         root = Path(tmp)
-        formula, paths = _build_case(root)
+        formula, paths, compile_kwargs = _build_case(root)
         runtime = compile_formula(
             formula,
             n_instruments=N,
             prefetch_rows=PREFETCH_ROWS,
+            **compile_kwargs,
         )
-        out = root / "out.bin"
+
+        output_root = Path(OUTPUT_DIR) if OUTPUT_DIR else root
+        output_root.mkdir(parents=True, exist_ok=True)
+        out = output_root / f"cpp_stream_{CASE}.out.bin"
 
         for _ in range(WARMUPS):
             runtime.run_files(paths, out_path=out, async_writeback_mb=0)
@@ -91,6 +128,7 @@ def main() -> None:
         print(f"rows={ROWS:,} instruments={N} warmups={WARMUPS} runs={RUNS}")
         print(f"prefetch_rows={PREFETCH_ROWS}")
         print(f"inputs={runtime.program.input_names}")
+        print(f"output={out}")
         print(f"median={median_mrows:.3f} M rows/s")
         print(f"mean={mean(rates) / 1e6:.3f} M rows/s")
         print(f"best={max(rates) / 1e6:.3f} M rows/s")
