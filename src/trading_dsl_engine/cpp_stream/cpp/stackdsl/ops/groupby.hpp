@@ -236,9 +236,43 @@ template <std::size_t N, std::size_t Capacity, class In, class Out>
 struct GroupedXsRankNode {
     RankScoreTable<N> scores{};
     void setup() noexcept { scores.setup(); }
-    template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        std::array<GroupRankItem, N> items{};
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        if constexpr (N <= 16) rank_count(ctx, out);
+        else rank_sort(ctx, out);
+    }
+
+private:
+    template <class Context>
+    STACKDSL_HOT void rank_count(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
+        std::array<double, N> values{};
+        std::array<std::uint32_t, N> groups{};
+        std::array<std::uint8_t, N> valid{};
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            values[lane] = ctx.template read<In>(lane);
+            valid[lane] = static_cast<std::uint8_t>(finite(values[lane]));
+            groups[lane] = static_cast<std::uint32_t>((*ctx.partitions)[lane]) * static_cast<std::uint32_t>(Capacity)
+                + static_cast<std::uint32_t>((*ctx.group_slots)[lane]);
+            if (!valid[lane]) out[lane] = kNaN;
+        }
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            if (!valid[lane]) continue;
+            std::size_t count = 0;
+            std::size_t upper = 0;
+            for (std::size_t other = 0; other < N; ++other) {
+                if (!valid[other] || groups[other] != groups[lane]) continue;
+                ++count;
+                upper += static_cast<std::size_t>(values[other] <= values[lane]);
+            }
+            out[lane] = scores.get(count, upper - 1);
+        }
+    }
+
+    template <class Context>
+    STACKDSL_HOT void rank_sort(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
+        std::array<GroupRankItem, N> items{};
         std::size_t count = 0;
         for (std::size_t lane = 0; lane < N; ++lane) {
             const double value = ctx.template read<In>(lane);
