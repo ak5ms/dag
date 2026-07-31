@@ -196,28 +196,6 @@ struct alignas(64) GroupRowContext {
     }
 };
 
-template <std::size_t N, std::size_t Capacity, class In, class Out>
-struct GroupedCumsumNode {
-    alignas(64) std::array<double, N * Capacity> value{};
-
-    void setup() noexcept { value.fill(0.0); }
-
-    template <class Context>
-    STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            const double x = ctx.template read<In>(lane);
-            const std::size_t index = static_cast<std::size_t>((*ctx.group_slots)[lane]) * N + lane;
-            if (finite(x)) {
-                value[index] += x;
-                out[lane] = value[index];
-            } else {
-                out[lane] = kNaN;
-            }
-        }
-    }
-};
-
 template <std::size_t N, class Resolver, class Partitions, class InnerPlan, class Out, class KeyList, class FeedList>
 struct GroupByNode;
 
