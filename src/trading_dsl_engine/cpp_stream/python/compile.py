@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,22 +35,33 @@ def _compiler() -> str:
     return resolved
 
 
+def _compiler_identity(compiler: str) -> str:
+    result = subprocess.run([compiler, "--version"], check=False, capture_output=True, text=True)
+    first_line = (result.stdout or result.stderr).splitlines()
+    return f"{compiler}\n{first_line[0] if first_line else 'unknown-version'}"
+
+
 def _compile_flags() -> list[str]:
     if os.name == "nt":
         raise RuntimeError("cpp_stream mmap codegen currently targets POSIX/Linux; Windows support is not implemented yet")
     flags = ["-std=c++20", "-O3", "-DNDEBUG", "-fPIC", "-shared", "-fno-math-errno", "-funroll-loops"]
+    if sys.platform.startswith("linux"):
+        flags.append("-D_GNU_SOURCE")
     if os.environ.get("TRADING_DSL_ENGINE_CPP_NATIVE", "1").lower() not in {"0", "false", "no", "off"}:
         flags.extend(["-march=native", "-mtune=native"])
     if os.environ.get("TRADING_DSL_ENGINE_CPP_LTO", "1").lower() not in {"0", "false", "no", "off"}:
         flags.append("-flto")
-    extra = os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS", "").strip()
-    if extra:
-        import shlex
-        flags.extend(shlex.split(extra))
+    flags.extend(shlex.split(os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS", "")))
     return flags
 
 
-def _fingerprint(source: str, compiler: str, flags: list[str]) -> str:
+def _link_flags() -> list[str]:
+    flags = ["-Wl,-O3"]
+    flags.extend(shlex.split(os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", "")))
+    return flags
+
+
+def _fingerprint(source: str, compiler: str, flags: list[str], link_flags: list[str]) -> str:
     digest = hashlib.sha256()
     digest.update(source.encode())
     cpp_root = _cpp_root()
@@ -58,9 +70,12 @@ def _fingerprint(source: str, compiler: str, flags: list[str]) -> str:
         digest.update(b"\0")
         digest.update(header.read_bytes())
         digest.update(b"\0")
-    digest.update(compiler.encode())
+    digest.update(_compiler_identity(compiler).encode())
     digest.update("\0".join(flags).encode())
+    digest.update("\0".join(link_flags).encode())
     digest.update(platform.platform().encode())
+    digest.update(platform.machine().encode())
+    digest.update(platform.processor().encode())
     digest.update(sys.implementation.cache_tag.encode())
     return digest.hexdigest()
 
@@ -68,7 +83,8 @@ def _fingerprint(source: str, compiler: str, flags: list[str]) -> str:
 def _build_shared(source: str) -> tuple[Path, Path]:
     compiler = _compiler()
     flags = _compile_flags()
-    fingerprint = _fingerprint(source, compiler, flags)
+    link_flags = _link_flags()
+    fingerprint = _fingerprint(source, compiler, flags, link_flags)
     build_dir = _cache_root() / fingerprint
     cpp_path = build_dir / "formula.cpp"
     so_path = build_dir / "formula.so"
@@ -78,7 +94,7 @@ def _build_shared(source: str) -> tuple[Path, Path]:
     temporary = build_dir / f"formula.{os.getpid()}.cpp"
     temporary.write_text(source)
     output_tmp = build_dir / f"formula.{os.getpid()}.so"
-    command = [compiler, *flags, f"-I{_cpp_root()}", str(temporary), "-o", str(output_tmp)]
+    command = [compiler, *flags, f"-I{_cpp_root()}", str(temporary), *link_flags, "-o", str(output_tmp)]
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
