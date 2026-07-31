@@ -9,9 +9,13 @@ This backend is designed to remain independent of `jax_flat`.
 - Do not add Python loops to the per-row execution path.
 - Do not allocate from the heap in operator `on_data`/row execution. Construction, compilation, mapping setup, and error paths may allocate.
 - Keep stateful operators in their own headers. Stateless arithmetic and rank live in `ops/naryop.hpp`.
-- Do not add `FastGroupedFooNode` classes. Grouped and ungrouped variants must share the same operator implementation through compile-time policies such as state indexing or rank-group identity. This keeps semantics and optimizations in one template and lets `if constexpr` remove irrelevant paths.
+- `groupby.hpp` must remain operator agnostic. It owns key resolution, grouped context construction, and inner-plan invocation only. It must not define cumsum, EWM, rank, rolling, regression, or any other operator implementation.
+- Never create `GroupedFooNode` or `FastGroupedFooNode`. Every node has one implementation and receives the plan execution scope through its final template parameter. The supported scopes are `DirectExecution<N>` and `GroupedExecution<N, Capacity>`.
+- Python codegen must not branch by operator to select grouped types. `_stage_type` emits the same C++ node name inside and outside groupby; only the execution-scope argument changes.
+- Stateful nodes obtain storage size and lane state addresses from `Execution::state_size` and `Execution::state_index(ctx, lane)`. Cross-sectional nodes obtain group identity from `Execution::rank_group(ctx, lane)`. Stateless nodes accept and ignore the same execution parameter.
+- A newly added operator must therefore have one C++ node implementation. Once its normal codegen mapping exists, it must work inside groupby without a second node class or a grouped codegen branch.
 - Preserve the all-finite small-width rank path. Checking `finite[j]` inside every N x N comparison was a measured regression for N=9.
-- Preserve the `MinPeriods<=0 && IgnoreNa && !Adjust` EWM policy specialization inside the shared EWM implementation. It is semantically equivalent to the general policy but avoids weight/count traffic for both direct and grouped state.
+- Preserve the `MinPeriods<=0 && IgnoreNa && !Adjust` EWM policy specialization inside the single EWM implementation. It is semantically equivalent to the general policy but avoids weight/count traffic for both direct and grouped state.
 - Groupby uses the canonical shared form `groupby(key_tuple, lhs, rhs_using_self_)`. Tuple keys may combine one `univ(...)` component with arbitrary supported dynamic expressions. Preserve NaN-key canonicalization and +/-0 equivalence.
 - Calendar aliases such as `var("minute")` are derived from `_ev_ts` by the neutral frontend. Do not require pre-materialized calendar columns when the shared DSL already defines the derivation.
 - Dense bounded input keys should bypass hashing through `key_cardinalities`; preserve a dedicated NaN slot. Derived key-domain metadata should eventually provide the same optimization without user hints.
