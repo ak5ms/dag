@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -10,7 +9,6 @@
 #include <type_traits>
 
 #include "stackdsl/engine.hpp"
-#include "stackdsl/ops/naryop.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -69,7 +67,10 @@ struct FixedGroupTable {
     std::array<std::int32_t, bucket_count> buckets{};
     std::size_t count = 0;
 
-    void setup() noexcept { buckets.fill(-1); count = 0; }
+    void setup() noexcept {
+        buckets.fill(-1);
+        count = 0;
+    }
 
     STACKDSL_HOT int get_or_insert(const KeyBits<Parts>& key) noexcept {
         const std::size_t start = static_cast<std::size_t>(hash_key(key)) & (bucket_count - 1);
@@ -97,7 +98,10 @@ struct HashGroupResolver {
     std::array<std::uint16_t, N> cached_slots{};
     std::array<std::uint8_t, N> cache_valid{};
 
-    void setup() noexcept { table.setup(); cache_valid.fill(0); }
+    void setup() noexcept {
+        table.setup();
+        cache_valid.fill(0);
+    }
 
     template <class Context, class... KeySources>
     bool resolve_all(Context& ctx, SourceList<KeySources...>, std::array<std::uint16_t, N>& slots) noexcept {
@@ -130,20 +134,28 @@ template <std::size_t N>
 struct NoKeyResolver {
     static constexpr std::size_t capacity = 1;
     void setup() noexcept {}
+
     template <class Context>
-    bool resolve_all(Context&, SourceList<>, std::array<std::uint16_t, N>& slots) noexcept { slots.fill(0); return true; }
+    bool resolve_all(Context&, SourceList<>, std::array<std::uint16_t, N>& slots) noexcept {
+        slots.fill(0);
+        return true;
+    }
 };
 
 template <std::size_t N, std::size_t Cardinality, std::int64_t Offset = 0>
 struct DenseGroupResolver {
     static constexpr std::size_t capacity = Cardinality + 1;
     void setup() noexcept {}
+
     template <class Context, class KeySource>
     bool resolve_all(Context& ctx, SourceList<KeySource>, std::array<std::uint16_t, N>& slots) noexcept {
         static_assert(capacity <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
         for (std::size_t lane = 0; lane < N; ++lane) {
             const double raw = ctx.template read<KeySource>(lane);
-            if (std::isnan(raw)) { slots[lane] = static_cast<std::uint16_t>(Cardinality); continue; }
+            if (std::isnan(raw)) {
+                slots[lane] = static_cast<std::uint16_t>(Cardinality);
+                continue;
+            }
             if (!finite(raw)) return false;
             const double rounded = std::round(raw);
             if (std::abs(raw - rounded) > 1e-12) return false;
@@ -162,17 +174,23 @@ struct alignas(64) GroupRowContext {
     double* output = nullptr;
     const std::array<std::uint16_t, N>* group_slots = nullptr;
     const std::array<std::uint16_t, N>* partitions = nullptr;
-    template <class Src> STACKDSL_HOT double read(std::size_t lane) const noexcept {
+
+    template <class Src>
+    STACKDSL_HOT double read(std::size_t lane) const noexcept {
         if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
         else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][lane];
         else return Src::value;
     }
-    template <class Src> STACKDSL_HOT const double* read_ptr() const noexcept {
+
+    template <class Src>
+    STACKDSL_HOT const double* read_ptr() const noexcept {
         static_assert(!is_literal_source_v<Src>);
         if constexpr (requires { Src::input_index; }) return inputs[Src::input_index];
         else return scratch[Src::slot_index].data();
     }
-    template <class Dst> STACKDSL_HOT double* write_ptr() noexcept {
+
+    template <class Dst>
+    STACKDSL_HOT double* write_ptr() noexcept {
         if constexpr (std::is_same_v<Dst, OutputDst>) return output;
         else return scratch[Dst::slot_index].data();
     }
@@ -181,121 +199,21 @@ struct alignas(64) GroupRowContext {
 template <std::size_t N, std::size_t Capacity, class In, class Out>
 struct GroupedCumsumNode {
     alignas(64) std::array<double, N * Capacity> value{};
+
     void setup() noexcept { value.fill(0.0); }
-    template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            const double x = ctx.template read<In>(lane);
-            const std::size_t index = static_cast<std::size_t>((*ctx.group_slots)[lane]) * N + lane;
-            if (finite(x)) { value[index] += x; out[lane] = value[index]; }
-            else out[lane] = kNaN;
-        }
-    }
-};
-
-template <std::size_t N, std::size_t Capacity, class In, class Out, std::uint64_t SpanBits, int MinPeriods, bool IgnoreNa, bool Adjust>
-struct GroupedEwmNode {
-    static constexpr double span = std::bit_cast<double>(SpanBits);
-    static_assert(span > 0.0);
-    static constexpr double alpha = 2.0 / (span + 1.0);
-    static constexpr double old_weight_factor = 1.0 - alpha;
-    static constexpr std::size_t state_size = N * Capacity;
-    alignas(64) std::array<double, state_size> value{};
-    alignas(64) std::array<double, state_size> weight{};
-    alignas(64) std::array<std::int64_t, state_size> count{};
-    alignas(64) std::array<std::uint8_t, state_size> initialized{};
-
-    void setup() noexcept { value.fill(0.0); weight.fill(0.0); count.fill(0); initialized.fill(0); }
-    template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            const std::size_t index = static_cast<std::size_t>((*ctx.group_slots)[lane]) * N + lane;
-            const double x = ctx.template read<In>(lane);
-            const bool observation = finite(x);
-            double old_weight = weight[index];
-            if (initialized[index] && (observation || !IgnoreNa)) old_weight *= old_weight_factor;
-            if (observation) {
-                if (initialized[index]) {
-                    double new_weight = Adjust ? 1.0 : alpha;
-                    if constexpr (!Adjust) if (std::abs(alpha - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
-                    if (value[index] != x) value[index] = (old_weight * value[index] + new_weight * x) / (old_weight + new_weight);
-                    old_weight = Adjust ? old_weight + new_weight : 1.0;
-                } else { value[index] = x; initialized[index] = 1; old_weight = 1.0; }
-                ++count[index];
-            }
-            weight[index] = old_weight;
-            const bool enough = MinPeriods <= 0 || count[index] >= MinPeriods;
-            out[lane] = initialized[index] && enough ? value[index] : kNaN;
-        }
-    }
-};
-
-struct GroupRankItem { std::uint32_t group; double value; std::uint16_t lane; };
-
-template <std::size_t N, std::size_t Capacity, class In, class Out>
-struct GroupedXsRankNode {
-    RankScoreTable<N> scores{};
-    void setup() noexcept { scores.setup(); }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        if constexpr (N <= 16) rank_count(ctx, out);
-        else rank_sort(ctx, out);
-    }
-
-private:
-    template <class Context>
-    STACKDSL_HOT void rank_count(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
-        std::array<double, N> values{};
-        std::array<std::uint32_t, N> groups{};
-        std::array<std::uint8_t, N> valid{};
         for (std::size_t lane = 0; lane < N; ++lane) {
-            values[lane] = ctx.template read<In>(lane);
-            valid[lane] = static_cast<std::uint8_t>(finite(values[lane]));
-            groups[lane] = static_cast<std::uint32_t>((*ctx.partitions)[lane]) * static_cast<std::uint32_t>(Capacity)
-                + static_cast<std::uint32_t>((*ctx.group_slots)[lane]);
-            if (!valid[lane]) out[lane] = kNaN;
-        }
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            if (!valid[lane]) continue;
-            std::size_t count = 0;
-            std::size_t upper = 0;
-            for (std::size_t other = 0; other < N; ++other) {
-                if (!valid[other] || groups[other] != groups[lane]) continue;
-                ++count;
-                upper += static_cast<std::size_t>(values[other] <= values[lane]);
+            const double x = ctx.template read<In>(lane);
+            const std::size_t index = static_cast<std::size_t>((*ctx.group_slots)[lane]) * N + lane;
+            if (finite(x)) {
+                value[index] += x;
+                out[lane] = value[index];
+            } else {
+                out[lane] = kNaN;
             }
-            out[lane] = scores.get(count, upper - 1);
-        }
-    }
-
-    template <class Context>
-    STACKDSL_HOT void rank_sort(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
-        std::array<GroupRankItem, N> items{};
-        std::size_t count = 0;
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            const double value = ctx.template read<In>(lane);
-            if (!finite(value)) { out[lane] = kNaN; continue; }
-            const std::uint32_t group = static_cast<std::uint32_t>((*ctx.partitions)[lane]) * static_cast<std::uint32_t>(Capacity) + static_cast<std::uint32_t>((*ctx.group_slots)[lane]);
-            items[count++] = GroupRankItem{group, value, static_cast<std::uint16_t>(lane)};
-        }
-        std::sort(items.begin(), items.begin() + static_cast<std::ptrdiff_t>(count), [](const GroupRankItem& a, const GroupRankItem& b) { return a.group < b.group || (a.group == b.group && a.value < b.value); });
-        std::size_t group_start = 0;
-        while (group_start < count) {
-            std::size_t group_end = group_start + 1;
-            while (group_end < count && items[group_end].group == items[group_start].group) ++group_end;
-            const std::size_t group_count = group_end - group_start;
-            std::size_t tie_start = group_start;
-            while (tie_start < group_end) {
-                std::size_t upper = tie_start + 1;
-                while (upper < group_end && items[upper].value == items[tie_start].value) ++upper;
-                const std::size_t upper_rank = upper - group_start;
-                const double score = scores.get(group_count, upper_rank - 1);
-                for (std::size_t pos = tie_start; pos < upper; ++pos) out[items[pos].lane] = score;
-                tie_start = upper;
-            }
-            group_start = group_end;
         }
     }
 };
@@ -308,14 +226,24 @@ struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, SourceList<KeySource
     Resolver resolver{};
     InnerPlan inner{};
     std::array<std::uint16_t, N> group_slots{};
-    void setup() noexcept { resolver.setup(); inner.setup(); }
-    template <class Context> STACKDSL_HOT bool on_data_checked(Context& ctx) noexcept {
+
+    void setup() noexcept {
+        resolver.setup();
+        inner.setup();
+    }
+
+    template <class Context>
+    STACKDSL_HOT bool on_data_checked(Context& ctx) noexcept {
         if (!resolver.resolve_all(ctx, SourceList<KeySources...>{}, group_slots)) return false;
         std::array<const double*, sizeof...(FeedSources)> feeds{ctx.template read_ptr<FeedSources>()...};
         inner.on_data(feeds, group_slots, Partitions::values, ctx.template write_ptr<Out>());
         return true;
     }
-    template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept { (void)on_data_checked(ctx); }
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        (void)on_data_checked(ctx);
+    }
 };
 
 }  // namespace stackdsl
