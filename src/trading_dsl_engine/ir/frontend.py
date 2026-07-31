@@ -13,7 +13,12 @@ class FormulaIRCompileError(ValueError):
     pass
 
 
-_NARY_ARITY = {"add": 2, "sub": 2, "mul": 2, "div": 2}
+_NARY_ARITY = {"add": 2, "sub": 2, "mul": 2, "div": 2, "mod": 2, "floor": 1}
+_DERIVED_TERMINALS: dict[str, Expr] = {
+    # Calendar aliases are derived from the canonical microseconds-since-epoch
+    # event timestamp rather than requiring pre-materialized input columns.
+    "minute": Call("minute", (Identifier("_ev_ts"),), ()),
+}
 
 
 def _expr_key(node: Expr) -> tuple:
@@ -132,6 +137,11 @@ class _Builder:
         key = _expr_key(node)
         if use_cache and key in self.memo:
             return self.memo[key]
+        if isinstance(node, Identifier) and node.name in _DERIVED_TERMINALS:
+            result = self.build(_DERIVED_TERMINALS[node.name], use_cache=use_cache)
+            if use_cache:
+                self.memo[key] = result
+            return result
         if isinstance(node, Call):
             macro = self.dsl_registry.get(node.fn)
             if macro is not None:
@@ -207,10 +217,20 @@ class _Builder:
             raise FormulaIRCompileError("cpp_stream groupby lhs must be vector-valued")
         inner_builder = _InnerBuilder(self)
         inner_root = inner_builder.build(call.args[2])
-        inner_program = Program(nodes=tuple(inner_builder.nodes), outputs=(inner_root,), input_names=("__self__",) + tuple(f"__capture_{i}__" for i in range(len(inner_builder.capture_ids))))
+        inner_program = Program(
+            nodes=tuple(inner_builder.nodes),
+            outputs=(inner_root,),
+            input_names=("__self__",) + tuple(f"__capture_{i}__" for i in range(len(inner_builder.capture_ids))),
+        )
         if inner_program.nodes[inner_root].value_type.kind != "vector":
             raise FormulaIRCompileError("cpp_stream groupby RHS must emit a vector")
-        op = GroupByOp(n_dynamic_keys=len(key_ids), static_groups=static_groups, inner_program=inner_program, capacity=capacity, hash_capacity=hash_capacity)
+        op = GroupByOp(
+            n_dynamic_keys=len(key_ids),
+            static_groups=static_groups,
+            inner_program=inner_program,
+            capacity=capacity,
+            hash_capacity=hash_capacity,
+        )
         children = key_ids + (lhs_id,) + tuple(inner_builder.capture_ids)
         return self._append(op, children, VECTOR)
 
@@ -293,9 +313,17 @@ class _InnerBuilder:
         return result
 
 
-def compile_ir(formula: str | Expr, *, dsl_registry: DSLFunctionRegistry | None = None, column_names: list[str] | tuple[str, ...] | None = None) -> Program:
+def compile_ir(
+    formula: str | Expr,
+    *,
+    dsl_registry: DSLFunctionRegistry | None = None,
+    column_names: list[str] | tuple[str, ...] | None = None,
+) -> Program:
     """Compile the shared DSL AST into backend-neutral streaming IR."""
     expr = parse_formula(formula) if isinstance(formula, str) else formula
-    builder = _Builder(dsl_registry=dsl_registry or DEFAULT_DSL_REGISTRY, column_name_to_index={name: i for i, name in enumerate(column_names or ())})
+    builder = _Builder(
+        dsl_registry=dsl_registry or DEFAULT_DSL_REGISTRY,
+        column_name_to_index={name: i for i, name in enumerate(column_names or ())},
+    )
     root = builder.build(expr)
     return Program(nodes=tuple(builder.nodes), outputs=(root,), input_names=tuple(builder.inputs))
