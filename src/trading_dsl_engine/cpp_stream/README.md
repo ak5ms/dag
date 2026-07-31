@@ -7,7 +7,7 @@ DSL Expr/string -> neutral IR -> cpp_stream physical lowering -> generated C++20
     -> mmap input rows -> flat native stages -> mmap output rows
 ```
 
-The first integrated operator set is arithmetic (`add/sub/mul/div`), `cumsum`, `ewm`, `xs_rank`, and canonical `groupby(key_tuple, lhs, rhs_using_self_)`, including composite dynamic keys and one `univ(...)` static column partition. Group RHS graphs may compose the supported arithmetic/stateful/rank operators arbitrarily; nested `groupby` is intentionally rejected for now.
+The first integrated operator set is arithmetic (`add/sub/mul/div/mod/floor`), `cumsum`, `ewm`, `xs_rank`, and canonical `groupby(key_tuple, lhs, rhs_using_self_)`, including composite dynamic keys and one `univ(...)` static column partition. Group RHS graphs may compose the supported operators arbitrarily; nested `groupby` is intentionally rejected for now.
 
 ## File API
 
@@ -36,33 +36,58 @@ Python lowering produces typed C++ template arguments and immutable template vie
 
 `Jinja2>=3.1` is a project dependency, and the `.j2` template is included in package data so code generation works from installed wheels as well as editable checkouts.
 
-## Group keys and dense domains
+## Operator-agnostic group execution
 
-Existing DSL syntax is retained:
+There are no `GroupedCumsumNode`, `GroupedEwmNode`, `GroupedXsRankNode`, or other grouped operator classes. `groupby.hpp` owns only key resolution and invocation of an ordinary inner plan.
+
+Every generated operator receives one final execution-scope template argument:
+
+```cpp
+stackdsl::DirectExecution<N>
+stackdsl::GroupedExecution<N, Capacity>
+```
+
+Codegen emits the same node type inside and outside groupby. For example, both forms use `EwmNode`; only the execution scope changes:
+
+```cpp
+EwmNode<N, In, Out, SpanBits, MinPeriods, IgnoreNa, Adjust,
+        DirectExecution<N>>
+
+EwmNode<N, In, Out, SpanBits, MinPeriods, IgnoreNa, Adjust,
+        GroupedExecution<N, Capacity>>
+```
+
+Stateful nodes obtain storage size and addresses through `Execution::state_size` and `Execution::state_index(ctx, lane)`. Cross-sectional nodes obtain group identity through `Execution::rank_group(ctx, lane)`. Stateless nodes accept the same scope and ignore it. Therefore, once an operator has its normal C++ implementation and one codegen mapping, it works inside groupby without a second class or grouped codegen branch.
+
+## Group keys and calendar fields
+
+Existing DSL syntax is retained. Calendar aliases are derived from the canonical `_ev_ts` microseconds-since-epoch field:
 
 ```python
 groupby(
-    (univ([0], [1, 2], [3, 4, 5], [6, 7, 8]), minute_of_day),
-    close / open,
-    ewm(cumsum(self_), 21),
+    (univ([0], [1, 2], list(range(3, 9))), var("minute")),
+    var("close"),
+    ewm(cumsum(self_), 3),
 )
 ```
 
+Here `var("minute")` expands to the existing DSL `minute(_ev_ts)` expression. The current DSL definition is minute within the hour (`0..59`).
+
 `univ(...)` is compiled to a static lane partition. Dynamic composite keys are stored exactly and mapped through a fixed-capacity open-addressed table. NaNs canonicalize to one key and `-0.0/+0.0` compare/hash identically.
 
-For dense bounded categories, pass a compile hint:
+For a direct bounded categorical input, a compile hint can bypass hashing:
 
 ```python
-compile_formula(expr, n_instruments=9, key_cardinalities={"minute_of_day": 1440})
+compile_formula(expr, n_instruments=9, key_cardinalities={"some_key": 1440})
 ```
 
-A single direct input key with a declared cardinality bypasses hashing and indexes its state slot directly. One extra slot preserves valid NaN-key semantics.
+A single direct input key with a declared cardinality indexes its state slot directly. One extra slot preserves valid NaN-key semantics. Domain propagation for derived expressions such as `minute(_ev_ts)` remains a planned neutral-IR optimization.
 
 ## Allocation and state layout
 
-The generated hot path uses compile-time `std::array` state/scratch and no dynamic allocation. Input/output files are mmap mappings. Formula compilation and mapping setup may allocate normally; no allocation occurs per row. Stateful grouped operators store `[group_slot][lane]` scalar state. The static `univ` partition is not multiplied into that state because a lane's static partition cannot change; cross-sectional grouped rank includes the static partition in its group identity.
+The generated hot path uses compile-time `std::array` state/scratch and no dynamic allocation. Input/output files are mmap mappings. Formula compilation and mapping setup may allocate normally; no allocation occurs per row. Grouped state uses `[group_slot][lane]`. The static `univ` partition is not multiplied into lane-local state because a lane's static partition cannot change; cross-sectional rank includes the static partition in its group identity.
 
-`default_group_capacity=64` bounds unknown dynamic-key state unless the formula's `groupby(..., capacity=...)` overrides it. Use dense cardinality hints for domains such as minute-of-day instead of provisioning a hash table for 1,440 known integer values.
+`default_group_capacity=64` bounds unknown dynamic-key state unless the formula's `groupby(..., capacity=...)` overrides it.
 
 Reusable output files are not truncated when their existing size is already correct. Every row is overwritten, so retaining the extent avoids repeated page-allocation noise without changing output semantics.
 
@@ -74,7 +99,7 @@ Run the full 5M x 9 mmap benchmark with:
 python scripts/benchmark_cpp_stream.py
 ```
 
-An environment-specific regression threshold can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology, the comparison against the earlier standalone prototype, and the retained EWM/rank fast paths are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
+An environment-specific regression threshold can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology and architecture comparisons are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Backend-neutral IR
 
