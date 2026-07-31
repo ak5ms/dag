@@ -71,7 +71,14 @@ class GroupStage:
     dense_offset: int = 0
 
 
-_BINARY_CPP = {"add": "stackdsl::AddOp", "sub": "stackdsl::SubOp", "mul": "stackdsl::MulOp", "div": "stackdsl::DivOp"}
+_BINARY_CPP = {
+    "add": "stackdsl::AddOp",
+    "sub": "stackdsl::SubOp",
+    "mul": "stackdsl::MulOp",
+    "div": "stackdsl::DivOp",
+    "mod": "stackdsl::ModOp",
+}
+_UNARY_CPP = {"floor": "stackdsl::FloorOp"}
 
 
 def double_bits(value: float) -> int:
@@ -85,6 +92,8 @@ def op_cpp_type(stage: Stage, n_expr: str = "N", *, grouped_capacity_expr: str |
         return f"stackdsl::CopyNode<{n_expr}, {ins[0]}, {out}>"
     if stage.kind == "binary":
         return f"stackdsl::BinaryNode<{n_expr}, {ins[0]}, {ins[1]}, {out}, {_BINARY_CPP[stage.op_name or '']}>"
+    if stage.kind == "unary":
+        return f"stackdsl::UnaryNode<{n_expr}, {ins[0]}, {out}, {_UNARY_CPP[stage.op_name or '']}>"
     if stage.kind == "cumsum":
         if grouped_capacity_expr is None:
             return f"stackdsl::CumsumNode<{n_expr}, {ins[0]}, {out}>"
@@ -123,7 +132,14 @@ def _partitions(groups: tuple[tuple[int, ...], ...] | None, n: int) -> tuple[int
     return tuple(result)
 
 
-def _build_plan(program: Program, *, n_instruments: int, default_group_capacity: int, key_cardinalities: Mapping[str, int] | None, grouped: bool) -> Plan:
+def _build_plan(
+    program: Program,
+    *,
+    n_instruments: int,
+    default_group_capacity: int,
+    key_cardinalities: Mapping[str, int] | None,
+    grouped: bool,
+) -> Plan:
     uses = [0] * len(program.nodes)
     root = program.output_id
     for node in program.nodes:
@@ -161,9 +177,12 @@ def _build_plan(program: Program, *, n_instruments: int, default_group_capacity:
                     break
         out = Dest(None if is_root else (reusable if reusable is not None else allocate()))
         if isinstance(op, NaryOp):
-            if op.name not in _BINARY_CPP or op.arity != 2:
-                raise CppStreamLoweringError(f"unsupported nary op {op.name!r}")
-            stage = Stage("binary", children, out, op_name=op.name)
+            if op.arity == 2 and op.name in _BINARY_CPP:
+                stage = Stage("binary", children, out, op_name=op.name)
+            elif op.arity == 1 and op.name in _UNARY_CPP:
+                stage = Stage("unary", children, out, op_name=op.name)
+            else:
+                raise CppStreamLoweringError(f"unsupported nary op {op.name!r}/{op.arity}")
         elif isinstance(op, CumsumOp):
             if not children[0].is_vector:
                 raise CppStreamLoweringError("cpp_stream cumsum requires vector input")
@@ -193,8 +212,22 @@ def _build_plan(program: Program, *, n_instruments: int, default_group_capacity:
                     if dense_cardinality <= 0:
                         raise CppStreamLoweringError("key cardinality must be > 0")
                     capacity = dense_cardinality + 1
-            inner = _build_plan(op.inner_program, n_instruments=n_instruments, default_group_capacity=default_group_capacity, key_cardinalities=key_cardinalities, grouped=True)
-            group_stage = GroupStage(inner=inner, partitions=_partitions(op.static_groups, n_instruments), capacity=capacity, hash_capacity=op.hash_capacity or 0, key_sources=key_sources, feed_sources=feed_sources, dense_cardinality=dense_cardinality)
+            inner = _build_plan(
+                op.inner_program,
+                n_instruments=n_instruments,
+                default_group_capacity=default_group_capacity,
+                key_cardinalities=key_cardinalities,
+                grouped=True,
+            )
+            group_stage = GroupStage(
+                inner=inner,
+                partitions=_partitions(op.static_groups, n_instruments),
+                capacity=capacity,
+                hash_capacity=op.hash_capacity or 0,
+                key_sources=key_sources,
+                feed_sources=feed_sources,
+                dense_cardinality=dense_cardinality,
+            )
             stage = Stage("groupby", children, out, group=group_stage)
         else:
             raise CppStreamLoweringError(f"unsupported IR op {type(op).__name__}")
@@ -211,9 +244,21 @@ def _build_plan(program: Program, *, n_instruments: int, default_group_capacity:
     return Plan(stages=tuple(stages), scratch_slots=next_slot, input_count=len(program.input_names))
 
 
-def lower_program(program: Program, *, n_instruments: int, default_group_capacity: int = 64, key_cardinalities: Mapping[str, int] | None = None) -> Plan:
+def lower_program(
+    program: Program,
+    *,
+    n_instruments: int,
+    default_group_capacity: int = 64,
+    key_cardinalities: Mapping[str, int] | None = None,
+) -> Plan:
     if n_instruments <= 0:
         raise CppStreamLoweringError("n_instruments must be > 0")
     if default_group_capacity <= 0:
         raise CppStreamLoweringError("default_group_capacity must be > 0")
-    return _build_plan(program, n_instruments=n_instruments, default_group_capacity=default_group_capacity, key_cardinalities=key_cardinalities, grouped=False)
+    return _build_plan(
+        program,
+        n_instruments=n_instruments,
+        default_group_capacity=default_group_capacity,
+        key_cardinalities=key_cardinalities,
+        grouped=False,
+    )
