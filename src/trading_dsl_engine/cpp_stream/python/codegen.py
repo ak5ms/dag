@@ -91,6 +91,11 @@ _BINARY_POLICIES = {
     "sub": "stackdsl::SubOp",
     "mul": "stackdsl::MulOp",
     "div": "stackdsl::DivOp",
+    "mod": "stackdsl::ModOp",
+}
+
+_UNARY_POLICIES = {
+    "floor": "stackdsl::FloorOp",
 }
 
 
@@ -101,6 +106,8 @@ def _stage_type(stage: Stage, n: CppType, *, grouped_capacity: CppType | None = 
         return tmpl("stackdsl::CopyNode", n, inputs[0], out)
     if stage.kind == "binary":
         return tmpl("stackdsl::BinaryNode", n, inputs[0], inputs[1], out, Name(_BINARY_POLICIES[stage.op_name or ""]))
+    if stage.kind == "unary":
+        return tmpl("stackdsl::UnaryNode", n, inputs[0], out, Name(_UNARY_POLICIES[stage.op_name or ""]))
     if stage.kind == "cumsum":
         if grouped_capacity is None:
             return tmpl("stackdsl::CumsumNode", n, inputs[0], out)
@@ -118,11 +125,11 @@ def _stage_type(stage: Stage, n: CppType, *, grouped_capacity: CppType | None = 
         )
         if grouped_capacity is None:
             return tmpl("stackdsl::EwmNode", *args)
-        return tmpl("stackdsl::FastGroupedEwmNode", n, grouped_capacity, *args[1:])
+        return tmpl("stackdsl::GroupedEwmNode", n, grouped_capacity, *args[1:])
     if stage.kind == "xs_rank":
         if grouped_capacity is None:
             return tmpl("stackdsl::XsRankNode", n, inputs[0], out)
-        return tmpl("stackdsl::FastGroupedXsRankNode", n, grouped_capacity, inputs[0], out)
+        return tmpl("stackdsl::GroupedXsRankNode", n, grouped_capacity, inputs[0], out)
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")
     raise AssertionError(stage.kind)
