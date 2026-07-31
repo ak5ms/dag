@@ -57,33 +57,37 @@ Controlled workload:
 - one pinned CPU
 - warmed mmap input pages
 - shared, pre-sized output mapping
+- calendar expression represented as the generated sequence of vector stages
 - GCC C++20, `-O3 -march=native -mtune=native -flto`
 - Intel Xeon E5-2673 v4
 
 | Implementation | Median throughput |
 | --- | ---: |
-| Legacy generic grouped EWM with weight/count traffic | 3.68 M rows/s |
-| Shared policy-based grouped EWM, no `FastGrouped*` class | **4.09 M rows/s** |
+| Legacy generic grouped EWM with weight/count traffic | 4.14 M rows/s |
+| Shared policy-based grouped EWM, no `FastGrouped*` class | **4.73 M rows/s** |
 
 Ten measured policy-based runs were:
 
 ```text
-4.136, 4.135, 4.125, 4.121, 4.113,
-4.064, 4.022, 3.916, 3.911, 3.849 M rows/s
+4.946, 4.854, 4.838, 4.833, 4.744,
+4.716, 4.705, 4.571, 4.563, 4.528 M rows/s
 ```
 
-The checksum matched the legacy implementation.
+The checksum matched the legacy implementation. The shared-policy design recovers
+about 14% without selecting an operator-specific grouped class in lowering or
+codegen.
 
 ## What still limits this formula
 
-A controlled architecture experiment produced:
+A controlled architecture experiment using the same stage-shaped calendar
+computation produced:
 
-| Key representation | Throughput |
+| Key/value representation | Throughput |
 | --- | ---: |
-| Current: vector `_ev_ts` derivation + hash lookup | 3.96 M rows/s |
-| Vector derivation + direct dense slot | 4.81 M rows/s |
-| Row-scalar derivation + hash lookup | 8.45 M rows/s |
-| Row-scalar derivation + direct dense slot | 15.11 M rows/s |
+| Current: vector `_ev_ts` stages + hash lookup | 4.85 M rows/s |
+| Vector `_ev_ts` stages + direct dense slot | 6.08 M rows/s |
+| Row-scalar calendar derivation + hash lookup | 7.96 M rows/s |
+| Row-scalar calendar derivation + direct dense slot | 15.97 M rows/s |
 
 These are not operator fast paths. They identify missing semantic information in the
 IR and data model:
@@ -92,10 +96,13 @@ IR and data model:
    the identical calendar expression nine times and reads nine timestamp values.
    The IR has no row-scalar/broadcast-invariant value kind.
 2. Macro expansion turns `minute(_ev_ts)` into generic `mod/floor/div` nodes and
-   drops the known integer domain `0..59`. The groupby lowering therefore uses a
-   hash table instead of direct dense indexing.
+   drops the known integer domain `0..59`. Groupby lowering therefore uses a hash
+   table instead of direct dense indexing.
 3. Group resolution materializes one slot per lane. The downstream plan cannot
-   express or exploit the fact that all lanes often share the same dynamic key.
+   represent or exploit the fact that all lanes often share the same dynamic key.
+4. The semantic IR describes values and operators, but not value invariance,
+   categorical domains, or grouped-state access runs. A C++ compiler cannot invent
+   those semantic facts from arbitrary runtime arrays.
 
 The next architecture-level optimizations should therefore be backend-neutral domain
 propagation and a row-scalar value type, followed by a generic uniform-slot/run
