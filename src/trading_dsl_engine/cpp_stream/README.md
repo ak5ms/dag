@@ -30,6 +30,12 @@ Each input file is raw row-major `float64` with exactly `n_instruments` values p
 
 `async_writeback_mb` requests nonblocking kernel writeback of completed output ranges. The runtime does not call `fsync` or synchronous `msync` before returning.
 
+## Code generation
+
+Python lowering produces typed C++ template arguments and immutable template views. It does not construct complete C++ functions or the row loop through operator-specific string concatenation. `python/templates/runner.cpp.j2` owns translation-unit structure, grouped inner-plan declarations, mmap setup, stage setup, the native row loop, and asynchronous writeback submission.
+
+`Jinja2>=3.1` is a project dependency, and the `.j2` template is included in package data so code generation works from installed wheels as well as editable checkouts.
+
 ## Group keys and dense domains
 
 Existing DSL syntax is retained:
@@ -57,6 +63,18 @@ A single direct input key with a declared cardinality bypasses hashing and index
 The generated hot path uses compile-time `std::array` state/scratch and no dynamic allocation. Input/output files are mmap mappings. Formula compilation and mapping setup may allocate normally; no allocation occurs per row. Stateful grouped operators store `[group_slot][lane]` scalar state. The static `univ` partition is not multiplied into that state because a lane's static partition cannot change; cross-sectional grouped rank includes the static partition in its group identity.
 
 `default_group_capacity=64` bounds unknown dynamic-key state unless the formula's `groupby(..., capacity=...)` overrides it. Use dense cardinality hints for domains such as minute-of-day instead of provisioning a hash table for 1,440 known integer values.
+
+Reusable output files are not truncated when their existing size is already correct. Every row is overwritten, so retaining the extent avoids repeated page-allocation noise without changing output semantics.
+
+## Performance regression checks
+
+Run the full 5M x 9 mmap benchmark with:
+
+```bash
+python scripts/benchmark_cpp_stream.py
+```
+
+An environment-specific regression threshold can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology, the comparison against the earlier standalone prototype, and the retained EWM/rank fast paths are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Backend-neutral IR
 
