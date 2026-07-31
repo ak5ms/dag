@@ -3,26 +3,36 @@
 #include <array>
 #include <cstddef>
 
+#include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
 
-template <std::size_t N, class In, class Out>
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
 struct CumsumNode {
-    alignas(64) std::array<double, N> value{};
+    alignas(64) std::array<double, Execution::state_size> value{};
 
     void setup() noexcept { value.fill(0.0); }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t i = 0; i < N; ++i) {
-            const double x = ctx.template read<In>(i);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 16
+#endif
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            const double x = ctx.template read<In>(lane);
+            const std::size_t index = Execution::state_index(ctx, lane);
             if (finite(x)) {
-                value[i] += x;
-                out[i] = value[i];
+                value[index] += x;
+                out[lane] = value[index];
             } else {
-                out[i] = kNaN;
+                out[lane] = kNaN;
             }
         }
     }
