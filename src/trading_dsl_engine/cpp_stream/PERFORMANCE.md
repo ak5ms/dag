@@ -1,86 +1,122 @@
 # cpp_stream performance baseline
 
-This document records the July 31, 2026 comparison between the integrated
-`trading_dsl_engine.cpp_stream` backend and the earlier standalone prototype.
+This document records the July 31, 2026 comparisons used while integrating and
+refactoring `trading_dsl_engine.cpp_stream`.
 
-## Why the earlier headline was not directly comparable
+## Standalone comparison
 
-The first standalone prototype used materially simpler semantics:
+The first standalone prototype used simpler semantics than the repository backend:
 
-- EWM assumed an all-finite stream and one synchronized initialization state.
+- EWM assumed an all-finite stream and synchronized initialization.
 - `xs_rank` emitted ordinal `[0, 1]` ranks and broke ties by lane index.
 
-The integrated backend preserves repository semantics instead:
+The integrated backend preserves independent per-lane initialization, NaN carry,
+`min_periods`, `ignore_na`, `adjust`, finite masking, and upper-tie normal scores.
+The earlier ~21 M rows/s headline was also measured on a different AMD EPYC host,
+so it is not an apples-to-apples threshold for this branch.
 
-- EWM is initialized independently per lane and supports NaN carry,
-  `min_periods`, `ignore_na`, and `adjust`.
-- `xs_rank` masks non-finite values and emits upper-tie normal scores.
+For `xs_rank(ewm(close / open, 21))` on the Intel Xeon E5-2673 v4 comparison host,
+the final integrated semantic path measured 14.36 M rows/s in a pinned,
+file-I/O-excluded kernel test versus 10.43 M rows/s for the earlier standalone
+implementation on the same host.
 
-The earlier ~21 M rows/s headline was also recorded on a different AMD EPYC host.
-It must not be treated as an apples-to-apples regression threshold for this branch.
+## No operator-specific groupby fast classes
 
-## Controlled kernel comparison
+`FastGroupedEwmNode` and `FastGroupedXsRankNode` were removed. Grouped and
+ungrouped execution now instantiate the same implementation through compile-time
+policies:
 
-Workload:
+- EWM uses `DirectStateIndex` or `GroupedStateIndex`.
+- Rank uses `GlobalRankGroup` or `ContextRankGroup`.
+
+The common recursive EWM policy and the all-finite small-width rank policy live once
+inside the shared templates. `if constexpr` removes paths that do not apply to the
+chosen policy. `groupby.hpp` owns key resolution and grouped execution plumbing,
+not EWM or rank implementations.
+
+## Timestamp-derived minute benchmark
+
+Requested formula:
+
+```python
+groupby(
+    (univ([0], [1, 2], list(range(3, 9))), var("minute")),
+    var("close"),
+    ewm(cumsum(self_), 3),
+)
+```
+
+`var("minute")` is expanded by the neutral frontend to the existing DSL
+`minute(_ev_ts)` derivation. The DSL definition is **minute within the hour**
+(`0..59`), not minute-of-day (`0..1439`). `_ev_ts` is a float64 microseconds-since-
+epoch input.
+
+Controlled workload:
 
 - 5,000,000 rows x 9 instruments
-- `xs_rank(ewm(close / open, 21))`
 - one pinned CPU
 - warmed mmap input pages
-- pre-touched anonymous output memory
-- file creation, output extent allocation, and storage writeback excluded
+- shared, pre-sized output mapping
 - GCC C++20, `-O3 -march=native -mtune=native -flto`
-- host used for this comparison: Intel Xeon E5-2673 v4
+- Intel Xeon E5-2673 v4
 
 | Implementation | Median throughput |
 | --- | ---: |
-| Earlier standalone prototype, simpler semantics | 10.43 M rows/s |
-| Integrated backend before fast paths, repository semantics | 10.33 M rows/s |
-| Integrated backend after fast paths, repository semantics | **14.36 M rows/s** |
+| Legacy generic grouped EWM with weight/count traffic | 3.68 M rows/s |
+| Shared policy-based grouped EWM, no `FastGrouped*` class | **4.09 M rows/s** |
 
-The integrated backend was effectively tied with the standalone implementation
-before optimization. The final implementation is about 39% faster than the
-pre-optimization integrated path and about 38% faster than the standalone
-comparison on this host while retaining the repository semantics.
+Ten measured policy-based runs were:
 
-## Fixes retained in the production path
+```text
+4.136, 4.135, 4.125, 4.121, 4.113,
+4.064, 4.022, 3.916, 3.911, 3.849 M rows/s
+```
 
-- `EwmNode` specializes the common `min_periods=0`, `ignore_na=True`,
-  `adjust=False` policy. Once every lane is initialized and the row is finite, it
-  executes only the recursive FMA update. A lane-aware fallback preserves NaN
-  and initialization behavior.
-- `XsRankNode` and grouped rank use an all-finite exact rank-count path for
-  `N <= 16`. This avoids a repeated finite-mask test inside every `N x N`
-  comparison. Wider universes retain the sorting implementation.
-- Grouped EWM/rank use the same specialized policies.
-- Reused output files are not truncated when their existing size is already
-  correct. Every output row is overwritten, so retruncation only reintroduces
-  extent/page-allocation noise.
+The checksum matched the legacy implementation.
 
-## Full mmap benchmark
+## What still limits this formula
 
-On the same constrained virtual host, the full file-backed benchmark was dominated
-by dirty-page and backing-store behavior. Depending on page-cache state, the
-pre-optimization path measured roughly 1.58-1.74 M rows/s and the optimized path
-roughly 1.71-1.98 M rows/s. These absolute values are not suitable for comparing
-machines, but the optimized version remained faster.
+A controlled architecture experiment produced:
 
-Use the pinned/controlled kernel benchmark when judging code-generation or operator
-regressions. Use the full mmap benchmark when judging I/O and writeback changes.
+| Key representation | Throughput |
+| --- | ---: |
+| Current: vector `_ev_ts` derivation + hash lookup | 3.96 M rows/s |
+| Vector derivation + direct dense slot | 4.81 M rows/s |
+| Row-scalar derivation + hash lookup | 8.45 M rows/s |
+| Row-scalar derivation + direct dense slot | 15.11 M rows/s |
+
+These are not operator fast paths. They identify missing semantic information in the
+IR and data model:
+
+1. `_ev_ts` is represented as a normal instrument vector, so the compiler computes
+   the identical calendar expression nine times and reads nine timestamp values.
+   The IR has no row-scalar/broadcast-invariant value kind.
+2. Macro expansion turns `minute(_ev_ts)` into generic `mod/floor/div` nodes and
+   drops the known integer domain `0..59`. The groupby lowering therefore uses a
+   hash table instead of direct dense indexing.
+3. Group resolution materializes one slot per lane. The downstream plan cannot
+   express or exploit the fact that all lanes often share the same dynamic key.
+
+The next architecture-level optimizations should therefore be backend-neutral domain
+propagation and a row-scalar value type, followed by a generic uniform-slot/run
+representation for grouped state access. They should not be implemented as
+`FastGroupedFooNode` classes.
 
 ## Reproducible repository benchmark
+
+The requested minute formula is now the default case:
 
 ```bash
 python scripts/benchmark_cpp_stream.py
 ```
 
-The script defaults to one warmup plus ten measured 5M x 9 runs and reuses the same
-output file. An environment-specific regression floor can be enforced with:
+The previous rank benchmark remains available with:
 
 ```bash
-CPP_STREAM_BENCH_MIN_MROWS=12 python scripts/benchmark_cpp_stream.py
+CPP_STREAM_BENCH_CASE=rank python scripts/benchmark_cpp_stream.py
 ```
 
-Do not commit one universal floor derived from a specific CPU or filesystem. Record
-host, compiler, CPU affinity, page-cache state, prefetch distance, and writeback
-settings with every reported result.
+The script defaults to one warmup and ten measured 5M x 9 runs. Do not commit a
+universal regression floor derived from one CPU or filesystem. Record host,
+compiler, CPU affinity, page-cache state, prefetch distance, and writeback settings
+with every reported result.
