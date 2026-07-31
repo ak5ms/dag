@@ -6,31 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
-
-template <std::size_t N>
-struct DirectStateIndex {
-    static constexpr std::size_t state_size = N;
-    static constexpr bool contiguous_lanes = true;
-
-    template <class Context>
-    STACKDSL_HOT static std::size_t get(const Context&, std::size_t lane) noexcept {
-        return lane;
-    }
-};
-
-template <std::size_t N, std::size_t Capacity>
-struct GroupedStateIndex {
-    static constexpr std::size_t state_size = N * Capacity;
-    static constexpr bool contiguous_lanes = false;
-
-    template <class Context>
-    STACKDSL_HOT static std::size_t get(const Context& ctx, std::size_t lane) noexcept {
-        return static_cast<std::size_t>((*ctx.group_slots)[lane]) * N + lane;
-    }
-};
 
 template <
     std::size_t N,
@@ -40,14 +19,14 @@ template <
     int MinPeriods,
     bool IgnoreNa,
     bool Adjust,
-    class StateIndex
+    class Execution = DirectExecution<N>
 >
-struct BasicEwmNode {
+struct EwmNode {
     static constexpr double span = std::bit_cast<double>(SpanBits);
     static_assert(span > 0.0);
     static constexpr double alpha = 2.0 / (span + 1.0);
     static constexpr double old_weight_factor = 1.0 - alpha;
-    static constexpr std::size_t state_size = StateIndex::state_size;
+    static constexpr std::size_t state_size = Execution::state_size;
 
     alignas(64) std::array<double, state_size> value{};
     alignas(64) std::array<double, state_size> weight{};
@@ -68,7 +47,7 @@ struct BasicEwmNode {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
 
         if constexpr (MinPeriods <= 0 && IgnoreNa && !Adjust) {
-            if constexpr (StateIndex::contiguous_lanes) {
+            if constexpr (Execution::contiguous_lanes) {
                 run_recursive_contiguous(ctx, out);
             } else {
                 run_recursive_indexed(ctx, out);
@@ -127,7 +106,7 @@ private:
 #pragma GCC unroll 16
 #endif
         for (std::size_t lane = 0; lane < N; ++lane) {
-            const std::size_t index = StateIndex::get(ctx, lane);
+            const std::size_t index = Execution::state_index(ctx, lane);
             const double x = ctx.template read<In>(lane);
             if (finite(x)) {
                 if (initialized[index]) value[index] = std::fma(alpha, x - value[index], value[index]);
@@ -143,7 +122,7 @@ private:
     template <class Context>
     STACKDSL_HOT void run_general(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
         for (std::size_t lane = 0; lane < N; ++lane) {
-            const std::size_t index = StateIndex::get(ctx, lane);
+            const std::size_t index = Execution::state_index(ctx, lane);
             const double x = ctx.template read<In>(lane);
             const bool observation = finite(x);
             double old_weight = weight[index];
@@ -169,11 +148,5 @@ private:
         }
     }
 };
-
-template <std::size_t N, class In, class Out, std::uint64_t SpanBits, int MinPeriods, bool IgnoreNa, bool Adjust>
-using EwmNode = BasicEwmNode<N, In, Out, SpanBits, MinPeriods, IgnoreNa, Adjust, DirectStateIndex<N>>;
-
-template <std::size_t N, std::size_t Capacity, class In, class Out, std::uint64_t SpanBits, int MinPeriods, bool IgnoreNa, bool Adjust>
-using GroupedEwmNode = BasicEwmNode<N, In, Out, SpanBits, MinPeriods, IgnoreNa, Adjust, GroupedStateIndex<N, Capacity>>;
 
 }  // namespace stackdsl
