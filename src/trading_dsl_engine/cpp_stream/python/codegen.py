@@ -99,22 +99,41 @@ _UNARY_POLICIES = {
 }
 
 
-def _stage_type(stage: Stage, n: CppType, *, grouped_capacity: CppType | None = None) -> CppType:
+def _stage_type(stage: Stage, n: CppType, execution: CppType) -> CppType:
+    """Render one operator type independent of whether its plan is grouped.
+
+    Grouping changes only ``execution``. There are no Grouped* operator names or
+    per-operator grouped branches in code generation.
+    """
     inputs = tuple(_source_type(source) for source in stage.inputs)
     out = _dest_type(stage)
     if stage.kind == "copy":
-        return tmpl("stackdsl::CopyNode", n, inputs[0], out)
+        return tmpl("stackdsl::CopyNode", n, inputs[0], out, execution)
     if stage.kind == "binary":
-        return tmpl("stackdsl::BinaryNode", n, inputs[0], inputs[1], out, Name(_BINARY_POLICIES[stage.op_name or ""]))
+        return tmpl(
+            "stackdsl::BinaryNode",
+            n,
+            inputs[0],
+            inputs[1],
+            out,
+            Name(_BINARY_POLICIES[stage.op_name or ""]),
+            execution,
+        )
     if stage.kind == "unary":
-        return tmpl("stackdsl::UnaryNode", n, inputs[0], out, Name(_UNARY_POLICIES[stage.op_name or ""]))
+        return tmpl(
+            "stackdsl::UnaryNode",
+            n,
+            inputs[0],
+            out,
+            Name(_UNARY_POLICIES[stage.op_name or ""]),
+            execution,
+        )
     if stage.kind == "cumsum":
-        if grouped_capacity is None:
-            return tmpl("stackdsl::CumsumNode", n, inputs[0], out)
-        return tmpl("stackdsl::GroupedCumsumNode", n, grouped_capacity, inputs[0], out)
+        return tmpl("stackdsl::CumsumNode", n, inputs[0], out, execution)
     if stage.kind == "ewm":
         assert stage.ewm is not None
-        args = (
+        return tmpl(
+            "stackdsl::EwmNode",
             n,
             inputs[0],
             out,
@@ -122,14 +141,10 @@ def _stage_type(stage: Stage, n: CppType, *, grouped_capacity: CppType | None = 
             IntArg(stage.ewm.min_periods),
             BoolArg(stage.ewm.ignore_na),
             BoolArg(stage.ewm.adjust),
+            execution,
         )
-        if grouped_capacity is None:
-            return tmpl("stackdsl::EwmNode", *args)
-        return tmpl("stackdsl::GroupedEwmNode", n, grouped_capacity, *args[1:])
     if stage.kind == "xs_rank":
-        if grouped_capacity is None:
-            return tmpl("stackdsl::XsRankNode", n, inputs[0], out)
-        return tmpl("stackdsl::GroupedXsRankNode", n, grouped_capacity, inputs[0], out)
+        return tmpl("stackdsl::XsRankNode", n, inputs[0], out, execution)
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")
     raise AssertionError(stage.kind)
@@ -160,12 +175,13 @@ class InputView:
 
 
 def _inner_view(name: str, group: GroupStage) -> InnerView:
-    capacity = Name("Capacity")
+    n = Name("N")
+    execution = tmpl("stackdsl::GroupedExecution", n, Name("Capacity"))
     stages: list[StageView] = []
     for index, stage in enumerate(group.inner.stages):
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
-        stages.append(StageView(index, _stage_type(stage, Name("N"), grouped_capacity=capacity).render()))
+        stages.append(StageView(index, _stage_type(stage, n, execution).render()))
     return InnerView(name, group.inner.input_count, group.inner.scratch_slots, tuple(stages))
 
 
@@ -228,6 +244,8 @@ def render_translation_unit(plan: Plan, *, n_instruments: int, prefetch_rows: in
         group_names[index] = name
         inners.append(_inner_view(name, stage.group))
 
+    n = IntArg(n_instruments)
+    direct_execution = tmpl("stackdsl::DirectExecution", n)
     stages: list[StageView] = []
     for index, stage in enumerate(plan.stages):
         if stage.kind == "groupby":
@@ -235,7 +253,7 @@ def render_translation_unit(plan: Plan, *, n_instruments: int, prefetch_rows: in
             cpp_type = _group_type(group_names[index], stage.group, stage, n_instruments)
             stages.append(StageView(index, cpp_type.render(), checked=True))
         else:
-            stages.append(StageView(index, _stage_type(stage, IntArg(n_instruments)).render()))
+            stages.append(StageView(index, _stage_type(stage, n, direct_execution).render()))
 
     if plan.input_count == 0:
         raise ValueError("cpp_stream requires at least one file-backed input")
