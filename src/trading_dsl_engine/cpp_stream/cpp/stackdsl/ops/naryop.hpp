@@ -43,9 +43,38 @@ struct XsRankNode {
     static constexpr int arity=1;
     RankScoreTable<N> scores{};
     void setup() noexcept { scores.setup(); }
-    template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        std::array<RankItem,N> items{};
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
         double* STACKDSL_RESTRICT out=ctx.template write_ptr<Out>();
+        if constexpr (N <= 16) rank_count(ctx, out);
+        else rank_sort(ctx, out);
+    }
+
+private:
+    template <class Context>
+    STACKDSL_HOT void rank_count(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
+        std::array<double,N> values{};
+        std::array<std::uint8_t,N> valid{};
+        std::size_t count=0;
+        for (std::size_t i=0;i<N;++i) {
+            values[i]=ctx.template read<In>(i);
+            valid[i]=static_cast<std::uint8_t>(finite(values[i]));
+            count+=valid[i];
+            if (!valid[i]) out[i]=kNaN;
+        }
+        for (std::size_t i=0;i<N;++i) {
+            if (!valid[i]) continue;
+            std::size_t upper=0;
+            const double value=values[i];
+            for (std::size_t j=0;j<N;++j) upper+=static_cast<std::size_t>(valid[j] && values[j]<=value);
+            out[i]=scores.get(count,upper-1);
+        }
+    }
+
+    template <class Context>
+    STACKDSL_HOT void rank_sort(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
+        std::array<RankItem,N> items{};
         std::size_t count=0;
         for (std::size_t i=0;i<N;++i) {
             const double value=ctx.template read<In>(i);
