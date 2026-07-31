@@ -92,43 +92,141 @@ epoch input.
 The operator-agnostic execution-scope implementation preserves the previously
 measured optimized grouped result while removing grouped operator boilerplate.
 
-## What still limits this formula
+## Same-host ablation against the old 21 M rows/s result
 
-A controlled architecture experiment using the same stage-shaped calendar
-computation produced:
+The old table used a precomputed key file and, for the 21.43 M rows/s case, direct
+dense indexing. The requested integrated formula derives the key from `_ev_ts` as
+generic vector arithmetic and then sends the result through the generic hash
+resolver. Those are materially different workloads.
 
-| Key/value representation | Throughput |
+The following ablation used one pinned Intel Xeon E5-2673 v4 core, GCC 14 C++20,
+`-O3 -march=native -mtune=native -flto`, 2,000,000 x 9 finite rows, warmed input
+pages, and an in-memory output. The grouped `cumsum -> EWM(span=3)` state layout and
+output semantics were held constant unless the row says otherwise.
+
+| Variant | Median throughput |
 | --- | ---: |
-| Current: vector `_ev_ts` stages + hash lookup | 4.85 M rows/s |
-| Vector `_ev_ts` stages + direct dense slot | 6.08 M rows/s |
-| Row-scalar calendar derivation + hash lookup | 7.96 M rows/s |
-| Row-scalar calendar derivation + direct dense slot | 15.97 M rows/s |
+| Precomputed dense minute, fused inner state loop | 21.92 M rows/s |
+| Precomputed dense minute, normal separated cumsum/EWM stages | **21.71 M rows/s** |
+| Precomputed minute, current full hash resolver | 11.72 M rows/s |
+| Generated four-stage vector calendar + current hash resolver, fused inner | 5.14 M rows/s |
+| **Generated four-stage vector calendar + current hash resolver, normal separated inner** | **4.74 M rows/s** |
+| Row-scalar float calendar + dense slot, separated inner | 12.73 M rows/s |
+| Row-scalar integer calendar + dense slot, separated inner | **20.32 M rows/s** |
 
-These are not operator fast paths. They identify missing semantic information in the
-IR and data model:
+The 4.74 M rows/s row reproduces the apparent integrated result. The 21.71 M rows/s
+control shows that the generic execution-scope groupby/state architecture still
+reaches the old dense-key throughput when key production and routing are held equal.
 
-1. `_ev_ts` is represented as a normal instrument vector, so the compiler computes
-   the identical calendar expression nine times and reads nine timestamp values.
-   The IR has no row-scalar/broadcast-invariant value kind.
-2. Macro expansion turns `minute(_ev_ts)` into generic `mod/floor/div` nodes and
-   drops the known integer domain `0..59`. Groupby lowering therefore uses a hash
-   table instead of direct dense indexing.
-3. Group resolution materializes one slot per lane. The downstream plan cannot
-   represent or exploit the fact that all lanes often share the same dynamic key.
-4. The semantic IR describes values and operators, but not value invariance,
-   categorical domains, or grouped-state access runs. A C++ compiler cannot invent
-   those semantic facts from arbitrary runtime arrays.
+Expressed as elapsed time per million rows:
 
-The next architecture-level optimizations should therefore be backend-neutral domain
-propagation and a row-scalar value type, followed by a generic uniform-slot/run
-representation for grouped state access. They should not be implemented as
-operator-specific grouped classes.
+| Step | Time per million rows | Incremental cost |
+| --- | ---: | ---: |
+| Precomputed dense key | 46.1 ms | baseline |
+| Precomputed key + current hash resolver | 85.3 ms | +39.2 ms |
+| Vector calendar stages + current hash resolver | 211.0 ms | +125.7 ms |
+
+About 78% of the final row time above the dense-key baseline comes from producing and
+resolving the key, not from cumsum, EWM, `GroupedExecution`, or output handling.
+
+### Resolver ablation
+
+For a uniform minute key shared by all nine lanes:
+
+| Resolver behavior | Median throughput |
+| --- | ---: |
+| Resolve/hash once and broadcast the slot | 15.87 M rows/s |
+| Generic row-reuse loop, no per-lane temporal cache | 13.52 M rows/s |
+| Current row-reuse plus per-lane temporal cache | 11.60 M rows/s |
+
+The per-lane cache is counterproductive for this key because minute changes on every
+row. All nine lane caches miss, are rewritten, and then the same-row reuse logic
+still performs the useful sharing. That cache can help persistent per-lane keys, but
+it should not be the only generic resolver policy.
+
+### Dense resolver and semantic checks
+
+Additional isolated controls:
+
+| Change | Median throughput |
+| --- | ---: |
+| Current formula, dense row-shared slot, simplified finite-only semantics | 22.53 M rows/s |
+| Current formula, dense row-shared slot, repository NaN-safe semantics | 21.34 M rows/s |
+| Dense validation repeated independently for all nine lanes | 17.46 M rows/s |
+| Dense validation once plus row-slot broadcast | 21.63 M rows/s |
+
+Repository-safe cumsum/EWM semantics cost about 5% on all-finite data. Revalidating an
+identical dense key nine times costs about 19%. Neither accounts for the overall
+4.7-versus-21 M rows/s gap.
+
+### Calendar representation ablation
+
+The existing DSL macro expands `minute(_ev_ts)` to floating-point `mod`, division,
+`floor`, and another `mod`. The IR currently treats `_ev_ts` as a nine-lane vector,
+so those operations are repeated for every lane and materialized as separate vector
+stages.
+
+| Calendar/key representation | Median throughput |
+| --- | ---: |
+| Vector floating calendar expression, current hash resolver | 4.74 M rows/s |
+| Row-scalar floating calendar expression, dense slot | 12.73 M rows/s |
+| Row-scalar integer timestamp arithmetic, dense slot | 20.32 M rows/s |
+
+The integer row-scalar version is close to the precomputed dense control. This is the
+main architectural path to recovering the old performance without adding any
+operator-specific groupby implementation.
+
+### What is not causing the regression
+
+- `GroupedExecution` versus separate grouped operator classes: effectively zero.
+- Splitting cumsum and EWM into normal graph stages: small, roughly 1-8% depending
+  on the run and surrounding key work.
+- Output placement after warmup: anonymous output, `/dev/shm`, and a reused normal
+  `MAP_SHARED` file measured within noise of one another in the controlled test.
+- The requested formula itself: with a precomputed dense key it reaches roughly
+  21-22 M rows/s on the comparison host.
+
+## Architectural fixes indicated by the ablation
+
+1. Add a backend-neutral row-scalar or lane-invariant value kind. `_ev_ts` should
+   normally be loaded and transformed once per row, then broadcast only when a
+   downstream vector operator requires it.
+2. Preserve timestamp/integer type information. Lower `minute(_ev_ts)` to integer
+   calendar arithmetic rather than four generic floating-point vector operators.
+3. Propagate categorical domains through the neutral IR. `minute(_ev_ts)` has known
+   domain `0..59`, so groupby can select direct dense state indexing automatically.
+4. Represent uniform group slots. A row-scalar key should resolve once and expose a
+   broadcast/uniform slot rather than materializing and validating nine independent
+   slots.
+5. Make resolver caching a compile-time policy selected from key metadata. Temporal
+   per-lane caching is useful for persistent lane-specific keys; it is harmful for a
+   row-scalar key that changes every row.
+6. Add generic producer-consumer fusion for cheap stateless key graphs where useful.
+   This is a graph/lowering optimization, not a grouped EWM/cumsum fast path.
 
 ## Reproducible repository benchmark
 
-The requested minute formula is the default case:
+The requested derived-minute formula remains the default case:
 
 ```bash
+python scripts/benchmark_cpp_stream.py
+```
+
+The two principal key ablations are now available directly:
+
+```bash
+CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_hash \
+python scripts/benchmark_cpp_stream.py
+
+CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_dense \
+python scripts/benchmark_cpp_stream.py
+```
+
+To match the old benchmark's output placement:
+
+```bash
+CPP_STREAM_BENCH_OUTPUT_DIR=/dev/shm \
+CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_dense \
 python scripts/benchmark_cpp_stream.py
 ```
 
