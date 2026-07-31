@@ -82,6 +82,20 @@ def _reference_rank(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _rank_one_group(row: np.ndarray, lanes: list[int], out: np.ndarray) -> None:
+    finite_lanes = [lane for lane in lanes if np.isfinite(row[lane])]
+    ordered = sorted(finite_lanes, key=lambda lane: row[lane])
+    pos = 0
+    while pos < len(ordered):
+        upper = pos + 1
+        while upper < len(ordered) and row[ordered[upper]] == row[ordered[pos]]:
+            upper += 1
+        score = ndtri(upper / (len(ordered) + 1.0))
+        for lane in ordered[pos:upper]:
+            out[lane] = score
+        pos = upper
+
+
 def test_cpp_stream_mmap_formula_matches_reference(tmp_path: Path):
     _require_native_compiler()
     rows, cols = 128, 5
@@ -133,3 +147,51 @@ def test_cpp_stream_dense_mixed_groupby_matches_reference(tmp_path: Path):
             state[key] = state.get(key, 0.0) + close[t, lane]
             expected[t, lane] = state[key]
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_cpp_stream_composite_groupby_nested_state_capture_and_rank(tmp_path: Path):
+    _require_native_compiler()
+    rows, cols = 72, 5
+    rng = np.random.default_rng(19)
+    close = rng.normal(size=(rows, cols)).astype(np.float64)
+    open_ = rng.normal(size=(rows, cols)).astype(np.float64)
+    key0 = (np.arange(rows, dtype=np.float64)[:, None] % 3.0) + np.zeros((rows, cols))
+    key1 = ((np.arange(rows, dtype=np.float64)[:, None] // 2.0) % 2.0) + np.zeros((rows, cols))
+    paths = {}
+    for name, value in {"close": close, "open": open_, "key0": key0, "key1": key1}.items():
+        path = tmp_path / f"{name}.bin"
+        value.tofile(path)
+        paths[name] = path
+    out_path = tmp_path / "nested_grouped.bin"
+
+    runtime = compile_formula(
+        "groupby((univ([0, 1], [2, 3, 4]), key0, key1), close, xs_rank(ewm(cumsum(self_) + open, 3)))",
+        n_instruments=cols,
+        default_group_capacity=16,
+    )
+    runtime.run_files(paths, out_path=out_path)
+    actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
+
+    cumulative: dict[tuple[int, int, int], float] = {}
+    ewm_value: dict[tuple[int, int, int], float] = {}
+    expected = np.full_like(close, np.nan)
+    alpha = 0.5
+    partitions = (0, 0, 1, 1, 1)
+    for t in range(rows):
+        before_rank = np.empty(cols, dtype=np.float64)
+        group_members: dict[tuple[int, int, int], list[int]] = {}
+        for lane in range(cols):
+            dynamic = (int(key0[t, lane]), int(key1[t, lane]))
+            state_key = (lane, *dynamic)
+            cumulative[state_key] = cumulative.get(state_key, 0.0) + close[t, lane]
+            x = cumulative[state_key] + open_[t, lane]
+            previous = ewm_value.get(state_key)
+            current = x if previous is None else (1.0 - alpha) * previous + alpha * x
+            ewm_value[state_key] = current
+            before_rank[lane] = current
+            cross_key = (partitions[lane], *dynamic)
+            group_members.setdefault(cross_key, []).append(lane)
+        for lanes in group_members.values():
+            _rank_one_group(before_rank, lanes, expected[t])
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11, equal_nan=True)
