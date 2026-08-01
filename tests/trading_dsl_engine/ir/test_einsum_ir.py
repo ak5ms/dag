@@ -42,10 +42,17 @@ def test_invalid_subscripts_match_numpy_style_constraints() -> None:
         parse_einsum("ij->ii", ((3, 4),))
     with pytest.raises(EinsumParseError, match="does not appear"):
         parse_einsum("ij->k", ((3, 4),))
-    with pytest.raises(EinsumParseError, match="not broadcastable"):
+    with pytest.raises(EinsumParseError, match="without an ellipsis"):
         parse_einsum("ij,ij->ij", ((3, 4), (3, 5)))
+    with pytest.raises(EinsumParseError, match="without an ellipsis"):
+        parse_einsum("ij,ij->ij", ((1, 4), (3, 4)))
     with pytest.raises(EinsumParseError, match="repeated einsum label"):
         parse_einsum("ii->i", ((3, 4),))
+
+
+def test_optimize_default_matches_numpy() -> None:
+    assert parse_einsum("i,i->", ((3,), (3,))).optimize == "none"
+    assert parse_einsum("i,i->", ((3,), (3,)), optimize=True).optimize == "greedy"
 
 
 def test_greedy_and_optimal_paths_reduce_nary_work() -> None:
