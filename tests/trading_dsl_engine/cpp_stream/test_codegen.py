@@ -31,7 +31,7 @@ def test_grouped_codegen_changes_only_execution_scope():
     assert "stackdsl::CumsumNode<" in source
     assert "stackdsl::EwmNode<" in source
     assert "stackdsl::XsRankNode<" in source
-    assert "stackdsl::GroupedExecution<N, Capacity>" in source
+    assert "stackdsl::GroupedExecution<N, Capacity, PartitionCount>" in source
     assert "GroupedCumsumNode" not in source
     assert "GroupedEwmNode" not in source
     assert "GroupedXsRankNode" not in source
@@ -47,6 +47,7 @@ def test_groupby_header_contains_no_operator_implementations():
     assert "CumsumNode" not in text
     assert "EwmNode" not in text
     assert "XsRankNode" not in text
+    assert "RidgeNode" not in text
 
 
 def test_key_descriptor_selects_dense_row_scalar_resolver():
@@ -85,11 +86,10 @@ def test_key_descriptor_selects_dense_row_scalar_resolver():
     assert "stackdsl::DenseTupleGroupResolver<" in source
     assert "stackdsl::KeySpec<" in source
     assert ", 60, 0, true>" in source
-    assert "stackdsl::GroupedExecution<N, Capacity>" in source
-    assert "stackdsl::SlotDst<" in source and ", std::int64_t>" in source
-    assert "stackdsl::SlotSrc<" in source and ", std::int64_t," in source
-    assert "std::int64_t, stackdsl::DivOp" in source
-    assert "std::int64_t, stackdsl::ModOp" in source
+    assert "stackdsl::GroupedExecution<N, Capacity, PartitionCount>" in source
+    assert "std::int64_t" in source
+    assert "stackdsl::DivOp" in source
+    assert "stackdsl::ModOp" in source
 
 
 def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
@@ -150,8 +150,6 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
     ).text
     assert "stackdsl::InputSrc<0, double, 9>" in source
     assert "stackdsl::InputSrc<1, std::int64_t, 1>" in source
-    # Mixed float64 + int64 has a float64 result, but the int64 input source is
-    # still read natively and promoted by AddOp rather than by RowContext.
     assert "stackdsl::BinaryNode<9," in source
     assert "stackdsl::OutputDst, double, stackdsl::AddOp" in source
     assert "cpp_stream_run_arrays" in source
