@@ -4,8 +4,18 @@ from dataclasses import dataclass
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
+from trading_dsl_engine.base.parser import (
+    Call,
+    Expr,
+    Identifier,
+    KeyTuple,
+    Number,
+    String,
+    Universe,
+    parse_formula,
+)
 from trading_dsl_engine.ir.ops import (
+    CatOp,
     CumsumOp,
     EwmOp,
     GroupByOp,
@@ -13,10 +23,19 @@ from trading_dsl_engine.ir.ops import (
     InputOp,
     LiteralOp,
     NaryOp,
+    RidgeOp,
+    RidgeProjectionOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
-from trading_dsl_engine.ir.types import SCALAR, VECTOR, ValueType
+from trading_dsl_engine.ir.types import (
+    SCALAR,
+    VECTOR,
+    ValueType,
+    fixed,
+    matrix,
+    object_value,
+)
 
 
 class FormulaIRCompileError(ValueError):
@@ -67,7 +86,9 @@ def _contains_self(node: Expr) -> bool:
     if isinstance(node, Key):
         return _contains_self(node.expr)
     if isinstance(node, Call):
-        return any(_contains_self(arg) for arg in node.args) or any(_contains_self(v) for _, v in node.kwargs)
+        return any(_contains_self(arg) for arg in node.args) or any(
+            _contains_self(value) for _, value in node.kwargs
+        )
     if isinstance(node, KeyTuple):
         return any(_contains_self(item) for item in node.items)
     return False
@@ -80,13 +101,20 @@ def _literal_number(node: Expr, name: str) -> float:
 
 
 def _literal_bool(node: Expr, name: str) -> bool:
+    if isinstance(node, Identifier) and node.name in {"True", "False"}:
+        return node.name == "True"
     value = _literal_number(node, name)
-    if value not in (0.0, 1.0):
+    if value not in (0.0, 1.0, 2.0, 3.0):
         raise FormulaIRCompileError(f"{name} must be a boolean/numeric literal")
+    if value in (2.0, 3.0):
+        return bool(int(value) - 2)
     return bool(value)
 
 
-def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str, int]) -> tuple[tuple[int, ...], ...]:
+def _resolve_universe_groups(
+    universe: Universe,
+    column_name_to_index: dict[str, int],
+) -> tuple[tuple[int, ...], ...]:
     groups: list[tuple[int, ...]] = []
     seen: set[int] = set()
     for group in universe.groups:
@@ -104,7 +132,9 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
             if index < 0:
                 raise FormulaIRCompileError("universe column indexes must be >= 0")
             if index in seen:
-                raise FormulaIRCompileError(f"universe column index {index} appears in more than one group")
+                raise FormulaIRCompileError(
+                    f"universe column index {index} appears in more than one group"
+                )
             seen.add(index)
             resolved.append(index)
         if not resolved:
@@ -113,8 +143,36 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
     return tuple(groups)
 
 
-def _result_type(children: list[Node]) -> ValueType:
-    return VECTOR if any(child.value_type.kind == "vector" for child in children) else SCALAR
+def _feature_width(value_type: ValueType) -> int:
+    if value_type.kind in {"scalar", "vector"}:
+        return 1
+    if value_type.kind == "matrix":
+        return int(value_type.width)
+    raise FormulaIRCompileError(
+        f"value kind {value_type.kind!r} cannot be used as a Ridge/cat feature"
+    )
+
+
+def _nary_result_type(children: list[Node]) -> ValueType:
+    matrices = [child.value_type for child in children if child.value_type.kind == "matrix"]
+    vectors = [child for child in children if child.value_type.kind == "vector"]
+    unsupported = [
+        child.value_type.kind
+        for child in children
+        if child.value_type.kind not in {"scalar", "vector", "matrix"}
+    ]
+    if unsupported:
+        raise FormulaIRCompileError(
+            f"arithmetic does not support value kinds {sorted(set(unsupported))}"
+        )
+    if matrices:
+        widths = {value.width for value in matrices}
+        if len(widths) != 1 or vectors:
+            raise FormulaIRCompileError(
+                "matrix arithmetic currently requires equal-width matrices and/or scalars"
+            )
+        return matrix(next(iter(widths)))
+    return VECTOR if vectors else SCALAR
 
 
 def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
@@ -150,6 +208,67 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
     return values["x"], span, min_periods, ignore_na, adjust
 
 
+def _flatten_cat_features(expressions: tuple[Expr, ...]) -> tuple[Expr, ...]:
+    flattened: list[Expr] = []
+    for expression in expressions:
+        if isinstance(expression, Call) and expression.fn == "cat" and not expression.kwargs:
+            flattened.extend(_flatten_cat_features(expression.args))
+        else:
+            flattened.append(expression)
+    return tuple(flattened)
+
+
+def _normalize_ridge(
+    call: Call,
+) -> tuple[tuple[Expr, ...], Expr, Expr | None, Expr, Expr, bool, bool]:
+    """Return features, y, weights, hl, lambda, nonneg, is_stateful."""
+    if call.kwargs:
+        allowed = {"y", "weights", "hl", "lambda_", "nonneg"}
+        values: dict[str, Expr] = {}
+        for name, value in call.kwargs:
+            if name not in allowed:
+                raise FormulaIRCompileError(f"unsupported Ridge keyword {name!r}")
+            if name in values:
+                raise FormulaIRCompileError(f"Ridge argument {name!r} specified twice")
+            values[name] = value
+        missing = [name for name in ("y", "hl", "lambda_") if name not in values]
+        if missing:
+            raise FormulaIRCompileError(f"Ridge keyword form is missing {missing}")
+        features = call.args
+        y = values["y"]
+        weights = values.get("weights")
+        hl = values["hl"]
+        lam = values["lambda_"]
+        nonneg = _literal_bool(values.get("nonneg", Number(0.0)), "Ridge nonneg")
+    else:
+        args = call.args
+        has_nonneg_sentinel = (
+            len(args) >= 5
+            and isinstance(args[-1], Number)
+            and float(args[-1].value) in (2.0, 3.0)
+        )
+        nonneg = _literal_bool(args[-1], "Ridge nonneg") if has_nonneg_sentinel else False
+        if has_nonneg_sentinel:
+            args = args[:-1]
+        if len(args) < 4:
+            raise FormulaIRCompileError(
+                "Ridge expects features..., y, hl, lambda or features..., y, weights, hl, lambda"
+            )
+        has_weights = len(args) >= 5
+        if has_weights:
+            features = args[:-4]
+            y, weights, hl, lam = args[-4:]
+        else:
+            features = args[:-3]
+            y, hl, lam = args[-3:]
+            weights = None
+    features = _flatten_cat_features(tuple(features))
+    if not features:
+        raise FormulaIRCompileError("Ridge expects at least one feature")
+    is_stateful = not (isinstance(hl, Number) and float(hl.value) == 0.0)
+    return features, y, weights, hl, lam, nonneg, is_stateful
+
+
 def _group_key(item: Expr) -> tuple[Expr, GroupKeySpec]:
     if isinstance(item, Key):
         if isinstance(item.expr, Universe):
@@ -178,28 +297,25 @@ class _Builder:
         self.nodes.append(Node(op=op, child_ids=child_ids, value_type=value_type))
         return index
 
+    def _expand_macro(self, node: Call) -> Expr | None:
+        macro = self.dsl_registry.get(node.fn)
+        if macro is None:
+            return None
+        try:
+            expanded = macro(*node.args, **dict(node.kwargs))
+        except Exception as exc:
+            raise FormulaIRCompileError(f"failed expanding DSL function {node.fn!r}: {exc}") from exc
+        return expanded if _expr_key(expanded) != _expr_key(node) else None
+
     def build(self, node: Expr, *, use_cache: bool = True) -> int:
         key = _expr_key(node)
         if use_cache and key in self.memo:
             return self.memo[key]
         if isinstance(node, Key):
             result = self.build(node.expr, use_cache=use_cache)
-            if use_cache:
-                self.memo[key] = result
-            return result
-        if isinstance(node, Call):
-            macro = self.dsl_registry.get(node.fn)
-            if macro is not None:
-                try:
-                    expanded = macro(*node.args, **dict(node.kwargs))
-                except Exception as exc:
-                    raise FormulaIRCompileError(f"failed expanding DSL function {node.fn!r}: {exc}") from exc
-                if _expr_key(expanded) != key:
-                    result = self.build(expanded, use_cache=use_cache)
-                    if use_cache:
-                        self.memo[key] = result
-                    return result
-        if isinstance(node, Identifier):
+        elif isinstance(node, Call) and (expanded := self._expand_macro(node)) is not None:
+            result = self.build(expanded, use_cache=use_cache)
+        elif isinstance(node, Identifier):
             derived = _DERIVED_TERMINALS.get(node.name)
             if derived is not None:
                 result = self.build(derived, use_cache=use_cache)
@@ -209,42 +325,112 @@ class _Builder:
                 input_index = self.inputs.setdefault(node.name, len(self.inputs))
                 result = self._append(InputOp(input_index, node.name), (), VECTOR)
         elif isinstance(node, Number):
-            result = self._append(LiteralOp(float(node.value)), (), SCALAR)
-        elif isinstance(node, Call) and node.fn in _NARY_ARITY:
+            result = self._append(LiteralOp(node.value), (), SCALAR)
+        elif isinstance(node, String):
+            raise FormulaIRCompileError(
+                f"string literal {node.value!r} is not valid in this cpp_stream expression"
+            )
+        elif isinstance(node, Call):
+            result = self._build_call(node, grouped=False)
+        else:
+            raise FormulaIRCompileError(f"unsupported expression {node!r}")
+        if use_cache:
+            self.memo[key] = result
+        return result
+
+    def _build_call(self, node: Call, *, grouped: bool) -> int:
+        if node.fn in _NARY_ARITY:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
                 raise FormulaIRCompileError(f"{node.fn} expects exactly {arity} positional arguments")
             child_ids = tuple(self.build(arg) for arg in node.args)
-            result = self._append(
+            return self._append(
                 NaryOp(node.fn, arity),
                 child_ids,
-                _result_type([self.nodes[i] for i in child_ids]),
+                _nary_result_type([self.nodes[i] for i in child_ids]),
             )
-        elif isinstance(node, Call) and node.fn == "cumsum":
+        if node.fn == "cat":
+            if node.kwargs or not node.args:
+                raise FormulaIRCompileError("cat expects at least one positional argument")
+            child_ids = tuple(self.build(arg) for arg in node.args)
+            widths = tuple(_feature_width(self.nodes[child].value_type) for child in child_ids)
+            return self._append(CatOp(widths), child_ids, matrix(sum(widths)))
+        if node.fn == "cumsum":
             if node.kwargs or len(node.args) != 1:
                 raise FormulaIRCompileError("cumsum expects exactly one positional argument")
             child = self.build(node.args[0])
-            result = self._append(CumsumOp(), (child,), self.nodes[child].value_type)
-        elif isinstance(node, Call) and node.fn == "ewm":
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("cumsum currently requires a vector input")
+            return self._append(CumsumOp(), (child,), VECTOR)
+        if node.fn == "ewm":
             x, span, min_periods, ignore_na, adjust = _normalize_ewm(node)
             child = self.build(x)
-            result = self._append(EwmOp(span, min_periods, ignore_na, adjust), (child,), self.nodes[child].value_type)
-        elif isinstance(node, Call) and node.fn == "xs_rank":
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("ewm currently requires a vector input")
+            return self._append(
+                EwmOp(span, min_periods, ignore_na, adjust),
+                (child,),
+                VECTOR,
+            )
+        if node.fn == "xs_rank":
             if node.kwargs or len(node.args) != 1:
                 raise FormulaIRCompileError("xs_rank expects exactly one positional argument")
             child = self.build(node.args[0])
             if self.nodes[child].value_type.kind != "vector":
                 raise FormulaIRCompileError("xs_rank requires a vector input")
-            result = self._append(XsRankOp(), (child,), VECTOR)
-        elif isinstance(node, Call) and node.fn == "groupby":
-            result = self._build_groupby(node)
-        else:
-            raise FormulaIRCompileError(
-                f"cpp_stream neutral IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}"
+            return self._append(XsRankOp(), (child,), VECTOR)
+        if node.fn == "Ridge":
+            features, y, weights, hl, lam, nonneg, is_stateful = _normalize_ridge(node)
+            feature_ids = tuple(self.build(expression) for expression in features)
+            feature_widths = tuple(
+                _feature_width(self.nodes[child].value_type) for child in feature_ids
             )
-        if use_cache:
-            self.memo[key] = result
-        return result
+            y_id = self.build(y)
+            if self.nodes[y_id].value_type.kind != "vector":
+                raise FormulaIRCompileError("Ridge y must be vector-valued")
+            children = list(feature_ids)
+            children.append(y_id)
+            has_weights = weights is not None
+            if weights is not None:
+                weight_id = self.build(weights)
+                if self.nodes[weight_id].value_type.kind not in {
+                    "scalar",
+                    "vector",
+                    "matrix",
+                }:
+                    raise FormulaIRCompileError("Ridge weights must be scalar, vector, or matrix")
+                children.append(weight_id)
+            children.extend((self.build(hl), self.build(lam)))
+            op = RidgeOp(
+                feature_widths=feature_widths,
+                has_weights=has_weights,
+                nonneg=nonneg,
+                is_stateful=is_stateful,
+            )
+            return self._append(op, tuple(children), object_value(op.coefficient_width))
+        if node.fn in {"get_beta", "get_preds"}:
+            if node.kwargs or len(node.args) != 1:
+                raise FormulaIRCompileError(f"{node.fn} expects exactly one Ridge value")
+            child = self.build(node.args[0])
+            child_node = self.nodes[child]
+            if not isinstance(child_node.op, RidgeOp):
+                raise FormulaIRCompileError(f"{node.fn} currently requires a Ridge value")
+            if node.fn == "get_preds":
+                value_type = VECTOR
+                field = "preds"
+            else:
+                value_type = matrix(child_node.op.coefficient_width) if grouped else fixed(
+                    child_node.op.coefficient_width
+                )
+                field = "beta"
+            return self._append(RidgeProjectionOp(field), (child,), value_type)
+        if node.fn == "groupby":
+            if grouped:
+                raise FormulaIRCompileError("nested groupby inside groupby RHS is not supported")
+            return self._build_groupby(node)
+        raise FormulaIRCompileError(
+            f"cpp_stream neutral IR does not yet support {node.fn!r}"
+        )
 
     def _build_groupby(self, call: Call) -> int:
         if len(call.args) != 3:
@@ -253,7 +439,9 @@ class _Builder:
         unknown = set(kw) - {"capacity", "hash_capacity"}
         if unknown:
             raise FormulaIRCompileError(f"unsupported groupby keyword argument(s): {sorted(unknown)}")
-        capacity = None if "capacity" not in kw else int(round(_literal_number(kw["capacity"], "groupby capacity")))
+        capacity = None if "capacity" not in kw else int(
+            round(_literal_number(kw["capacity"], "groupby capacity"))
+        )
         hash_capacity = None if "hash_capacity" not in kw else int(
             round(_literal_number(kw["hash_capacity"], "groupby hash_capacity"))
         )
@@ -276,8 +464,8 @@ class _Builder:
         for item in key_items:
             if isinstance(item, Universe):
                 continue
-            expr, spec = _group_key(item)
-            dynamic_items.append(expr)
+            expression, spec = _group_key(item)
+            dynamic_items.append(expression)
             key_specs.append(spec)
         key_ids = tuple(self.build(item) for item in dynamic_items)
 
@@ -292,8 +480,11 @@ class _Builder:
             input_names=("__self__",)
             + tuple(f"__capture_{i}__" for i in range(len(inner_builder.capture_ids))),
         )
-        if inner_program.nodes[inner_root].value_type.kind != "vector":
-            raise FormulaIRCompileError("cpp_stream groupby RHS must emit a vector")
+        inner_type = inner_program.nodes[inner_root].value_type
+        if inner_type.kind not in {"vector", "matrix"}:
+            raise FormulaIRCompileError(
+                "cpp_stream groupby RHS must emit a per-instrument vector or matrix"
+            )
         op = GroupByOp(
             key_specs=tuple(key_specs),
             static_groups=static_groups,
@@ -302,7 +493,7 @@ class _Builder:
             hash_capacity=hash_capacity,
         )
         children = key_ids + (lhs_id,) + tuple(inner_builder.capture_ids)
-        return self._append(op, children, VECTOR)
+        return self._append(op, children, inner_type)
 
 
 class _InnerBuilder:
@@ -319,76 +510,121 @@ class _InnerBuilder:
         self.nodes.append(Node(op=op, child_ids=child_ids, value_type=value_type))
         return index
 
-    def _input(self, input_index: int, name: str) -> int:
-        return self._append(InputOp(input_index, name), (), VECTOR)
+    def _input(self, input_index: int, name: str, value_type: ValueType) -> int:
+        return self._append(InputOp(input_index, name), (), value_type)
+
+    def _expand_macro(self, node: Call) -> Expr | None:
+        macro = self.outer.dsl_registry.get(node.fn)
+        if macro is None:
+            return None
+        try:
+            expanded = macro(*node.args, **dict(node.kwargs))
+        except Exception as exc:
+            raise FormulaIRCompileError(
+                f"failed expanding grouped DSL function {node.fn!r}: {exc}"
+            ) from exc
+        return expanded if _expr_key(expanded) != _expr_key(node) else None
 
     def build(self, node: Expr) -> int:
         key = _expr_key(node)
         if key in self.memo:
             return self.memo[key]
         if isinstance(node, Key):
-            return self.build(node.expr)
-        if isinstance(node, Identifier) and node.name == "self_":
+            result = self.build(node.expr)
+        elif isinstance(node, Identifier) and node.name == "self_":
             if self._self_input is None:
-                self._self_input = self._input(0, "__self__")
-            return self._self_input
-        if isinstance(node, Number):
-            result = self._append(LiteralOp(float(node.value)), (), SCALAR)
-            self.memo[key] = result
-            return result
-        if not _contains_self(node):
+                self._self_input = self._input(0, "__self__", VECTOR)
+            result = self._self_input
+        elif isinstance(node, Number):
+            result = self._append(LiteralOp(node.value), (), SCALAR)
+        elif not _contains_self(node):
             capture_pos = self.capture_map.get(key)
             if capture_pos is None:
                 outer_id = self.outer.build(node)
                 capture_pos = len(self.capture_ids)
                 self.capture_map[key] = capture_pos
                 self.capture_ids.append(outer_id)
-            result = self._input(capture_pos + 1, f"__capture_{capture_pos}__")
-            self.memo[key] = result
-            return result
-        if isinstance(node, Call):
-            macro = self.outer.dsl_registry.get(node.fn)
-            if macro is not None:
-                try:
-                    expanded = macro(*node.args, **dict(node.kwargs))
-                except Exception as exc:
-                    raise FormulaIRCompileError(f"failed expanding grouped DSL function {node.fn!r}: {exc}") from exc
-                if _expr_key(expanded) != key:
-                    result = self.build(expanded)
-                    self.memo[key] = result
-                    return result
-        if isinstance(node, Call) and node.fn in _NARY_ARITY:
+            outer_id = self.capture_ids[capture_pos]
+            result = self._input(
+                capture_pos + 1,
+                f"__capture_{capture_pos}__",
+                self.outer.nodes[outer_id].value_type,
+            )
+        elif isinstance(node, Call) and (expanded := self._expand_macro(node)) is not None:
+            result = self.build(expanded)
+        elif isinstance(node, Call):
+            # Reuse the outer builder's call semantics with this builder's node
+            # storage and grouped projection shape.
+            result = self._build_call(node)
+        else:
+            raise FormulaIRCompileError(f"unsupported grouped expression {node!r}")
+        self.memo[key] = result
+        return result
+
+    def _build_call(self, node: Call) -> int:
+        if node.fn in _NARY_ARITY:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
                 raise FormulaIRCompileError(f"{node.fn} expects exactly {arity} positional arguments")
             children = tuple(self.build(arg) for arg in node.args)
-            result = self._append(
+            return self._append(
                 NaryOp(node.fn, arity),
                 children,
-                _result_type([self.nodes[i] for i in children]),
+                _nary_result_type([self.nodes[i] for i in children]),
             )
-        elif isinstance(node, Call) and node.fn == "cumsum":
+        if node.fn == "cat":
+            if node.kwargs or not node.args:
+                raise FormulaIRCompileError("cat expects at least one positional argument")
+            children = tuple(self.build(arg) for arg in node.args)
+            widths = tuple(_feature_width(self.nodes[child].value_type) for child in children)
+            return self._append(CatOp(widths), children, matrix(sum(widths)))
+        if node.fn == "cumsum":
             if node.kwargs or len(node.args) != 1:
-                raise FormulaIRCompileError("cumsum expects exactly one positional argument")
+                raise FormulaIRCompileError("cumsum expects one argument")
             child = self.build(node.args[0])
-            result = self._append(CumsumOp(), (child,), self.nodes[child].value_type)
-        elif isinstance(node, Call) and node.fn == "ewm":
+            return self._append(CumsumOp(), (child,), VECTOR)
+        if node.fn == "ewm":
             x, span, min_periods, ignore_na, adjust = _normalize_ewm(node)
             child = self.build(x)
-            result = self._append(EwmOp(span, min_periods, ignore_na, adjust), (child,), self.nodes[child].value_type)
-        elif isinstance(node, Call) and node.fn == "xs_rank":
-            if node.kwargs or len(node.args) != 1:
-                raise FormulaIRCompileError("xs_rank expects exactly one positional argument")
-            child = self.build(node.args[0])
-            result = self._append(XsRankOp(), (child,), VECTOR)
-        elif isinstance(node, Call) and node.fn == "groupby":
-            raise FormulaIRCompileError("nested groupby inside groupby RHS is not yet supported by cpp_stream")
-        else:
-            raise FormulaIRCompileError(
-                f"cpp_stream grouped IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}"
+            return self._append(
+                EwmOp(span, min_periods, ignore_na, adjust),
+                (child,),
+                VECTOR,
             )
-        self.memo[key] = result
-        return result
+        if node.fn == "xs_rank":
+            if node.kwargs or len(node.args) != 1:
+                raise FormulaIRCompileError("xs_rank expects one argument")
+            child = self.build(node.args[0])
+            return self._append(XsRankOp(), (child,), VECTOR)
+        if node.fn == "Ridge":
+            features, y, weights, hl, lam, nonneg, is_stateful = _normalize_ridge(node)
+            feature_ids = tuple(self.build(expression) for expression in features)
+            feature_widths = tuple(
+                _feature_width(self.nodes[child].value_type) for child in feature_ids
+            )
+            children = list(feature_ids)
+            y_id = self.build(y)
+            children.append(y_id)
+            if weights is not None:
+                children.append(self.build(weights))
+            children.extend((self.build(hl), self.build(lam)))
+            op = RidgeOp(feature_widths, weights is not None, nonneg, is_stateful)
+            return self._append(op, tuple(children), object_value(op.coefficient_width))
+        if node.fn in {"get_beta", "get_preds"}:
+            if node.kwargs or len(node.args) != 1:
+                raise FormulaIRCompileError(f"{node.fn} expects one Ridge value")
+            child = self.build(node.args[0])
+            child_node = self.nodes[child]
+            if not isinstance(child_node.op, RidgeOp):
+                raise FormulaIRCompileError(f"{node.fn} requires a Ridge value")
+            field = "beta" if node.fn == "get_beta" else "preds"
+            value_type = matrix(child_node.op.coefficient_width) if field == "beta" else VECTOR
+            return self._append(RidgeProjectionOp(field), (child,), value_type)
+        if node.fn == "groupby":
+            raise FormulaIRCompileError("nested groupby inside groupby RHS is not supported")
+        raise FormulaIRCompileError(
+            f"cpp_stream grouped IR does not yet support {node.fn!r}"
+        )
 
 
 def compile_ir(
