@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 
 
 def _save(path: Path, value: np.ndarray) -> Path:
@@ -118,9 +118,9 @@ def test_cat_root_writes_row_major_matrix(tmp_path: Path) -> None:
         "x2": _save(tmp_path / "x2.npy", x2),
         "x3": _save(tmp_path / "x3.npy", x3),
     }
-    runtime = compile_npy_formula("cat(x1, x2, x3)", paths, n_instruments=n)
+    runtime = compile_formula("cat(x1, x2, x3)", paths, n_instruments=n)
     output = tmp_path / "cat.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(rows, n, 3))
     expected = np.stack((x1, x2, x3), axis=-1)
     np.testing.assert_array_equal(actual, expected)
@@ -148,9 +148,9 @@ def test_stateless_ridge_beta_matches_pairwise_reference(tmp_path: Path) -> None
         "weights": _save(tmp_path / "weights.npy", weights),
     }
     formula = "get_beta(Ridge(cat(x1, x2, x3), y=y, weights=weights, hl=0, lambda_=0.1))"
-    runtime = compile_npy_formula(formula, paths, n_instruments=n)
+    runtime = compile_formula(formula, paths, n_instruments=n)
     output = tmp_path / "beta.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(rows, 3))
     expected = np.stack([
         _solve_row(np.stack((x1[t], x2[t], x3[t]), axis=1), y[t], weights[t], 0.1)[0]
@@ -177,9 +177,9 @@ def test_stateful_ridge_preds_use_prior_beta_and_streaming_moments(tmp_path: Pat
         "y": _save(tmp_path / "y.npy", y),
     }
     formula = "get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1))"
-    runtime = compile_npy_formula(formula, paths, n_instruments=n)
+    runtime = compile_formula(formula, paths, n_instruments=n)
     output = tmp_path / "preds.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(rows, n))
     _, expected = _stateful_pairwise_reference(
         np.stack((x1, x2, x3), axis=-1), y, half_life=64, ridge_lambda=0.1
@@ -203,9 +203,9 @@ def test_stateful_ridge_finite_nan_finite_transition_matches_pairwise_reference(
         "y": _save(tmp_path / "y.npy", y),
     }
     formula = "get_beta(Ridge(cat(x1, x2), y=y, hl=8, lambda_=0.05))"
-    runtime = compile_npy_formula(formula, paths, n_instruments=n)
+    runtime = compile_formula(formula, paths, n_instruments=n)
     output = tmp_path / "transition_beta.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(rows, 2))
     expected, _ = _stateful_pairwise_reference(
         np.stack((x1, x2), axis=-1), y, half_life=8, ridge_lambda=0.05
@@ -218,9 +218,9 @@ def test_stateless_nonnegative_ridge_projects_negative_solution(tmp_path: Path) 
     y = np.array([[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]], dtype=np.float64)
     paths = {"x": _save(tmp_path / "x.npy", x), "y": _save(tmp_path / "y.npy", y)}
     formula = "get_beta(Ridge(x, y=y, hl=0, lambda_=0.0, nonneg=True))"
-    runtime = compile_npy_formula(formula, paths, n_instruments=3)
+    runtime = compile_formula(formula, paths, n_instruments=3)
     output = tmp_path / "nonnegative.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(2, 1))
     np.testing.assert_allclose(actual[:, 0], np.array([0.0, 1.0]), atol=1e-10)
 
@@ -240,9 +240,9 @@ def test_grouped_ridge_uses_same_generic_node(tmp_path: Path) -> None:
         "groupby(univ([0, 1], [2, 3, 4]), x1, "
         "get_preds(Ridge(cat(self_, x2), y=y, hl=0, lambda_=0.1)))"
     )
-    runtime = compile_npy_formula(formula, paths, n_instruments=n)
+    runtime = compile_formula(formula, paths, n_instruments=n)
     output = tmp_path / "grouped_preds.bin"
-    runtime.run_npy_files(paths, out_path=output)
+    runtime.run(out_path=output)
     actual = np.memmap(output, mode="r", dtype=np.float64, shape=(rows, n))
     expected = np.empty_like(actual)
     groups = ((0, 1), (2, 3, 4))
