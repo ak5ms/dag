@@ -2,37 +2,70 @@
 
 `cpp_stream` is a formula-specialized C++20 streaming backend. It consumes the
 backend-neutral `trading_dsl_engine.ir` graph, generates a typed translation unit,
-compiles a cached shared library, mmaps inputs, and executes the full row loop in
-native code. It does not depend on `jax_flat` at runtime.
+compiles a cached shared library, prepares each input through an independent source
+adapter, and executes the row loop in native code. It does not depend on `jax_flat`
+at runtime.
 
 ```text
 shared DSL / parser
         -> backend-neutral ir.Program
         -> cpp_stream physical lowering
         -> generated C++20
-        -> mmap inputs -> native row loop -> mmap output
+        -> heterogeneous source adapters
+        -> one typed-pointer native entrypoint
+        -> mmap output
 ```
 
-## Basic use
+## One compile API and one run API
 
 ```python
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 
-runtime = compile_npy_formula(
+runtime = compile_formula(
     "xs_rank(ewm(close / open, 21))",
-    {"close": "/data/close.npy", "open": "/data/open.npy"},
+    {
+        "close": "/data/close.npy",
+        "open": "/data/open.npy",
+    },
     n_instruments=9,
 )
-runtime.run_npy_files(
-    {"close": "/data/close.npy", "open": "/data/open.npy"},
-    out_path="/data/alpha.bin",
-)
+runtime.run(out_path="/data/alpha.bin")
 ```
 
-`.npy` inputs are mapped without copying. Any positive C-order per-row tensor shape
-is supported: `(rows,)`, `(rows,1)`, `(rows,N)`, `(rows,N,K)`, `(rows,B,N,K)`, and
-higher ranks. `(rows,)` and `(rows,1)` remain row-scalar. Supported dtypes are
-`float32`, `float64`, `int32`, `int64`, `uint32`, and `uint64`.
+There is no `.npy`-specific compiler or runner. Every input independently selects a
+source adapter from its object type, URI scheme, file extension, or explicit adapter
+name. A single formula may therefore mix formats:
+
+```python
+from trading_dsl_engine.cpp_stream import InputTypeSpec, source
+
+runtime = compile_formula(
+    "left + right",
+    {
+        "left": "/data/left.npy",
+        "right": source(
+            "/data/right.bin",
+            input_type=InputTypeSpec("float64", 9),
+        ),
+    },
+    n_instruments=9,
+)
+runtime.run(out_path="/data/result.bin")
+```
+
+Built-in adapters currently cover zero-copy C-order `.npy`, headerless `.bin`/`.raw`
+with explicit metadata, and C-contiguous in-memory NumPy arrays. Custom adapters can
+match extensions such as `.parquet`, URI schemes such as `tcp://`, or application
+source objects through `register_source_adapter(...)`. See `SOURCES.md`.
+
+Sources supplied at compilation are bound to the runtime. `runtime.run(new_sources,
+...)` may replace them with another compatible mapping, including different source
+formats with the same dtype and per-row shape.
+
+Any positive C-order per-row tensor shape is supported: `(rows,)`, `(rows, 1)`,
+`(rows, N)`, `(rows, N, K)`, `(rows, B, N, K)`, and higher ranks. `(rows,)` and
+`(rows, 1)` are row scalars. Supported native dtypes are `float32`, `float64`,
+`int32`, `int64`, `uint32`, and `uint64`.
 
 ## NumPy-style `einsum`
 
@@ -46,39 +79,25 @@ einsum("ii->i", square)
 einsum("ij,kj,kl->il", a, b, c, optimize="optimal")
 ```
 
-The old project-local order remains accepted for compatibility:
+Supported string-subscript behavior includes arbitrary case-sensitive ASCII labels,
+implicit and explicit outputs, scalar operands and reductions, arbitrary rank,
+diagonals, permutations, outer products, ellipsis broadcasting, and optimized n-ary
+contraction paths. Named labels require equal dimensions; broadcasting is enabled
+through `...`, matching NumPy.
 
-```python
-einsum(left, right, "ij,jk->ik")
-```
+The default is `optimize=False`. `True`, `"greedy"`, and `"optimal"` are supported.
+`"optimal"` exhaustively searches paths through eight operands and falls back to
+greedy for larger expressions.
 
-Supported string-subscript behavior includes:
+Subscripts are parsed once in the neutral IR and lowered to static unary/binary
+contraction stages. Generated C++ contains no runtime string parser, shape dispatch,
+or path search. Contiguous inner reductions use bulk loads and FMA loops; generic
+mapped loops cover diagonals, broadcasting, permutations, and arbitrary contraction
+axes.
 
-- arbitrary case-sensitive ASCII labels such as `ij`, `nf`, or `Qx`;
-- implicit and explicit output;
-- scalar operands and scalar reductions;
-- arbitrary operand/output rank;
-- repeated-label diagonal extraction;
-- permutations and outer products;
-- ellipsis expansion and NumPy-compatible ellipsis broadcasting;
-- raw arbitrary-rank mmap operands without copying;
-- lazy Cat/RBF feature matrices without eager materialization.
-
-As in NumPy, named labels must have equal dimensions; broadcasting is enabled only
-through `...`. The default is `optimize=False`. `True`, `"greedy"`, and `"optimal"`
-are supported. `"optimal"` exhaustively searches paths through eight operands and
-falls back to greedy for larger contractions.
-
-The frontend parses and validates subscripts once, canonicalizes labels to integer
-axis maps, and creates a static unary/binary contraction path. Generated C++ contains
-no runtime string parser, dynamic shape dispatch, or path search. Contiguous inner
-reductions use fixed-size bulk loads and FMA loops; generic loops cover broadcasting,
-diagonals, permutations, and arbitrary contraction dimensions.
-
-The native API intentionally does not yet implement NumPy's integer-sublist calling
-form, explicit precomputed path lists, `out=`, `dtype=`, `order=`, `casting=`, or
-writeable-view semantics. Native einsum results are currently accumulated and stored
-as `float64`.
+The native API does not yet implement NumPy's integer-sublist calling form,
+precomputed path lists, `out=`, `dtype=`, `order=`, `casting=`, or writeable-view
+semantics. Native einsum accumulation/output is currently `float64`.
 
 ## Execution model
 
@@ -97,28 +116,26 @@ invocation. No operator allocates from the heap during `on_data`.
 `cat(...)`, RBF bases, coefficient matrices, and einsum use compile-time dimensions.
 Lazy basis sources and nested Cat expressions flatten into `FeatureList<Sources...>`
 so consumers read original inputs directly. Arbitrary intermediates use compact
-fixed-size tensor scratch only when a contraction path actually requires them.
+fixed-size tensor scratch only when a contraction path requires them.
 
 ## `riskmodel.roll_rets`
 
-The actual expression object imported from `flows.riskmodel` compiles directly:
-
 ```python
 from flows.riskmodel import roll_rets
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 
-runtime = compile_npy_formula(
+runtime = compile_formula(
     roll_rets,
     paths,
     n_instruments=9,
     default_group_capacity=4096,
 )
-runtime.run_npy_files(paths, out_path="roll_rets.bin")
+runtime.run(out_path="roll_rets.bin")
 ```
 
 The generated plan contains 50 scalar/vector scratch slots and one six-wide matrix
 scratch slot. RBF and future-RBF basis values remain lazy. A native end-to-end test
-compares this exact expression against JAX-flat with finite-output checks and
+compares the exact expression against JAX-flat with finite-output checks and
 `rtol=2e-9`, `atol=2e-9`, equal-NaN semantics.
 
 ## 5M x 9 benchmarks
@@ -138,21 +155,8 @@ GitHub-hosted Ubuntu runner, GCC C++20 with
 
 For the n-ary case, planning reduced estimated work from 324 to 72 operations per
 row and reduced the largest intermediate scratch width from 9 to 2. Checksums were
-identical and every sampled output was finite. The updated `roll_rets` median is
-approximately 5.78 seconds for 5,000,000 rows and is above the prior 0.855752 M
-rows/s baseline.
-
-Reproduce with:
-
-```bash
-python scripts/benchmark_cpp_stream_einsum.py
-python scripts/benchmark_cpp_stream_roll_rets.py
-```
-
-Both scripts default to 5M x 9, one warmup, and ten measured runs. Input generation,
-source generation, native compilation, mmap setup, and warmup are excluded from the
-reported execution time. Full run distributions and checksums are in
-`PERFORMANCE.md`.
+identical and every sampled output was finite. Full distributions and checksums are
+in `PERFORMANCE.md`.
 
 ## Compilation cache
 
