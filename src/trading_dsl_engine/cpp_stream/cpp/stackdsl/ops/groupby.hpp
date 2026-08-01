@@ -16,6 +16,22 @@ namespace stackdsl {
 template <class... Sources>
 struct SourceList {};
 
+template <class... Keys>
+struct KeyList {};
+
+template <class Source, std::size_t NumKeys = 0, std::int64_t Offset = 0, bool RowScalar = false>
+struct KeySpec {
+    using source = Source;
+    static constexpr std::size_t num_keys = NumKeys;
+    static constexpr std::int64_t offset = Offset;
+    static constexpr bool row_scalar = RowScalar;
+
+    template <class Context>
+    STACKDSL_HOT static double read(const Context& ctx, std::size_t lane) noexcept {
+        return ctx.template read<Source>(RowScalar ? 0 : lane);
+    }
+};
+
 template <std::size_t N, std::uint16_t... Groups>
 struct StaticPartitions {
     static_assert(sizeof...(Groups) == N);
@@ -25,7 +41,9 @@ struct StaticPartitions {
 template <std::size_t Parts>
 struct KeyBits {
     std::array<std::uint64_t, Parts> part{};
-    friend STACKDSL_HOT bool operator==(const KeyBits& a, const KeyBits& b) noexcept { return a.part == b.part; }
+    friend STACKDSL_HOT bool operator==(const KeyBits& a, const KeyBits& b) noexcept {
+        return a.part == b.part;
+    }
 };
 
 STACKDSL_HOT std::uint64_t canonical_key_bits(double x) noexcept {
@@ -90,11 +108,13 @@ struct FixedGroupTable {
     }
 };
 
-template <std::size_t N, std::size_t Parts, std::size_t Capacity, std::size_t HashCapacityHint = 0>
+template <std::size_t N, std::size_t Capacity, std::size_t HashCapacityHint, class... Keys>
 struct HashGroupResolver {
+    static_assert(sizeof...(Keys) > 0);
     static constexpr std::size_t capacity = Capacity;
-    FixedGroupTable<Parts, Capacity, HashCapacityHint> table{};
-    std::array<KeyBits<Parts>, N> cached_keys{};
+    static constexpr std::size_t parts = sizeof...(Keys);
+    FixedGroupTable<parts, Capacity, HashCapacityHint> table{};
+    std::array<KeyBits<parts>, N> cached_keys{};
     std::array<std::uint16_t, N> cached_slots{};
     std::array<std::uint8_t, N> cache_valid{};
 
@@ -103,14 +123,25 @@ struct HashGroupResolver {
         cache_valid.fill(0);
     }
 
-    template <class Context, class... KeySources>
-    bool resolve_all(Context& ctx, SourceList<KeySources...>, std::array<std::uint16_t, N>& slots) noexcept {
-        static_assert(sizeof...(KeySources) == Parts);
-        KeyBits<Parts> previous_key{};
+    template <class Context>
+    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
+        auto make_key = [&](std::size_t lane) STACKDSL_HOT {
+            return KeyBits<parts>{{canonical_key_bits(Keys::read(ctx, lane))...}};
+        };
+
+        if constexpr ((Keys::row_scalar && ...)) {
+            const auto key = make_key(0);
+            const int slot = table.get_or_insert(key);
+            if (slot < 0) return false;
+            slots.fill(static_cast<std::uint16_t>(slot));
+            return true;
+        }
+
+        KeyBits<parts> previous_key{};
         int previous_slot = -1;
         bool previous_valid = false;
         for (std::size_t lane = 0; lane < N; ++lane) {
-            KeyBits<Parts> key{{canonical_key_bits(ctx.template read<KeySources>(lane))...}};
+            const auto key = make_key(lane);
             int slot = -1;
             if (cache_valid[lane] && cached_keys[lane] == key) slot = cached_slots[lane];
             else if (previous_valid && previous_key == key) slot = previous_slot;
@@ -130,39 +161,82 @@ struct HashGroupResolver {
     }
 };
 
+template <class... Keys>
+consteval std::size_t dense_tuple_capacity() {
+    static_assert(((Keys::num_keys > 0) && ...));
+    std::size_t result = 1;
+    ((result *= Keys::num_keys + 1), ...);  // one NaN digit per key
+    return result;
+}
+
+template <std::size_t N, class... Keys>
+struct DenseTupleGroupResolver {
+    static constexpr std::size_t capacity = dense_tuple_capacity<Keys...>();
+    static_assert(capacity <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
+
+    void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT static bool resolve_lane(
+        Context& ctx,
+        std::size_t lane,
+        std::uint16_t& slot_out
+    ) noexcept {
+        std::size_t slot = 0;
+        bool valid = true;
+        auto append = [&](auto key_tag) STACKDSL_HOT {
+            using Key = decltype(key_tag);
+            const double raw = Key::read(ctx, lane);
+            std::size_t digit = 0;
+            if (std::isnan(raw)) {
+                digit = Key::num_keys;
+            } else if (!finite(raw)) {
+                valid = false;
+                return;
+            } else {
+                const double rounded = std::round(raw);
+                if (std::abs(raw - rounded) > 1e-12) {
+                    valid = false;
+                    return;
+                }
+                const std::int64_t value = static_cast<std::int64_t>(rounded) - Key::offset;
+                if (value < 0 || value >= static_cast<std::int64_t>(Key::num_keys)) {
+                    valid = false;
+                    return;
+                }
+                digit = static_cast<std::size_t>(value);
+            }
+            slot = slot * (Key::num_keys + 1) + digit;
+        };
+        (append(Keys{}), ...);
+        if (!valid) return false;
+        slot_out = static_cast<std::uint16_t>(slot);
+        return true;
+    }
+
+    template <class Context>
+    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
+        if constexpr ((Keys::row_scalar && ...)) {
+            std::uint16_t slot = 0;
+            if (!resolve_lane(ctx, 0, slot)) return false;
+            slots.fill(slot);
+            return true;
+        }
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            if (!resolve_lane(ctx, lane, slots[lane])) return false;
+        }
+        return true;
+    }
+};
+
 template <std::size_t N>
 struct NoKeyResolver {
     static constexpr std::size_t capacity = 1;
     void setup() noexcept {}
 
     template <class Context>
-    bool resolve_all(Context&, SourceList<>, std::array<std::uint16_t, N>& slots) noexcept {
+    bool resolve_all(Context&, KeyList<>, std::array<std::uint16_t, N>& slots) noexcept {
         slots.fill(0);
-        return true;
-    }
-};
-
-template <std::size_t N, std::size_t Cardinality, std::int64_t Offset = 0>
-struct DenseGroupResolver {
-    static constexpr std::size_t capacity = Cardinality + 1;
-    void setup() noexcept {}
-
-    template <class Context, class KeySource>
-    bool resolve_all(Context& ctx, SourceList<KeySource>, std::array<std::uint16_t, N>& slots) noexcept {
-        static_assert(capacity <= static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()));
-        for (std::size_t lane = 0; lane < N; ++lane) {
-            const double raw = ctx.template read<KeySource>(lane);
-            if (std::isnan(raw)) {
-                slots[lane] = static_cast<std::uint16_t>(Cardinality);
-                continue;
-            }
-            if (!finite(raw)) return false;
-            const double rounded = std::round(raw);
-            if (std::abs(raw - rounded) > 1e-12) return false;
-            const std::int64_t value = static_cast<std::int64_t>(rounded) - Offset;
-            if (value < 0 || value >= static_cast<std::int64_t>(Cardinality)) return false;
-            slots[lane] = static_cast<std::uint16_t>(value);
-        }
         return true;
     }
 };
@@ -196,11 +270,19 @@ struct alignas(64) GroupRowContext {
     }
 };
 
-template <std::size_t N, class Resolver, class Partitions, class InnerPlan, class Out, class KeyList, class FeedList>
+template <std::size_t N, class Resolver, class Partitions, class InnerPlan, class Out, class Keys, class FeedList>
 struct GroupByNode;
 
-template <std::size_t N, class Resolver, class Partitions, class InnerPlan, class Out, class... KeySources, class... FeedSources>
-struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, SourceList<KeySources...>, SourceList<FeedSources...>> {
+template <
+    std::size_t N,
+    class Resolver,
+    class Partitions,
+    class InnerPlan,
+    class Out,
+    class... Keys,
+    class... FeedSources
+>
+struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, KeyList<Keys...>, SourceList<FeedSources...>> {
     Resolver resolver{};
     InnerPlan inner{};
     std::array<std::uint16_t, N> group_slots{};
@@ -212,7 +294,7 @@ struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, SourceList<KeySource
 
     template <class Context>
     STACKDSL_HOT bool on_data_checked(Context& ctx) noexcept {
-        if (!resolver.resolve_all(ctx, SourceList<KeySources...>{}, group_slots)) return false;
+        if (!resolver.resolve_all(ctx, KeyList<Keys...>{}, group_slots)) return false;
         std::array<const double*, sizeof...(FeedSources)> feeds{ctx.template read_ptr<FeedSources>()...};
         inner.on_data(feeds, group_slots, Partitions::values, ctx.template write_ptr<Out>());
         return true;
