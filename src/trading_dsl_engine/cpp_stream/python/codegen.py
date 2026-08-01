@@ -259,6 +259,12 @@ def _tensor_source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
+    if source.kind == "input" and len(source.shape) >= 2:
+        return tmpl(
+            "stackdsl::DenseTensorSource",
+            _source_type(source, n=n, input_types=input_types),
+            _tensor_shape(source.shape),
+        )
     if source.kind == "tensor_slot":
         return tmpl(
             "stackdsl::FlatTensorSource",
@@ -715,11 +721,6 @@ def render_translation_unit(
         )
     if len(input_types) != plan.input_count:
         raise ValueError("input type count does not match the compiled program")
-    for spec in input_types:
-        if spec.row_width not in (1, n_instruments):
-            raise ValueError(
-                f"input row width must be 1 or {n_instruments}, got {spec.row_width}"
-            )
 
     group_names: dict[int, str] = {}
     inners: list[InnerView] = []
