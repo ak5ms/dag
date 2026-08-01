@@ -233,9 +233,8 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
         std::array<std::uint32_t, MaxActiveGroups> active_groups{};
         std::array<std::uint8_t, N> active_index_by_lane{};
         std::size_t active_count = 1;
-        if constexpr (Groups == 1) {
-            active_groups[0] = 0;
-        } else {
+        if constexpr (Groups == 1) active_groups[0] = 0;
+        else {
             active_count = 0;
             for (std::size_t lane = 0; lane < N; ++lane) {
                 const auto group = static_cast<std::uint32_t>(Execution::cross_group(ctx, lane));
@@ -320,10 +319,12 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                     for (std::size_t j = 0; j < K; ++j) {
                         const std::size_t sj = state_vector + j;
                         state.xy[sj] = std::fma(decay, xy_new[local_vector + j] - state.xy[sj], state.xy[sj]);
+                        state.last_xy[sj] = state.t;
                         xy[j] = state.xy[sj];
                         for (std::size_t k = 0; k < K; ++k) {
                             const std::size_t sjk = state_matrix + j * K + k;
                             state.xx[sjk] = std::fma(decay, xx_new[local_matrix + j * K + k] - state.xx[sjk], state.xx[sjk]);
+                            state.last_xx[sjk] = state.t;
                             xx[j * K + k] = state.xx[sjk];
                         }
                     }
