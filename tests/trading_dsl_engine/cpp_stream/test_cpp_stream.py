@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from scipy.special import ndtri
 
-from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream import InputTypeSpec, compile_formula, source
 from trading_dsl_engine.ir import GroupByOp, compile_ir
 
 
@@ -31,6 +31,10 @@ def test_neutral_ir_preserves_univ_plus_dynamic_groupby():
 def _require_native_compiler():
     if sys.platform == "win32" or shutil.which("g++") is None:
         pytest.skip("cpp_stream integration test requires POSIX and g++")
+
+
+def _raw(path: Path, width: int):
+    return source(path, input_type=InputTypeSpec("float64", width))
 
 
 def _reference_ewm(values: np.ndarray, span: float) -> np.ndarray:
@@ -109,9 +113,10 @@ def test_cpp_stream_mmap_formula_matches_reference(tmp_path: Path):
     out_path = tmp_path / "alpha.bin"
     close.tofile(close_path)
     open_.tofile(open_path)
+    data = {"close": _raw(close_path, cols), "open": _raw(open_path, cols)}
 
-    runtime = compile_formula("xs_rank(ewm(close / open, 21))", n_instruments=cols)
-    result = runtime.run_files({"close": close_path, "open": open_path}, out_path=out_path)
+    runtime = compile_formula("xs_rank(ewm(close / open, 21))", data, n_instruments=cols)
+    result = runtime.run(out_path=out_path)
     actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
     ratio = np.divide(close, open_, out=np.full_like(close, np.nan), where=open_ != 0.0)
     expected = _reference_rank(_reference_ewm(ratio, 21.0))
@@ -130,13 +135,15 @@ def test_cpp_stream_dense_mixed_groupby_matches_reference(tmp_path: Path):
     out_path = tmp_path / "grouped.bin"
     close.tofile(close_path)
     minute.tofile(minute_path)
+    data = {"minute": _raw(minute_path, cols), "close": _raw(close_path, cols)}
 
     runtime = compile_formula(
         "groupby((univ([0], [1, 2]), minute), close, cumsum(self_))",
+        data,
         n_instruments=cols,
         key_cardinalities={"minute": 4},
     )
-    runtime.run_files({"minute": minute_path, "close": close_path}, out_path=out_path)
+    runtime.run(out_path=out_path)
     actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
 
     state: dict[tuple[int, int], float] = {}
@@ -161,15 +168,16 @@ def test_cpp_stream_composite_groupby_nested_state_capture_and_rank(tmp_path: Pa
     for name, value in {"close": close, "open": open_, "key0": key0, "key1": key1}.items():
         path = tmp_path / f"{name}.bin"
         value.tofile(path)
-        paths[name] = path
+        paths[name] = _raw(path, cols)
     out_path = tmp_path / "nested_grouped.bin"
 
     runtime = compile_formula(
         "groupby((univ([0, 1], [2, 3, 4]), key0, key1), close, xs_rank(ewm(cumsum(self_) + open, 3)))",
+        paths,
         n_instruments=cols,
         default_group_capacity=16,
     )
-    runtime.run_files(paths, out_path=out_path)
+    runtime.run(out_path=out_path)
     actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
 
     cumulative: dict[tuple[int, int, int], float] = {}
