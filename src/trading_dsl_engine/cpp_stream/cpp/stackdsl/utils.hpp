@@ -43,7 +43,13 @@ STACKDSL_HOT double norm_inv(double p) noexcept {
     return x-u/(1.0+0.5*x*u);
 }
 
-template <std::size_t Index> struct InputSrc { static constexpr std::size_t input_index=Index; };
+template <std::size_t Index, class ValueType = double, std::size_t RowWidth = 0>
+struct InputSrc {
+    static constexpr std::size_t input_index = Index;
+    using value_type = ValueType;
+    static constexpr std::size_t row_width = RowWidth;
+};
+
 template <std::size_t Index> struct SlotSrc { static constexpr std::size_t slot_index=Index; };
 template <double Value> struct LiteralSrc { static constexpr double value=Value; };
 struct OutputDst {};
@@ -52,20 +58,38 @@ template <class T> inline constexpr bool is_literal_source_v = requires { T::val
 
 template <std::size_t N, std::size_t Inputs, std::size_t ScratchSlots>
 struct alignas(64) RowContext {
-    std::array<const double*, Inputs> inputs{};
+    std::array<const void*, Inputs> inputs{};
     alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch{};
     double* output=nullptr;
-    template <class Src> STACKDSL_HOT double read(std::size_t lane) const noexcept {
-        if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
-        else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][lane];
-        else return Src::value;
+
+    template <class Src>
+    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+        if constexpr (requires { Src::input_index; }) {
+            using ValueType = typename Src::value_type;
+            const auto* values = static_cast<const ValueType*>(inputs[Src::input_index]);
+            const std::size_t offset = Src::row_width == 1 ? 0 : lane;
+            return static_cast<double>(values[offset]);
+        } else if constexpr (requires { Src::slot_index; }) {
+            return scratch[Src::slot_index][lane];
+        } else {
+            return Src::value;
+        }
     }
-    template <class Src> STACKDSL_HOT const double* read_ptr() const noexcept {
+
+    template <class Src>
+    STACKDSL_HOT const double* read_ptr() const noexcept {
         static_assert(!is_literal_source_v<Src>);
-        if constexpr (requires { Src::input_index; }) return inputs[Src::input_index];
-        else return scratch[Src::slot_index].data();
+        if constexpr (requires { Src::input_index; }) {
+            static_assert(std::is_same_v<typename Src::value_type, double>);
+            static_assert(Src::row_width == 0 || Src::row_width == N);
+            return static_cast<const double*>(inputs[Src::input_index]);
+        } else {
+            return scratch[Src::slot_index].data();
+        }
     }
-    template <class Dst> STACKDSL_HOT double* write_ptr() noexcept {
+
+    template <class Dst>
+    STACKDSL_HOT double* write_ptr() noexcept {
         if constexpr (std::is_same_v<Dst, OutputDst>) return output;
         else return scratch[Dst::slot_index].data();
     }
