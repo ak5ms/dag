@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 
+from trading_dsl_engine.ir.einsum import EinsumSpec
+
 if TYPE_CHECKING:
     from trading_dsl_engine.ir.program import Program
 
@@ -87,7 +89,11 @@ class FutureRbfBasisSumOp:
 
 @dataclass(frozen=True, slots=True)
 class EinsumOp:
-    subscripts: str
+    spec: EinsumSpec
+
+    @property
+    def subscripts(self) -> str:
+        return self.spec.subscripts
 
 
 @dataclass(frozen=True, slots=True)
