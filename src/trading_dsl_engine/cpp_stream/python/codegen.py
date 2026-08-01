@@ -6,7 +6,13 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from trading_dsl_engine.cpp_stream.python.lowering import GroupStage, Plan, Source, Stage, double_bits
+from trading_dsl_engine.cpp_stream.python.lowering import (
+    GroupStage,
+    Plan,
+    Source,
+    Stage,
+    double_bits,
+)
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import (
     EwmOp,
@@ -43,42 +49,55 @@ class CppType:
 @dataclass(frozen=True, slots=True)
 class Name(CppType):
     value: str
-    def render(self) -> str: return self.value
+
+    def render(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True, slots=True)
 class IntArg(CppType):
     value: int
-    def render(self) -> str: return str(self.value)
+
+    def render(self) -> str:
+        return str(self.value)
 
 
 @dataclass(frozen=True, slots=True)
 class SignedValueArg(CppType):
     value: int
-    def render(self) -> str: return f"{self.value}LL"
+
+    def render(self) -> str:
+        return f"{self.value}LL"
 
 
 @dataclass(frozen=True, slots=True)
 class UnsignedValueArg(CppType):
     value: int
-    def render(self) -> str: return f"{self.value}ULL"
+
+    def render(self) -> str:
+        return f"{self.value}ULL"
 
 
 @dataclass(frozen=True, slots=True)
 class UInt64Arg(CppType):
     value: int
-    def render(self) -> str: return f"0x{self.value:016x}ULL"
+
+    def render(self) -> str:
+        return f"0x{self.value:016x}ULL"
 
 
 @dataclass(frozen=True, slots=True)
 class BoolArg(CppType):
     value: bool
-    def render(self) -> str: return "true" if self.value else "false"
+
+    def render(self) -> str:
+        return "true" if self.value else "false"
 
 
 @dataclass(frozen=True, slots=True)
 class DoubleArg(CppType):
     value: float
+
     def render(self) -> str:
         text = repr(float(self.value))
         return text if any(char in text for char in ".eE") else text + ".0"
@@ -87,6 +106,7 @@ class DoubleArg(CppType):
 @dataclass(frozen=True, slots=True)
 class FloatArg(CppType):
     value: float
+
     def render(self) -> str:
         text = repr(float(self.value))
         return text + ("f" if any(char in text for char in ".eE") else ".0f")
@@ -96,6 +116,7 @@ class FloatArg(CppType):
 class TemplateType(CppType):
     name: str
     args: tuple[CppType, ...]
+
     def render(self) -> str:
         return f"{self.name}<" + ", ".join(arg.render() for arg in self.args) + ">"
 
@@ -147,7 +168,17 @@ def _source_type(
             BoolArg(source.row_scalar),
         )
     if source.kind == "matrix_slot":
-        return tmpl("stackdsl::MatrixSlotSrc", IntArg(int(source.value)), IntArg(source.width))
+        return tmpl(
+            "stackdsl::MatrixSlotSrc",
+            IntArg(int(source.value)),
+            IntArg(source.width),
+        )
+    if source.kind == "tensor_slot":
+        return tmpl(
+            "stackdsl::TensorSlotSrc",
+            IntArg(int(source.value)),
+            IntArg(math.prod(source.shape) if source.shape else 1),
+        )
     if source.kind == "literal":
         if source.dtype in {"float32", "float64"}:
             value = float(source.value)
@@ -165,7 +196,10 @@ def _source_type(
         return tmpl(
             "stackdsl::RbfBasisSrc",
             IntArg(source.op.n_basis),
-            *(_source_type(part, n=n, input_types=input_types) for part in source.parts),
+            *(
+                _source_type(part, n=n, input_types=input_types)
+                for part in source.parts
+            ),
         )
     if source.kind == "future_rbf":
         assert isinstance(source.op, FutureRbfBasisSumOp) and len(source.parts) == 3
@@ -173,7 +207,10 @@ def _source_type(
             "stackdsl::FutureRbfBasisSumSrc",
             IntArg(source.op.n_basis),
             IntArg(source.op.n_steps),
-            *(_source_type(part, n=n, input_types=input_types) for part in source.parts),
+            *(
+                _source_type(part, n=n, input_types=input_types)
+                for part in source.parts
+            ),
         )
     raise ValueError(f"source kind {source.kind!r} is not directly renderable")
 
@@ -198,20 +235,81 @@ def _feature_list(
         flattened.extend(_flatten_source(source))
     return tmpl(
         "stackdsl::FeatureList",
-        *(_source_type(source, n=n, input_types=input_types) for source in flattened),
+        *(
+            _source_type(source, n=n, input_types=input_types)
+            for source in flattened
+        ),
+    )
+
+
+def _tensor_shape(shape: tuple[int, ...]) -> CppType:
+    return tmpl("stackdsl::TensorShape", *(IntArg(extent) for extent in shape))
+
+
+def _index_map(labels: tuple[str, ...], loop_labels: tuple[str, ...]) -> CppType:
+    positions = {label: index for index, label in enumerate(loop_labels)}
+    return tmpl(
+        "stackdsl::IndexMap", *(IntArg(positions[label]) for label in labels)
+    )
+
+
+def _tensor_source_type(
+    source: Source,
+    *,
+    n: int | CppType,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
+    if source.kind == "tensor_slot":
+        return tmpl(
+            "stackdsl::FlatTensorSource",
+            _source_type(source, n=n, input_types=input_types),
+            _tensor_shape(source.shape),
+        )
+    if source.shape == ():
+        return tmpl(
+            "stackdsl::ScalarTensorSource",
+            _source_type(source, n=n, input_types=input_types),
+        )
+    if len(source.shape) == 1:
+        return tmpl(
+            "stackdsl::VectorTensorSource",
+            IntArg(source.shape[0]),
+            _source_type(source, n=n, input_types=input_types),
+        )
+    if len(source.shape) == 2 and source.kind in {
+        "cat",
+        "rbf",
+        "future_rbf",
+        "matrix_slot",
+    }:
+        return tmpl(
+            "stackdsl::FeatureTensorSource",
+            IntArg(source.shape[0]),
+            _feature_list((source,), n=n, input_types=input_types),
+        )
+    raise ValueError(
+        f"cannot render tensor source kind={source.kind!r} shape={source.shape!r}"
     )
 
 
 def _dest_type(stage: Stage) -> CppType:
     if stage.out.slot is None:
         return Name("stackdsl::OutputDst")
+    if stage.out.tensor:
+        return tmpl(
+            "stackdsl::TensorSlotDst",
+            IntArg(stage.out.slot),
+            IntArg(stage.out.size),
+        )
     if stage.out.matrix:
         return tmpl(
             "stackdsl::MatrixSlotDst",
             IntArg(stage.out.slot),
             IntArg(stage.out.width),
         )
-    return tmpl("stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype))
+    return tmpl(
+        "stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype)
+    )
 
 
 _BINARY_POLICIES = {
@@ -266,14 +364,41 @@ def _stage_type(
             execution,
         )
     if stage.kind == "einsum":
-        return tmpl(
-            "stackdsl::EinsumNfNfToNNode",
-            n,
-            _feature_list((stage.inputs[0],), n=n, input_types=input_types),
-            _feature_list((stage.inputs[1],), n=n, input_types=input_types),
-            out,
-            execution,
+        step = stage.einsum_step
+        if step is None:
+            raise ValueError("einsum stage is missing its contraction step")
+        tensors = tuple(
+            _tensor_source_type(source, n=n, input_types=input_types)
+            for source in stage.inputs
         )
+        maps = tuple(
+            _index_map(labels, step.loop_labels) for labels in step.input_labels
+        )
+        loop_shape = _tensor_shape(step.loop_extents)
+        output_rank = IntArg(len(step.output_labels))
+        if len(tensors) == 1:
+            return tmpl(
+                "stackdsl::UnaryEinsumNode",
+                tensors[0],
+                out,
+                loop_shape,
+                maps[0],
+                output_rank,
+                execution,
+            )
+        if len(tensors) == 2:
+            return tmpl(
+                "stackdsl::BinaryEinsumNode",
+                tensors[0],
+                tensors[1],
+                out,
+                loop_shape,
+                maps[0],
+                maps[1],
+                output_rank,
+                execution,
+            )
+        raise ValueError("physical einsum stages must be unary or binary")
 
     inputs = tuple(
         _source_type(source, n=n, input_types=input_types)
@@ -285,7 +410,9 @@ def _stage_type(
         return tmpl(
             "stackdsl::BinaryNode",
             stage_n,
-            inputs[0], inputs[1], out,
+            inputs[0],
+            inputs[1],
+            out,
             _cpp_type(stage.dtype),
             Name(_BINARY_POLICIES[stage.op_name or ""]),
             execution,
@@ -294,7 +421,10 @@ def _stage_type(
         return tmpl(
             "stackdsl::TernaryNode",
             stage_n,
-            inputs[0], inputs[1], inputs[2], out,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            out,
             _cpp_type(stage.dtype),
             Name(_TERNARY_POLICIES[stage.op_name or ""]),
             execution,
@@ -303,7 +433,8 @@ def _stage_type(
         return tmpl(
             "stackdsl::UnaryNode",
             stage_n,
-            inputs[0], out,
+            inputs[0],
+            out,
             _cpp_type(stage.dtype),
             Name(_UNARY_POLICIES[stage.op_name or ""]),
             execution,
@@ -312,7 +443,9 @@ def _stage_type(
         try:
             policy = _CUSTOM_POLICIES[stage.op_name or ""]
         except KeyError as exc:
-            raise ValueError(f"no native policy for stateless call {stage.op_name!r}") from exc
+            raise ValueError(
+                f"no native policy for stateless call {stage.op_name!r}"
+            ) from exc
         return tmpl(
             "stackdsl::StatelessNode",
             stage_n,
@@ -328,20 +461,30 @@ def _stage_type(
         limit = -1 if stage.op.limit is None else stage.op.limit
         return tmpl(
             "stackdsl::FFillNode",
-            stage_n, inputs[0], out, SignedValueArg(limit), execution,
+            stage_n,
+            inputs[0],
+            out,
+            SignedValueArg(limit),
+            execution,
         )
     if stage.kind == "shift":
         assert isinstance(stage.op, ShiftOp)
         return tmpl(
             "stackdsl::ShiftNode",
-            stage_n, inputs[0], out,
-            IntArg(stage.op.lag), IntArg(stage.op.max_lag), execution,
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.lag),
+            IntArg(stage.op.max_lag),
+            execution,
         )
     if stage.kind == "ewm":
         assert isinstance(stage.op, EwmOp)
         return tmpl(
             "stackdsl::EwmNode",
-            stage_n, inputs[0], out,
+            stage_n,
+            inputs[0],
+            out,
             UInt64Arg(double_bits(stage.op.span)),
             IntArg(stage.op.min_periods),
             BoolArg(stage.op.ignore_na),
@@ -352,7 +495,8 @@ def _stage_type(
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
     if stage.kind == "instrument_basis":
         assert isinstance(stage.op, InstrumentBasisMeanOp)
-        assert stage.projection in {"beta", "preds"} and stage.half_life is not None
+        assert stage.projection in {"beta", "preds"}
+        assert stage.half_life is not None
         features = stage.inputs[:-2]
         y_source, weight_source = stage.inputs[-2:]
         projection = (
@@ -377,7 +521,11 @@ def _stage_type(
         assert stage.half_life is not None and stage.ridge_lambda is not None
         features = stage.inputs[:-2]
         y_source, weight_source = stage.inputs[-2:]
-        stateful = stage.op.is_stateful and math.isfinite(stage.half_life) and stage.half_life > 0.0
+        stateful = (
+            stage.op.is_stateful
+            and math.isfinite(stage.half_life)
+            and stage.half_life > 0.0
+        )
         projection = (
             "stackdsl::RidgeBetaProjection"
             if stage.projection == "beta"
@@ -410,7 +558,10 @@ def _source_list(
 ) -> CppType:
     return tmpl(
         "stackdsl::SourceList",
-        *(_source_type(source, n=n, input_types=input_types) for source in sources),
+        *(
+            _source_type(source, n=n, input_types=input_types)
+            for source in sources
+        ),
     )
 
 
@@ -481,7 +632,10 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
         stages.append(
-            StageView(index, _stage_type(stage, n, execution, input_types=None).render())
+            StageView(
+                index,
+                _stage_type(stage, n, execution, input_types=None).render(),
+            )
         )
     return InnerView(
         name,
@@ -508,7 +662,10 @@ def _group_type(
     else:
         resolver = tmpl(
             "stackdsl::HashGroupResolver",
-            IntArg(n), IntArg(group.capacity), IntArg(group.hash_capacity), *keys,
+            IntArg(n),
+            IntArg(group.capacity),
+            IntArg(group.hash_capacity),
+            *keys,
         )
     partitions = tmpl(
         "stackdsl::StaticPartitions",
@@ -523,7 +680,11 @@ def _group_type(
     )
     return tmpl(
         "stackdsl::GroupByNode",
-        IntArg(n), resolver, partitions, inner, _dest_type(stage),
+        IntArg(n),
+        resolver,
+        partitions,
+        inner,
+        _dest_type(stage),
         tmpl("stackdsl::KeyList", *keys),
         _source_list(group.feed_sources, n=n, input_types=input_types),
     )
@@ -579,7 +740,11 @@ def render_translation_unit(
                 StageView(
                     index,
                     _group_type(
-                        group_names[index], stage.group, stage, n_instruments, input_types
+                        group_names[index],
+                        stage.group,
+                        stage,
+                        n_instruments,
+                        input_types,
                     ).render(),
                     True,
                 )
@@ -588,7 +753,9 @@ def render_translation_unit(
             stages.append(
                 StageView(
                     index,
-                    _stage_type(stage, n, direct, input_types=input_types).render(),
+                    _stage_type(
+                        stage, n, direct, input_types=input_types
+                    ).render(),
                 )
             )
     if plan.input_count == 0:
