@@ -6,6 +6,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from trading_dsl_engine.cpp_stream.python.lowering import GroupStage, Plan, Source, Stage, double_bits
+from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import GroupKeySpec
 
 
@@ -73,9 +74,23 @@ def tmpl(name: str, *args: CppType) -> TemplateType:
     return TemplateType(name, tuple(args))
 
 
-def _source_type(source: Source) -> CppType:
+def _source_type(
+    source: Source,
+    *,
+    n: int | CppType,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
     if source.kind == "input":
-        return tmpl("stackdsl::InputSrc", IntArg(int(source.value)))
+        index = int(source.value)
+        if input_types is None:
+            cpp_type = Name("double")
+            row_width = n if isinstance(n, CppType) else IntArg(n)
+        else:
+            spec = input_types[index]
+            cpp_type = Name(spec.cpp_type)
+            row_width = IntArg(spec.row_width)
+        row_width_arg = row_width if isinstance(row_width, CppType) else row_width
+        return tmpl("stackdsl::InputSrc", IntArg(index), cpp_type, row_width_arg)
     if source.kind == "slot":
         return tmpl("stackdsl::SlotSrc", IntArg(int(source.value)))
     if source.kind == "literal":
@@ -102,9 +117,18 @@ _UNARY_POLICIES = {
 }
 
 
-def _stage_type(stage: Stage, n: CppType, execution: CppType) -> CppType:
+def _stage_type(
+    stage: Stage,
+    n: CppType,
+    execution: CppType,
+    *,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
     """Render one operator type independent of whether its plan is grouped."""
-    inputs = tuple(_source_type(source) for source in stage.inputs)
+    inputs = tuple(
+        _source_type(source, n=n, input_types=input_types)
+        for source in stage.inputs
+    )
     out = _dest_type(stage)
     if stage.kind == "copy":
         return tmpl("stackdsl::CopyNode", n, inputs[0], out, execution)
@@ -149,25 +173,44 @@ def _stage_type(stage: Stage, n: CppType, execution: CppType) -> CppType:
     raise AssertionError(stage.kind)
 
 
-def _source_list(sources: tuple[Source, ...]) -> CppType:
-    return tmpl("stackdsl::SourceList", *(_source_type(source) for source in sources))
+def _source_list(
+    sources: tuple[Source, ...],
+    *,
+    n: int | CppType,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
+    return tmpl(
+        "stackdsl::SourceList",
+        *(_source_type(source, n=n, input_types=input_types) for source in sources),
+    )
 
 
-def _key_type(source: Source, spec: GroupKeySpec) -> CppType:
+def _key_type(
+    source: Source,
+    spec: GroupKeySpec,
+    *,
+    n: int,
+    input_types: tuple[InputTypeSpec, ...],
+) -> CppType:
     return tmpl(
         "stackdsl::KeySpec",
-        _source_type(source),
+        _source_type(source, n=n, input_types=input_types),
         IntArg(0 if spec.num_keys is None else int(spec.num_keys)),
         IntArg(int(spec.offset)),
         BoolArg(bool(spec.row_scalar)),
     )
 
 
-def _key_list(group: GroupStage) -> tuple[CppType, ...]:
+def _key_list(
+    group: GroupStage,
+    *,
+    n: int,
+    input_types: tuple[InputTypeSpec, ...],
+) -> tuple[CppType, ...]:
     if len(group.key_sources) != len(group.key_specs):
         raise ValueError("group key source/spec length mismatch")
     return tuple(
-        _key_type(source, spec)
+        _key_type(source, spec, n=n, input_types=input_types)
         for source, spec in zip(group.key_sources, group.key_specs)
     )
 
@@ -190,6 +233,8 @@ class InnerView:
 @dataclass(frozen=True, slots=True)
 class InputView:
     index: int
+    cpp_type: str
+    row_width: int
 
 
 def _inner_view(name: str, group: GroupStage) -> InnerView:
@@ -199,12 +244,23 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
     for index, stage in enumerate(group.inner.stages):
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
-        stages.append(StageView(index, _stage_type(stage, n, execution).render()))
+        stages.append(
+            StageView(
+                index,
+                _stage_type(stage, n, execution, input_types=None).render(),
+            )
+        )
     return InnerView(name, group.inner.input_count, group.inner.scratch_slots, tuple(stages))
 
 
-def _group_type(group_name: str, group: GroupStage, stage: Stage, n: int) -> CppType:
-    keys = _key_list(group)
+def _group_type(
+    group_name: str,
+    group: GroupStage,
+    stage: Stage,
+    n: int,
+    input_types: tuple[InputTypeSpec, ...],
+) -> CppType:
+    keys = _key_list(group, n=n, input_types=input_types)
     if not keys:
         resolver = tmpl("stackdsl::NoKeyResolver", IntArg(n))
     elif group.dense:
@@ -232,7 +288,7 @@ def _group_type(group_name: str, group: GroupStage, stage: Stage, n: int) -> Cpp
         inner,
         _dest_type(stage),
         key_list,
-        _source_list(group.feed_sources),
+        _source_list(group.feed_sources, n=n, input_types=input_types),
     )
 
 
@@ -248,7 +304,26 @@ def _environment() -> Environment:
     )
 
 
-def render_translation_unit(plan: Plan, *, n_instruments: int, prefetch_rows: int) -> GeneratedSource:
+def render_translation_unit(
+    plan: Plan,
+    *,
+    n_instruments: int,
+    prefetch_rows: int,
+    input_types: tuple[InputTypeSpec, ...] | None = None,
+) -> GeneratedSource:
+    if input_types is None:
+        input_types = tuple(
+            InputTypeSpec("float64", n_instruments)
+            for _ in range(plan.input_count)
+        )
+    if len(input_types) != plan.input_count:
+        raise ValueError("input type count does not match the compiled program")
+    for spec in input_types:
+        if spec.row_width not in (1, n_instruments):
+            raise ValueError(
+                f"input row width must be 1 or n_instruments={n_instruments}, got {spec.row_width}"
+            )
+
     group_names: dict[int, str] = {}
     inners: list[InnerView] = []
     for index, stage in enumerate(plan.stages):
@@ -265,10 +340,26 @@ def render_translation_unit(plan: Plan, *, n_instruments: int, prefetch_rows: in
     for index, stage in enumerate(plan.stages):
         if stage.kind == "groupby":
             assert stage.group is not None
-            cpp_type = _group_type(group_names[index], stage.group, stage, n_instruments)
+            cpp_type = _group_type(
+                group_names[index],
+                stage.group,
+                stage,
+                n_instruments,
+                input_types,
+            )
             stages.append(StageView(index, cpp_type.render(), checked=True))
         else:
-            stages.append(StageView(index, _stage_type(stage, n, direct_execution).render()))
+            stages.append(
+                StageView(
+                    index,
+                    _stage_type(
+                        stage,
+                        n,
+                        direct_execution,
+                        input_types=input_types,
+                    ).render(),
+                )
+            )
 
     if plan.input_count == 0:
         raise ValueError("cpp_stream requires at least one file-backed input")
@@ -279,7 +370,10 @@ def render_translation_unit(plan: Plan, *, n_instruments: int, prefetch_rows: in
         input_count=plan.input_count,
         scratch_slots=plan.scratch_slots,
         prefetch_rows=prefetch_rows,
-        inputs=tuple(InputView(index) for index in range(plan.input_count)),
+        inputs=tuple(
+            InputView(index, spec.cpp_type, spec.row_width)
+            for index, spec in enumerate(input_types)
+        ),
         stages=tuple(stages),
         inners=tuple(inners),
     )
