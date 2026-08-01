@@ -6,7 +6,7 @@ import jax
 import numpy as np
 
 from flows.riskmodel import roll_rets
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.jax_flat.engine import compile_formula as compile_jax_formula
 
 
@@ -63,14 +63,14 @@ def test_roll_rets_native_matches_jax_flat(tmp_path: Path) -> None:
     data = _data(rows)
     paths = _save_npy(tmp_path, data)
 
-    cpp_runtime = compile_npy_formula(
+    cpp_runtime = compile_formula(
         roll_rets,
         paths,
         n_instruments=N,
         default_group_capacity=256,
     )
     cpp_output_path = tmp_path / "roll_rets.bin"
-    cpp_runtime.run_npy_files(paths, out_path=cpp_output_path)
+    cpp_runtime.run(out_path=cpp_output_path)
     cpp_output = np.asarray(
         np.memmap(cpp_output_path, mode="r", dtype=np.float64, shape=(rows, N))
     ).copy()
