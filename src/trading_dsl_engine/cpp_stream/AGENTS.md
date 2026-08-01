@@ -7,9 +7,19 @@ This backend must remain independent of `jax_flat`.
 - Shared formula semantics belong in `trading_dsl_engine.ir`; never import JAX or JAX-flat types into that package.
 - Value kind, logical shape, dtype, and compile-time dimensions belong in neutral `ValueType`. Matrix, fixed-width, arbitrary tensor, and object values must not be disguised as ordinary vectors.
 - Do not eagerly convert mapped inputs to float64. `InputSrc`, `SlotSrc`, and `SlotDst` carry native scalar types. Statistical/einsum operators may define float64 accumulation at their boundary.
-- `.npy` inputs are mmap-only. Inspect dtype, complete shape, payload offset, and C-order layout before compilation. Preserve arbitrary positive per-row shapes rather than flattening shape metadata away.
-- `(rows,)` and `(rows,1)` are row-scalar. Higher-rank row tensors are contiguous zero-copy tensor operands.
 - Never add a per-element runtime dtype or rank switch.
+
+## Unified source layer
+
+- There is one public compiler, `compile_formula`, and one public runner, `CppStreamRuntime.run`. Do not add `compile_<format>_formula`, `run_<format>_files`, or format-specific native entrypoints.
+- Every formula input is resolved independently through `SourceAdapter`; a single formula may mix file formats, URI schemes, in-memory arrays, shared memory, and custom source objects.
+- Adapter selection may use object type, URI scheme, extension, or explicit adapter name. Source selection belongs in `python/sources.py`, not the compiler, lowering, codegen, or operator nodes.
+- Built-in `.npy`, raw, and ndarray adapters must remain zero-copy. `.npy` inspection preserves dtype, complete shape, payload offset, and C-order layout. Raw/headerless inputs require explicit `InputTypeSpec` metadata.
+- `(rows,)` and `(rows, 1)` are row-scalar. Higher-rank row tensors preserve their complete positive C-order shape.
+- All adapters return the same `PreparedSource` contract: compile-time `InputTypeSpec`, row count, stable contiguous pointer, owner, and deterministic close callback.
+- The generated shared object receives only typed pointers, row counts, and row widths. It must not know whether an input came from `.npy`, raw mmap, Parquet, Arrow, a network feed, or another adapter.
+- New source formats should register an adapter. A true chunked/network implementation may extend the source execution layer, but must not create another compiler or runner.
+- Runtime replacement sources may use different formats from compile-time sources, but dtype and logical per-row shape must exactly match the compiled plan.
 
 ## NumPy-style einsum
 
@@ -23,10 +33,10 @@ This backend must remain independent of `jax_flat`.
 - Keep one generic `UnaryEinsumNode` and one generic `BinaryEinsumNode`; never add pattern-named nodes such as `EinsumNfNfToNNode` or formula-specific kernels.
 - Preserve the contiguous identity-mapping FMA path. It must bulk-load a lazy feature row once, not recompute an RBF normalization for each feature access.
 - General mapped loops must retain correct broadcasting, diagonal, permutation, scalar, and arbitrary-reduction semantics.
-- Raw arbitrary-rank mmap tensors use a zero-copy dense tensor source. Cat/RBF sources stay lazy. Only selected contraction intermediates use fixed tensor scratch.
+- Arbitrary-rank contiguous tensors use a zero-copy dense tensor source. Cat/RBF sources stay lazy. Only selected contraction intermediates use fixed tensor scratch.
 - Scratch is compact by logical tensor size. Do not reserve `N * max_width` semantics for every arbitrary tensor unless its layout actually requires it.
 - Native einsum currently accumulates/stores float64. Keep unsupported NumPy surfaces explicit: integer-sublist calls, precomputed path-list arguments, `out=`, `dtype=`, `order=`, `casting=`, and writeable-view behavior.
-- Do not introduce Einsums, Eigen Tensor, TBLIS, or another contraction dependency unless same-host benchmarks show a material win without forcing copies/materialization of mmap, Cat, or RBF sources.
+- Do not introduce Einsums, Eigen Tensor, TBLIS, or another contraction dependency unless same-host benchmarks show a material win without forcing copies/materialization of mapped, Cat, or RBF sources.
 
 ## Key metadata
 
@@ -81,11 +91,12 @@ This backend must remain independent of `jax_flat`.
 
 ## Testing and benchmarks
 
-- Einsum correctness must cover implicit/explicit output, arbitrary labels, scalar operands/reductions, ellipsis broadcasting, rejection of non-ellipsis broadcasting, diagonals, transposes, raw rank-2/rank-4 mmap inputs, tensor scratch, and n-ary paths.
+- Source tests must cover independent extension inference, mixed-format inputs in one formula, raw metadata validation, replacement source compatibility, and at least one registered custom adapter.
+- Einsum correctness must cover implicit/explicit output, arbitrary labels, scalar operands/reductions, ellipsis broadcasting, rejection of non-ellipsis broadcasting, diagonals, transposes, rank-2/rank-4 mapped inputs, tensor scratch, and n-ary paths.
 - Compare native output against NumPy for isolated einsum cases and against JAX-flat for the exact `roll_rets` graph.
-- Tests must assert the old pattern-specific einsum node is absent from generated C++.
+- Tests must assert the old pattern-specific einsum node and format-specific native runner are absent from generated C++.
 - Hot-path changes should be benchmarked at 5M x 9 with one warmup and ten measured runs when practical.
 - Report every run, median/mean/best, checksums, finite fraction, estimated contraction work, and largest intermediate.
 - Benchmark `optimize=False`, greedy, and optimal on the same n-ary expression. Reject an optimizer that changes the checksum or increases estimated work without a justified measured gain.
-- Re-run `scripts/benchmark_cpp_stream_roll_rets.py` after einsum changes to detect end-to-end regressions.
+- Re-run `scripts/benchmark_cpp_stream_roll_rets.py` after source or einsum changes to detect end-to-end regressions.
 - Do not hard-code one hosted CPU's throughput as a universal threshold; use environment-provided floors.
