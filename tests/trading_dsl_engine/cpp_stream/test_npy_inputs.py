@@ -6,28 +6,34 @@ import numpy as np
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.cpp_stream import compile_npy_formula, inspect_npy, mmap_npy
+from trading_dsl_engine.cpp_stream import (
+    InputTypeSpec,
+    compile_formula,
+    inspect_source,
+    open_source,
+    source,
+)
 
 
-def test_npy_reader_exposes_dtype_shape_and_row_scalar(tmp_path: Path):
+def test_source_inference_exposes_npy_dtype_shape_and_row_scalar(tmp_path: Path):
     path = tmp_path / "timestamp.npy"
     values = np.arange(10, dtype=np.int64)
     np.save(path, values)
 
-    info = inspect_npy(path)
-    assert info.dtype == "int64"
-    assert info.shape == (10,)
+    info = inspect_source(path)
+    assert info.adapter == "npy"
     assert info.rows == 10
-    assert info.row_width == 1
-    assert info.row_scalar is True
-    assert info.cpp_type == "std::int64_t"
+    assert info.input_type.dtype == "int64"
+    assert info.input_type.row_width == 1
+    assert info.input_type.row_scalar is True
+    assert info.input_type.cpp_type == "std::int64_t"
 
-    mapped = mmap_npy(path)
+    mapped = open_source(path)
     try:
-        assert mapped.data_pointer == mapped.array.ctypes.data
-        np.testing.assert_array_equal(mapped.array, values)
+        assert mapped.data_pointer == mapped.owner.array.ctypes.data
+        np.testing.assert_array_equal(mapped.owner.array, values)
     finally:
-        mapped.array._mmap.close()
+        mapped.close()
 
 
 def test_typed_row_scalar_npy_input_broadcasts_without_copy(tmp_path: Path):
@@ -38,26 +44,44 @@ def test_typed_row_scalar_npy_input_broadcasts_without_copy(tmp_path: Path):
     close_path = tmp_path / "close.npy"
     np.save(timestamp_path, timestamp)
     np.save(close_path, close)
+    data = {"close": close_path, "_ev_ts": timestamp_path}
 
-    runtime = compile_npy_formula(
-        "close + _ev_ts",
-        {"close": close_path, "_ev_ts": timestamp_path},
-        n_instruments=n,
-    )
+    runtime = compile_formula("close + _ev_ts", data, n_instruments=n)
     assert runtime.input_types[0].dtype == "float64"
     assert runtime.input_types[0].row_width == n
     assert runtime.input_types[1].dtype == "int64"
     assert runtime.input_types[1].row_width == 1
 
     out_path = tmp_path / "out.bin"
-    result = runtime.run_npy_files(
-        {"close": close_path, "_ev_ts": timestamp_path},
-        out_path=out_path,
-    )
+    result = runtime.run(out_path=out_path)
     assert result.rows == rows
     actual = np.memmap(out_path, mode="r", dtype=np.float64, shape=(rows, n))
-    expected = close + timestamp[:, None]
-    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(actual, close + timestamp[:, None], rtol=0.0, atol=0.0)
+
+
+def test_npy_and_raw_sources_can_be_mixed_per_input(tmp_path: Path):
+    rows, n = 17, 4
+    left = np.arange(rows * n, dtype=np.float64).reshape(rows, n)
+    right = 100.0 + left
+    left_path = tmp_path / "left.npy"
+    right_path = tmp_path / "right.bin"
+    np.save(left_path, left)
+    right.tofile(right_path)
+
+    data = {
+        "left": left_path,
+        "right": source(
+            right_path,
+            input_type=InputTypeSpec("float64", n),
+        ),
+    }
+    runtime = compile_formula("left + right", data, n_instruments=n)
+    out_path = tmp_path / "mixed.bin"
+    runtime.run(out_path=out_path)
+    actual = np.asarray(
+        np.memmap(out_path, mode="r", dtype=np.float64, shape=(rows, n))
+    )
+    np.testing.assert_array_equal(actual, left + right)
 
 
 def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
@@ -81,7 +105,7 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
         var("close"),
         ewm(cumsum(self_), 3),
     )
-    runtime = compile_npy_formula(
+    runtime = compile_formula(
         formula,
         {"_ev_ts": timestamp_path, "close": close_path},
         n_instruments=n,
@@ -96,10 +120,7 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
     assert "std::int64_t, stackdsl::ModOp" in generated
 
     out_path = tmp_path / "grouped.bin"
-    runtime.run_npy_files(
-        {"_ev_ts": timestamp_path, "close": close_path},
-        out_path=out_path,
-    )
+    runtime.run(out_path=out_path)
     actual = np.asarray(
         np.memmap(out_path, mode="r", dtype=np.float64, shape=(rows, n))
     )
@@ -124,8 +145,6 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
 
 
 def test_dense_key_offset_maps_domain_to_zero_based_slots(tmp_path: Path):
-    # num_keys=3 and offset=10 means the valid categories are 10, 11, and 12.
-    # Dense routing uses value - offset, so they map to state digits 0, 1, and 2.
     venue = np.array([10, 11, 10, 12, 11], dtype=np.int32)
     close = np.array([1.0, 10.0, 2.0, 100.0, 20.0], dtype=np.float64)
     venue_path = tmp_path / "venue.npy"
@@ -134,17 +153,11 @@ def test_dense_key_offset_maps_domain_to_zero_based_slots(tmp_path: Path):
     np.save(close_path, close)
 
     formula = groupby(
-        Key(
-            var("venue"),
-            num_keys=3,
-            offset=10,
-            row_scalar=True,
-            dtype="int32",
-        ),
+        Key(var("venue"), num_keys=3, offset=10, row_scalar=True, dtype="int32"),
         var("close"),
         cumsum(self_),
     )
-    runtime = compile_npy_formula(
+    runtime = compile_formula(
         formula,
         {"venue": venue_path, "close": close_path},
         n_instruments=1,
@@ -155,10 +168,7 @@ def test_dense_key_offset_maps_domain_to_zero_based_slots(tmp_path: Path):
     assert ", 3, 10, true>" in generated
 
     out_path = tmp_path / "offset.bin"
-    runtime.run_npy_files(
-        {"venue": venue_path, "close": close_path},
-        out_path=out_path,
-    )
+    runtime.run(out_path=out_path)
     actual = np.asarray(
         np.memmap(out_path, mode="r", dtype=np.float64, shape=(venue.size, 1))
     )[:, 0]
@@ -178,7 +188,7 @@ def test_int64_hash_keys_remain_distinct_above_2_to_53(tmp_path: Path):
         var("close"),
         cumsum(self_),
     )
-    runtime = compile_npy_formula(
+    runtime = compile_formula(
         formula,
         {"key_value": key_path, "close": close_path},
         n_instruments=1,
@@ -188,10 +198,7 @@ def test_int64_hash_keys_remain_distinct_above_2_to_53(tmp_path: Path):
     assert "InputSrc<0, std::int64_t, 1>" in generated
 
     out_path = tmp_path / "exact_hash.bin"
-    runtime.run_npy_files(
-        {"key_value": key_path, "close": close_path},
-        out_path=out_path,
-    )
+    runtime.run(out_path=out_path)
     actual = np.asarray(
         np.memmap(out_path, mode="r", dtype=np.float64, shape=(3, 1))
     )[:, 0]
