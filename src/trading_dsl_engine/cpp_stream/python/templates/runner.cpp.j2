@@ -12,7 +12,7 @@ namespace {
 thread_local std::string g_last_error;
 
 {% for inner in inners %}
-template <std::size_t N, std::size_t Capacity>
+template <std::size_t N, std::size_t Capacity, std::size_t PartitionCount>
 struct {{ inner.name }} {
     stackdsl::GroupRowContext<N, {{ inner.input_count }}, {{ inner.scratch_slots }}> ctx{};
 {% for stage in inner.stages %}
