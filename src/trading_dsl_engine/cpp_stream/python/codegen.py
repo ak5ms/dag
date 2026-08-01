@@ -89,10 +89,13 @@ def _source_type(
             spec = input_types[index]
             cpp_type = Name(spec.cpp_type)
             row_width = IntArg(spec.row_width)
-        row_width_arg = row_width if isinstance(row_width, CppType) else row_width
-        return tmpl("stackdsl::InputSrc", IntArg(index), cpp_type, row_width_arg)
+        return tmpl("stackdsl::InputSrc", IntArg(index), cpp_type, row_width)
     if source.kind == "slot":
-        return tmpl("stackdsl::SlotSrc", IntArg(int(source.value)))
+        return tmpl(
+            "stackdsl::SlotSrc",
+            IntArg(int(source.value)),
+            BoolArg(source.row_scalar),
+        )
     if source.kind == "literal":
         return tmpl("stackdsl::LiteralSrc", DoubleArg(float(source.value)))
     raise AssertionError(source.kind)
@@ -112,9 +115,7 @@ _BINARY_POLICIES = {
     "mod": "stackdsl::ModOp",
 }
 
-_UNARY_POLICIES = {
-    "floor": "stackdsl::FloorOp",
-}
+_UNARY_POLICIES = {"floor": "stackdsl::FloorOp"}
 
 
 def _stage_type(
@@ -125,17 +126,18 @@ def _stage_type(
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
     """Render one operator type independent of whether its plan is grouped."""
+    stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     inputs = tuple(
         _source_type(source, n=n, input_types=input_types)
         for source in stage.inputs
     )
     out = _dest_type(stage)
     if stage.kind == "copy":
-        return tmpl("stackdsl::CopyNode", n, inputs[0], out, execution)
+        return tmpl("stackdsl::CopyNode", stage_n, inputs[0], out, execution)
     if stage.kind == "binary":
         return tmpl(
             "stackdsl::BinaryNode",
-            n,
+            stage_n,
             inputs[0],
             inputs[1],
             out,
@@ -145,19 +147,19 @@ def _stage_type(
     if stage.kind == "unary":
         return tmpl(
             "stackdsl::UnaryNode",
-            n,
+            stage_n,
             inputs[0],
             out,
             Name(_UNARY_POLICIES[stage.op_name or ""]),
             execution,
         )
     if stage.kind == "cumsum":
-        return tmpl("stackdsl::CumsumNode", n, inputs[0], out, execution)
+        return tmpl("stackdsl::CumsumNode", stage_n, inputs[0], out, execution)
     if stage.kind == "ewm":
         assert stage.ewm is not None
         return tmpl(
             "stackdsl::EwmNode",
-            n,
+            stage_n,
             inputs[0],
             out,
             UInt64Arg(double_bits(stage.ewm.span)),
@@ -167,7 +169,7 @@ def _stage_type(
             execution,
         )
     if stage.kind == "xs_rank":
-        return tmpl("stackdsl::XsRankNode", n, inputs[0], out, execution)
+        return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")
     raise AssertionError(stage.kind)
@@ -245,10 +247,7 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
         stages.append(
-            StageView(
-                index,
-                _stage_type(stage, n, execution, input_types=None).render(),
-            )
+            StageView(index, _stage_type(stage, n, execution, input_types=None).render())
         )
     return InnerView(name, group.inner.input_count, group.inner.scratch_slots, tuple(stages))
 
@@ -341,11 +340,7 @@ def render_translation_unit(
         if stage.kind == "groupby":
             assert stage.group is not None
             cpp_type = _group_type(
-                group_names[index],
-                stage.group,
-                stage,
-                n_instruments,
-                input_types,
+                group_names[index], stage.group, stage, n_instruments, input_types
             )
             stages.append(StageView(index, cpp_type.render(), checked=True))
         else:
