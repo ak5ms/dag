@@ -77,6 +77,32 @@ def test_key_descriptor_selects_dense_row_scalar_resolver():
     assert "stackdsl::GroupedExecution<N, Capacity>" in source
 
 
+def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
+    formula = groupby(
+        (
+            univ([0, 1], [2, 3, 4]),
+            Key(var("venue"), num_keys=3, offset=10, dtype="int32"),
+            Key(var("bucket"), num_keys=4, row_scalar=True, dtype="uint32"),
+        ),
+        var("close"),
+        cumsum(self_),
+    )
+    program = compile_ir(formula)
+    plan = lower_program(program, n_instruments=5)
+    group = next(stage.group for stage in plan.stages if stage.group is not None)
+    assert group.dense is True
+    assert group.capacity == (3 + 1) * (4 + 1)
+    source = render_translation_unit(
+        plan,
+        n_instruments=5,
+        prefetch_rows=16,
+    ).text
+    assert "stackdsl::DenseTupleGroupResolver<" in source
+    assert source.count("stackdsl::KeySpec<") >= 2
+    assert ", 3, 10, false>" in source
+    assert ", 4, 0, true>" in source
+
+
 def test_codegen_embeds_typed_row_widths():
     program = compile_ir("close + _ev_ts")
     plan = lower_program(program, n_instruments=9)
