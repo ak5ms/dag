@@ -82,12 +82,15 @@ def test_roll_rets_native_matches_jax_flat(tmp_path: Path) -> None:
 
     assert np.isfinite(expected).any(), "reference output must contain finite values"
     assert np.isfinite(cpp_output).any(), "native output must contain finite values"
-    np.testing.assert_allclose(cpp_output, expected, rtol=2e-9, atol=2e-9, equal_nan=True)
+    np.testing.assert_allclose(
+        cpp_output, expected, rtol=2e-9, atol=2e-9, equal_nan=True
+    )
     generated = cpp_runtime.generated_cpp.read_text()
     assert "RbfBasisSrc<6" in generated
     assert "FutureRbfBasisSumSrc<6, 1440" in generated
     assert "InstrumentBasisMeanNode" in generated
-    assert "EinsumNfNfToNNode" in generated
+    assert "BinaryEinsumNode" in generated
+    assert "EinsumNfNfToNNode" not in generated
     assert "FFillNode" in generated
     assert "ShiftNode" in generated
     assert "GroupedInstrumentBasis" not in generated
