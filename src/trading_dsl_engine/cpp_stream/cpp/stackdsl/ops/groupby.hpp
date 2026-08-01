@@ -19,6 +19,8 @@ struct SourceList {};
 template <class... Keys>
 struct KeyList {};
 
+STACKDSL_HOT std::uint64_t canonical_key_bits(double x) noexcept;
+
 template <class Source, std::size_t NumKeys = 0, std::int64_t Offset = 0, bool RowScalar = false>
 struct KeySpec {
     using source = Source;
@@ -27,8 +29,24 @@ struct KeySpec {
     static constexpr bool row_scalar = RowScalar;
 
     template <class Context>
+    STACKDSL_HOT static auto read_native(const Context& ctx, std::size_t lane) noexcept {
+        return ctx.template read_native<Source>(RowScalar ? 0 : lane);
+    }
+
+    template <class Context>
     STACKDSL_HOT static double read(const Context& ctx, std::size_t lane) noexcept {
-        return ctx.template read<Source>(RowScalar ? 0 : lane);
+        return static_cast<double>(read_native(ctx, lane));
+    }
+
+    template <class Context>
+    STACKDSL_HOT static std::uint64_t canonical_bits(const Context& ctx, std::size_t lane) noexcept {
+        const auto raw = read_native(ctx, lane);
+        using Value = std::remove_cv_t<decltype(raw)>;
+        if constexpr (std::is_integral_v<Value>) {
+            return static_cast<std::uint64_t>(raw);
+        } else {
+            return canonical_key_bits(static_cast<double>(raw));
+        }
     }
 };
 
@@ -124,8 +142,8 @@ struct HashGroupResolver {
     }
 
     template <class Context>
-    STACKDSL_HOT static KeyBits<parts> make_key(Context& ctx, std::size_t lane) noexcept {
-        return KeyBits<parts>{{canonical_key_bits(Keys::read(ctx, lane))...}};
+    STACKDSL_HOT static KeyBits<parts> make_key(const Context& ctx, std::size_t lane) noexcept {
+        return KeyBits<parts>{{Keys::canonical_bits(ctx, lane)...}};
     }
 
     template <class Context>
@@ -179,30 +197,55 @@ struct DenseTupleGroupResolver {
 
     template <class Key, class Context>
     STACKDSL_HOT static bool append_key(
-        Context& ctx,
+        const Context& ctx,
         std::size_t lane,
         std::size_t& slot
     ) noexcept {
-        const double raw = Key::read(ctx, lane);
+        const auto raw = Key::read_native(ctx, lane);
+        using Value = std::remove_cv_t<decltype(raw)>;
         std::size_t digit = 0;
-        if (std::isnan(raw)) {
-            digit = Key::num_keys;
-        } else if (!finite(raw)) {
-            return false;
+
+        if constexpr (std::is_integral_v<Value>) {
+            if constexpr (std::is_signed_v<Value>) {
+                const __int128 delta = static_cast<__int128>(raw) - static_cast<__int128>(Key::offset);
+                if (delta < 0 || delta >= static_cast<__int128>(Key::num_keys)) return false;
+                digit = static_cast<std::size_t>(delta);
+            } else {
+                const unsigned __int128 value = static_cast<unsigned __int128>(raw);
+                unsigned __int128 delta = 0;
+                if constexpr (Key::offset >= 0) {
+                    const auto offset = static_cast<unsigned __int128>(Key::offset);
+                    if (value < offset) return false;
+                    delta = value - offset;
+                } else {
+                    delta = value + static_cast<unsigned __int128>(-static_cast<__int128>(Key::offset));
+                }
+                if (delta >= static_cast<unsigned __int128>(Key::num_keys)) return false;
+                digit = static_cast<std::size_t>(delta);
+            }
         } else {
-            const double rounded = std::round(raw);
-            if (std::abs(raw - rounded) > 1e-12) return false;
-            const std::int64_t value = static_cast<std::int64_t>(rounded) - Key::offset;
-            if (value < 0 || value >= static_cast<std::int64_t>(Key::num_keys)) return false;
-            digit = static_cast<std::size_t>(value);
+            const double value = static_cast<double>(raw);
+            if (std::isnan(value)) {
+                digit = Key::num_keys;
+            } else if (!finite(value)) {
+                return false;
+            } else {
+                const double rounded = std::round(value);
+                if (std::abs(value - rounded) > 1e-12) return false;
+                const long double delta = static_cast<long double>(rounded)
+                    - static_cast<long double>(Key::offset);
+                if (delta < 0.0L || delta >= static_cast<long double>(Key::num_keys)) return false;
+                digit = static_cast<std::size_t>(delta);
+            }
         }
+
         slot = slot * (Key::num_keys + 1) + digit;
         return true;
     }
 
     template <class Context>
     STACKDSL_HOT static bool resolve_lane(
-        Context& ctx,
+        const Context& ctx,
         std::size_t lane,
         std::uint16_t& slot_out
     ) noexcept {
@@ -249,10 +292,15 @@ struct alignas(64) GroupRowContext {
     const std::array<std::uint16_t, N>* partitions = nullptr;
 
     template <class Src>
-    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+    STACKDSL_HOT double read_native(std::size_t lane) const noexcept {
         if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
-        else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][lane];
+        else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
         else return Src::value;
+    }
+
+    template <class Src>
+    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+        return read_native<Src>(lane);
     }
 
     template <class Src>
