@@ -73,10 +73,38 @@ struct MatrixSlotSrc {
     using value_type = double;
 };
 
+// Arbitrary fixed-shape tensors reuse matrix scratch storage. tensor_size is the
+// compact number of elements; matrix_slot_index keeps existing destination/context
+// plumbing generic.
+template <std::size_t Index, std::size_t Size>
+struct TensorSlotSrc {
+    static constexpr std::size_t matrix_slot_index = Index;
+    static constexpr std::size_t tensor_slot_index = Index;
+    static constexpr std::size_t tensor_size = Size;
+    static constexpr std::size_t feature_width = Size;
+    using value_type = double;
+};
+
 template <auto Value>
 struct LiteralSrc {
     using value_type = std::remove_cv_t<decltype(Value)>;
     static constexpr value_type value = Value;
+    static constexpr std::size_t feature_width = 1;
+};
+
+struct NaNLiteralSrc {
+    using value_type = double;
+    static constexpr double value = std::numeric_limits<double>::quiet_NaN();
+    static constexpr std::size_t feature_width = 1;
+};
+struct PositiveInfinityLiteralSrc {
+    using value_type = double;
+    static constexpr double value = std::numeric_limits<double>::infinity();
+    static constexpr std::size_t feature_width = 1;
+};
+struct NegativeInfinityLiteralSrc {
+    using value_type = double;
+    static constexpr double value = -std::numeric_limits<double>::infinity();
     static constexpr std::size_t feature_width = 1;
 };
 
@@ -92,6 +120,14 @@ template <std::size_t Index, std::size_t Width>
 struct MatrixSlotDst {
     static constexpr std::size_t matrix_slot_index = Index;
     static constexpr std::size_t feature_width = Width;
+    using value_type = double;
+};
+
+template <std::size_t Index, std::size_t Size>
+struct TensorSlotDst {
+    static constexpr std::size_t matrix_slot_index = Index;
+    static constexpr std::size_t tensor_slot_index = Index;
+    static constexpr std::size_t tensor_size = Size;
     using value_type = double;
 };
 
@@ -142,7 +178,7 @@ struct alignas(64) RowContext {
 
     template <class Src>
     STACKDSL_HOT source_value_t<Src> read_native(std::size_t lane) const noexcept {
-        static_assert(source_width_v<Src> == 1, "scalar read of matrix source");
+        static_assert(source_width_v<Src> == 1, "scalar read of matrix/tensor source");
         if constexpr (requires { Src::input_index; }) {
             const auto* values = static_cast<const source_value_t<Src>*>(inputs[Src::input_index]);
             return values[Src::row_width == 1 ? 0 : lane];
