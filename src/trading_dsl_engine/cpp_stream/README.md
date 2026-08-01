@@ -23,15 +23,62 @@ runtime = compile_npy_formula(
     {"close": "/data/close.npy", "open": "/data/open.npy"},
     n_instruments=9,
 )
-result = runtime.run_npy_files(
+runtime.run_npy_files(
     {"close": "/data/close.npy", "open": "/data/open.npy"},
     out_path="/data/alpha.bin",
 )
 ```
 
-`.npy` inputs are mapped without copying. Supported C-order shapes are `(rows,)`,
-`(rows, 1)`, and `(rows, n_instruments)`. Supported dtypes are `float32`, `float64`,
-`int32`, `int64`, `uint32`, and `uint64`.
+`.npy` inputs are mapped without copying. Any positive C-order per-row tensor shape
+is supported: `(rows,)`, `(rows,1)`, `(rows,N)`, `(rows,N,K)`, `(rows,B,N,K)`, and
+higher ranks. `(rows,)` and `(rows,1)` remain row-scalar. Supported dtypes are
+`float32`, `float64`, `int32`, `int64`, `uint32`, and `uint64`.
+
+## NumPy-style `einsum`
+
+The canonical call order matches NumPy:
+
+```python
+einsum("ij,jk->ik", left, right)
+einsum("...ij,...jk->...ik", left, right)
+einsum("ij,ij->", left, right)
+einsum("ii->i", square)
+einsum("ij,kj,kl->il", a, b, c, optimize="optimal")
+```
+
+The old project-local order remains accepted for compatibility:
+
+```python
+einsum(left, right, "ij,jk->ik")
+```
+
+Supported string-subscript behavior includes:
+
+- arbitrary case-sensitive ASCII labels such as `ij`, `nf`, or `Qx`;
+- implicit and explicit output;
+- scalar operands and scalar reductions;
+- arbitrary operand/output rank;
+- repeated-label diagonal extraction;
+- permutations and outer products;
+- ellipsis expansion and NumPy-compatible ellipsis broadcasting;
+- raw arbitrary-rank mmap operands without copying;
+- lazy Cat/RBF feature matrices without eager materialization.
+
+As in NumPy, named labels must have equal dimensions; broadcasting is enabled only
+through `...`. The default is `optimize=False`. `True`, `"greedy"`, and `"optimal"`
+are supported. `"optimal"` exhaustively searches paths through eight operands and
+falls back to greedy for larger contractions.
+
+The frontend parses and validates subscripts once, canonicalizes labels to integer
+axis maps, and creates a static unary/binary contraction path. Generated C++ contains
+no runtime string parser, dynamic shape dispatch, or path search. Contiguous inner
+reductions use fixed-size bulk loads and FMA loops; generic loops cover broadcasting,
+diagonals, permutations, and arbitrary contraction dimensions.
+
+The native API intentionally does not yet implement NumPy's integer-sublist calling
+form, explicit precomputed path lists, `out=`, `dtype=`, `order=`, `casting=`, or
+writeable-view semantics. Native einsum results are currently accumulated and stored
+as `float64`.
 
 ## Execution model
 
@@ -45,49 +92,12 @@ GroupedExecution<N, Capacity, PartitionCount>
 
 There are no `GroupedFooNode` or formula-specific fast-path classes. `groupby.hpp`
 contains only key resolution, grouped-context construction, and inner-plan
-invocation. Stateful and cross-sectional nodes obtain storage/group identity through
-the generic execution interface.
+invocation. No operator allocates from the heap during `on_data`.
 
-Mapped values retain native types through typed scalar/vector scratch. Matrix-valued
-intermediates use separate fixed-width matrix scratch. No operator allocates from the
-heap during `on_data`.
-
-## Matrix and feature values
-
-`cat(...)`, RBF bases, coefficient matrices, and einsum use compile-time feature
-widths. Lazy basis sources and nested Cat expressions are flattened into
-`FeatureList<Sources...>` so consumers read original inputs directly.
-
-For example, these produce the same generated Ridge source:
-
-```python
-Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1)
-Ridge(x1, x2, x3, y=y, hl=64, lambda_=0.1)
-```
-
-A standalone Cat root is written as logical shape `(rows, N, K)`. The
-`InstrumentBasisMean` beta used by `roll_rets` is the only materialized six-wide
-matrix in that plan; RBF and future-RBF basis values remain lazy.
-
-## Supported native operators
-
-The backend now supports every operator used by `flows.riskmodel.roll_rets`:
-
-```text
-arithmetic: add, sub, mul, div, mod, pow, floor
-comparisons: eq, ne, lt, gt, le, ge
-logic/select: and, or, xor, where, fillna
-history: cumsum, ffill, shift, ewm
-cross-sectional: xs_rank
-matrix/features: cat, rbf_basis, future_rbf_basis_sum,
-                 einsum("nf,nf->n")
-models: Ridge, InstrumentBasisMean, get_beta, get_preds
-grouping: univ plus bounded-dense or exact-hash dynamic tuple keys
-named stateless calls used by POV/roll_rets
-```
-
-Named stateless expressions are backend-neutral. JAX backends retain their Python
-callable; native lowering selects an explicitly registered C++ policy by stable name.
+`cat(...)`, RBF bases, coefficient matrices, and einsum use compile-time dimensions.
+Lazy basis sources and nested Cat expressions flatten into `FeatureList<Sources...>`
+so consumers read original inputs directly. Arbitrary intermediates use compact
+fixed-size tensor scratch only when a contraction path actually requires them.
 
 ## `riskmodel.roll_rets`
 
@@ -107,54 +117,42 @@ runtime.run_npy_files(paths, out_path="roll_rets.bin")
 ```
 
 The generated plan contains 50 scalar/vector scratch slots and one six-wide matrix
-scratch slot. It includes generic RBF sources, session-grouped cumulative state,
-`InstrumentBasisMean`, `einsum`, forward fill, shift, boolean selection, and the
-remaining arithmetic graph.
+scratch slot. RBF and future-RBF basis values remain lazy. A native end-to-end test
+compares this exact expression against JAX-flat with finite-output checks and
+`rtol=2e-9`, `atol=2e-9`, equal-NaN semantics.
 
-A native end-to-end test compares this exact expression against JAX-flat on identical
-input data, including missing/tradability transitions. The comparison is non-vacuous
-and passes at `rtol=2e-9`, `atol=2e-9` with equal-NaN semantics.
+## 5M x 9 benchmarks
 
-## 5M x 9 `roll_rets` benchmark
-
-GitHub-hosted Ubuntu runner, float64 mmap inputs, GCC C++20 with
+GitHub-hosted Ubuntu runner, GCC C++20 with
 `-O3 -march=native -mtune=native -flto`, one warmup and ten measured executions:
 
-```text
-median  0.855752 M rows/s
-mean    0.855213 M rows/s
-best    0.856243 M rows/s
-```
+| Workload | Median throughput |
+| --- | ---: |
+| `einsum("nf,nf->n", ...)`, six features | 12.076 M rows/s |
+| equivalent ellipsis reduction | 12.097 M rows/s |
+| scalar reduction `einsum("n,n->", ...)` | 85.027 M rows/s |
+| three-operand contraction, `optimize=False` | 5.533 M rows/s |
+| same contraction, greedy | 11.605 M rows/s |
+| same contraction, optimal | 11.624 M rows/s |
+| full `flows.riskmodel.roll_rets` | 0.865675 M rows/s |
 
-This is approximately 5.84 seconds for 5,000,000 rows, or 7.70 million instrument
-observations per second. All ten runs were within roughly 0.4% of the median. The
-sampled output tail was 100% finite and had checksum `-0.790555667227`.
+For the n-ary case, planning reduced estimated work from 324 to 72 operations per
+row and reduced the largest intermediate scratch width from 9 to 2. Checksums were
+identical and every sampled output was finite. The updated `roll_rets` median is
+approximately 5.78 seconds for 5,000,000 rows and is above the prior 0.855752 M
+rows/s baseline.
 
 Reproduce with:
 
 ```bash
+python scripts/benchmark_cpp_stream_einsum.py
 python scripts/benchmark_cpp_stream_roll_rets.py
 ```
 
-The script defaults to 5M x 9, one warmup, and ten measured runs. Input generation,
+Both scripts default to 5M x 9, one warmup, and ten measured runs. Input generation,
 source generation, native compilation, mmap setup, and warmup are excluded from the
-reported execution time.
-
-## Other measured baselines
-
-On the same class of hosted runner:
-
-| Workload | Median throughput |
-| --- | ---: |
-| Typed row-scalar minute groupby | 20-22 M rows/s |
-| `cat(x1,x2,x3)` root | 11.307 M rows/s |
-| Stateful K=3 Ridge predictions | 6.377 M rows/s |
-| Stateless K=3 Ridge beta | 9.169 M rows/s |
-| One-group grouped stateful Ridge | 6.176 M rows/s |
-| Three-group grouped stateful Ridge | 2.787 M rows/s |
-
-Absolute throughput is host-dependent. Same-host checksums and run distributions are
-recorded in `PERFORMANCE.md`.
+reported execution time. Full run distributions and checksums are in
+`PERFORMANCE.md`.
 
 ## Compilation cache
 
