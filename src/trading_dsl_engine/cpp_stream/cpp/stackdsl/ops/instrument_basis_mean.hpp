@@ -15,28 +15,10 @@ namespace stackdsl {
 struct InstrumentBasisBetaProjection {};
 struct InstrumentBasisPredsProjection {};
 
-template<
-    std::size_t N,
-    class Features,
-    class Y,
-    class Weights,
-    class Out,
-    std::uint64_t AlphaBits,
-    class Projection,
-    class Execution=DirectExecution<N>
->
+template<std::size_t N,class Features,class Y,class Weights,class Out,std::uint64_t AlphaBits,class Projection,class Execution=DirectExecution<N>>
 struct InstrumentBasisMeanNode;
 
-template<
-    std::size_t N,
-    class Y,
-    class Weights,
-    class Out,
-    std::uint64_t AlphaBits,
-    class Projection,
-    class Execution,
-    class... FeatureSources
->
+template<std::size_t N,class Y,class Weights,class Out,std::uint64_t AlphaBits,class Projection,class Execution,class... FeatureSources>
 struct InstrumentBasisMeanNode<N,FeatureList<FeatureSources...>,Y,Weights,Out,AlphaBits,Projection,Execution> {
     static constexpr std::size_t K=FeatureList<FeatureSources...>::width;
     static constexpr std::size_t StateSize=Execution::state_size;
@@ -52,8 +34,6 @@ struct InstrumentBasisMeanNode<N,FeatureList<FeatureSources...>,Y,Weights,Out,Al
         constexpr double alpha=std::bit_cast<double>(AlphaBits);
         auto* out=ctx.template write_ptr<Out>();
         constexpr bool beta_projection=std::is_same_v<Projection,InstrumentBasisBetaProjection>;
-        constexpr bool matrix_slot=requires { Out::matrix_slot_index; };
-        constexpr std::size_t stride=matrix_slot?Context::matrix_scratch_width:K;
         for(std::size_t lane=0;lane<N;++lane){
             std::array<double,K> features{};
             load_features(ctx,lane,features,FeatureList<FeatureSources...>{});
@@ -65,7 +45,10 @@ struct InstrumentBasisMeanNode<N,FeatureList<FeatureSources...>,Y,Weights,Out,Al
             if constexpr(!beta_projection){
                 bool all_features=true;
                 double prediction=0.0;
-                for(std::size_t j=0;j<K;++j){ all_features&=finite(features[j]); prediction=std::fma(features[j],beta[base+j],prediction); }
+                for(std::size_t j=0;j<K;++j){
+                    all_features&=finite(features[j]);
+                    prediction=std::fma(features[j],beta[base+j],prediction);
+                }
                 out[lane]=valid_row&&all_features?prediction:kNaN;
             }
             for(std::size_t j=0;j<K;++j){
@@ -86,7 +69,7 @@ struct InstrumentBasisMeanNode<N,FeatureList<FeatureSources...>,Y,Weights,Out,Al
                 if(finite(candidate))beta[index]=candidate;
             }
             if constexpr(beta_projection){
-                for(std::size_t j=0;j<K;++j)out[lane*stride+j]=beta[base+j];
+                for(std::size_t j=0;j<K;++j)out[lane*K+j]=beta[base+j];
             }
         }
     }
