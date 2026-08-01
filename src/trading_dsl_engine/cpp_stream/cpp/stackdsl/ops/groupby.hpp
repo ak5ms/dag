@@ -124,13 +124,14 @@ struct HashGroupResolver {
     }
 
     template <class Context>
-    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
-        auto make_key = [&](std::size_t lane) STACKDSL_HOT {
-            return KeyBits<parts>{{canonical_key_bits(Keys::read(ctx, lane))...}};
-        };
+    STACKDSL_HOT static KeyBits<parts> make_key(Context& ctx, std::size_t lane) noexcept {
+        return KeyBits<parts>{{canonical_key_bits(Keys::read(ctx, lane))...}};
+    }
 
+    template <class Context>
+    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
         if constexpr ((Keys::row_scalar && ...)) {
-            const auto key = make_key(0);
+            const auto key = make_key(ctx, 0);
             const int slot = table.get_or_insert(key);
             if (slot < 0) return false;
             slots.fill(static_cast<std::uint16_t>(slot));
@@ -141,7 +142,7 @@ struct HashGroupResolver {
         int previous_slot = -1;
         bool previous_valid = false;
         for (std::size_t lane = 0; lane < N; ++lane) {
-            const auto key = make_key(lane);
+            const auto key = make_key(ctx, lane);
             int slot = -1;
             if (cache_valid[lane] && cached_keys[lane] == key) slot = cached_slots[lane];
             else if (previous_valid && previous_key == key) slot = previous_slot;
@@ -165,7 +166,7 @@ template <class... Keys>
 consteval std::size_t dense_tuple_capacity() {
     static_assert(((Keys::num_keys > 0) && ...));
     std::size_t result = 1;
-    ((result *= Keys::num_keys + 1), ...);  // one NaN digit per key
+    ((result *= Keys::num_keys + 1), ...);
     return result;
 }
 
@@ -176,6 +177,29 @@ struct DenseTupleGroupResolver {
 
     void setup() noexcept {}
 
+    template <class Key, class Context>
+    STACKDSL_HOT static bool append_key(
+        Context& ctx,
+        std::size_t lane,
+        std::size_t& slot
+    ) noexcept {
+        const double raw = Key::read(ctx, lane);
+        std::size_t digit = 0;
+        if (std::isnan(raw)) {
+            digit = Key::num_keys;
+        } else if (!finite(raw)) {
+            return false;
+        } else {
+            const double rounded = std::round(raw);
+            if (std::abs(raw - rounded) > 1e-12) return false;
+            const std::int64_t value = static_cast<std::int64_t>(rounded) - Key::offset;
+            if (value < 0 || value >= static_cast<std::int64_t>(Key::num_keys)) return false;
+            digit = static_cast<std::size_t>(value);
+        }
+        slot = slot * (Key::num_keys + 1) + digit;
+        return true;
+    }
+
     template <class Context>
     STACKDSL_HOT static bool resolve_lane(
         Context& ctx,
@@ -183,32 +207,7 @@ struct DenseTupleGroupResolver {
         std::uint16_t& slot_out
     ) noexcept {
         std::size_t slot = 0;
-        bool valid = true;
-        auto append = [&](auto key_tag) STACKDSL_HOT {
-            using Key = decltype(key_tag);
-            const double raw = Key::read(ctx, lane);
-            std::size_t digit = 0;
-            if (std::isnan(raw)) {
-                digit = Key::num_keys;
-            } else if (!finite(raw)) {
-                valid = false;
-                return;
-            } else {
-                const double rounded = std::round(raw);
-                if (std::abs(raw - rounded) > 1e-12) {
-                    valid = false;
-                    return;
-                }
-                const std::int64_t value = static_cast<std::int64_t>(rounded) - Key::offset;
-                if (value < 0 || value >= static_cast<std::int64_t>(Key::num_keys)) {
-                    valid = false;
-                    return;
-                }
-                digit = static_cast<std::size_t>(value);
-            }
-            slot = slot * (Key::num_keys + 1) + digit;
-        };
-        (append(Keys{}), ...);
+        const bool valid = (append_key<Keys>(ctx, lane, slot) && ...);
         if (!valid) return false;
         slot_out = static_cast<std::uint16_t>(slot);
         return true;
