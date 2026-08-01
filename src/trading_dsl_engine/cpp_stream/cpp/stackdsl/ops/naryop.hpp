@@ -5,40 +5,133 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <type_traits>
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
 
-struct AddOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return a + b; } };
-struct SubOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return a - b; } };
-struct MulOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return a * b; } };
-struct DivOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return b == 0.0 ? kNaN : a / b; } };
-struct ModOp { static constexpr int arity = 2; STACKDSL_HOT static double apply(double a, double b) noexcept { return b == 0.0 ? kNaN : std::fmod(a, b); } };
-struct FloorOp { static constexpr int arity = 1; STACKDSL_HOT static double apply(double a) noexcept { return std::floor(a); } };
+template <class Result>
+STACKDSL_HOT constexpr Result invalid_integral_result() noexcept {
+    static_assert(std::is_integral_v<Result>);
+    if constexpr (std::is_signed_v<Result>) return std::numeric_limits<Result>::min();
+    else return std::numeric_limits<Result>::max();
+}
+
+// Policies are templated on the compiler-selected result type. Inputs are read in
+// their native type; same-typed integer operations therefore never pass through
+// double. Mixed-type promotion occurs only because the operation's result type
+// requires it.
+struct AddOp {
+    static constexpr int arity = 2;
+    template <class Result, class A, class B>
+    STACKDSL_HOT static Result apply(A a, B b) noexcept {
+        return static_cast<Result>(a) + static_cast<Result>(b);
+    }
+};
+
+struct SubOp {
+    static constexpr int arity = 2;
+    template <class Result, class A, class B>
+    STACKDSL_HOT static Result apply(A a, B b) noexcept {
+        return static_cast<Result>(a) - static_cast<Result>(b);
+    }
+};
+
+struct MulOp {
+    static constexpr int arity = 2;
+    template <class Result, class A, class B>
+    STACKDSL_HOT static Result apply(A a, B b) noexcept {
+        return static_cast<Result>(a) * static_cast<Result>(b);
+    }
+};
+
+struct DivOp {
+    static constexpr int arity = 2;
+    template <class Result, class A, class B>
+    STACKDSL_HOT static Result apply(A a, B b) noexcept {
+        const Result lhs = static_cast<Result>(a);
+        const Result rhs = static_cast<Result>(b);
+        if (rhs == Result{0}) {
+            if constexpr (std::is_floating_point_v<Result>) {
+                return std::numeric_limits<Result>::quiet_NaN();
+            } else {
+                return invalid_integral_result<Result>();
+            }
+        }
+        if constexpr (std::is_integral_v<Result>) {
+            // When an explicitly integral key expression contains floor(div(...)),
+            // the compiler keeps the division integral. Use mathematical floor
+            // division rather than C++'s truncation-toward-zero rule.
+            Result quotient = lhs / rhs;
+            const Result remainder = lhs % rhs;
+            if constexpr (std::is_signed_v<Result>) {
+                if (remainder != Result{0} && ((remainder < Result{0}) != (rhs < Result{0}))) {
+                    --quotient;
+                }
+            }
+            return quotient;
+        } else {
+            return lhs / rhs;
+        }
+    }
+};
+
+struct ModOp {
+    static constexpr int arity = 2;
+    template <class Result, class A, class B>
+    STACKDSL_HOT static Result apply(A a, B b) noexcept {
+        const Result lhs = static_cast<Result>(a);
+        const Result rhs = static_cast<Result>(b);
+        if (rhs == Result{0}) {
+            if constexpr (std::is_floating_point_v<Result>) {
+                return std::numeric_limits<Result>::quiet_NaN();
+            } else {
+                return invalid_integral_result<Result>();
+            }
+        }
+        if constexpr (std::is_integral_v<Result>) return lhs % rhs;
+        else return std::fmod(lhs, rhs);
+    }
+};
+
+struct FloorOp {
+    static constexpr int arity = 1;
+    template <class Result, class A>
+    STACKDSL_HOT static Result apply(A a) noexcept {
+        if constexpr (std::is_integral_v<Result>) return static_cast<Result>(a);
+        else return std::floor(static_cast<Result>(a));
+    }
+};
 
 template <
     std::size_t N,
     class Lhs,
     class Rhs,
     class Out,
+    class Result,
     class Op,
     class Execution = DirectExecution<N>
 >
 struct BinaryNode {
     static_assert(Op::arity == 2);
+    static_assert(std::is_same_v<Out, OutputDst> || std::is_same_v<destination_value_t<Out>, Result>);
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         (void)sizeof(Execution);
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC ivdep
 #endif
         for (std::size_t lane = 0; lane < N; ++lane) {
-            out[lane] = Op::apply(ctx.template read<Lhs>(lane), ctx.template read<Rhs>(lane));
+            out[lane] = Op::template apply<Result>(
+                ctx.template read_native<Lhs>(lane),
+                ctx.template read_native<Rhs>(lane)
+            );
         }
     }
 };
@@ -47,22 +140,24 @@ template <
     std::size_t N,
     class In,
     class Out,
+    class Result,
     class Op,
     class Execution = DirectExecution<N>
 >
 struct UnaryNode {
     static_assert(Op::arity == 1);
+    static_assert(std::is_same_v<Out, OutputDst> || std::is_same_v<destination_value_t<Out>, Result>);
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         (void)sizeof(Execution);
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC ivdep
 #endif
         for (std::size_t lane = 0; lane < N; ++lane) {
-            out[lane] = Op::apply(ctx.template read<In>(lane));
+            out[lane] = Op::template apply<Result>(ctx.template read_native<In>(lane));
         }
     }
 };
@@ -79,9 +174,9 @@ struct CopyNode {
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         (void)sizeof(Execution);
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
         for (std::size_t lane = 0; lane < N; ++lane) {
-            out[lane] = ctx.template read<In>(lane);
+            out[lane] = ctx.template read_native<In>(lane);
         }
     }
 };
