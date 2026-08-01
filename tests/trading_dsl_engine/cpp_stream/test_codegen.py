@@ -64,10 +64,21 @@ def test_key_descriptor_selects_dense_row_scalar_resolver():
     assert group_op.key_specs[0].num_keys == 60
     assert group_op.key_specs[0].row_scalar is True
     assert group_op.key_specs[0].dtype == "int64"
+
+    input_types = (
+        InputTypeSpec("int64", 1),
+        InputTypeSpec("float64", 9),
+    )
+    plan = lower_program(
+        program,
+        n_instruments=9,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
+    )
     source = render_translation_unit(
-        lower_program(program, n_instruments=9),
+        plan,
         n_instruments=9,
         prefetch_rows=16,
+        input_types=input_types,
     ).text
     assert "stackdsl::FloorOp" in source
     assert "stackdsl::ModOp" in source
@@ -75,6 +86,10 @@ def test_key_descriptor_selects_dense_row_scalar_resolver():
     assert "stackdsl::KeySpec<" in source
     assert ", 60, 0, true>" in source
     assert "stackdsl::GroupedExecution<N, Capacity>" in source
+    assert "stackdsl::SlotDst<" in source and ", std::int64_t>" in source
+    assert "stackdsl::SlotSrc<" in source and ", std::int64_t," in source
+    assert "std::int64_t, stackdsl::DivOp" in source
+    assert "std::int64_t, stackdsl::ModOp" in source
 
 
 def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
@@ -88,7 +103,17 @@ def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
         cumsum(self_),
     )
     program = compile_ir(formula)
-    plan = lower_program(program, n_instruments=5)
+    assert program.input_names == ("venue", "bucket", "close")
+    input_types = (
+        InputTypeSpec("int32", 5),
+        InputTypeSpec("uint32", 1),
+        InputTypeSpec("float64", 5),
+    )
+    plan = lower_program(
+        program,
+        n_instruments=5,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
+    )
     group = next(stage.group for stage in plan.stages if stage.group is not None)
     assert group.dense is True
     assert group.capacity == (3 + 1) * (4 + 1)
@@ -96,25 +121,37 @@ def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
         plan,
         n_instruments=5,
         prefetch_rows=16,
+        input_types=input_types,
     ).text
     assert "stackdsl::DenseTupleGroupResolver<" in source
     assert source.count("stackdsl::KeySpec<") >= 2
+    assert "stackdsl::InputSrc<0, std::int32_t, 5>" in source
+    assert "stackdsl::InputSrc<1, std::uint32_t, 1>" in source
     assert ", 3, 10, false>" in source
     assert ", 4, 0, true>" in source
 
 
-def test_codegen_embeds_typed_row_widths():
+def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
     program = compile_ir("close + _ev_ts")
-    plan = lower_program(program, n_instruments=9)
+    input_types = (
+        InputTypeSpec("float64", 9),
+        InputTypeSpec("int64", 1),
+    )
+    plan = lower_program(
+        program,
+        n_instruments=9,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
+    )
     source = render_translation_unit(
         plan,
         n_instruments=9,
         prefetch_rows=16,
-        input_types=(
-            InputTypeSpec("float64", 9),
-            InputTypeSpec("int64", 1),
-        ),
+        input_types=input_types,
     ).text
     assert "stackdsl::InputSrc<0, double, 9>" in source
     assert "stackdsl::InputSrc<1, std::int64_t, 1>" in source
+    # Mixed float64 + int64 has a float64 result, but the int64 input source is
+    # still read natively and promoted by AddOp rather than by RowContext.
+    assert "stackdsl::BinaryNode<9," in source
+    assert "stackdsl::OutputDst, double, stackdsl::AddOp" in source
     assert "cpp_stream_run_arrays" in source
