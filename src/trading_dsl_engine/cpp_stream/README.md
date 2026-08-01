@@ -1,64 +1,77 @@
-# `cpp_stream`
+# `trading_dsl_engine.cpp_stream`
 
-`cpp_stream` is a formula-specialized native backend for large row-major datasets. It consumes the shared `trading_dsl_engine` DSL through the backend-neutral `trading_dsl_engine.ir` frontend and does **not** depend on `jax_flat`.
+`cpp_stream` is a formula-specialized C++20 streaming backend. It consumes the
+backend-neutral `trading_dsl_engine.ir` graph, generates a typed translation unit
+with Jinja, compiles a cached shared library, mmaps inputs, and executes the full
+row loop in native code.
+
+It does not depend on `jax_flat`.
 
 ```text
-DSL Expr/string -> neutral IR -> cpp_stream physical lowering -> generated C++20
-    -> mmap input rows -> flat native stages -> mmap output rows
+shared DSL / parser
+        |
+        v
+backend-neutral ir.Program
+        |
+        v
+cpp_stream physical lowering
+  - native dtypes
+  - row-scalar propagation
+  - scratch liveness
+  - execution scope
+  - dense/hash key policy
+        |
+        v
+Jinja C++ translation unit
+        |
+        v
+mmap inputs -> native row loop -> mmap output
 ```
 
-The first integrated operator set is arithmetic (`add/sub/mul/div/mod/floor`), `cumsum`, `ewm`, `xs_rank`, and canonical `groupby(key_tuple, lhs, rhs_using_self_)`, including composite dynamic keys and one `univ(...)` static column partition. Group RHS graphs may compose the supported operators arbitrarily; nested `groupby` is intentionally rejected for now.
-
-## Raw file API
-
-```python
-from trading_dsl_engine.cpp_stream import compile_formula
-
-runtime = compile_formula(
-    "xs_rank(ewm(close / open, 21))",
-    n_instruments=9,
-)
-
-result = runtime.run_files(
-    {"close": "/data/close.bin", "open": "/data/open.bin"},
-    out_path="/data/alpha.bin",
-    async_writeback_mb=64,
-)
-```
-
-When `input_types` is omitted, raw inputs are row-major `float64` with `n_instruments` values per row. Typed headerless inputs can be declared with `InputTypeSpec`. The root output is currently a raw row-major `float64` vector file.
-
-## Typed mmap `.npy` API
-
-`compile_npy_formula` reads each NumPy header before native compilation. Dtype and row width become compile-time C++ template arguments; execution maps the payload and passes its pointer directly to C++ without copying.
+## Basic use
 
 ```python
 from trading_dsl_engine.cpp_stream import compile_npy_formula
 
 paths = {
-    "_ev_ts": "/data/_ev_ts.npy",  # int64, shape (rows,)
-    "close": "/data/close.npy",    # float64, shape (rows, 9)
+    "close": "/data/close.npy",
+    "open": "/data/open.npy",
 }
 
 runtime = compile_npy_formula(
-    "close + _ev_ts",
+    "xs_rank(ewm(close / open, 21))",
     paths,
     n_instruments=9,
 )
 
-result = runtime.run_npy_files(paths, out_path="/data/result.bin")
+result = runtime.run_npy_files(paths, out_path="/data/alpha.bin")
+print(result.rows_per_second)
 ```
 
-Supported input dtypes are `float32`, `float64`, `int32`, `int64`, `uint32`, and `uint64`. Arrays must be native/little-endian, C-contiguous, and one- or two-dimensional:
+`.npy` files are mapped without copying. Their headers determine dtype, row count,
+and whether each input is row-scalar or vector-valued before native compilation.
 
-- `(rows,)` and `(rows, 1)` are row-scalar and broadcast across lanes;
-- `(rows, n_instruments)` is a normal vector input.
+Supported input dtypes:
 
-`inspect_npy` exposes `dtype`, `shape`, `data_offset`, `rows`, `row_width`, and `row_scalar`. `mmap_npy` returns the metadata plus a live `np.memmap` payload view.
+```text
+float32, float64, int32, int64, uint32, uint64
+```
 
-## Native expression types
+Supported C-order shapes:
 
-Mapped values are not eagerly converted to `double`. Generated source descriptors carry their scalar type:
+```text
+(rows,)
+(rows, 1)
+(rows, n_instruments)
+```
+
+Object, structured, big-endian, Fortran-order, and higher-rank arrays are rejected.
+Headerless raw files remain available through `compile_formula(..., input_types=...)`
+and `run_files(...)`.
+
+## Native typing
+
+Mapped values are not eagerly converted to `float64`:
 
 ```cpp
 InputSrc<Index, ValueType, RowWidth>
@@ -66,162 +79,212 @@ SlotSrc<Index, ValueType, RowScalar>
 SlotDst<Index, ValueType>
 ```
 
-`RowContext::read_native<Source>()` returns that exact type. Stateless arithmetic is templated on its result type, and typed scratch preserves intermediate values. Same-typed integer arithmetic therefore remains integer from mmap load through key resolution.
+Typed arithmetic retains native integer or floating-point types when the operation
+permits it. Conversion occurs only at an operator whose result requires another
+type, or at an explicitly float64 statistical/output boundary. This preserves exact
+integer key identity, including values above `2**53`.
 
-Mixed-type operations promote only because the operation result requires promotion. For example, `float64 + int64` has a `float64` result, but the `int64` input is still loaded natively and promoted inside `AddOp`, not in `RowContext`.
+## Key descriptors
 
-Stateful/statistical operations such as cumsum, EWM, and rank currently define float64 semantics. Groupby lhs/captures and the root output file also remain float64. These are explicit operator/output boundaries rather than implicit conversions on every input read.
-
-## Per-key descriptors
-
-Each dynamic group key can carry its own semantic and physical metadata:
+Grouping hints are attached to each dynamic key:
 
 ```python
 from trading_dsl_engine import Key
 
-groupby(
-    (
-        univ([0], [1, 2], list(range(3, 9))),
-        Key(
-            expr=var("minute"),
-            num_keys=60,
-            offset=0,
-            row_scalar=True,
-            dtype="int64",
-        ),
-    ),
-    var("close"),
-    ewm(cumsum(self_), 3),
+Key(
+    expr=var("minute"),
+    num_keys=60,
+    offset=0,
+    row_scalar=True,
+    dtype="int64",
 )
 ```
 
-The parameters mean:
-
-- `expr`: the dynamic key expression;
-- `num_keys=K`: exactly `K` consecutive non-NaN integer categories;
-- `offset`: the first valid category, so valid values are `[offset, offset + K)` and dense digit is `value - offset`;
-- `row_scalar=True`: one key value applies to every lane in the row;
-- `row_scalar=None`: infer lane invariance from shapes and dependencies;
-- `dtype`: the expected native type of the completed key expression.
-
-Examples of `offset`:
+`num_keys` is the number of consecutive bounded categories. `offset` is the first
+valid category; dense routing uses `value - offset` as the zero-based digit.
 
 ```python
-Key(var("minute"), num_keys=60, offset=0)  # 0..59
-Key(var("month"),  num_keys=12, offset=1)  # 1..12
-Key(var("venue"),  num_keys=3,  offset=10) # 10, 11, 12
+Key(var("month"), num_keys=12, offset=1)  # values 1..12
+Key(var("venue"), num_keys=3, offset=10)  # values 10,11,12
 ```
 
-`dtype` is validated; it does not authorize a cast. A direct mapped input must exactly match it. An explicitly integral derived key graph requires matching integral input leaves, while constants are compiled at that type only after exact integrality and range checks.
+`row_scalar=True` asserts that one value applies to every instrument in a row, so
+the expression and resolver execute once per row. `dtype` is validation metadata,
+not permission to cast an input.
 
-NaN remains an additional valid category for floating-point keys. An out-of-range, nonintegral, or infinite dense value fails native execution rather than silently aliasing another state slot.
+When every key in a tuple has `num_keys`, cpp_stream uses mixed-radix dense routing.
+Otherwise it hashes the exact complete tuple.
 
-A tuple can contain independently described keys:
+## Operator-agnostic groupby
 
-```python
-groupby(
-    (
-        univ([0, 1], [2, 3, 4]),
-        Key(var("venue"), num_keys=3, offset=10, dtype="int32"),
-        Key(var("bucket"), num_keys=4, row_scalar=True, dtype="uint32"),
-    ),
-    var("close"),
-    cumsum(self_),
-)
-```
-
-If every dynamic key has `num_keys`, lowering uses one mixed-radix dense slot with capacity:
-
-```text
-product(num_keys_i + 1)
-```
-
-Each `+1` reserves that floating key's NaN digit. Otherwise, the complete tuple is stored exactly in the fixed-capacity hash resolver. Native `int64`/`uint64` keys are never routed through `double`, so values above `2^53` remain distinct.
-
-When every key in a tuple is row-scalar, group resolution evaluates the tuple once and broadcasts one slot. For `.npy` inputs, shape-derived row-scalar information propagates through pure arithmetic and those producer stages instantiate at width one.
-
-The older global `key_cardinalities` argument remains for compatibility with direct input keys, but `Key(...)` is the preferred interface because metadata remains attached to the exact key expression and supports composite tuples.
-
-See [`KEYS_AND_NPY.md`](KEYS_AND_NPY.md) for the complete typing, validation, and routing contract.
-
-## Calendar fields
-
-Calendar aliases are derived from the canonical `_ev_ts` microseconds-since-epoch field:
-
-```python
-var("minute")
-```
-
-expands to the existing DSL `minute(_ev_ts)` expression. The current definition is minute within the hour (`0..59`). With an `int64 (rows,)` `_ev_ts.npy` and:
-
-```python
-Key(var("minute"), num_keys=60, row_scalar=True, dtype="int64")
-```
-
-the generic expanded graph remains native `int64`:
-
-```text
-int64 _ev_ts
-  -> int64 modulo
-  -> int64 floor-division
-  -> int64 floor identity
-  -> int64 modulo
-  -> dense group slot
-```
-
-No calendar-specific C++ node or grouped-operator fast path is required.
-
-## Code generation
-
-Python lowering produces typed C++ template arguments and immutable template views. `python/templates/runner.cpp.j2` owns translation-unit structure, grouped inner-plan declarations, mmap setup, stage setup, the native row loop, and asynchronous writeback submission.
-
-`Jinja2>=3.1` is a project dependency, and the `.j2` template is included in package data so code generation works from installed wheels as well as editable checkouts.
-
-## Operator-agnostic group execution
-
-There are no `GroupedCumsumNode`, `GroupedEwmNode`, `GroupedXsRankNode`, or other grouped operator classes. `groupby.hpp` owns only key resolution and invocation of an ordinary inner plan.
-
-Every generated operator receives one final execution-scope template argument:
+Grouping changes the execution environment, not the operator class:
 
 ```cpp
-stackdsl::DirectExecution<N>
-stackdsl::GroupedExecution<N, Capacity>
+DirectExecution<N>
+GroupedExecution<N, Capacity, PartitionCount>
 ```
 
-Codegen emits the same node type inside and outside groupby. Stateful nodes obtain storage size and addresses through `Execution::state_size` and `Execution::state_index(ctx, lane)`. Cross-sectional nodes obtain group identity through `Execution::rank_group(ctx, lane)`. Stateless nodes accept the same scope and ignore it. Once an operator has its normal C++ implementation and one codegen mapping, it works inside groupby without a second class or grouped codegen branch.
+Every node receives one of these as its final template parameter. There are no
+`GroupedEwmNode`, `GroupedCumsumNode`, `GroupedRidgeNode`, or `FastGrouped*` types.
 
-## Allocation and state layout
+The execution scope supplies generic state and cross-sectional addressing:
 
-The generated hot path uses compile-time `std::array` state/scratch and no dynamic allocation. Formula compilation and mapping setup may allocate normally; no allocation occurs per row. Grouped state uses `[group_slot][lane]`. The static `univ` partition is not multiplied into lane-local state because a lane's static partition cannot change; cross-sectional rank includes the static partition in its group identity.
-
-`default_group_capacity=64` bounds unknown dynamic-key state unless the formula's `groupby(..., capacity=...)` overrides it.
-
-Reusable output files are not truncated when their existing size is already correct. Every row is overwritten, so retaining the extent avoids repeated page-allocation noise without changing output semantics. `async_writeback_mb` requests nonblocking kernel writeback and does not call `fsync` or synchronous `msync` before returning.
-
-## Performance regression checks
-
-The default benchmark uses typed `.npy` inputs and the hinted timestamp-minute key:
-
-```bash
-python scripts/benchmark_cpp_stream.py
+```cpp
+Execution::state_index(ctx, lane)
+Execution::rank_group(ctx, lane)
+Execution::cross_group(ctx, lane)
+Execution::state_size
+Execution::cross_state_size
 ```
 
-A same-run GitHub-hosted comparison after native integer lowering measured:
+`groupby.hpp` owns only key resolution, grouped-context construction, and invocation
+of the normal inner plan. It contains no indicator or regression implementation.
+
+## `cat`
+
+`cat(...)` has compile-time feature width and can be a matrix root:
+
+```python
+runtime = compile_npy_formula(
+    "cat(x1, x2, x3)",
+    paths,
+    n_instruments=9,
+)
+```
+
+Its output has logical shape:
 
 ```text
-vector float64 calendar + hash:       4.349 M rows/s median
-typed int64 row-scalar + dense:      22.244 M rows/s median
-speedup:                               5.11x
+(rows, n_instruments, 3)
 ```
 
-Hosted CPUs vary, so absolute throughput is not a universal threshold. Other cases are selected through `CPP_STREAM_BENCH_CASE`, and an environment-specific floor can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology and architecture comparisons are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
+When `cat` feeds Ridge, it is a zero-copy compile-time `FeatureList`. Nested cat
+expressions are flattened, and Ridge reads original mapped/scratch sources directly;
+an intermediate `N x K` matrix is not materialized.
 
-## Backend-neutral IR
+These formulas compile to identical native source:
 
-`trading_dsl_engine.ir` owns parser/DSL expansion, canonical groupby decomposition, per-key specifications, static universe resolution, capture extraction for grouped RHS graphs, and semantic operator parameters. It imports neither JAX nor C++ runtime code. Backend-specific scratch liveness, state layout, dense-vs-hash routing, C++ types, mmap behavior, and code generation stay under `cpp_stream`.
+```python
+Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1)
+Ridge(x1, x2, x3, y=y, hl=64, lambda_=0.1)
+```
 
-`jax_flat` remains unchanged. A later migration can make it consume the neutral IR without making `cpp_stream` depend on JAX.
+## Ridge
 
-## Current platform scope
+Project a Ridge object with `get_preds` or `get_beta`:
 
-The generated mmap runner currently targets POSIX/Linux and uses a C++20 compiler (`g++` by default). Windows support is not yet wired into the file-mapping/codegen layer.
+```python
+preds = "get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1))"
+beta = "get_beta(Ridge(cat(x1, x2, x3), y=y, hl=0, lambda_=0.1))"
+```
+
+The generated node is always one generic template:
+
+```cpp
+RidgeNode<
+    N,
+    FeatureList<...>,
+    Y,
+    Weights,
+    Out,
+    AlphaBits,
+    LambdaBits,
+    Nonnegative,
+    Stateful,
+    Projection,
+    Execution
+>
+```
+
+There is one direct/grouped implementation with compile-time `K` and fixed
+`std::array` storage. No allocation occurs during row execution.
+
+Implemented semantics:
+
+- weighted pairwise-missing `X'WX` and `X'Wy` moments;
+- per-moment missing-data timing for stateful Ridge;
+- prior-beta predictions for positive half-life;
+- current-row solution when `hl <= 0` or nonfinite;
+- regularization `XX + lambda * diag(diag(XX))`;
+- Cholesky solve, pivoted solve, and pseudoinverse fallback;
+- optional generic nonnegative coordinate-descent solve.
+
+For fully finite panels, the same node uses synchronized group-level moment timing
+and a fixed-size update without per-pair validity branches. Missing-data rows use the
+complete pairwise path. This is a semantic data-validity branch, not a shape-specific
+or groupby-specific implementation.
+
+Output shapes:
+
+```text
+get_preds(...)                 (rows, n_instruments)
+get_beta(...) direct           (rows, K)
+get_beta(...) inside groupby   (rows, n_instruments, K)
+```
+
+Current Ridge restrictions:
+
+- `hl` and `lambda_` must be compile-time numeric literals;
+- weights may be scalar or instrument-vector, not an `N x N` matrix;
+- a raw Ridge object cannot be written; select beta or predictions;
+- non-root beta/matrix values are not yet materialized for arbitrary downstream
+  matrix operations.
+
+## Performance baseline
+
+GitHub-hosted Ubuntu runner, 5,000,000 rows x 9 instruments, float64 mmap inputs,
+`-O3 -march=native -mtune=native -flto`, one warmup, ten measured runs:
+
+| Case | Median throughput |
+| --- | ---: |
+| `cat(x1,x2,x3)` root, 27 doubles written per row | 11.307 M rows/s |
+| Stateful K=3 Ridge predictions using `cat` | 6.377 M rows/s |
+| Stateful K=3 Ridge predictions using separate args | 6.367 M rows/s |
+| Stateless K=3 beta | 9.169 M rows/s |
+| One-group grouped stateful Ridge | 6.176 M rows/s |
+| Three-group grouped stateful Ridge | 2.787 M rows/s |
+
+`cat` and separate arguments produced the same generated source and checksum. The
+one-group grouped form is about 3% below direct execution. The three-group case
+performs three independent K=3 solves per row, so its lower throughput is real
+additional statistical work rather than an operator-specific groupby layer.
+
+Reproduce the full matrix with:
+
+```bash
+CPP_STREAM_RIDGE_CASE=all \
+python scripts/benchmark_cpp_stream_ridge.py
+```
+
+The script defaults to 5M x 9, one warmup, and ten measured executions. Compilation,
+input generation, and warmup are excluded from reported native runtime.
+
+## Current native operators
+
+```text
+add, sub, mul, div, mod, floor
+cumsum
+ewm
+xs_rank
+cat
+Ridge + get_beta/get_preds
+groupby with univ and dynamic tuple keys
+```
+
+## Compilation cache
+
+The cache key includes generated source, packaged headers, compiler identity,
+compile/link flags, platform/machine, and Python ABI. The default cache is:
+
+```text
+~/.cache/trading_dsl_engine/cpp_stream
+```
+
+Override it with `TRADING_DSL_ENGINE_CPP_STREAM_CACHE`.
+
+## Validation
+
+Focused tests compile and execute generated native code for typed `.npy` inputs,
+integer key identity, mixed-radix routing, cat layout, stateless/stateful Ridge,
+pairwise missing data, finite-to-NaN transitions, nonnegative Ridge, and grouped
+Ridge. The focused workflow does not represent the full repository/JAX suite.
