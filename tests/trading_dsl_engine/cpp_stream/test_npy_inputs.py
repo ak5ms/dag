@@ -119,3 +119,36 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
             expected[row, lane] = ewm_state[minute, lane]
 
     np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-12)
+
+
+def test_int64_hash_keys_remain_distinct_above_2_to_53(tmp_path: Path):
+    key_values = np.array([2**53, 2**53 + 1, 2**53], dtype=np.int64)
+    close = np.array([1.0, 10.0, 2.0], dtype=np.float64)
+    key_path = tmp_path / "key_value.npy"
+    close_path = tmp_path / "close.npy"
+    np.save(key_path, key_values)
+    np.save(close_path, close)
+
+    formula = groupby(
+        Key(var("key_value"), row_scalar=True, dtype="int64"),
+        var("close"),
+        cumsum(self_),
+    )
+    runtime = compile_npy_formula(
+        formula,
+        {"key_value": key_path, "close": close_path},
+        n_instruments=1,
+    )
+    generated = runtime.generated_cpp.read_text()
+    assert "HashGroupResolver" in generated
+    assert "InputSrc<0, std::int64_t, 1>" in generated
+
+    out_path = tmp_path / "exact_hash.bin"
+    runtime.run_npy_files(
+        {"key_value": key_path, "close": close_path},
+        out_path=out_path,
+    )
+    actual = np.asarray(
+        np.memmap(out_path, mode="r", dtype=np.float64, shape=(3, 1))
+    )[:, 0]
+    np.testing.assert_array_equal(actual, np.array([1.0, 10.0, 3.0]))
