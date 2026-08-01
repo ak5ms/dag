@@ -50,7 +50,12 @@ struct InputSrc {
     static constexpr std::size_t row_width = RowWidth;
 };
 
-template <std::size_t Index> struct SlotSrc { static constexpr std::size_t slot_index=Index; };
+template <std::size_t Index, bool RowScalar = false>
+struct SlotSrc {
+    static constexpr std::size_t slot_index = Index;
+    static constexpr bool row_scalar = RowScalar;
+};
+
 template <double Value> struct LiteralSrc { static constexpr double value=Value; };
 struct OutputDst {};
 template <std::size_t Index> struct SlotDst { static constexpr std::size_t slot_index=Index; };
@@ -70,7 +75,7 @@ struct alignas(64) RowContext {
             const std::size_t offset = Src::row_width == 1 ? 0 : lane;
             return static_cast<double>(values[offset]);
         } else if constexpr (requires { Src::slot_index; }) {
-            return scratch[Src::slot_index][lane];
+            return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
         } else {
             return Src::value;
         }
@@ -84,6 +89,7 @@ struct alignas(64) RowContext {
             static_assert(Src::row_width == 0 || Src::row_width == N);
             return static_cast<const double*>(inputs[Src::input_index]);
         } else {
+            static_assert(!Src::row_scalar, "row-scalar scratch cannot be passed as a full vector pointer");
             return scratch[Src::slot_index].data();
         }
     }
