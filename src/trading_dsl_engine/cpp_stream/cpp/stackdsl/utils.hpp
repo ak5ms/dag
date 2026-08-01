@@ -21,7 +21,14 @@ namespace stackdsl {
 
 inline constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
-STACKDSL_HOT bool finite(double value) noexcept { return std::isfinite(value); }
+template <class T>
+inline constexpr bool always_false_v = false;
+
+template <class T>
+STACKDSL_HOT bool finite(T value) noexcept {
+    if constexpr (std::is_floating_point_v<T>) return std::isfinite(value);
+    else return true;
+}
 
 STACKDSL_HOT double norm_inv(double p) noexcept {
     if (std::isnan(p)) return kNaN;
@@ -43,6 +50,10 @@ STACKDSL_HOT double norm_inv(double p) noexcept {
     return x-u/(1.0+0.5*x*u);
 }
 
+// Source and destination descriptors carry their native scalar type all the way
+// into generated operators. InputSrc never converts a mapped value merely to read
+// it; an operator converts only when that operator's declared result type requires
+// promotion (for example int64 + float64 -> float64).
 template <std::size_t Index, class ValueType = double, std::size_t RowWidth = 0>
 struct InputSrc {
     static constexpr std::size_t input_index = Index;
@@ -50,37 +61,85 @@ struct InputSrc {
     static constexpr std::size_t row_width = RowWidth;
 };
 
-template <std::size_t Index, bool RowScalar = false>
+template <std::size_t Index, class ValueType = double, bool RowScalar = false>
 struct SlotSrc {
     static constexpr std::size_t slot_index = Index;
+    using value_type = ValueType;
     static constexpr bool row_scalar = RowScalar;
 };
 
-template <double Value> struct LiteralSrc { static constexpr double value=Value; };
-struct OutputDst {};
-template <std::size_t Index> struct SlotDst { static constexpr std::size_t slot_index=Index; };
+template <auto Value>
+struct LiteralSrc {
+    using value_type = std::remove_cv_t<decltype(Value)>;
+    static constexpr value_type value = Value;
+};
+
+struct OutputDst { using value_type = double; };
+
+template <std::size_t Index, class ValueType = double>
+struct SlotDst {
+    static constexpr std::size_t slot_index = Index;
+    using value_type = ValueType;
+};
+
 template <class T> inline constexpr bool is_literal_source_v = requires { T::value; };
+template <class Src> using source_value_t = typename Src::value_type;
+template <class Dst> using destination_value_t = typename Dst::value_type;
 
 template <std::size_t N, std::size_t Inputs, std::size_t ScratchSlots>
 struct alignas(64) RowContext {
     std::array<const void*, Inputs> inputs{};
-    alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch{};
+
+    // Scratch is separated by scalar type. A logical slot index may be reused at
+    // another type after liveness ends; no value is converted when written to or
+    // read from a typed slot. The extra zero-sized arrays are optimized away when
+    // ScratchSlots == 0 and remain small for the intended short formula plans.
+    alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch_f64{};
+    alignas(64) std::array<std::array<float, N>, ScratchSlots> scratch_f32{};
+    alignas(64) std::array<std::array<std::int64_t, N>, ScratchSlots> scratch_i64{};
+    alignas(64) std::array<std::array<std::uint64_t, N>, ScratchSlots> scratch_u64{};
+    alignas(64) std::array<std::array<std::int32_t, N>, ScratchSlots> scratch_i32{};
+    alignas(64) std::array<std::array<std::uint32_t, N>, ScratchSlots> scratch_u32{};
     double* output=nullptr;
 
+    template <class T>
+    STACKDSL_HOT auto& scratch_storage() noexcept {
+        if constexpr (std::is_same_v<T, double>) return scratch_f64;
+        else if constexpr (std::is_same_v<T, float>) return scratch_f32;
+        else if constexpr (std::is_same_v<T, std::int64_t>) return scratch_i64;
+        else if constexpr (std::is_same_v<T, std::uint64_t>) return scratch_u64;
+        else if constexpr (std::is_same_v<T, std::int32_t>) return scratch_i32;
+        else if constexpr (std::is_same_v<T, std::uint32_t>) return scratch_u32;
+        else static_assert(always_false_v<T>, "unsupported cpp_stream scratch type");
+    }
+
+    template <class T>
+    STACKDSL_HOT const auto& scratch_storage() const noexcept {
+        if constexpr (std::is_same_v<T, double>) return scratch_f64;
+        else if constexpr (std::is_same_v<T, float>) return scratch_f32;
+        else if constexpr (std::is_same_v<T, std::int64_t>) return scratch_i64;
+        else if constexpr (std::is_same_v<T, std::uint64_t>) return scratch_u64;
+        else if constexpr (std::is_same_v<T, std::int32_t>) return scratch_i32;
+        else if constexpr (std::is_same_v<T, std::uint32_t>) return scratch_u32;
+        else static_assert(always_false_v<T>, "unsupported cpp_stream scratch type");
+    }
+
     template <class Src>
-    STACKDSL_HOT auto read_native(std::size_t lane) const noexcept {
+    STACKDSL_HOT source_value_t<Src> read_native(std::size_t lane) const noexcept {
         if constexpr (requires { Src::input_index; }) {
-            using ValueType = typename Src::value_type;
-            const auto* values = static_cast<const ValueType*>(inputs[Src::input_index]);
+            const auto* values = static_cast<const source_value_t<Src>*>(inputs[Src::input_index]);
             const std::size_t offset = Src::row_width == 1 ? 0 : lane;
             return values[offset];
         } else if constexpr (requires { Src::slot_index; }) {
-            return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
+            const auto& storage = scratch_storage<source_value_t<Src>>();
+            return storage[Src::slot_index][Src::row_scalar ? 0 : lane];
         } else {
             return Src::value;
         }
     }
 
+    // Stateful/statistical nodes currently define double-valued semantics and use
+    // read(). Stateless typed arithmetic and key resolution use read_native().
     template <class Src>
     STACKDSL_HOT double read(std::size_t lane) const noexcept {
         return static_cast<double>(read_native<Src>(lane));
@@ -89,20 +148,21 @@ struct alignas(64) RowContext {
     template <class Src>
     STACKDSL_HOT const double* read_ptr() const noexcept {
         static_assert(!is_literal_source_v<Src>);
+        static_assert(std::is_same_v<source_value_t<Src>, double>,
+                      "full-vector pointer consumers currently require float64 sources");
         if constexpr (requires { Src::input_index; }) {
-            static_assert(std::is_same_v<typename Src::value_type, double>);
             static_assert(Src::row_width == 0 || Src::row_width == N);
             return static_cast<const double*>(inputs[Src::input_index]);
         } else {
             static_assert(!Src::row_scalar, "row-scalar scratch cannot be passed as a full vector pointer");
-            return scratch[Src::slot_index].data();
+            return scratch_f64[Src::slot_index].data();
         }
     }
 
     template <class Dst>
-    STACKDSL_HOT double* write_ptr() noexcept {
+    STACKDSL_HOT auto* write_ptr() noexcept {
         if constexpr (std::is_same_v<Dst, OutputDst>) return output;
-        else return scratch[Dst::slot_index].data();
+        else return scratch_storage<destination_value_t<Dst>>()[Dst::slot_index].data();
     }
 };
 
