@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from trading_dsl_engine.base.dsl import cat, einsum, var
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 
 
 N = 5
@@ -34,9 +34,9 @@ def _run(
         path = tmp_path / f"{name}_{index}.npy"
         np.save(path, data[input_name])
         paths[input_name] = path
-    runtime = compile_npy_formula(formula, paths, n_instruments=N)
+    runtime = compile_formula(formula, paths, n_instruments=N)
     output_path = tmp_path / f"{name}.bin"
-    runtime.run_npy_files(paths, out_path=output_path)
+    runtime.run(out_path=output_path)
     output_shape = (ROWS,) + tuple(runtime.plan.output_shape)
     output = np.asarray(
         np.memmap(output_path, mode="r", dtype=np.float64, shape=output_shape)
