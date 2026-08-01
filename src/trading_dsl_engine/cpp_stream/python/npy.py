@@ -19,6 +19,32 @@ _SUPPORTED_DTYPES: dict[str, str] = {
 
 
 @dataclass(frozen=True, slots=True)
+class InputTypeSpec:
+    dtype: str
+    row_width: int
+
+    def __post_init__(self) -> None:
+        dtype = str(self.dtype).lower()
+        if dtype not in _SUPPORTED_DTYPES:
+            raise TypeError(
+                f"unsupported cpp_stream input dtype {dtype!r}; expected one of "
+                f"{sorted(_SUPPORTED_DTYPES)}"
+            )
+        if int(self.row_width) <= 0:
+            raise ValueError("input row_width must be > 0")
+        object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "row_width", int(self.row_width))
+
+    @property
+    def cpp_type(self) -> str:
+        return _SUPPORTED_DTYPES[self.dtype]
+
+    @property
+    def row_scalar(self) -> bool:
+        return self.row_width == 1
+
+
+@dataclass(frozen=True, slots=True)
 class NpyArrayInfo:
     path: Path
     dtype: str
@@ -35,6 +61,10 @@ class NpyArrayInfo:
     @property
     def cpp_type(self) -> str:
         return _SUPPORTED_DTYPES[self.dtype]
+
+    @property
+    def input_type(self) -> InputTypeSpec:
+        return InputTypeSpec(dtype=self.dtype, row_width=self.row_width)
 
 
 @dataclass(slots=True)
@@ -113,4 +143,11 @@ def inspect_npy_mapping(data: Mapping[str, str | Path]) -> dict[str, NpyArrayInf
     return {name: inspect_npy(path) for name, path in data.items()}
 
 
-__all__ = ["NpyArrayInfo", "NpyMMap", "inspect_npy", "inspect_npy_mapping", "mmap_npy"]
+__all__ = [
+    "InputTypeSpec",
+    "NpyArrayInfo",
+    "NpyMMap",
+    "inspect_npy",
+    "inspect_npy_mapping",
+    "mmap_npy",
+]
