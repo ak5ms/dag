@@ -5,6 +5,7 @@ import math
 import struct
 from typing import Mapping
 
+from trading_dsl_engine.ir.einsum import ContractionStep, build_contraction_plan
 from trading_dsl_engine.ir.ops import (
     CatOp,
     CumsumOp,
@@ -27,7 +28,7 @@ from trading_dsl_engine.ir.ops import (
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
-from trading_dsl_engine.ir.types import ValueType
+from trading_dsl_engine.ir.types import ValueType, resolve_shape, shape_size
 
 
 class CppStreamLoweringError(ValueError):
@@ -52,19 +53,29 @@ class Source:
     row_scalar: bool = False
     dtype: str = "float64"
     width: int = 1
+    shape: tuple[int, ...] = ()
     parts: tuple["Source", ...] = ()
     op: object | None = None
 
     @property
     def is_scalar_width(self) -> bool:
-        return self.width == 1 and self.kind not in {"cat", "rbf", "future_rbf", "matrix_slot"}
+        return self.width == 1 and self.kind not in {
+            "cat",
+            "rbf",
+            "future_rbf",
+            "matrix_slot",
+            "tensor_slot",
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class Dest:
     slot: int | None
     matrix: bool = False
+    tensor: bool = False
     width: int = 1
+    size: int = 1
+    shape: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +93,7 @@ class Stage:
     half_life: float | None = None
     ridge_lambda: float | None = None
     group: "GroupStage | None" = None
+    einsum_step: ContractionStep | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +106,7 @@ class Plan:
     output_kind: str
     output_width: int
     output_row_width: int
+    output_shape: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +140,9 @@ def _coerce_literal_for_dtype(value: int | float, dtype: str) -> int | float:
     if dtype in _INTEGRAL_DTYPES:
         numeric = float(value)
         if not math.isfinite(numeric) or not numeric.is_integer():
-            raise CppStreamLoweringError(f"non-integral literal {value!r} in {dtype} expression")
+            raise CppStreamLoweringError(
+                f"non-integral literal {value!r} in {dtype} expression"
+            )
         integer = int(numeric)
         lower, upper = _DTYPE_LIMITS[dtype]
         if not lower <= integer <= upper:
@@ -155,7 +170,8 @@ def _forced_key_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> dict[
         if previous is not None:
             if previous != dtype:
                 raise CppStreamLoweringError(
-                    f"node {node_id} shared by incompatible key dtypes {previous!r}/{dtype!r}"
+                    f"node {node_id} shared by incompatible key dtypes "
+                    f"{previous!r}/{dtype!r}"
                 )
             return
         forced[node_id] = dtype
@@ -164,7 +180,8 @@ def _forced_key_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> dict[
             actual = input_dtypes[op.input_index]
             if actual != dtype:
                 raise CppStreamLoweringError(
-                    f"Key dtype {dtype!r} does not match input {op.name!r} dtype {actual!r}"
+                    f"Key dtype {dtype!r} does not match input {op.name!r} "
+                    f"dtype {actual!r}"
                 )
         elif isinstance(op, LiteralOp):
             _coerce_literal_for_dtype(op.value, dtype)
@@ -173,7 +190,8 @@ def _forced_key_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> dict[
                 force(child, dtype)
         else:
             raise CppStreamLoweringError(
-                f"Key dtype assertions require input/literal/arithmetic graphs, got {type(op).__name__}"
+                "Key dtype assertions require input/literal/arithmetic graphs, "
+                f"got {type(op).__name__}"
             )
 
     for node in program.nodes:
@@ -216,7 +234,9 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         elif isinstance(op, NaryOp):
             dtype = forced.get(
                 node_id,
-                _normal_nary_dtype(op, tuple(result[child] for child in node.child_ids)),
+                _normal_nary_dtype(
+                    op, tuple(result[child] for child in node.child_ids)
+                ),
             )
         elif isinstance(op, float_ops):
             dtype = "float64"
@@ -227,18 +247,17 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
 
 
 def _output_row_width(value_type: ValueType, n: int) -> int:
-    if value_type.kind == "scalar":
-        return 1
-    if value_type.kind == "vector":
-        return n
-    if value_type.kind == "matrix":
-        return n * int(value_type.width)
-    if value_type.kind == "fixed":
-        return int(value_type.width)
-    raise CppStreamLoweringError(f"cannot materialize output kind {value_type.kind!r}")
+    try:
+        return shape_size(resolve_shape(value_type, n))
+    except ValueError as exc:
+        raise CppStreamLoweringError(
+            f"cannot materialize output kind {value_type.kind!r}"
+        ) from exc
 
 
-def _partitions(groups: tuple[tuple[int, ...], ...] | None, n: int) -> tuple[int, ...]:
+def _partitions(
+    groups: tuple[tuple[int, ...], ...] | None, n: int
+) -> tuple[int, ...]:
     if groups is None:
         return (0,) * n
     result = [-1] * n
@@ -279,7 +298,9 @@ def _dense_capacity(specs: tuple[GroupKeySpec, ...]) -> int:
         assert spec.num_keys is not None
         capacity *= int(spec.num_keys) + 1
     if capacity > 65535:
-        raise CppStreamLoweringError(f"dense key capacity {capacity} exceeds uint16")
+        raise CppStreamLoweringError(
+            f"dense key capacity {capacity} exceeds uint16"
+        )
     return capacity
 
 
@@ -316,36 +337,118 @@ def _build_plan(
     next_matrix_slot = 0
     max_matrix_width = 1
 
-    def scalar_dest(is_root: bool) -> Dest:
+    def scalar_dest(is_root: bool, shape: tuple[int, ...] = ()) -> Dest:
         nonlocal next_slot
         if is_root:
-            return Dest(None)
+            return Dest(None, size=shape_size(shape), shape=shape)
         slot = next_slot
         next_slot += 1
-        return Dest(slot)
+        return Dest(slot, size=shape_size(shape), shape=shape)
 
     def matrix_dest(is_root: bool, width: int) -> Dest:
         nonlocal next_matrix_slot, max_matrix_width
         max_matrix_width = max(max_matrix_width, width)
+        shape = (n_instruments, width)
         if is_root:
-            return Dest(None, matrix=True, width=width)
+            return Dest(
+                None,
+                matrix=True,
+                width=width,
+                size=n_instruments * width,
+                shape=shape,
+            )
         slot = next_matrix_slot
         next_matrix_slot += 1
-        return Dest(slot, matrix=True, width=width)
+        return Dest(
+            slot,
+            matrix=True,
+            width=width,
+            size=n_instruments * width,
+            shape=shape,
+        )
+
+    def tensor_dest(is_root: bool, shape: tuple[int, ...]) -> Dest:
+        nonlocal next_matrix_slot, max_matrix_width
+        size = shape_size(shape)
+        width = max(1, (size + n_instruments - 1) // n_instruments)
+        max_matrix_width = max(max_matrix_width, width)
+        if is_root:
+            return Dest(None, tensor=True, width=width, size=size, shape=shape)
+        slot = next_matrix_slot
+        next_matrix_slot += 1
+        return Dest(
+            slot,
+            tensor=True,
+            width=width,
+            size=size,
+            shape=shape,
+        )
+
+    def value_dest(is_root: bool, shape: tuple[int, ...]) -> Dest:
+        if shape == () or shape == (n_instruments,):
+            return scalar_dest(is_root, shape)
+        if len(shape) == 2 and shape[0] == n_instruments:
+            return matrix_dest(is_root, shape[1])
+        return tensor_dest(is_root, shape)
+
+    def source_from_dest(
+        dest: Dest,
+        shape: tuple[int, ...],
+        *,
+        dtype: str = "float64",
+    ) -> Source:
+        if dest.slot is None:
+            return Source("output", -1, dtype=dtype, width=max(1, dest.width), shape=shape)
+        if dest.tensor:
+            return Source(
+                "tensor_slot",
+                dest.slot,
+                dtype=dtype,
+                width=dest.size,
+                shape=shape,
+            )
+        if dest.matrix:
+            return Source(
+                "matrix_slot",
+                dest.slot,
+                dtype=dtype,
+                width=dest.width,
+                shape=shape,
+            )
+        return Source(
+            "slot",
+            dest.slot,
+            row_scalar=shape == (),
+            dtype=dtype,
+            width=1,
+            shape=shape,
+        )
 
     for node_id, node in enumerate(program.nodes):
         op = node.op
         dtype = node_dtypes[node_id]
         row_scalar = node_id in row_scalar_nodes
         lane_count = 1 if row_scalar else n_instruments
+        node_shape = resolve_shape(node.value_type, n_instruments)
+
         if isinstance(op, InputOp):
             sources[node_id] = Source(
-                "input", op.input_index, row_scalar, input_dtypes[op.input_index]
+                "input",
+                op.input_index,
+                row_scalar,
+                input_dtypes[op.input_index],
+                1,
+                node_shape,
             )
             continue
         if isinstance(op, LiteralOp):
             sources[node_id] = Source(
-                "literal", _coerce_literal_for_dtype(op.value, dtype), True, dtype
+                "literal",
+                _coerce_literal_for_dtype(op.value, dtype),
+                True,
+                dtype,
+                1,
+                (),
             )
             continue
 
@@ -353,45 +456,97 @@ def _build_plan(
         is_root = node_id == root
 
         if isinstance(op, RbfBasisOp):
-            sources[node_id] = Source("rbf", width=op.n_basis, parts=children, op=op)
+            source = Source(
+                "rbf",
+                width=op.n_basis,
+                shape=node_shape,
+                parts=children,
+                op=op,
+            )
+            sources[node_id] = source
             if is_root:
                 stages.append(
-                    Stage("cat", (sources[node_id],), matrix_dest(True, op.n_basis), n_instruments,
-                          output_kind="matrix", output_width=op.n_basis)
+                    Stage(
+                        "cat",
+                        (source,),
+                        matrix_dest(True, op.n_basis),
+                        n_instruments,
+                        output_kind="matrix",
+                        output_width=op.n_basis,
+                    )
                 )
             continue
+
         if isinstance(op, FutureRbfBasisSumOp):
-            sources[node_id] = Source("future_rbf", width=op.n_basis, parts=children, op=op)
+            source = Source(
+                "future_rbf",
+                width=op.n_basis,
+                shape=node_shape,
+                parts=children,
+                op=op,
+            )
+            sources[node_id] = source
             if is_root:
                 stages.append(
-                    Stage("cat", (sources[node_id],), matrix_dest(True, op.n_basis), n_instruments,
-                          output_kind="matrix", output_width=op.n_basis)
+                    Stage(
+                        "cat",
+                        (source,),
+                        matrix_dest(True, op.n_basis),
+                        n_instruments,
+                        output_kind="matrix",
+                        output_width=op.n_basis,
+                    )
                 )
             continue
+
         if isinstance(op, CatOp):
             parts: list[Source] = []
             for child in children:
                 parts.extend(_flatten_features(child))
             width = sum(part.width for part in parts)
-            source = Source("cat", width=width, parts=tuple(parts), op=op)
+            source = Source(
+                "cat",
+                width=width,
+                shape=node_shape,
+                parts=tuple(parts),
+                op=op,
+            )
             sources[node_id] = source
             if is_root:
                 stages.append(
-                    Stage("cat", tuple(parts), matrix_dest(True, width), n_instruments,
-                          output_kind="matrix", output_width=width)
+                    Stage(
+                        "cat",
+                        tuple(parts),
+                        matrix_dest(True, width),
+                        n_instruments,
+                        output_kind="matrix",
+                        output_width=width,
+                    )
                 )
             continue
+
         if isinstance(op, InstrumentBasisMeanOp):
             sources[node_id] = Source(
-                "instrument_basis", width=op.feature_width, parts=children, op=op
+                "instrument_basis",
+                width=op.feature_width,
+                shape=(),
+                parts=children,
+                op=op,
             )
             if is_root:
                 raise CppStreamLoweringError(
                     "InstrumentBasisMean object must be projected with get_beta/get_preds"
                 )
             continue
+
         if isinstance(op, RidgeOp):
-            sources[node_id] = Source("ridge", width=op.coefficient_width, parts=children, op=op)
+            sources[node_id] = Source(
+                "ridge",
+                width=op.coefficient_width,
+                shape=(),
+                parts=children,
+                op=op,
+            )
             if is_root:
                 raise CppStreamLoweringError("Ridge object must be projected")
             continue
@@ -401,7 +556,9 @@ def _build_plan(
             if object_source.kind != "instrument_basis" or not isinstance(
                 object_source.op, InstrumentBasisMeanOp
             ):
-                raise CppStreamLoweringError("InstrumentBasis projection lost object source")
+                raise CppStreamLoweringError(
+                    "InstrumentBasis projection lost object source"
+                )
             basis_op = object_source.op
             object_children = object_source.parts
             feature_sources = _flatten_features(object_children[0])
@@ -410,14 +567,12 @@ def _build_plan(
                 weight_source = object_children[2]
                 hl_source = object_children[3]
             else:
-                weight_source = Source("literal", 1.0, True, "float64")
+                weight_source = Source(
+                    "literal", 1.0, True, "float64", 1, ()
+                )
                 hl_source = object_children[2]
             half_life = _literal_scalar(hl_source, "InstrumentBasisMean hl")
-            out = (
-                matrix_dest(is_root, basis_op.feature_width)
-                if op.field == "beta"
-                else scalar_dest(is_root)
-            )
+            out = value_dest(is_root, node_shape)
             stages.append(
                 Stage(
                     "instrument_basis",
@@ -431,18 +586,14 @@ def _build_plan(
                     half_life=half_life,
                 )
             )
-            sources[node_id] = (
-                Source("matrix_slot", out.slot, width=basis_op.feature_width)
-                if out.slot is not None and out.matrix
-                else Source("slot", out.slot, row_scalar=row_scalar)
-                if out.slot is not None
-                else Source("output", -1, width=int(node.value_type.width))
-            )
+            sources[node_id] = source_from_dest(out, node_shape)
             continue
 
         if isinstance(op, RidgeProjectionOp):
             object_source = children[0]
-            if object_source.kind != "ridge" or not isinstance(object_source.op, RidgeOp):
+            if object_source.kind != "ridge" or not isinstance(
+                object_source.op, RidgeOp
+            ):
                 raise CppStreamLoweringError("Ridge projection lost object source")
             ridge_op = object_source.op
             object_children = object_source.parts
@@ -456,16 +607,14 @@ def _build_plan(
                 weight_source = object_children[cursor]
                 cursor += 1
             else:
-                weight_source = Source("literal", 1.0, True, "float64")
+                weight_source = Source(
+                    "literal", 1.0, True, "float64", 1, ()
+                )
             half_life = _literal_scalar(object_children[cursor], "Ridge hl")
-            ridge_lambda = _literal_scalar(object_children[cursor + 1], "Ridge lambda")
-            out = (
-                matrix_dest(is_root, ridge_op.coefficient_width)
-                if op.field == "beta" and node.value_type.kind == "matrix"
-                else scalar_dest(is_root)
-                if op.field == "preds"
-                else Dest(None, matrix=True, width=ridge_op.coefficient_width)
+            ridge_lambda = _literal_scalar(
+                object_children[cursor + 1], "Ridge lambda"
             )
+            out = value_dest(is_root, node_shape)
             stages.append(
                 Stage(
                     "ridge",
@@ -480,28 +629,89 @@ def _build_plan(
                     ridge_lambda=ridge_lambda,
                 )
             )
-            if out.slot is not None:
-                sources[node_id] = (
-                    Source("matrix_slot", out.slot, width=out.width)
-                    if out.matrix
-                    else Source("slot", out.slot, row_scalar=row_scalar)
-                )
-            else:
-                sources[node_id] = Source("output", -1, width=int(node.value_type.width))
+            sources[node_id] = source_from_dest(out, node_shape)
             continue
 
-        out = scalar_dest(is_root)
+        if isinstance(op, EinsumOp):
+            contraction = build_contraction_plan(
+                op.spec, tuple(child.shape for child in children)
+            )
+            terms = list(children)
+            final_source: Source | None = None
+            for step_index, step in enumerate(contraction.steps):
+                selected = tuple(terms[position] for position in step.operand_positions)
+                final_step = step_index == len(contraction.steps) - 1
+                out = value_dest(is_root and final_step, step.output_shape)
+                stages.append(
+                    Stage(
+                        "einsum",
+                        selected,
+                        out,
+                        n_instruments,
+                        output_kind=(
+                            node.value_type.kind if final_step else "tensor"
+                        ),
+                        output_width=(
+                            int(node.value_type.width)
+                            if final_step
+                            else max(1, shape_size(step.output_shape))
+                        ),
+                        op=op,
+                        einsum_step=step,
+                    )
+                )
+                selected_positions = set(step.operand_positions)
+                terms = [
+                    term
+                    for position, term in enumerate(terms)
+                    if position not in selected_positions
+                ]
+                final_source = source_from_dest(out, step.output_shape)
+                terms.append(final_source)
+            assert final_source is not None
+            sources[node_id] = final_source
+            continue
+
+        out = scalar_dest(is_root, node_shape)
         if isinstance(op, NaryOp):
             if any(child.width != 1 for child in children):
-                raise CppStreamLoweringError("matrix nary operations are not implemented")
-            kind = "unary" if op.arity == 1 else "binary" if op.arity == 2 else "ternary"
-            stage = Stage(kind, children, out, lane_count, dtype=dtype, op_name=op.name)
+                raise CppStreamLoweringError(
+                    "matrix/tensor nary operations are not implemented"
+                )
+            kind = (
+                "unary"
+                if op.arity == 1
+                else "binary"
+                if op.arity == 2
+                else "ternary"
+            )
+            stage = Stage(
+                kind,
+                children,
+                out,
+                lane_count,
+                dtype=dtype,
+                op_name=op.name,
+                output_kind=node.value_type.kind,
+                output_width=int(node.value_type.width),
+            )
         elif isinstance(op, CustomCallOp):
             if any(child.width != 1 for child in children):
-                raise CppStreamLoweringError("named stateless calls currently require scalar-width inputs")
-            stage = Stage("custom", children, out, lane_count, op_name=op.name, op=op)
+                raise CppStreamLoweringError(
+                    "named stateless calls currently require scalar-width inputs"
+                )
+            stage = Stage(
+                "custom",
+                children,
+                out,
+                lane_count,
+                op_name=op.name,
+                op=op,
+                output_kind=node.value_type.kind,
+                output_width=int(node.value_type.width),
+            )
         elif isinstance(op, CumsumOp):
-            stage = Stage("cumsum", children, out, lane_count)
+            stage = Stage("cumsum", children, out, lane_count, op=op)
         elif isinstance(op, FFillOp):
             stage = Stage("ffill", children, out, lane_count, op=op)
         elif isinstance(op, ShiftOp):
@@ -509,22 +719,30 @@ def _build_plan(
         elif isinstance(op, EwmOp):
             stage = Stage("ewm", children, out, lane_count, op=op)
         elif isinstance(op, XsRankOp):
-            stage = Stage("xs_rank", children, out, lane_count)
-        elif isinstance(op, EinsumOp):
-            if len(children) != 2 or children[0].width != children[1].width:
-                raise CppStreamLoweringError("einsum source width mismatch")
-            stage = Stage("einsum", children, out, n_instruments, op=op)
+            stage = Stage("xs_rank", children, out, lane_count, op=op)
         elif isinstance(op, GroupByOp):
             if grouped:
                 raise CppStreamLoweringError("nested groupby is not supported")
             key_count = op.n_dynamic_keys
             key_sources = children[:key_count]
             feed_sources = children[key_count:]
-            if any(source.width != 1 for source in key_sources + feed_sources):
-                raise CppStreamLoweringError("groupby keys/lhs/captures must be scalar-width vectors")
-            specs = _resolved_key_specs(program, node.child_ids, op, key_cardinalities)
-            dense = bool(specs) and all(spec.num_keys is not None for spec in specs)
-            capacity = _dense_capacity(specs) if dense else (op.capacity or default_group_capacity)
+            if any(
+                source.width != 1 for source in key_sources + feed_sources
+            ):
+                raise CppStreamLoweringError(
+                    "groupby keys/lhs/captures must be scalar-width vectors"
+                )
+            specs = _resolved_key_specs(
+                program, node.child_ids, op, key_cardinalities
+            )
+            dense = bool(specs) and all(
+                spec.num_keys is not None for spec in specs
+            )
+            capacity = (
+                _dense_capacity(specs)
+                if dense
+                else (op.capacity or default_group_capacity)
+            )
             inner_dtypes = ("float64",) * len(op.inner_program.input_names)
             inner = _build_plan(
                 op.inner_program,
@@ -559,16 +777,23 @@ def _build_plan(
             raise CppStreamLoweringError(f"unsupported IR op {type(op).__name__}")
 
         stages.append(stage)
-        sources[node_id] = (
-            Source("slot", out.slot, row_scalar=row_scalar, dtype=stage.dtype)
-            if out.slot is not None
-            else Source("output", -1, width=stage.output_width)
-        )
+        sources[node_id] = source_from_dest(out, node_shape, dtype=stage.dtype)
 
     root_type = program.nodes[root].value_type
+    root_shape = resolve_shape(root_type, n_instruments)
     if isinstance(program.nodes[root].op, (InputOp, LiteralOp)):
         source = sources[root]
-        stages.append(Stage("copy", (source,), Dest(None), n_instruments, dtype=source.dtype))
+        stages.append(
+            Stage(
+                "copy",
+                (source,),
+                Dest(None, size=shape_size(root_shape), shape=root_shape),
+                1 if root_shape == () else n_instruments,
+                dtype=source.dtype,
+                output_kind=root_type.kind,
+                output_width=int(root_type.width),
+            )
+        )
     return Plan(
         tuple(stages),
         next_slot,
@@ -578,6 +803,7 @@ def _build_plan(
         root_type.kind,
         int(root_type.width),
         _output_row_width(root_type, n_instruments),
+        root_shape,
     )
 
 
@@ -591,7 +817,9 @@ def lower_program(
     input_dtypes: tuple[str, ...] | None = None,
 ) -> Plan:
     if n_instruments <= 0 or default_group_capacity <= 0:
-        raise CppStreamLoweringError("n_instruments and group capacity must be > 0")
+        raise CppStreamLoweringError(
+            "n_instruments and group capacity must be > 0"
+        )
     if input_dtypes is None:
         input_dtypes = ("float64",) * len(program.input_names)
     return _build_plan(
