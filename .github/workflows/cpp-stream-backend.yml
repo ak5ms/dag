@@ -4,9 +4,12 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "src/trading_dsl_engine/base/custom.py"
       - "src/trading_dsl_engine/base/keys.py"
       - "src/trading_dsl_engine/ir/**"
       - "src/trading_dsl_engine/cpp_stream/**"
+      - "src/flows/pov.py"
+      - "src/flows/riskmodel.py"
       - "tests/trading_dsl_engine/cpp_stream/**"
       - "scripts/benchmark_cpp_stream*.py"
       - ".github/workflows/cpp-stream-backend.yml"
@@ -22,15 +25,17 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install focused dependencies
-        run: python -m pip install --upgrade pip numpy numba pytest jinja2
-      - name: Run IR, codegen, typed mmap, cat, and Ridge tests
+        run: python -m pip install --upgrade pip numpy numba pytest jinja2 jax
+      - name: Run IR, native operator, and roll_rets tests
         env:
           PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
         run: >-
           python -m pytest -q -o addopts=""
           tests/trading_dsl_engine/cpp_stream/test_codegen.py
           tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
           tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
       - name: Compare unhinted and typed hinted minute keys
         env:
           PYTHONPATH: src
