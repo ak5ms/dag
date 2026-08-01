@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
-from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream import InputTypeSpec, compile_formula, source
 from trading_dsl_engine.ir import compile_ir
 
 
@@ -43,9 +43,13 @@ def test_minute_groupby_native_matches_reference(tmp_path: Path):
     out_path = tmp_path / "out.bin"
     close.tofile(close_path)
     ev_ts.tofile(ts_path)
+    data = {
+        "_ev_ts": source(ts_path, input_type=InputTypeSpec("float64", cols)),
+        "close": source(close_path, input_type=InputTypeSpec("float64", cols)),
+    }
 
-    runtime = compile_formula(_formula(), n_instruments=cols)
-    runtime.run_files({"_ev_ts": ts_path, "close": close_path}, out_path=out_path)
+    runtime = compile_formula(_formula(), data, n_instruments=cols)
+    runtime.run(out_path=out_path)
     actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
 
     cumsum_state: dict[tuple[int, int], float] = {}
