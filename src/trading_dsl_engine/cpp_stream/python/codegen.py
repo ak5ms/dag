@@ -149,6 +149,16 @@ def _source_type(
     if source.kind == "matrix_slot":
         return tmpl("stackdsl::MatrixSlotSrc", IntArg(int(source.value)), IntArg(source.width))
     if source.kind == "literal":
+        if source.dtype in {"float32", "float64"}:
+            value = float(source.value)
+            if math.isnan(value):
+                return Name("stackdsl::NaNLiteralSrc")
+            if math.isinf(value):
+                return Name(
+                    "stackdsl::PositiveInfinityLiteralSrc"
+                    if value > 0.0
+                    else "stackdsl::NegativeInfinityLiteralSrc"
+                )
         return tmpl("stackdsl::LiteralSrc", _literal_arg(source))
     if source.kind == "rbf":
         assert isinstance(source.op, RbfBasisOp) and len(source.parts) == 3
