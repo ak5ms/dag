@@ -92,6 +92,8 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
     assert "stackdsl::BinaryNode<1," in generated
     assert "stackdsl::UnaryNode<1," in generated
     assert "stackdsl::SlotSrc<" in generated and ", true>" in generated
+    assert "std::int64_t, stackdsl::DivOp" in generated
+    assert "std::int64_t, stackdsl::ModOp" in generated
 
     out_path = tmp_path / "grouped.bin"
     runtime.run_npy_files(
@@ -119,6 +121,48 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
             expected[row, lane] = ewm_state[minute, lane]
 
     np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-12)
+
+
+def test_dense_key_offset_maps_domain_to_zero_based_slots(tmp_path: Path):
+    # num_keys=3 and offset=10 means the valid categories are 10, 11, and 12.
+    # Dense routing uses value - offset, so they map to state digits 0, 1, and 2.
+    venue = np.array([10, 11, 10, 12, 11], dtype=np.int32)
+    close = np.array([1.0, 10.0, 2.0, 100.0, 20.0], dtype=np.float64)
+    venue_path = tmp_path / "venue.npy"
+    close_path = tmp_path / "close.npy"
+    np.save(venue_path, venue)
+    np.save(close_path, close)
+
+    formula = groupby(
+        Key(
+            var("venue"),
+            num_keys=3,
+            offset=10,
+            row_scalar=True,
+            dtype="int32",
+        ),
+        var("close"),
+        cumsum(self_),
+    )
+    runtime = compile_npy_formula(
+        formula,
+        {"venue": venue_path, "close": close_path},
+        n_instruments=1,
+    )
+    generated = runtime.generated_cpp.read_text()
+    assert "DenseTupleGroupResolver" in generated
+    assert "InputSrc<0, std::int32_t, 1>" in generated
+    assert ", 3, 10, true>" in generated
+
+    out_path = tmp_path / "offset.bin"
+    runtime.run_npy_files(
+        {"venue": venue_path, "close": close_path},
+        out_path=out_path,
+    )
+    actual = np.asarray(
+        np.memmap(out_path, mode="r", dtype=np.float64, shape=(venue.size, 1))
+    )[:, 0]
+    np.testing.assert_array_equal(actual, np.array([1.0, 10.0, 3.0, 100.0, 30.0]))
 
 
 def test_int64_hash_keys_remain_distinct_above_2_to_53(tmp_path: Path):
