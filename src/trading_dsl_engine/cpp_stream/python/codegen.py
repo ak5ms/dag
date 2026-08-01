@@ -5,7 +5,13 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from trading_dsl_engine.cpp_stream.python.lowering import GroupStage, Plan, Source, Stage, double_bits
+from trading_dsl_engine.cpp_stream.python.lowering import (
+    GroupStage,
+    Plan,
+    Source,
+    Stage,
+    double_bits,
+)
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import GroupKeySpec
 
@@ -155,7 +161,19 @@ def _source_type(
         )
     if source.kind == "literal":
         return tmpl("stackdsl::LiteralSrc", _literal_arg(source))
-    raise AssertionError(source.kind)
+    raise ValueError(f"source kind {source.kind!r} is a composite and must be flattened before codegen")
+
+
+def _feature_list(
+    sources: tuple[Source, ...],
+    *,
+    n: int | CppType,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
+    return tmpl(
+        "stackdsl::FeatureList",
+        *(_source_type(source, n=n, input_types=input_types) for source in sources),
+    )
 
 
 def _dest_type(stage: Stage) -> CppType:
@@ -171,7 +189,6 @@ _BINARY_POLICIES = {
     "div": "stackdsl::DivOp",
     "mod": "stackdsl::ModOp",
 }
-
 _UNARY_POLICIES = {"floor": "stackdsl::FloorOp"}
 
 
@@ -212,6 +229,14 @@ def _stage_type(
             Name(_UNARY_POLICIES[stage.op_name or ""]),
             execution,
         )
+    if stage.kind == "cat":
+        return tmpl(
+            "stackdsl::CatNode",
+            n,
+            _feature_list(stage.inputs, n=n, input_types=input_types),
+            out,
+            execution,
+        )
     if stage.kind == "cumsum":
         return tmpl("stackdsl::CumsumNode", stage_n, inputs[0], out, execution)
     if stage.kind == "ewm":
@@ -229,6 +254,34 @@ def _stage_type(
         )
     if stage.kind == "xs_rank":
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
+    if stage.kind == "ridge":
+        assert stage.ridge is not None
+        assert stage.projection in {"beta", "preds"}
+        assert stage.half_life is not None
+        assert stage.ridge_lambda is not None
+        feature_count = stage.ridge.coefficient_width
+        feature_sources = stage.inputs[:feature_count]
+        y_source = stage.inputs[feature_count]
+        weight_source = stage.inputs[feature_count + 1]
+        projection = (
+            "stackdsl::RidgeBetaProjection"
+            if stage.projection == "beta"
+            else "stackdsl::RidgePredsProjection"
+        )
+        return tmpl(
+            "stackdsl::RidgeNode",
+            n,
+            _feature_list(feature_sources, n=n, input_types=input_types),
+            _source_type(y_source, n=n, input_types=input_types),
+            _source_type(weight_source, n=n, input_types=input_types),
+            out,
+            UInt64Arg(double_bits(stage.half_life)),
+            UInt64Arg(double_bits(stage.ridge_lambda)),
+            BoolArg(stage.ridge.nonneg),
+            BoolArg(stage.ridge.is_stateful),
+            Name(projection),
+            execution,
+        )
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")
     raise AssertionError(stage.kind)
@@ -423,6 +476,7 @@ def render_translation_unit(
         n=n_instruments,
         input_count=plan.input_count,
         scratch_slots=plan.scratch_slots,
+        output_row_width=plan.output_row_width,
         prefetch_rows=prefetch_rows,
         inputs=tuple(
             InputView(index, spec.cpp_type, spec.row_width)
