@@ -61,6 +61,16 @@ jobs:
           CPP_STREAM_RIDGE_CASE: all
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_ridge.py
+      - name: Smoke benchmark generic einsum
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_EINSUM_ROWS: "250000"
+          CPP_STREAM_EINSUM_INSTRUMENTS: "9"
+          CPP_STREAM_EINSUM_RUNS: "3"
+          CPP_STREAM_EINSUM_WARMUPS: "1"
+          CPP_STREAM_EINSUM_CASE: all
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_einsum.py
       - name: Smoke benchmark riskmodel roll_rets
         env:
           PYTHONPATH: src
