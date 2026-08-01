@@ -1,5 +1,14 @@
 from trading_dsl_engine.ir.frontend import FormulaIRCompileError, compile_ir
-from trading_dsl_engine.ir.ops import CumsumOp, EwmOp, GroupByOp, InputOp, LiteralOp, NaryOp, XsRankOp
+from trading_dsl_engine.ir.ops import (
+    CumsumOp,
+    EwmOp,
+    GroupByOp,
+    GroupKeySpec,
+    InputOp,
+    LiteralOp,
+    NaryOp,
+    XsRankOp,
+)
 from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import SCALAR, VECTOR, ValueType
 
@@ -17,5 +26,6 @@ __all__ = [
     "CumsumOp",
     "EwmOp",
     "XsRankOp",
+    "GroupKeySpec",
     "GroupByOp",
 ]
