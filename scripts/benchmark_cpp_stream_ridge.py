@@ -7,7 +7,7 @@ import tempfile
 
 import numpy as np
 
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.ir import compile_ir
 
 
@@ -105,13 +105,18 @@ def _formula(case: str) -> str:
 def _benchmark(case: str, all_paths: dict[str, Path], output_root: Path) -> dict[str, object]:
     formula = _formula(case)
     input_names = compile_ir(formula).input_names
-    paths = {name: all_paths[name] for name in input_names}
-    runtime = compile_npy_formula(formula, paths, n_instruments=N, prefetch_rows=PREFETCH_ROWS)
+    data = {name: all_paths[name] for name in input_names}
+    runtime = compile_formula(
+        formula,
+        data,
+        n_instruments=N,
+        prefetch_rows=PREFETCH_ROWS,
+    )
     output = output_root / f"cpp_stream_ridge_{case}.bin"
     for _ in range(WARMUPS):
-        runtime.run_npy_files(paths, out_path=output, async_writeback_mb=0)
+        runtime.run(out_path=output, async_writeback_mb=0)
     rates = [
-        runtime.run_npy_files(paths, out_path=output, async_writeback_mb=0).rows_per_second
+        runtime.run(out_path=output, async_writeback_mb=0).rows_per_second
         for _ in range(RUNS)
     ]
     values = np.memmap(
