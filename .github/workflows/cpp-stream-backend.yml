@@ -58,12 +58,12 @@ jobs:
           CPP_STREAM_RIDGE_CASE: all
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_ridge.py
-      - name: Benchmark riskmodel roll_rets at 5M x 9
+      - name: Smoke benchmark riskmodel roll_rets
         env:
           PYTHONPATH: src
-          CPP_STREAM_ROLL_ROWS: "5000000"
+          CPP_STREAM_ROLL_ROWS: "250000"
           CPP_STREAM_ROLL_INSTRUMENTS: "9"
-          CPP_STREAM_ROLL_RUNS: "10"
+          CPP_STREAM_ROLL_RUNS: "3"
           CPP_STREAM_ROLL_WARMUPS: "1"
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_roll_rets.py
