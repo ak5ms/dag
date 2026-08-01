@@ -5,13 +5,28 @@ This backend must remain independent of `jax_flat`.
 ## Shared IR and typing
 
 - Shared formula semantics belong in `trading_dsl_engine.ir`; never import JAX or JAX-flat types into that package.
-- Value kind and compile-time width belong in neutral `ValueType`. Matrix, fixed-width, and object values must not be disguised as ordinary vectors.
-- Do not eagerly convert mapped inputs to float64. `InputSrc`, `SlotSrc`, and `SlotDst` carry native scalar types.
-- Same-typed integer arithmetic stays integer through typed scratch. Mixed types promote only because the operation result requires it.
-- Integral division in explicitly integral key graphs uses mathematical floor division; integral `floor` is an identity.
-- Statistical operators may define float64 semantics, but conversions must occur at the operator boundary, not during input loading.
-- `.npy` inputs are mmap-only. Inspect dtype, shape, payload offset, and C-order layout before compilation. Never add a per-element runtime dtype switch.
-- Supported `.npy` shapes are `(rows,)`, `(rows,1)`, and `(rows,N)`; width one is row-scalar.
+- Value kind, logical shape, dtype, and compile-time dimensions belong in neutral `ValueType`. Matrix, fixed-width, arbitrary tensor, and object values must not be disguised as ordinary vectors.
+- Do not eagerly convert mapped inputs to float64. `InputSrc`, `SlotSrc`, and `SlotDst` carry native scalar types. Statistical/einsum operators may define float64 accumulation at their boundary.
+- `.npy` inputs are mmap-only. Inspect dtype, complete shape, payload offset, and C-order layout before compilation. Preserve arbitrary positive per-row shapes rather than flattening shape metadata away.
+- `(rows,)` and `(rows,1)` are row-scalar. Higher-rank row tensors are contiguous zero-copy tensor operands.
+- Never add a per-element runtime dtype or rank switch.
+
+## NumPy-style einsum
+
+- String-form subscript semantics belong in `trading_dsl_engine.ir.einsum`, not cpp_stream codegen.
+- Match NumPy string behavior: case-sensitive ASCII labels, implicit/explicit output, empty scalar terms, repeated-label diagonals, arbitrary rank, and one ellipsis per term.
+- Ordinary named dimensions must match exactly. Broadcasting is allowed only for ellipsis dimensions.
+- NumPy's default is `optimize=False`; preserve left-to-right evaluation unless the caller requests `True`, `greedy`, or `optimal`.
+- `greedy` and `optimal` choose a static pairwise path during lowering. `optimal` may exhaustively search only under a documented operand-count limit and must use a deterministic fallback afterward.
+- Generated C++ must not parse subscript strings, inspect dynamic shapes, allocate a path, or search contraction order at runtime.
+- Canonicalized labels become compile-time integer axis maps. Loop extents and output/reduction ordering are compile-time template arguments.
+- Keep one generic `UnaryEinsumNode` and one generic `BinaryEinsumNode`; never add pattern-named nodes such as `EinsumNfNfToNNode` or formula-specific kernels.
+- Preserve the contiguous identity-mapping FMA path. It must bulk-load a lazy feature row once, not recompute an RBF normalization for each feature access.
+- General mapped loops must retain correct broadcasting, diagonal, permutation, scalar, and arbitrary-reduction semantics.
+- Raw arbitrary-rank mmap tensors use a zero-copy dense tensor source. Cat/RBF sources stay lazy. Only selected contraction intermediates use fixed tensor scratch.
+- Scratch is compact by logical tensor size. Do not reserve `N * max_width` semantics for every arbitrary tensor unless its layout actually requires it.
+- Native einsum currently accumulates/stores float64. Keep unsupported NumPy surfaces explicit: integer-sublist calls, precomputed path-list arguments, `out=`, `dtype=`, `order=`, `casting=`, and writeable-view behavior.
+- Do not introduce Einsums, Eigen Tensor, TBLIS, or another contraction dependency unless same-host benchmarks show a material win without forcing copies/materialization of mmap, Cat, or RBF sources.
 
 ## Key metadata
 
@@ -24,63 +39,53 @@ This backend must remain independent of `jax_flat`.
 
 ## Operator-agnostic groupby
 
-- `groupby.hpp` owns only key resolution, grouped context creation, and inner-plan invocation. It must contain no indicator, regression, rolling, or cross-sectional operator implementation.
+- `groupby.hpp` owns only key resolution, grouped context creation, and inner-plan invocation. It must contain no operator implementation.
 - Never create `GroupedFooNode` or `FastGroupedFooNode`.
-- Every operator has one C++ node and receives its execution scope through the final template parameter.
-- Supported scopes are `DirectExecution<N>` and `GroupedExecution<N, Capacity, PartitionCount>`.
-- Stateful lane operators use `Execution::state_size` and `Execution::state_index`.
-- Cross-sectional operators use `Execution::rank_group` or `Execution::cross_group` and size state from `Execution::cross_state_size`.
-- The exact static partition count is compile-time execution metadata. Do not use conservative N-sized cross-state when the plan knows fewer partitions.
+- Every operator has one C++ node and receives `DirectExecution<N>` or `GroupedExecution<N, Capacity, PartitionCount>` through the final template parameter.
+- Stateful lane operators use `Execution::state_size/state_index`; cross-sectional operators use `rank_group/cross_group`.
 - Python codegen must emit the same node name inside and outside groupby; only the execution type changes.
-- Adding a normal codegen mapping for a new operator should make it usable in groupby without a second class or grouped branch.
 
-## Cat and fixed-width values
+## Cat, basis, and fixed-width values
 
 - `cat(...)` is represented by compile-time feature width.
-- When Cat feeds Ridge, flatten it into `FeatureList<Sources...>` and read the original sources directly. Do not materialize an intermediate `N x K` matrix.
-- Nested cat and separate Ridge feature arguments must lower to the same feature list and generated source.
-- A standalone Cat root is row-major `(rows,N,K)` and may use `CatNode`.
-- Do not introduce a Ridge-specific Cat implementation.
+- Flatten Cat into `FeatureList<Sources...>` when consumed by Ridge, InstrumentBasisMean, or einsum. Read original sources directly instead of materializing `N x K`.
+- Lazy RBF/future-RBF sources must support random feature reads and efficient full-row loads.
+- Nested Cat and separate Ridge feature arguments must lower to the same feature list and generated source.
+- A standalone Cat root is row-major `(rows,N,K)` and may use `CatNode`; do not add consumer-specific Cat implementations.
 
 ## Ridge
 
 - Ridge is one generic `RidgeNode<..., Execution>` for direct and grouped execution. `GroupedRidgeNode` is forbidden.
-- K is compile-time. Moment state, beta state, local systems, and solver workspaces use fixed `std::array` storage.
+- K is compile-time. Moment state, beta state, systems, and solver workspaces use fixed `std::array` storage.
 - Preserve weighted pairwise-missing moments and per-moment last-update timing.
 - Positive-half-life predictions use the prior beta; `hl<=0` or nonfinite is current-row/stateless.
 - Regularization is `XX + lambda * diag(diag(XX))`, with nonnegative lambda.
-- Keep generic solver order: Cholesky first, pivoted solve second, symmetric pseudoinverse fallback last.
-- Nonnegative Ridge uses the same fixed-size generic quadratic solver; do not add K-specific or formula-specific implementations.
-- The finite-panel path may skip pairwise validity bookkeeping only when every required value in the row is finite. Missing-data rows must use the complete pairwise path.
-- Finite-panel synchronized state is a semantic data-validity optimization, not a separate node. Maintain exact transition behavior across finite -> missing -> finite rows.
-- Precompute literal decay and regularization constants during codegen where possible.
-- `get_beta` and `get_preds` are projections of the neutral Ridge object. A raw Ridge object is not a file output.
-- Direct beta output is `(rows,K)`; grouped beta output is `(rows,N,K)`.
-- Current physical limitations must remain explicit: literal hl/lambda, scalar/vector weights, and no arbitrary downstream materialization of non-root matrix/fixed beta values.
+- Solver order remains Cholesky, pivoted solve, then symmetric pseudoinverse fallback.
+- Nonnegative Ridge uses the same fixed-size generic solver; do not add K-specific implementations.
+- `get_beta` and `get_preds` are projections of the neutral Ridge object. A raw object is not a file output.
 
-## Existing operator performance invariants
+## Existing performance invariants
 
-- Preserve the all-finite small-width rank-count path. For N=9 it materially outperforms sorting.
-- Preserve the common recursive-EWM policy in the single EWM implementation; avoid weight/count traffic when semantics permit it.
-- Row-scalar facts must propagate through pure stateless graphs so timestamp expressions execute once per row.
+- Preserve the all-finite small-width rank-count path.
+- Preserve the common recursive-EWM policy and avoid weight/count traffic when semantics permit it.
+- Row-scalar facts must propagate through pure stateless graphs.
 - Reusable output files must not be retruncated when their size already matches.
+- No operator may allocate from the heap in `on_data`; no Python per-row loop is allowed.
 
 ## Code generation and runtime
 
 - Translation-unit structure belongs in `python/templates/runner.cpp.j2`.
-- Python codegen should build typed immutable template arguments/views, not concatenate complete row loops.
-- Keep Jinja2 as a runtime dependency and package required `.j2` files.
-- Physical choices such as scratch liveness, direct output writes, prefetching, mmap/writeback, state layout, and compiler flags belong in cpp_stream.
-- Do not add Python per-row loops.
-- Do not allocate from the heap in operator `on_data`. Compilation, setup, mapping, and error paths may allocate.
+- Python codegen builds typed immutable template arguments/views, not complete string-concatenated row loops.
+- Physical choices such as scratch liveness, direct output writes, prefetching, mmap/writeback, state layout, compiler flags, and contraction paths belong in cpp_stream lowering/codegen.
+- Cache keys must include generated source, all packaged headers, compiler identity, flags, platform, and Python ABI.
 
 ## Testing and benchmarks
 
-- Correctness tests must cover native compilation/execution, NaNs, finite-to-missing transitions, grouped execution, and output shapes.
-- Tests must assert groupby source contains no operator implementations and generated code contains no `Grouped*Node` classes.
+- Einsum correctness must cover implicit/explicit output, arbitrary labels, scalar operands/reductions, ellipsis broadcasting, rejection of non-ellipsis broadcasting, diagonals, transposes, raw rank-2/rank-4 mmap inputs, tensor scratch, and n-ary paths.
+- Compare native output against NumPy for isolated einsum cases and against JAX-flat for the exact `roll_rets` graph.
+- Tests must assert the old pattern-specific einsum node is absent from generated C++.
 - Hot-path changes should be benchmarked at 5M x 9 with one warmup and ten measured runs when practical.
-- Report all runs and checksums, not only the best result.
-- Compare direct and one-group grouped controls before attributing a slowdown to groupby.
-- `scripts/benchmark_cpp_stream.py` covers timestamp/groupby/rank workloads.
-- `scripts/benchmark_cpp_stream_ridge.py` covers Cat, direct Ridge, and grouped Ridge.
-- Do not hard-code one hosted CPU's throughput as a universal test threshold; use environment-provided regression floors.
+- Report every run, median/mean/best, checksums, finite fraction, estimated contraction work, and largest intermediate.
+- Benchmark `optimize=False`, greedy, and optimal on the same n-ary expression. Reject an optimizer that changes the checksum or increases estimated work without a justified measured gain.
+- Re-run `scripts/benchmark_cpp_stream_roll_rets.py` after einsum changes to detect end-to-end regressions.
+- Do not hard-code one hosted CPU's throughput as a universal threshold; use environment-provided floors.
