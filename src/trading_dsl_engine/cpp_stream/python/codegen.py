@@ -5,13 +5,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from trading_dsl_engine.cpp_stream.python.lowering import (
-    GroupStage,
-    Plan,
-    Source,
-    Stage,
-    double_bits,
-)
+from trading_dsl_engine.cpp_stream.python.lowering import GroupStage, Plan, Source, Stage, double_bits
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import GroupKeySpec
 
@@ -161,7 +155,7 @@ def _source_type(
         )
     if source.kind == "literal":
         return tmpl("stackdsl::LiteralSrc", _literal_arg(source))
-    raise ValueError(f"source kind {source.kind!r} is a composite and must be flattened before codegen")
+    raise ValueError(f"source kind {source.kind!r} is composite and must be flattened before codegen")
 
 
 def _feature_list(
@@ -177,9 +171,9 @@ def _feature_list(
 
 
 def _dest_type(stage: Stage) -> CppType:
-    return Name("stackdsl::OutputDst") if stage.out.slot is None else tmpl(
-        "stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype)
-    )
+    if stage.out.slot is None:
+        return Name("stackdsl::OutputDst")
+    return tmpl("stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype))
 
 
 _BINARY_POLICIES = {
@@ -199,81 +193,49 @@ def _stage_type(
     *,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
-    """Render one operator type independent of whether its plan is grouped."""
+    """Render one operator type independent of grouped/direct execution."""
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
-    inputs = tuple(
-        _source_type(source, n=n, input_types=input_types)
-        for source in stage.inputs
-    )
+    inputs = tuple(_source_type(source, n=n, input_types=input_types) for source in stage.inputs)
     out = _dest_type(stage)
     if stage.kind == "copy":
         return tmpl("stackdsl::CopyNode", stage_n, inputs[0], out, execution)
     if stage.kind == "binary":
         return tmpl(
-            "stackdsl::BinaryNode",
-            stage_n,
-            inputs[0],
-            inputs[1],
-            out,
-            _cpp_type(stage.dtype),
-            Name(_BINARY_POLICIES[stage.op_name or ""]),
-            execution,
+            "stackdsl::BinaryNode", stage_n, inputs[0], inputs[1], out,
+            _cpp_type(stage.dtype), Name(_BINARY_POLICIES[stage.op_name or ""]), execution,
         )
     if stage.kind == "unary":
         return tmpl(
-            "stackdsl::UnaryNode",
-            stage_n,
-            inputs[0],
-            out,
-            _cpp_type(stage.dtype),
-            Name(_UNARY_POLICIES[stage.op_name or ""]),
-            execution,
+            "stackdsl::UnaryNode", stage_n, inputs[0], out,
+            _cpp_type(stage.dtype), Name(_UNARY_POLICIES[stage.op_name or ""]), execution,
         )
     if stage.kind == "cat":
         return tmpl(
-            "stackdsl::CatNode",
-            n,
-            _feature_list(stage.inputs, n=n, input_types=input_types),
-            out,
-            execution,
+            "stackdsl::CatNode", n,
+            _feature_list(stage.inputs, n=n, input_types=input_types), out, execution,
         )
     if stage.kind == "cumsum":
         return tmpl("stackdsl::CumsumNode", stage_n, inputs[0], out, execution)
     if stage.kind == "ewm":
         assert stage.ewm is not None
         return tmpl(
-            "stackdsl::EwmNode",
-            stage_n,
-            inputs[0],
-            out,
-            UInt64Arg(double_bits(stage.ewm.span)),
-            IntArg(stage.ewm.min_periods),
-            BoolArg(stage.ewm.ignore_na),
-            BoolArg(stage.ewm.adjust),
-            execution,
+            "stackdsl::EwmNode", stage_n, inputs[0], out,
+            UInt64Arg(double_bits(stage.ewm.span)), IntArg(stage.ewm.min_periods),
+            BoolArg(stage.ewm.ignore_na), BoolArg(stage.ewm.adjust), execution,
         )
     if stage.kind == "xs_rank":
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
     if stage.kind == "ridge":
         assert stage.ridge is not None
         assert stage.projection in {"beta", "preds"}
-        assert stage.half_life is not None
-        assert stage.ridge_lambda is not None
+        assert stage.half_life is not None and stage.ridge_lambda is not None
         feature_count = stage.ridge.coefficient_width
-        feature_sources = stage.inputs[:feature_count]
-        y_source = stage.inputs[feature_count]
-        weight_source = stage.inputs[feature_count + 1]
-        projection = (
-            "stackdsl::RidgeBetaProjection"
-            if stage.projection == "beta"
-            else "stackdsl::RidgePredsProjection"
-        )
+        projection = "stackdsl::RidgeBetaProjection" if stage.projection == "beta" else "stackdsl::RidgePredsProjection"
         return tmpl(
-            "stackdsl::RidgeNode",
-            n,
-            _feature_list(feature_sources, n=n, input_types=input_types),
-            _source_type(y_source, n=n, input_types=input_types),
-            _source_type(weight_source, n=n, input_types=input_types),
+            "stackdsl::RidgeNode", n,
+            _feature_list(stage.inputs[:feature_count], n=n, input_types=input_types),
+            _source_type(stage.inputs[feature_count], n=n, input_types=input_types),
+            _source_type(stage.inputs[feature_count + 1], n=n, input_types=input_types),
             out,
             UInt64Arg(double_bits(stage.half_life)),
             UInt64Arg(double_bits(stage.ridge_lambda)),
@@ -353,14 +315,17 @@ class InputView:
 
 def _inner_view(name: str, group: GroupStage) -> InnerView:
     n = Name("N")
-    execution = tmpl("stackdsl::GroupedExecution", n, Name("Capacity"))
-    stages: list[StageView] = []
+    execution = tmpl(
+        "stackdsl::GroupedExecution",
+        n,
+        Name("Capacity"),
+        Name("PartitionCount"),
+    )
+    stages = []
     for index, stage in enumerate(group.inner.stages):
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
-        stages.append(
-            StageView(index, _stage_type(stage, n, execution, input_types=None).render())
-        )
+        stages.append(StageView(index, _stage_type(stage, n, execution, input_types=None).render()))
     return InnerView(name, group.inner.input_count, group.inner.scratch_slots, tuple(stages))
 
 
@@ -378,35 +343,31 @@ def _group_type(
         resolver = tmpl("stackdsl::DenseTupleGroupResolver", IntArg(n), *keys)
     else:
         resolver = tmpl(
-            "stackdsl::HashGroupResolver",
-            IntArg(n),
-            IntArg(group.capacity),
-            IntArg(group.hash_capacity),
-            *keys,
+            "stackdsl::HashGroupResolver", IntArg(n), IntArg(group.capacity),
+            IntArg(group.hash_capacity), *keys,
         )
     partitions = tmpl(
         "stackdsl::StaticPartitions",
         IntArg(n),
         *(IntArg(value) for value in group.partitions),
     )
-    inner = tmpl(group_name, IntArg(n), Name(f"{resolver.render()}::capacity"))
-    key_list = tmpl("stackdsl::KeyList", *keys)
-    return tmpl(
-        "stackdsl::GroupByNode",
+    partition_count = max(group.partitions, default=0) + 1
+    inner = tmpl(
+        group_name,
         IntArg(n),
-        resolver,
-        partitions,
-        inner,
-        _dest_type(stage),
-        key_list,
+        Name(f"{resolver.render()}::capacity"),
+        IntArg(partition_count),
+    )
+    return tmpl(
+        "stackdsl::GroupByNode", IntArg(n), resolver, partitions, inner,
+        _dest_type(stage), tmpl("stackdsl::KeyList", *keys),
         _source_list(group.feed_sources, n=n, input_types=input_types),
     )
 
 
 def _environment() -> Environment:
-    template_dir = Path(__file__).with_name("templates")
     return Environment(
-        loader=FileSystemLoader(template_dir),
+        loader=FileSystemLoader(Path(__file__).with_name("templates")),
         undefined=StrictUndefined,
         autoescape=False,
         keep_trailing_newline=True,
@@ -423,10 +384,7 @@ def render_translation_unit(
     input_types: tuple[InputTypeSpec, ...] | None = None,
 ) -> GeneratedSource:
     if input_types is None:
-        input_types = tuple(
-            InputTypeSpec("float64", n_instruments)
-            for _ in range(plan.input_count)
-        )
+        input_types = tuple(InputTypeSpec("float64", n_instruments) for _ in range(plan.input_count))
     if len(input_types) != plan.input_count:
         raise ValueError("input type count does not match the compiled program")
     for spec in input_types:
@@ -438,12 +396,11 @@ def render_translation_unit(
     group_names: dict[int, str] = {}
     inners: list[InnerView] = []
     for index, stage in enumerate(plan.stages):
-        if stage.kind != "groupby":
-            continue
-        assert stage.group is not None
-        name = f"CppStreamInner{index}"
-        group_names[index] = name
-        inners.append(_inner_view(name, stage.group))
+        if stage.kind == "groupby":
+            assert stage.group is not None
+            name = f"CppStreamInner{index}"
+            group_names[index] = name
+            inners.append(_inner_view(name, stage.group))
 
     n = IntArg(n_instruments)
     direct_execution = tmpl("stackdsl::DirectExecution", n)
@@ -451,28 +408,25 @@ def render_translation_unit(
     for index, stage in enumerate(plan.stages):
         if stage.kind == "groupby":
             assert stage.group is not None
-            cpp_type = _group_type(
-                group_names[index], stage.group, stage, n_instruments, input_types
+            stages.append(
+                StageView(
+                    index,
+                    _group_type(group_names[index], stage.group, stage, n_instruments, input_types).render(),
+                    checked=True,
+                )
             )
-            stages.append(StageView(index, cpp_type.render(), checked=True))
         else:
             stages.append(
                 StageView(
                     index,
-                    _stage_type(
-                        stage,
-                        n,
-                        direct_execution,
-                        input_types=input_types,
-                    ).render(),
+                    _stage_type(stage, n, direct_execution, input_types=input_types).render(),
                 )
             )
 
     if plan.input_count == 0:
         raise ValueError("cpp_stream requires at least one file-backed input")
 
-    template = _environment().get_template("runner.cpp.j2")
-    text = template.render(
+    text = _environment().get_template("runner.cpp.j2").render(
         n=n_instruments,
         input_count=plan.input_count,
         scratch_slots=plan.scratch_slots,
