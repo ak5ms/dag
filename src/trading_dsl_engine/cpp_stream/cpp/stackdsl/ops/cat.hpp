@@ -10,39 +10,35 @@
 
 namespace stackdsl {
 
-// Compile-time feature concatenation. Physical lowering recursively flattens
-// nested cat(...) expressions into this list, so consumers read the original
-// mapped/scratch values directly without materializing an intermediate N x K
-// matrix. This is a general value-layout primitive, not a Ridge-specific path.
 template <class... Sources>
 struct FeatureList {
-    static constexpr std::size_t width = sizeof...(Sources);
+    static constexpr std::size_t width = (source_width_v<Sources> + ... + 0);
 };
 
-template <class Context, class... Sources, std::size_t... I>
-STACKDSL_HOT void load_features_impl(
+template <class Source, class Context>
+STACKDSL_HOT void load_source_features(
     const Context& ctx,
     std::size_t lane,
-    std::array<double, sizeof...(Sources)>& values,
-    FeatureList<Sources...>,
-    std::index_sequence<I...>
+    double* STACKDSL_RESTRICT out
 ) noexcept {
-    ((values[I] = ctx.template read<Sources>(lane)), ...);
+    if constexpr (requires { Source::load_features(ctx, lane, out); }) {
+        Source::load_features(ctx, lane, out);
+    } else {
+        for (std::size_t feature = 0; feature < source_width_v<Source>; ++feature) {
+            out[feature] = ctx.template read_feature<Source>(lane, feature);
+        }
+    }
 }
 
 template <class Context, class... Sources>
 STACKDSL_HOT void load_features(
     const Context& ctx,
     std::size_t lane,
-    std::array<double, sizeof...(Sources)>& values,
-    FeatureList<Sources...> sources = {}
+    std::array<double, FeatureList<Sources...>::width>& values,
+    FeatureList<Sources...> = {}
 ) noexcept {
-    load_features_impl(
-        ctx,
-        lane,
-        values,
-        sources,
-        std::index_sequence_for<Sources...>{});
+    std::size_t offset = 0;
+    ((load_source_features<Sources>(ctx, lane, values.data() + offset), offset += source_width_v<Sources>), ...);
 }
 
 template <std::size_t N, class Features, class Out, class Execution = DirectExecution<N>>
@@ -50,26 +46,21 @@ struct CatNode;
 
 template <std::size_t N, class Out, class Execution, class... Sources>
 struct CatNode<N, FeatureList<Sources...>, Out, Execution> {
-    static constexpr std::size_t K = sizeof...(Sources);
-    static_assert(K > 0, "cat requires at least one feature");
-
+    static constexpr std::size_t K = FeatureList<Sources...>::width;
+    static_assert(K > 0);
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         (void)sizeof(Execution);
-        static_assert(
-            std::is_same_v<Out, OutputDst>,
-            "matrix cat output is currently materialized only at a program/groupby root");
-        double* STACKDSL_RESTRICT out = ctx.output;
+        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        constexpr bool matrix_slot = requires { Out::matrix_slot_index; };
+        constexpr std::size_t stride = matrix_slot ? Context::matrix_scratch_width : K;
         for (std::size_t lane = 0; lane < N; ++lane) {
             std::array<double, K> values{};
             load_features(ctx, lane, values, FeatureList<Sources...>{});
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC ivdep
-#endif
             for (std::size_t feature = 0; feature < K; ++feature) {
-                out[lane * K + feature] = values[feature];
+                out[lane * stride + feature] = values[feature];
             }
         }
     }
