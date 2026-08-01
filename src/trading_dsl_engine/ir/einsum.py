@@ -27,7 +27,7 @@ class EinsumSpec:
     input_labels: tuple[tuple[Label, ...], ...]
     output_labels: tuple[Label, ...]
     label_extents: tuple[tuple[Label, Dimension], ...]
-    optimize: str = "greedy"
+    optimize: str = "none"
 
     @property
     def extents(self) -> dict[Label, Dimension]:
@@ -103,25 +103,33 @@ def _tokenize_term(term: str, *, output: bool) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-def _merge_extent(left: Dimension, right: Dimension, *, diagonal: bool = False) -> Dimension:
-    if diagonal:
-        if left == right:
-            return left
-        if left is None or right is None:
-            # Equality involving symbolic N is checked after N is known.
-            return None
-        raise EinsumParseError(f"repeated einsum label dimensions differ: {left} != {right}")
+def _merge_extent(
+    left: Dimension,
+    right: Dimension,
+    *,
+    diagonal: bool = False,
+    broadcast: bool = False,
+) -> Dimension:
     if left == right:
         return left
-    if left == 1:
-        return right
-    if right == 1:
-        return left
     if left is None or right is None:
-        # Symbolic N versus a fixed non-unit extent is checked by lowering.
+        # Equality involving symbolic N is checked after N is known. For an
+        # ellipsis, symbolic N may also resolve against a unit broadcast axis.
         return None
+    if diagonal:
+        raise EinsumParseError(
+            f"repeated einsum label dimensions differ: {left} != {right}"
+        )
+    if broadcast:
+        if left == 1:
+            return right
+        if right == 1:
+            return left
+        raise EinsumParseError(
+            f"einsum ellipsis dimensions are not broadcastable: {left} and {right}"
+        )
     raise EinsumParseError(
-        f"einsum label dimensions are not broadcastable: {left} and {right}"
+        f"einsum label dimensions differ without an ellipsis: {left} != {right}"
     )
 
 
@@ -129,13 +137,13 @@ def parse_einsum(
     subscripts: str,
     operand_shapes: Sequence[Sequence[Dimension]],
     *,
-    optimize: object = True,
+    optimize: object = False,
 ) -> EinsumSpec:
     """Parse NumPy string-form einsum subscripts and infer symbolic output shape.
 
     Supported syntax matches NumPy's string form: ASCII letter labels, empty
     scalar terms, one ellipsis per term, implicit or explicit output, repeated
-    labels for diagonals, and broadcasting of equal labels/ellipsis dimensions.
+    labels for diagonals, and broadcasting only through ellipsis dimensions.
     """
 
     if not isinstance(subscripts, str):
@@ -228,12 +236,18 @@ def parse_einsum(
             if not (extent is None or isinstance(extent, int) and extent >= 0):
                 raise EinsumParseError(f"invalid operand extent {extent!r}")
             if label in local:
-                local[label] = _merge_extent(local[label], extent, diagonal=True)
+                local[label] = _merge_extent(
+                    local[label], extent, diagonal=True
+                )
             else:
                 local[label] = extent
         for label, extent in local.items():
             if label in extents:
-                extents[label] = _merge_extent(extents[label], extent)
+                extents[label] = _merge_extent(
+                    extents[label],
+                    extent,
+                    broadcast=label in ellipsis_labels,
+                )
             else:
                 extents[label] = extent
 
@@ -246,8 +260,10 @@ def parse_einsum(
     )
 
 
-def resolve_spec(spec: EinsumSpec, operand_shapes: Sequence[Sequence[int]]) -> EinsumSpec:
-    """Resolve symbolic dimensions and repeat all NumPy broadcast checks."""
+def resolve_spec(
+    spec: EinsumSpec, operand_shapes: Sequence[Sequence[int]]
+) -> EinsumSpec:
+    """Resolve symbolic dimensions and repeat all NumPy shape checks."""
 
     return parse_einsum(spec.subscripts, operand_shapes, optimize=spec.optimize)
 
