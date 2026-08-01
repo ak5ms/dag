@@ -10,6 +10,16 @@ from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import GroupKeySpec
 
 
+_CPP_TYPES = {
+    "float32": "float",
+    "float64": "double",
+    "int32": "std::int32_t",
+    "int64": "std::int64_t",
+    "uint32": "std::uint32_t",
+    "uint64": "std::uint64_t",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class GeneratedSource:
     text: str
@@ -34,6 +44,22 @@ class IntArg(CppType):
 
     def render(self) -> str:
         return str(self.value)
+
+
+@dataclass(frozen=True, slots=True)
+class SignedValueArg(CppType):
+    value: int
+
+    def render(self) -> str:
+        return f"{self.value}LL"
+
+
+@dataclass(frozen=True, slots=True)
+class UnsignedValueArg(CppType):
+    value: int
+
+    def render(self) -> str:
+        return f"{self.value}ULL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +88,17 @@ class DoubleArg(CppType):
 
 
 @dataclass(frozen=True, slots=True)
+class FloatArg(CppType):
+    value: float
+
+    def render(self) -> str:
+        text = repr(float(self.value))
+        if not any(char in text for char in ".eE"):
+            text += ".0"
+        return text + "f"
+
+
+@dataclass(frozen=True, slots=True)
 class TemplateType(CppType):
     name: str
     args: tuple[CppType, ...]
@@ -74,6 +111,25 @@ def tmpl(name: str, *args: CppType) -> TemplateType:
     return TemplateType(name, tuple(args))
 
 
+def _cpp_type(dtype: str) -> CppType:
+    try:
+        return Name(_CPP_TYPES[dtype])
+    except KeyError as exc:
+        raise ValueError(f"unsupported cpp_stream dtype {dtype!r}") from exc
+
+
+def _literal_arg(source: Source) -> CppType:
+    if source.dtype in {"int32", "int64"}:
+        return SignedValueArg(int(source.value))
+    if source.dtype in {"uint32", "uint64"}:
+        return UnsignedValueArg(int(source.value))
+    if source.dtype == "float32":
+        return FloatArg(float(source.value))
+    if source.dtype == "float64":
+        return DoubleArg(float(source.value))
+    raise ValueError(f"unsupported literal dtype {source.dtype!r}")
+
+
 def _source_type(
     source: Source,
     *,
@@ -83,7 +139,7 @@ def _source_type(
     if source.kind == "input":
         index = int(source.value)
         if input_types is None:
-            cpp_type = Name("double")
+            cpp_type = _cpp_type(source.dtype)
             row_width = n if isinstance(n, CppType) else IntArg(n)
         else:
             spec = input_types[index]
@@ -94,16 +150,17 @@ def _source_type(
         return tmpl(
             "stackdsl::SlotSrc",
             IntArg(int(source.value)),
+            _cpp_type(source.dtype),
             BoolArg(source.row_scalar),
         )
     if source.kind == "literal":
-        return tmpl("stackdsl::LiteralSrc", DoubleArg(float(source.value)))
+        return tmpl("stackdsl::LiteralSrc", _literal_arg(source))
     raise AssertionError(source.kind)
 
 
 def _dest_type(stage: Stage) -> CppType:
     return Name("stackdsl::OutputDst") if stage.out.slot is None else tmpl(
-        "stackdsl::SlotDst", IntArg(stage.out.slot)
+        "stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype)
     )
 
 
@@ -141,6 +198,7 @@ def _stage_type(
             inputs[0],
             inputs[1],
             out,
+            _cpp_type(stage.dtype),
             Name(_BINARY_POLICIES[stage.op_name or ""]),
             execution,
         )
@@ -150,6 +208,7 @@ def _stage_type(
             stage_n,
             inputs[0],
             out,
+            _cpp_type(stage.dtype),
             Name(_UNARY_POLICIES[stage.op_name or ""]),
             execution,
         )
