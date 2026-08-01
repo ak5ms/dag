@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Mapping
 
 import numpy as np
-from numpy.lib import format as npy_format
 
 
 _SUPPORTED_DTYPES: dict[str, str] = {
@@ -77,16 +76,15 @@ class NpyMMap:
         return int(self.array.ctypes.data)
 
 
-def inspect_npy(path: str | Path) -> NpyArrayInfo:
-    resolved = Path(path)
-    with resolved.open("rb") as handle:
-        version = npy_format.read_magic(handle)
-        # NumPy's private helper is the single implementation used by the public
-        # v1/v2 wrappers and correctly handles v3 UTF-8 headers as well.
-        shape, fortran_order, dtype = npy_format._read_array_header(handle, version)  # type: ignore[attr-defined]
-        data_offset = handle.tell()
+def _open_public_memmap(path: Path, mode: str) -> np.memmap:
+    array = np.load(path, mmap_mode=mode, allow_pickle=False)
+    if not isinstance(array, np.memmap):
+        raise TypeError(f"expected a .npy memory map for {path}")
+    return array
 
-    dtype = np.dtype(dtype)
+
+def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
+    dtype = np.dtype(array.dtype)
     if dtype.hasobject or dtype.fields is not None or dtype.subdtype is not None:
         raise TypeError(f"cpp_stream does not support object/structured .npy dtype {dtype}")
     if dtype.byteorder == ">" or (dtype.byteorder == "=" and not np.little_endian):
@@ -97,9 +95,9 @@ def inspect_npy(path: str | Path) -> NpyArrayInfo:
             f"unsupported cpp_stream .npy dtype {dtype_name!r}; expected one of "
             f"{sorted(_SUPPORTED_DTYPES)}"
         )
-    if fortran_order:
+    if not array.flags.c_contiguous:
         raise ValueError("cpp_stream requires C-order .npy arrays")
-    shape = tuple(int(value) for value in shape)
+    shape = tuple(int(value) for value in array.shape)
     if len(shape) == 1:
         rows, row_width = shape[0], 1
     elif len(shape) == 2:
@@ -108,15 +106,16 @@ def inspect_npy(path: str | Path) -> NpyArrayInfo:
         raise ValueError(f"cpp_stream expects a 1D or 2D .npy array, got shape={shape}")
     if rows < 0 or row_width <= 0:
         raise ValueError(f"invalid .npy shape {shape}")
+    data_offset = int(array.offset)
     expected_bytes = data_offset + rows * row_width * dtype.itemsize
-    actual_bytes = resolved.stat().st_size
+    actual_bytes = path.stat().st_size
     if actual_bytes != expected_bytes:
         raise ValueError(
-            f".npy payload size mismatch for {resolved}: expected {expected_bytes} bytes, "
+            f".npy payload size mismatch for {path}: expected {expected_bytes} bytes, "
             f"found {actual_bytes}"
         )
     return NpyArrayInfo(
-        path=resolved,
+        path=path,
         dtype=dtype_name,
         shape=shape,
         fortran_order=False,
@@ -126,16 +125,27 @@ def inspect_npy(path: str | Path) -> NpyArrayInfo:
     )
 
 
+def inspect_npy(path: str | Path) -> NpyArrayInfo:
+    resolved = Path(path)
+    array = _open_public_memmap(resolved, "r")
+    try:
+        return _info_from_memmap(resolved, array)
+    finally:
+        mapping = getattr(array, "_mmap", None)
+        if mapping is not None:
+            mapping.close()
+
+
 def mmap_npy(path: str | Path, *, mode: str = "r") -> NpyMMap:
-    info = inspect_npy(path)
-    array = np.memmap(
-        info.path,
-        dtype=np.dtype(info.dtype),
-        mode=mode,
-        offset=info.data_offset,
-        shape=info.shape,
-        order="C",
-    )
+    resolved = Path(path)
+    array = _open_public_memmap(resolved, mode)
+    try:
+        info = _info_from_memmap(resolved, array)
+    except Exception:
+        mapping = getattr(array, "_mmap", None)
+        if mapping is not None:
+            mapping.close()
+        raise
     return NpyMMap(info=info, array=array)
 
 
