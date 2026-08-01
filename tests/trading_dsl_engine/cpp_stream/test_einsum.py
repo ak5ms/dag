@@ -100,7 +100,7 @@ def test_ellipsis_feature_reduction(tmp_path: Path) -> None:
     np.testing.assert_allclose(output, expected, rtol=1e-13, atol=1e-13)
 
 
-def test_unary_transpose_and_diagonal_tensor_slot(tmp_path: Path) -> None:
+def test_unary_transpose_diagonal_and_tensor_scratch(tmp_path: Path) -> None:
     data = _data()
     outer = einsum("i,j->ij", var("x"), var("y"))
     diagonal = einsum("ii->i", outer)
@@ -115,7 +115,7 @@ def test_unary_transpose_and_diagonal_tensor_slot(tmp_path: Path) -> None:
     )
     generated = runtime.generated_cpp.read_text()
     assert "UnaryEinsumNode" in generated
-    assert "TensorSlotSrc" in generated
+    assert "MatrixSlotSrc" in generated
 
     matrix = cat(var("x"), var("y"), var("z"))
     transposed, _ = _run(
@@ -124,11 +124,18 @@ def test_unary_transpose_and_diagonal_tensor_slot(tmp_path: Path) -> None:
         {"x": data["x"], "y": data["y"], "z": data["z"]},
         "transpose",
     )
-    expected = np.transpose(
-        np.stack((data["x"], data["y"], data["z"]), axis=-1),
-        (0, 2, 1),
-    )
+    matrix_np = np.stack((data["x"], data["y"], data["z"]), axis=-1)
+    expected = np.transpose(matrix_np, (0, 2, 1))
     np.testing.assert_allclose(transposed, expected, rtol=1e-13, atol=1e-13)
+
+    restored, nested_runtime = _run(
+        tmp_path,
+        einsum("ji->ij", einsum("ij->ji", matrix)),
+        {"x": data["x"], "y": data["y"], "z": data["z"]},
+        "nested_transpose",
+    )
+    np.testing.assert_allclose(restored, matrix_np, rtol=1e-13, atol=1e-13)
+    assert "TensorSlotSrc" in nested_runtime.generated_cpp.read_text()
 
 
 def test_implicit_scalar_output_and_scalar_operand(tmp_path: Path) -> None:
