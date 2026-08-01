@@ -149,6 +149,7 @@ def _apply_input_key_hints(
     program: Program,
     input_types: tuple[InputTypeSpec, ...],
 ) -> Program:
+    """Fill shape/type facts that can be proven without inserting conversions."""
     is_row_scalar = _row_scalar_analysis(program, input_types)
     nodes: list[Node] = []
     for node in program.nodes:
@@ -163,19 +164,19 @@ def _apply_input_key_hints(
             row_scalar = spec.row_scalar
             if row_scalar is None:
                 row_scalar = is_row_scalar(child_id)
+
+            # A direct input's dtype is known from the mmap/headerless input
+            # binding. A derived expression is left for native dtype inference;
+            # do not default it to float64 before lowering.
             dtype = spec.dtype
-            if dtype is None:
-                dtype = (
-                    input_types[child_op.input_index].dtype
-                    if isinstance(child_op, InputOp)
-                    else "float64"
-                )
-            elif isinstance(child_op, InputOp):
+            if isinstance(child_op, InputOp):
                 actual = input_types[child_op.input_index].dtype
-                if dtype != actual:
+                if dtype is None:
+                    dtype = actual
+                elif dtype != actual:
                     raise TypeError(
                         f"Key dtype hint {dtype!r} does not match direct input "
-                        f"{child_op.name!r} dtype {actual!r}"
+                        f"{child_op.name!r} dtype {actual!r}; no implicit conversion is inserted"
                     )
             specs.append(replace(spec, row_scalar=row_scalar, dtype=dtype))
         nodes.append(replace(node, op=replace(op, key_specs=tuple(specs))))
@@ -201,6 +202,7 @@ def _compile_program(
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
         row_scalar_nodes=row_scalar_nodes,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
     )
     generated = render_translation_unit(
         plan,
@@ -232,9 +234,13 @@ def compile_formula(
 ) -> CppStreamRuntime:
     """Compile a formula-specialized raw-file runner.
 
-    ``input_types`` may describe typed headerless inputs. When omitted, every
-    input is row-major float64 with width ``n_instruments``. Per-key ``Key``
-    descriptors are preferred over the legacy global ``key_cardinalities`` map.
+    ``input_types`` describes each headerless input's native dtype and row width.
+    Those types are embedded into generated sources and are not eagerly converted
+    to float64. Stateless expressions retain native types where their operation
+    and ``Key.dtype`` assertions permit it. The root file format remains float64.
+
+    Per-key ``Key`` descriptors are preferred over the legacy global
+    ``key_cardinalities`` map.
     """
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
@@ -298,7 +304,11 @@ def compile_npy_formula(
     key_cardinalities: Mapping[str, int] | None = None,
     prefetch_rows: int = 16,
 ) -> CppStreamRuntime:
-    """Inspect mmap .npy headers, then compile exact input dtypes and widths."""
+    """Inspect mmap .npy headers, then compile exact input dtypes and widths.
+
+    The mapped payload is read through ``InputSrc<..., ValueType, RowWidth>`` in
+    its native type. No eager float64 conversion or input copy is performed.
+    """
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
     program = compile_ir(formula, dsl_registry=dsl_registry, column_names=column_names)
