@@ -1,8 +1,10 @@
 from pathlib import Path
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
+from trading_dsl_engine.base.keys import Key
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
+from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir import compile_ir
 
 
@@ -47,14 +49,21 @@ def test_groupby_header_contains_no_operator_implementations():
     assert "XsRankNode" not in text
 
 
-def test_minute_terminal_expands_from_event_timestamp():
+def test_key_descriptor_selects_dense_row_scalar_resolver():
     formula = groupby(
-        (univ([0], [1, 2], list(range(3, 9))), var("minute")),
+        (
+            univ([0], [1, 2], list(range(3, 9))),
+            Key(var("minute"), num_keys=60, row_scalar=True, dtype="int64"),
+        ),
         var("close"),
         ewm(cumsum(self_), 3),
     )
     program = compile_ir(formula)
     assert program.input_names == ("_ev_ts", "close")
+    group_op = program.nodes[program.output_id].op
+    assert group_op.key_specs[0].num_keys == 60
+    assert group_op.key_specs[0].row_scalar is True
+    assert group_op.key_specs[0].dtype == "int64"
     source = render_translation_unit(
         lower_program(program, n_instruments=9),
         n_instruments=9,
@@ -62,5 +71,24 @@ def test_minute_terminal_expands_from_event_timestamp():
     ).text
     assert "stackdsl::FloorOp" in source
     assert "stackdsl::ModOp" in source
-    assert "stackdsl::EwmNode<" in source
+    assert "stackdsl::DenseTupleGroupResolver<" in source
+    assert "stackdsl::KeySpec<" in source
+    assert ", 60, 0, true>" in source
     assert "stackdsl::GroupedExecution<N, Capacity>" in source
+
+
+def test_codegen_embeds_typed_row_widths():
+    program = compile_ir("close + _ev_ts")
+    plan = lower_program(program, n_instruments=9)
+    source = render_translation_unit(
+        plan,
+        n_instruments=9,
+        prefetch_rows=16,
+        input_types=(
+            InputTypeSpec("float64", 9),
+            InputTypeSpec("int64", 1),
+        ),
+    ).text
+    assert "stackdsl::InputSrc<0, double, 9>" in source
+    assert "stackdsl::InputSrc<1, std::int64_t, 1>" in source
+    assert "cpp_stream_run_arrays" in source
