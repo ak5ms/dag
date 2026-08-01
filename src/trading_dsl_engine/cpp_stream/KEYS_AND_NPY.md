@@ -41,6 +41,11 @@ any key is unbounded, the complete tuple uses the generic fixed-capacity hash
 resolver. If every key is row-scalar, either resolver evaluates one tuple and
 broadcasts one group slot.
 
+Direct integer keys are read and hashed in their native input type. In particular,
+`int64` and `uint64` values are not converted to `double` before key equality, so
+values above `2^53` remain distinct. Dense integer range checks also use exact
+128-bit intermediate arithmetic rather than floating-point rounding.
+
 ## Typed `.npy` mapping
 
 `compile_npy_formula` inspects all input headers before native compilation:
@@ -99,9 +104,10 @@ The focused Linux workflow compiles and executes generated C++ for:
 - `int64 (rows,)` timestamp broadcasting against `float64 (rows, 9)` data;
 - dense row-scalar `minute(_ev_ts)` groupby with grouped cumsum and EWM;
 - independently hinted composite key tuples and mixed-radix capacity;
-- width-one generated calendar stages.
+- width-one generated calendar stages;
+- distinct hashed `int64` keys `2^53` and `2^53 + 1`.
 
-The July 31, 2026 focused run completed with nine passing tests.
+The final focused run completed with ten passing tests.
 
 ## Non-gating same-run benchmark
 
@@ -115,17 +121,18 @@ output in /dev/shm
 GCC native/LTO cpp_stream defaults
 ```
 
-Unhinted baseline:
+Two separate hosted-runner executions produced:
 
-```text
-float64 _ev_ts, shape (rows, 9)
-vector floating calendar stages
-hash resolver
-median: 4.117 M rows/s
-runs: 4.119, 4.058, 4.116, 4.117, 4.122 M rows/s
-```
+| Run | Vector/hash baseline | Typed row-scalar/dense | Speedup |
+| --- | ---: | ---: | ---: |
+| A | 4.117 M rows/s | 10.924 M rows/s | 2.65x |
+| B | 4.407 M rows/s | 9.752 M rows/s | 2.21x |
 
-Typed hinted path:
+The hosted CPU varied between runs, so absolute throughput is not a regression
+threshold. In both same-run comparisons, the typed hinted path was substantially
+faster.
+
+The optimized path used:
 
 ```text
 int64 _ev_ts.npy, shape (rows,)
@@ -133,11 +140,7 @@ float64 close.npy, shape (rows, 9)
 Key(minute, num_keys=60, row_scalar=True, dtype="int64")
 width-one floating calendar stages
 dense resolver
-median: 10.924 M rows/s
-runs: 10.899, 10.924, 10.936, 10.917, 10.938 M rows/s
 ```
 
-The key descriptor plus typed row-scalar `.npy` representation improved this
-end-to-end workload by approximately 2.65x on the shared runner. It does not yet
-reach the earlier row-scalar integer-calendar ablation because the generic calendar
-arithmetic still executes in `float64`.
+It does not yet reach the earlier row-scalar integer-calendar ablation because the
+generic calendar arithmetic still executes in `float64`.
