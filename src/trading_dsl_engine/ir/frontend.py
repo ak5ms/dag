@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from trading_dsl_engine.base.custom import StatelessCall
@@ -287,7 +288,7 @@ def _normalize_einsum(call: Call) -> tuple[str, tuple[Expr, ...], object]:
         raise FormulaIRCompileError(
             f"unsupported einsum keyword argument(s): {sorted(unknown)}"
         )
-    optimize: object = True if "optimize" not in kwargs else _literal_optimize(
+    optimize: object = False if "optimize" not in kwargs else _literal_optimize(
         kwargs["optimize"]
     )
 
@@ -565,6 +566,7 @@ class _BaseBuilder:
 class _OuterBuilder(_BaseBuilder):
     registry: DSLFunctionRegistry
     columns: dict[str, int]
+    input_value_types: Mapping[str, ValueType]
     grouped: bool = False
 
     def __post_init__(self) -> None:
@@ -583,7 +585,11 @@ class _OuterBuilder(_BaseBuilder):
         if node.name == "self_":
             raise FormulaIRCompileError("self_ only valid in groupby RHS")
         input_index = self.inputs.setdefault(node.name, len(self.inputs))
-        return self._append(InputOp(input_index, node.name), (), VECTOR)
+        return self._append(
+            InputOp(input_index, node.name),
+            (),
+            self.input_value_types.get(node.name, VECTOR),
+        )
 
     def _build_groupby(self, call: Call) -> int:
         if len(call.args) != 3:
@@ -697,11 +703,13 @@ def compile_ir(
     *,
     dsl_registry: DSLFunctionRegistry | None = None,
     column_names: list[str] | tuple[str, ...] | None = None,
+    input_value_types: Mapping[str, ValueType] | None = None,
 ) -> Program:
     expression = parse_formula(formula) if isinstance(formula, str) else formula
     builder = _OuterBuilder(
         dsl_registry or DEFAULT_DSL_REGISTRY,
         {name: index for index, name in enumerate(column_names or ())},
+        input_value_types or {},
     )
     root = builder.build(expression)
     return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
