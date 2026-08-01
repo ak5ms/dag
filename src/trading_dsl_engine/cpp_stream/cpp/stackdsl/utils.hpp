@@ -68,17 +68,22 @@ struct alignas(64) RowContext {
     double* output=nullptr;
 
     template <class Src>
-    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+    STACKDSL_HOT auto read_native(std::size_t lane) const noexcept {
         if constexpr (requires { Src::input_index; }) {
             using ValueType = typename Src::value_type;
             const auto* values = static_cast<const ValueType*>(inputs[Src::input_index]);
             const std::size_t offset = Src::row_width == 1 ? 0 : lane;
-            return static_cast<double>(values[offset]);
+            return values[offset];
         } else if constexpr (requires { Src::slot_index; }) {
             return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
         } else {
             return Src::value;
         }
+    }
+
+    template <class Src>
+    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+        return static_cast<double>(read_native<Src>(lane));
     }
 
     template <class Src>
