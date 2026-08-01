@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install focused dependencies
-        run: python -m pip install --upgrade pip numpy numba pytest jinja2 jax
+        run: python -m pip install --upgrade pip numpy numba pytest jinja2 jax astropy
       - name: Run IR, native operator, and roll_rets tests
         env:
           PYTHONPATH: src
