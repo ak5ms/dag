@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -40,7 +41,8 @@ template<std::size_t K,std::size_t Steps,class EventTs,class SessionStart,class 
 struct FutureRbfBasisSumSrc {
     static constexpr std::size_t feature_width=K;
     using value_type=double;
-    static consteval std::array<double,(Steps+1)*K> make_table() {
+
+    static std::array<double,(Steps+1)*K> make_table() {
         std::array<double,(Steps+1)*K> table{};
         std::array<double,K> running{};
         constexpr double sigma=1.0/static_cast<double>(K>1?K-1:1);
@@ -62,7 +64,7 @@ struct FutureRbfBasisSumSrc {
         }
         return table;
     }
-    static constexpr auto table=make_table();
+    inline static const std::array<double,(Steps+1)*K> table=make_table();
 
     template<class Context>
     STACKDSL_HOT static void load_features(const Context& ctx,std::size_t lane,double* out) noexcept {
