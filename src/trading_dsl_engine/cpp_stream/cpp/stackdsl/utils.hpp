@@ -100,9 +100,6 @@ template <class Src> using source_value_t = typename Src::value_type;
 template <class Dst> using destination_value_t = typename Dst::value_type;
 template <class Src> inline constexpr std::size_t source_width_v = Src::feature_width;
 
-// MatrixScratchWidth is the maximum feature width of any materialized matrix in
-// this plan. Matrix slots are independent from typed scalar/vector slots, so a
-// scalar liveness slot never aliases matrix storage accidentally.
 template <
     std::size_t N,
     std::size_t Inputs,
@@ -164,7 +161,7 @@ struct alignas(64) RowContext {
     template <class Src>
     STACKDSL_HOT double read_feature(std::size_t lane, std::size_t feature) const noexcept {
         if constexpr (requires { Src::matrix_slot_index; }) {
-            return scratch_matrix_f64[Src::matrix_slot_index][lane * MatrixScratchWidth + feature];
+            return scratch_matrix_f64[Src::matrix_slot_index][lane * Src::feature_width + feature];
         } else {
             (void)feature;
             return read<Src>(lane);
