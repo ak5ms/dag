@@ -40,10 +40,119 @@ struct {{ inner.name }} {
     }
 };
 {% endfor %}
+
+int run_bound_inputs(
+    const std::array<const void*, {{ input_count }}>& input_data,
+    std::size_t rows,
+    const char* output_path,
+    std::size_t async_writeback_bytes,
+    std::size_t* rows_out,
+    double* seconds_out) {
+    constexpr std::size_t N = {{ n }};
+    constexpr std::size_t output_row_bytes = N * sizeof(double);
+    stackdsl::MMapFile output(output_path, true, rows * output_row_bytes);
+    output.advise_sequential();
+    auto* STACKDSL_RESTRICT out = static_cast<double*>(output.data());
+
+    stackdsl::RowContext<N, {{ input_count }}, {{ scratch_slots }}> ctx{};
+{% for stage in stages %}
+    {{ stage.cpp_type }} s{{ stage.index }}{};
+{% endfor %}
+{% for stage in stages %}
+    s{{ stage.index }}.setup();
+{% endfor %}
+
+    std::size_t writeback_start = 0;
+    const auto started = std::chrono::steady_clock::now();
+    for (std::size_t t = 0; t < rows; ++t) {
+{% if prefetch_rows > 0 %}
+{% for input in inputs %}
+        if (t + {{ prefetch_rows }} < rows) {
+            __builtin_prefetch(
+                static_cast<const {{ input.cpp_type }}*>(input_data[{{ input.index }}])
+                    + (t + {{ prefetch_rows }}) * {{ input.row_width }},
+                0,
+                1);
+        }
+{% endfor %}
+{% endif %}
+{% for input in inputs %}
+        ctx.inputs[{{ input.index }}] =
+            static_cast<const {{ input.cpp_type }}*>(input_data[{{ input.index }}])
+                + t * {{ input.row_width }};
+{% endfor %}
+        ctx.output = out + t * N;
+{% for stage in stages %}
+{% if stage.checked %}
+        if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
+{% else %}
+        s{{ stage.index }}.on_data(ctx);
+{% endif %}
+{% endfor %}
+        if (async_writeback_bytes > 0) {
+            const std::size_t completed = (t + 1) * output_row_bytes;
+            if (completed - writeback_start >= async_writeback_bytes) {
+                output.request_writeback(writeback_start, completed - writeback_start);
+                writeback_start = completed;
+            }
+        }
+    }
+    const auto ended = std::chrono::steady_clock::now();
+    const std::size_t output_bytes = rows * output_row_bytes;
+    if (async_writeback_bytes > 0 && writeback_start < output_bytes) {
+        output.request_writeback(writeback_start, output_bytes - writeback_start);
+    }
+    if (rows_out) *rows_out = rows;
+    if (seconds_out) *seconds_out = std::chrono::duration<double>(ended - started).count();
+    return 0;
+}
 }  // namespace
 
 extern "C" const char* cpp_stream_last_error() noexcept {
     return g_last_error.c_str();
+}
+
+extern "C" int cpp_stream_run_arrays(
+    const void* const* input_data,
+    const std::size_t* input_rows,
+    const std::size_t* input_widths,
+    std::size_t input_count,
+    const char* output_path,
+    std::size_t async_writeback_bytes,
+    std::size_t* rows_out,
+    double* seconds_out) noexcept {
+    try {
+        g_last_error.clear();
+        if (
+            input_count != {{ input_count }} || input_data == nullptr ||
+            input_rows == nullptr || input_widths == nullptr || output_path == nullptr
+        ) return 1;
+        const std::size_t rows = input_rows[0];
+{% for input in inputs %}
+        if (input_data[{{ input.index }}] == nullptr) return 1;
+        if (input_widths[{{ input.index }}] != {{ input.row_width }}) return 2;
+{% if input.index > 0 %}
+        if (input_rows[{{ input.index }}] != rows) return 3;
+{% endif %}
+{% endfor %}
+        std::array<const void*, {{ input_count }}> bases{};
+{% for input in inputs %}
+        bases[{{ input.index }}] = input_data[{{ input.index }}];
+{% endfor %}
+        return run_bound_inputs(
+            bases,
+            rows,
+            output_path,
+            async_writeback_bytes,
+            rows_out,
+            seconds_out);
+    } catch (const std::exception& exc) {
+        g_last_error = exc.what();
+        return 100;
+    } catch (...) {
+        g_last_error = "unknown cpp_stream exception";
+        return 101;
+    }
 }
 
 extern "C" int cpp_stream_run_files(
@@ -55,71 +164,30 @@ extern "C" int cpp_stream_run_files(
     double* seconds_out) noexcept {
     try {
         g_last_error.clear();
-        constexpr std::size_t N = {{ n }};
-        constexpr std::size_t row_bytes = N * sizeof(double);
         if (input_count != {{ input_count }} || input_paths == nullptr || output_path == nullptr) return 1;
 {% for input in inputs %}
         stackdsl::MMapFile in{{ input.index }}(input_paths[{{ input.index }}], false);
         in{{ input.index }}.advise_sequential();
-{% endfor %}
-{% for input in inputs %}
-        if (in{{ input.index }}.size() % row_bytes != 0) return 2;
-        const std::size_t rows{{ input.index }} = in{{ input.index }}.size() / row_bytes;
+        constexpr std::size_t input_row_bytes{{ input.index }} =
+            {{ input.row_width }} * sizeof({{ input.cpp_type }});
+        if (in{{ input.index }}.size() % input_row_bytes{{ input.index }} != 0) return 2;
+        const std::size_t rows{{ input.index }} =
+            in{{ input.index }}.size() / input_row_bytes{{ input.index }};
 {% if input.index > 0 %}
         if (rows{{ input.index }} != rows0) return 3;
 {% endif %}
 {% endfor %}
-        const std::size_t rows = rows0;
-        stackdsl::MMapFile output(output_path, true, rows * row_bytes);
-        output.advise_sequential();
-        auto* STACKDSL_RESTRICT out = static_cast<double*>(output.data());
+        std::array<const void*, {{ input_count }}> bases{};
 {% for input in inputs %}
-        const auto* STACKDSL_RESTRICT base{{ input.index }} = static_cast<const double*>(in{{ input.index }}.data());
+        bases[{{ input.index }}] = in{{ input.index }}.data();
 {% endfor %}
-
-        stackdsl::RowContext<N, {{ input_count }}, {{ scratch_slots }}> ctx{};
-{% for stage in stages %}
-        {{ stage.cpp_type }} s{{ stage.index }}{};
-{% endfor %}
-{% for stage in stages %}
-        s{{ stage.index }}.setup();
-{% endfor %}
-
-        std::size_t writeback_start = 0;
-        const auto started = std::chrono::steady_clock::now();
-        for (std::size_t t = 0; t < rows; ++t) {
-{% if prefetch_rows > 0 %}
-{% for input in inputs %}
-            if (t + {{ prefetch_rows }} < rows) __builtin_prefetch(base{{ input.index }} + (t + {{ prefetch_rows }}) * N, 0, 1);
-{% endfor %}
-{% endif %}
-{% for input in inputs %}
-            ctx.inputs[{{ input.index }}] = base{{ input.index }} + t * N;
-{% endfor %}
-            ctx.output = out + t * N;
-{% for stage in stages %}
-{% if stage.checked %}
-            if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
-{% else %}
-            s{{ stage.index }}.on_data(ctx);
-{% endif %}
-{% endfor %}
-            if (async_writeback_bytes > 0) {
-                const std::size_t completed = (t + 1) * row_bytes;
-                if (completed - writeback_start >= async_writeback_bytes) {
-                    output.request_writeback(writeback_start, completed - writeback_start);
-                    writeback_start = completed;
-                }
-            }
-        }
-        const auto ended = std::chrono::steady_clock::now();
-        const std::size_t output_bytes = rows * row_bytes;
-        if (async_writeback_bytes > 0 && writeback_start < output_bytes) {
-            output.request_writeback(writeback_start, output_bytes - writeback_start);
-        }
-        if (rows_out) *rows_out = rows;
-        if (seconds_out) *seconds_out = std::chrono::duration<double>(ended - started).count();
-        return 0;
+        return run_bound_inputs(
+            bases,
+            rows0,
+            output_path,
+            async_writeback_bytes,
+            rows_out,
+            seconds_out);
     } catch (const std::exception& exc) {
         g_last_error = exc.what();
         return 100;
