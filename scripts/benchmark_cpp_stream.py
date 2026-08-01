@@ -9,7 +9,7 @@ import numpy as np
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.cpp_stream import compile_formula, compile_npy_formula
+from trading_dsl_engine.cpp_stream import InputTypeSpec, compile_formula, source
 
 ROWS = int(os.environ.get("CPP_STREAM_BENCH_ROWS", "5000000"))
 N = int(os.environ.get("CPP_STREAM_BENCH_INSTRUMENTS", "9"))
@@ -37,6 +37,10 @@ def _write_npy(path: Path, shape: tuple[int, ...], dtype, values, *, chunk_rows:
         arr[start:stop] = values(start, stop)
     arr.flush()
     del arr
+
+
+def _raw(path: Path, *, dtype: str = "float64", width: int = N):
+    return source(path, input_type=InputTypeSpec(dtype, width))
 
 
 def _minute_formula(key_expr):
@@ -81,8 +85,7 @@ def _build_case(root: Path):
         formula = _minute_formula(
             Key(var("minute"), num_keys=60, row_scalar=True, dtype="int64")
         )
-        paths = {"_ev_ts": timestamp_path, "close": close_path}
-        return formula, paths, True, {}
+        return formula, {"_ev_ts": timestamp_path, "close": close_path}, {}
 
     close_path = root / "close.bin"
     _write_raw_matrix(
@@ -108,8 +111,7 @@ def _build_case(root: Path):
         )
         return (
             _minute_formula(key_expr),
-            {"_ev_ts": timestamp_path, "close": close_path},
-            False,
+            {"_ev_ts": _raw(timestamp_path), "close": _raw(close_path)},
             {},
         )
 
@@ -123,8 +125,7 @@ def _build_case(root: Path):
         )
         return (
             _minute_formula(key_expr),
-            {"minute_key": minute_path, "close": close_path},
-            False,
+            {"minute_key": _raw(minute_path), "close": _raw(close_path)},
             {},
         )
 
@@ -136,8 +137,7 @@ def _build_case(root: Path):
         )
         return (
             "xs_rank(ewm(close / open, 21))",
-            {"close": close_path, "open": open_path},
-            False,
+            {"close": _raw(close_path), "open": _raw(open_path)},
             {},
         )
 
@@ -147,34 +147,24 @@ def _build_case(root: Path):
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cpp_stream_bench_") as tmp:
         root = Path(tmp)
-        formula, paths, npy_mode, compile_kwargs = _build_case(root)
-        if npy_mode:
-            runtime = compile_npy_formula(
-                formula,
-                paths,
-                n_instruments=N,
-                prefetch_rows=PREFETCH_ROWS,
-                **compile_kwargs,
-            )
-            run = runtime.run_npy_files
-        else:
-            runtime = compile_formula(
-                formula,
-                n_instruments=N,
-                prefetch_rows=PREFETCH_ROWS,
-                **compile_kwargs,
-            )
-            run = runtime.run_files
+        formula, data, compile_kwargs = _build_case(root)
+        runtime = compile_formula(
+            formula,
+            data,
+            n_instruments=N,
+            prefetch_rows=PREFETCH_ROWS,
+            **compile_kwargs,
+        )
 
         output_root = Path(OUTPUT_DIR) if OUTPUT_DIR else root
         output_root.mkdir(parents=True, exist_ok=True)
         out = output_root / f"cpp_stream_{CASE}.out.bin"
 
         for _ in range(WARMUPS):
-            run(paths, out_path=out, async_writeback_mb=0)
+            runtime.run(out_path=out, async_writeback_mb=0)
 
         rates = [
-            run(paths, out_path=out, async_writeback_mb=0).rows_per_second
+            runtime.run(out_path=out, async_writeback_mb=0).rows_per_second
             for _ in range(RUNS)
         ]
         median_mrows = median(rates) / 1e6
