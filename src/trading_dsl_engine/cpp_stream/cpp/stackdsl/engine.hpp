@@ -9,8 +9,6 @@ namespace stackdsl {
 
 // Execution is a plan-level concern, not an operator variant. Every generated
 // node receives one of these scopes through the same final template parameter.
-// Stateless nodes simply ignore it. Stateful and cross-sectional nodes use the
-// generic state_index/rank_group/cross_group interface.
 template <std::size_t N>
 struct DirectExecution {
     static constexpr std::size_t state_size = N;
@@ -33,13 +31,11 @@ struct DirectExecution {
     }
 };
 
-template <std::size_t N, std::size_t Capacity>
+template <std::size_t N, std::size_t Capacity, std::size_t PartitionCount>
 struct GroupedExecution {
+    static_assert(PartitionCount > 0);
     static constexpr std::size_t state_size = N * Capacity;
-    // Static partitions are encoded by lane and can number at most N. Dynamic
-    // slots number Capacity. This fixed upper bound keeps every grouped
-    // cross-sectional operator heap-free and independent of the operator type.
-    static constexpr std::size_t cross_state_size = N * Capacity;
+    static constexpr std::size_t cross_state_size = PartitionCount * Capacity;
     static constexpr bool contiguous_lanes = false;
 
     template <class Context>
