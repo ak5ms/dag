@@ -29,3 +29,13 @@ jobs:
           python -m pytest -q -o addopts=""
           tests/trading_dsl_engine/cpp_stream/test_codegen.py
           tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
+      - name: Compare unhinted and typed hinted minute keys
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_BENCH_ROWS: "1000000"
+          CPP_STREAM_BENCH_RUNS: "5"
+          CPP_STREAM_BENCH_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: |
+          CPP_STREAM_BENCH_CASE=minute_groupby python scripts/benchmark_cpp_stream.py
+          CPP_STREAM_BENCH_CASE=minute_groupby_npy python scripts/benchmark_cpp_stream.py
