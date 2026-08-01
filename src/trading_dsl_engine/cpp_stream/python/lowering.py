@@ -25,6 +25,7 @@ class CppStreamLoweringError(ValueError):
 class Source:
     kind: str
     value: int | float
+    row_scalar: bool = False
 
     @property
     def is_vector(self) -> bool:
@@ -41,6 +42,7 @@ class Stage:
     kind: str
     inputs: tuple[Source, ...]
     out: Dest
+    lane_count: int
     op_name: str | None = None
     ewm: EwmOp | None = None
     group: "GroupStage | None" = None
@@ -122,7 +124,7 @@ def _dense_capacity(specs: tuple[GroupKeySpec, ...]) -> int:
     capacity = 1
     for spec in specs:
         assert spec.num_keys is not None
-        capacity *= int(spec.num_keys) + 1  # one NaN digit per key
+        capacity *= int(spec.num_keys) + 1
     if capacity > 65535:
         raise CppStreamLoweringError(
             f"dense composite key requires {capacity} slots, exceeding uint16 capacity"
@@ -137,6 +139,7 @@ def _build_plan(
     default_group_capacity: int,
     key_cardinalities: Mapping[str, int] | None,
     grouped: bool,
+    row_scalar_nodes: frozenset[int],
 ) -> Plan:
     uses = [0] * len(program.nodes)
     root = program.output_id
@@ -159,11 +162,13 @@ def _build_plan(
 
     for node_id, node in enumerate(program.nodes):
         op = node.op
+        row_scalar = node_id in row_scalar_nodes
+        lane_count = 1 if row_scalar else n_instruments
         if isinstance(op, InputOp):
-            sources[node_id] = Source("input", op.input_index)
+            sources[node_id] = Source("input", op.input_index, row_scalar=row_scalar)
             continue
         if isinstance(op, LiteralOp):
-            sources[node_id] = Source("literal", op.value)
+            sources[node_id] = Source("literal", op.value, row_scalar=True)
             continue
 
         children = tuple(sources[child] for child in node.child_ids)
@@ -171,30 +176,34 @@ def _build_plan(
         reusable: int | None = None
         if not is_root and not isinstance(op, GroupByOp):
             for child_id, source in zip(node.child_ids, children):
-                if source.kind == "slot" and uses[child_id] == 1:
+                if (
+                    source.kind == "slot"
+                    and uses[child_id] == 1
+                    and (row_scalar or not source.row_scalar)
+                ):
                     reusable = int(source.value)
                     break
         out = Dest(None if is_root else (reusable if reusable is not None else allocate()))
 
         if isinstance(op, NaryOp):
             if op.arity == 2 and op.name in _BINARY_CPP:
-                stage = Stage("binary", children, out, op_name=op.name)
+                stage = Stage("binary", children, out, lane_count, op_name=op.name)
             elif op.arity == 1 and op.name in _UNARY_CPP:
-                stage = Stage("unary", children, out, op_name=op.name)
+                stage = Stage("unary", children, out, lane_count, op_name=op.name)
             else:
                 raise CppStreamLoweringError(f"unsupported nary op {op.name!r}/{op.arity}")
         elif isinstance(op, CumsumOp):
             if not children[0].is_vector:
                 raise CppStreamLoweringError("cpp_stream cumsum requires vector input")
-            stage = Stage("cumsum", children, out)
+            stage = Stage("cumsum", children, out, lane_count)
         elif isinstance(op, EwmOp):
             if not children[0].is_vector:
                 raise CppStreamLoweringError("cpp_stream ewm requires vector input")
-            stage = Stage("ewm", children, out, ewm=op)
+            stage = Stage("ewm", children, out, lane_count, ewm=op)
         elif isinstance(op, XsRankOp):
             if not children[0].is_vector:
                 raise CppStreamLoweringError("cpp_stream xs_rank requires vector input")
-            stage = Stage("xs_rank", children, out)
+            stage = Stage("xs_rank", children, out, lane_count)
         elif isinstance(op, GroupByOp):
             if grouped:
                 raise CppStreamLoweringError("nested groupby is not supported")
@@ -214,6 +223,7 @@ def _build_plan(
                 default_group_capacity=default_group_capacity,
                 key_cardinalities=key_cardinalities,
                 grouped=True,
+                row_scalar_nodes=frozenset(),
             )
             group_stage = GroupStage(
                 inner=inner,
@@ -225,12 +235,16 @@ def _build_plan(
                 feed_sources=feed_sources,
                 dense=dense,
             )
-            stage = Stage("groupby", children, out, group=group_stage)
+            stage = Stage("groupby", children, out, n_instruments, group=group_stage)
         else:
             raise CppStreamLoweringError(f"unsupported IR op {type(op).__name__}")
 
         stages.append(stage)
-        sources[node_id] = Source("slot", out.slot) if out.slot is not None else Source("slot", -1)
+        sources[node_id] = Source(
+            "slot",
+            out.slot if out.slot is not None else -1,
+            row_scalar=row_scalar,
+        )
         for child_id, source in zip(node.child_ids, children):
             uses[child_id] -= 1
             if uses[child_id] == 0 and source.kind == "slot":
@@ -239,7 +253,7 @@ def _build_plan(
                     free_slots.append(slot)
 
     if isinstance(program.nodes[root].op, (InputOp, LiteralOp)):
-        stages.append(Stage("copy", (sources[root],), Dest(None)))
+        stages.append(Stage("copy", (sources[root],), Dest(None), n_instruments))
     return Plan(stages=tuple(stages), scratch_slots=next_slot, input_count=len(program.input_names))
 
 
@@ -249,6 +263,7 @@ def lower_program(
     n_instruments: int,
     default_group_capacity: int = 64,
     key_cardinalities: Mapping[str, int] | None = None,
+    row_scalar_nodes: frozenset[int] | None = None,
 ) -> Plan:
     if n_instruments <= 0:
         raise CppStreamLoweringError("n_instruments must be > 0")
@@ -260,4 +275,5 @@ def lower_program(
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
         grouped=False,
+        row_scalar_nodes=row_scalar_nodes or frozenset(),
     )
