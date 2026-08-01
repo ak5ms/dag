@@ -133,6 +133,18 @@ def _row_scalar_analysis(program: Program, input_types: tuple[InputTypeSpec, ...
     return visit
 
 
+def _row_scalar_node_ids(
+    program: Program,
+    input_types: tuple[InputTypeSpec, ...],
+) -> frozenset[int]:
+    is_row_scalar = _row_scalar_analysis(program, input_types)
+    return frozenset(
+        node_id
+        for node_id in range(len(program.nodes))
+        if is_row_scalar(node_id)
+    )
+
+
 def _apply_input_key_hints(
     program: Program,
     input_types: tuple[InputTypeSpec, ...],
@@ -182,11 +194,13 @@ def _compile_program(
     if program.nodes[program.output_id].value_type.kind != "vector":
         raise ValueError("cpp_stream currently requires a vector root output")
     program = _apply_input_key_hints(program, input_types)
+    row_scalar_nodes = _row_scalar_node_ids(program, input_types)
     plan = lower_program(
         program,
         n_instruments=n_instruments,
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
+        row_scalar_nodes=row_scalar_nodes,
     )
     generated = render_translation_unit(
         plan,
