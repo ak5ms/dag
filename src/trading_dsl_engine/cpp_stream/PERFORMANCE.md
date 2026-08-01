@@ -1,27 +1,25 @@
 # cpp_stream performance notes
 
-Benchmarks here measure generated native execution only. Formula compilation, C++
-compilation, input generation, mmap setup, and warmup are excluded unless stated.
-Absolute throughput varies across hosted CPUs; architectural comparisons should run
-in the same process or workflow job.
+Benchmarks measure generated native execution only. Input generation, Python/IR
+lowering, C++ compilation, mmap setup, and warmup are excluded unless stated.
+Absolute throughput varies across hosts; architectural comparisons should use the
+same process or workflow job.
 
 ## Standard commands
 
 ```bash
 python scripts/benchmark_cpp_stream.py
-
-CPP_STREAM_RIDGE_CASE=all \
-python scripts/benchmark_cpp_stream_ridge.py
+CPP_STREAM_RIDGE_CASE=all python scripts/benchmark_cpp_stream_ridge.py
+python scripts/benchmark_cpp_stream_roll_rets.py
 ```
 
-Both scripts default to 5,000,000 rows, 9 instruments, one warmup, and ten measured
-executions.
+The full benchmarks default to 5,000,000 rows, 9 instruments, one warmup, and ten
+measured executions.
 
 ## Timestamp-derived grouping
 
-The apparent drop from roughly 20 M rows/s to roughly 4-5 M rows/s was not caused by
-the generic groupby execution scope. It came from representing `_ev_ts -> minute`
-as nine float64 lanes and hashing the result.
+The earlier apparent groupby regression was caused by representing `_ev_ts -> minute`
+as nine float64 lanes and hashing it, not by the generic grouped execution scope.
 
 Same-host ablation:
 
@@ -33,28 +31,14 @@ Same-host ablation:
 | Row-scalar float calendar + dense | 12.73 M rows/s |
 | Row-scalar integer calendar + dense | 20.32 M rows/s |
 
-The production typed `.npy` path preserves `int64` timestamp arithmetic, propagates
-row-scalar width, and uses `Key(num_keys=60, ...)` for dense routing. Hosted same-run
-comparisons have measured approximately 20-25 M rows/s for native scalar/dense
-routing versus approximately 4.2 M rows/s for vector/hash routing.
+The production `.npy` path preserves native `int64` timestamp arithmetic,
+row-scalar width, and bounded dense routing. Recent focused workflow runs measured
+approximately 21.8 M rows/s for typed row-scalar dense routing versus 4.38 M rows/s
+for the old vector/hash representation.
 
-## Small-width rank
+## Cat and Ridge: 5M x 9
 
-For N=9, exact upper-rank counting is faster than sorting while preserving tie and
-NaN semantics:
-
-| Kernel | Sort | Rank count |
-| --- | ---: | ---: |
-| `xs_rank` | 6.1-6.3 M rows/s | 15.8-16.7 M rows/s |
-| grouped `xs_rank` | 5.9-6.4 M rows/s | 12.1-12.9 M rows/s |
-| `div -> EWM -> xs_rank` | 5.6-5.7 M rows/s | 10.9-11.6 M rows/s |
-
-The single `XsRankNode` uses compile-time N to choose the algorithm. There is no
-grouped rank implementation.
-
-## Cat and Ridge: 5M x 9 baseline
-
-Workflow configuration:
+Configuration:
 
 ```text
 rows              5,000,000
@@ -69,8 +53,6 @@ flags             -O3 -march=native -mtune=native -flto
 output            reused /dev/shm mmap
 ```
 
-Results from the successful full workflow run on August 1, 2026:
-
 | Case | Median | Mean | Best |
 | --- | ---: | ---: | ---: |
 | Cat root, output width 27 | 11.307 | 11.143 | 11.329 M rows/s |
@@ -80,90 +62,104 @@ Results from the successful full workflow run on August 1, 2026:
 | One-group grouped stateful predictions | 6.176 | 6.177 | 6.182 M rows/s |
 | Three-group grouped stateful predictions | 2.787 | 2.786 | 2.788 M rows/s |
 
-Ten-run distributions:
+`Ridge(cat(x1,x2,x3), ...)` and separate feature arguments generated the same native
+source and checksum. One-group grouped execution was 3.15% below direct execution.
+The three-group workload performs three independent moment updates and solves per
+row, so its lower throughput reflects real work rather than a grouped Ridge class.
+
+## `flows.riskmodel.roll_rets`: 5M x 9
+
+This benchmark imports the actual expression object from `flows.riskmodel`; it is not
+a copied or reduced formula. The native plan includes:
+
+- session-grouped cumulative volume state;
+- RBF basis and future RBF mass;
+- per-instrument `InstrumentBasisMean` coefficients;
+- `einsum("nf,nf->n")`;
+- named POV stateless policies;
+- forward fill and shift;
+- comparisons, boolean logic, where/fillna, and arithmetic.
+
+Plan shape:
 
 ```text
-cat_root
-11.305, 10.209, 11.034, 11.310, 11.317,
-11.273, 11.323, 11.329, 11.327, 11.007
-
-stateful_cat
-6.370, 6.382, 6.377, 6.379, 6.310,
-6.371, 6.373, 6.378, 6.377, 6.381
-
-stateful_args
-6.391, 6.392, 6.373, 6.364, 6.364,
-6.366, 6.364, 6.369, 6.353, 6.374
-
-stateless_beta
-9.169, 9.175, 9.170, 9.166, 9.164,
-9.165, 9.171, 9.168, 9.164, 9.172
-
-one_group
-6.172, 6.174, 6.175, 6.180, 6.177,
-6.182, 6.173, 6.180, 6.180, 6.176
-
-three_groups
-2.786, 2.786, 2.786, 2.786, 2.784,
-2.788, 2.787, 2.787, 2.788, 2.787
+scalar/vector scratch slots   50
+matrix scratch slots           1
+matrix scratch width           6
+group capacity              4096
 ```
 
-### Interpretation
-
-`Ridge(cat(x1,x2,x3), ...)` and `Ridge(x1,x2,x3, ...)` produced the same generated
-C++ cache key and identical checksums. Cat therefore adds no Ridge execution cost;
-physical lowering flattens both into the same compile-time `FeatureList`.
-
-The one-group grouped form is 3.2% below direct execution:
+Successful workflow run on August 1, 2026:
 
 ```text
-1 - 6.176 / 6.377 = 3.15%
+rows             5,000,000
+instruments      9
+warmup           1
+measured runs    10
+median           0.855752 M rows/s
+mean             0.855213 M rows/s
+best             0.856243 M rows/s
+checksum        -0.790555667227
+tail finite      100%
 ```
 
-That is the measured cost of grouped context/resolution for one static group. The
-three-group workload performs three independent moment updates and three K=3 solves
-per row. Its lower throughput is expected additional work, not an operator-specific
-groupby dispatch path.
-
-At 6.377 M rows/s with nine instruments, stateful K=3 Ridge processes about
-57.4 million instrument observations and 6.377 million complete K=3 solves per
-second in one native row loop.
-
-Cat root writes 27 float64 values per row. Its median corresponds to approximately
-2.44 GB/s of output payload before input traffic:
+Ten measured runs:
 
 ```text
-11.307e6 * 27 * 8 = 2.442e9 bytes/s
+0.855827, 0.854544, 0.856243, 0.855371, 0.856076,
+0.852580, 0.856137, 0.855779, 0.853851, 0.855725 M rows/s
 ```
 
-## Generic optimizations used by Ridge
+The median corresponds to approximately:
 
-Performance remains one `RidgeNode` for direct and grouped execution. Optimizations
-are structural and apply to arbitrary compile-time K:
+```text
+5.842 seconds per 5,000,000 rows
+7.702 million instrument observations/second
+```
 
-- compile-time feature width and fixed `std::array` state;
-- zero-copy `FeatureList` flattening for nested cat;
-- precomputed decay coefficient embedded in the generated type;
-- Cholesky-first solve with pivoted and pseudoinverse fallbacks;
-- exact `Execution::cross_group` state addressing;
-- exact compile-time static partition count;
-- finite-panel synchronized moment updates;
-- full pairwise-missing fallback when any row value is nonfinite;
-- no heap allocation in `on_data`.
+The run distribution is tight: the slowest and fastest measurements differ by less
+than 0.43% of the median. The benchmark output tail was entirely finite, so the
+result is not an all-NaN or masked-output artifact.
 
-There are no K=3-specific kernels, no `GroupedRidgeNode`, and no codegen branch that
-selects a grouped Ridge implementation.
+### Correctness reference
+
+The focused suite imports the same `roll_rets` object and runs it through both
+cpp_stream and JAX-flat on identical session/tradability/missing-value data. It
+asserts that each output contains finite values and then compares with:
+
+```text
+rtol = 2e-9
+atol = 2e-9
+equal_nan = true
+```
+
+The full focused suite passed 18 tests before the benchmark step.
+
+## Generic implementation choices used by `roll_rets`
+
+The implementation remains operator- and formula-agnostic:
+
+- backend-neutral named stateless calls carry a stable native policy name;
+- RBF values are lazy compile-time-width feature sources;
+- nested Cat and basis values flatten into `FeatureList<Sources...>`;
+- only the coefficient matrix needed by einsum is materialized;
+- history nodes use `Execution::state_index` and fixed arrays;
+- direct and grouped plans use the same node classes;
+- explicit NaN/infinity source types avoid invalid generated C++ literals;
+- no Python per-row execution and no heap allocation in operator `on_data`.
+
+No `GroupedInstrumentBasisMean`, grouped history variants, or `roll_rets`-specific
+native node was added.
 
 ## Regression methodology
 
 1. Keep semantics and workload identical.
-2. Run one warmup and at least ten measured executions.
+2. Run one warmup and at least ten measured executions for full benchmarks.
 3. Exclude source generation and native compilation.
-4. Report every run, not only the best.
-5. Compare direct and one-group controls before blaming groupby.
-6. Use checksums/correctness tests to reject output-changing transformations.
-7. Prefer generic compile-time policy and data-layout changes over formula-specific
-   branches.
+4. Report every run and a checksum, not only the best.
+5. Verify finite/nontrivial output before accepting throughput.
+6. Compare against an independent backend when available.
+7. Prefer generic compile-time policy and layout changes over formula-specific code.
 
-Hosted thresholds should be supplied through environment variables rather than
-hard-coded globally because runner CPUs and contention vary.
+Hosted performance thresholds should be supplied through environment variables
+rather than hard-coded globally because CPU model, filesystem, and contention vary.
