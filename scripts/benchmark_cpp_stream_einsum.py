@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 
 from trading_dsl_engine.base.dsl import cat, einsum, var
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 
 
 ROWS = int(os.environ.get("CPP_STREAM_EINSUM_ROWS", "5000000"))
@@ -64,15 +64,11 @@ def _cases():
             ("w", "x", "y", "z"),
         ),
         "nary_greedy": (
-            einsum(
-                "ij,kj,kl->il", left2, middle2, right2, optimize="greedy"
-            ),
+            einsum("ij,kj,kl->il", left2, middle2, right2, optimize="greedy"),
             ("w", "x", "y", "z"),
         ),
         "nary_optimal": (
-            einsum(
-                "ij,kj,kl->il", left2, middle2, right2, optimize="optimal"
-            ),
+            einsum("ij,kj,kl->il", left2, middle2, right2, optimize="optimal"),
             ("w", "x", "y", "z"),
         ),
     }
@@ -99,20 +95,18 @@ def main() -> None:
         output_root.mkdir(parents=True, exist_ok=True)
 
         for name, (formula, input_names) in _selected_cases().items():
-            paths = {input_name: all_paths[input_name] for input_name in input_names}
-            runtime = compile_npy_formula(
+            data = {input_name: all_paths[input_name] for input_name in input_names}
+            runtime = compile_formula(
                 formula,
-                paths,
+                data,
                 n_instruments=N,
                 prefetch_rows=PREFETCH_ROWS,
             )
             output = output_root / f"cpp_stream_einsum_{name}.bin"
             for _ in range(WARMUPS):
-                runtime.run_npy_files(paths, out_path=output, async_writeback_mb=0)
+                runtime.run(out_path=output, async_writeback_mb=0)
             rates = [
-                runtime.run_npy_files(
-                    paths, out_path=output, async_writeback_mb=0
-                ).rows_per_second
+                runtime.run(out_path=output, async_writeback_mb=0).rows_per_second
                 for _ in range(RUNS)
             ]
             output_shape = (ROWS,) + tuple(runtime.plan.output_shape)
