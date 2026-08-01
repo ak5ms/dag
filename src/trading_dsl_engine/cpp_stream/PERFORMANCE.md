@@ -10,42 +10,22 @@ same process or workflow job.
 ```bash
 python scripts/benchmark_cpp_stream.py
 CPP_STREAM_RIDGE_CASE=all python scripts/benchmark_cpp_stream_ridge.py
+python scripts/benchmark_cpp_stream_einsum.py
 python scripts/benchmark_cpp_stream_roll_rets.py
 ```
 
-The full benchmarks default to 5,000,000 rows, 9 instruments, one warmup, and ten
-measured executions.
+The full einsum and roll-rets benchmarks default to 5,000,000 rows, 9 instruments,
+one warmup, and ten measured executions.
 
-## Timestamp-derived grouping
+## Generic einsum: 5M x 9
 
-The earlier apparent groupby regression was caused by representing `_ev_ts -> minute`
-as nine float64 lanes and hashing it, not by the generic grouped execution scope.
-
-Same-host ablation:
-
-| Key representation | Throughput |
-| --- | ---: |
-| Precomputed dense minute | 21.71 M rows/s |
-| Precomputed minute + hash | 11.72 M rows/s |
-| Vector float calendar + hash | 4.74 M rows/s |
-| Row-scalar float calendar + dense | 12.73 M rows/s |
-| Row-scalar integer calendar + dense | 20.32 M rows/s |
-
-The production `.npy` path preserves native `int64` timestamp arithmetic,
-row-scalar width, and bounded dense routing. Recent focused workflow runs measured
-approximately 21.8 M rows/s for typed row-scalar dense routing versus 4.38 M rows/s
-for the old vector/hash representation.
-
-## Cat and Ridge: 5M x 9
-
-Configuration:
+Successful GitHub-hosted Ubuntu workflow run on August 1, 2026:
 
 ```text
 rows              5,000,000
 instruments       9
-features          3
 input dtype       float64
-input format      mmap .npy
+input format      zero-copy mmap .npy / lazy FeatureList
 warmup            1
 measured runs     10
 compiler          GCC C++20
@@ -53,103 +33,134 @@ flags             -O3 -march=native -mtune=native -flto
 output            reused /dev/shm mmap
 ```
 
-| Case | Median | Mean | Best |
-| --- | ---: | ---: | ---: |
-| Cat root, output width 27 | 11.307 | 11.143 | 11.329 M rows/s |
-| Stateful K=3 predictions, `cat` syntax | 6.377 | 6.370 | 6.382 M rows/s |
-| Stateful K=3 predictions, separate args | 6.367 | 6.371 | 6.392 M rows/s |
-| Stateless K=3 beta | 9.169 | 9.168 | 9.175 M rows/s |
-| One-group grouped stateful predictions | 6.176 | 6.177 | 6.182 M rows/s |
-| Three-group grouped stateful predictions | 2.787 | 2.786 | 2.788 M rows/s |
+| Case | Estimated operations/row | Largest scratch width | Median | Mean | Best |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `nf,nf->n`, six lazy features | 54 | 1 | 12.076401 | 12.071388 | 12.097915 M rows/s |
+| `...f,...f->...`, same work | 54 | 1 | 12.097036 | 12.091035 | 12.113350 M rows/s |
+| `n,n->` scalar reduction | 9 | 1 | 85.027352 | 84.742551 | 85.062145 M rows/s |
+| `ij,kj,kl->il`, optimize false | 324 | 9 | 5.532522 | 5.517750 | 5.549309 M rows/s |
+| same, greedy | 72 | 2 | 11.604658 | 11.603833 | 11.627009 M rows/s |
+| same, optimal | 72 | 2 | 11.624376 | 11.621512 | 11.654887 M rows/s |
 
-`Ridge(cat(x1,x2,x3), ...)` and separate feature arguments generated the same native
-source and checksum. One-group grouped execution was 3.15% below direct execution.
-The three-group workload performs three independent moment updates and solves per
-row, so its lower throughput reflects real work rather than a grouped Ridge class.
-
-## `flows.riskmodel.roll_rets`: 5M x 9
-
-This benchmark imports the actual expression object from `flows.riskmodel`; it is not
-a copied or reduced formula. The native plan includes:
-
-- session-grouped cumulative volume state;
-- RBF basis and future RBF mass;
-- per-instrument `InstrumentBasisMean` coefficients;
-- `einsum("nf,nf->n")`;
-- named POV stateless policies;
-- forward fill and shift;
-- comparisons, boolean logic, where/fillna, and arithmetic.
-
-Plan shape:
+Measured distributions:
 
 ```text
-scalar/vector scratch slots   50
-matrix scratch slots           1
-matrix scratch width           6
-group capacity              4096
+row_dot
+12.070698, 12.056928, 12.097915, 12.071733, 12.075735,
+12.092778, 12.077068, 12.071557, 12.061435, 12.037038
+
+ellipsis_dot
+12.099192, 12.113350, 12.081671, 12.094155, 12.074098,
+12.103474, 12.096291, 12.103080, 12.098407, 12.046629
+
+scalar_reduce
+84.879211, 85.062145, 85.029431, 85.035897, 85.025273,
+85.057815, 85.051755, 85.052004, 85.025172, 83.207066
+
+nary_none
+5.519907, 5.545252, 5.527155, 5.543305, 5.520648,
+5.539696, 5.530866, 5.549309, 5.544008, 5.357350
+
+nary_greedy
+11.614170, 11.627009, 11.595284, 11.607848, 11.601468,
+11.610031, 11.607155, 11.601907, 11.600899, 11.572559
+
+nary_optimal
+11.628397, 11.617523, 11.654887, 11.634023, 11.620284,
+11.598129, 11.607501, 11.626283, 11.607036, 11.620056
 ```
 
-Successful workflow run on August 1, 2026:
+All sampled tails were finite. Optimized and unoptimized n-ary cases produced the
+same checksum, `2795330.14075`. Greedy reduced estimated work by 77.8% and improved
+median throughput by 2.10x. Optimal selected the same-cost path and was 2.10x faster
+than left-to-right evaluation.
+
+### Native implementation
+
+Subscripts are parsed once in the backend-neutral IR. The planner expands ellipses,
+validates dimensions, canonicalizes labels to integer axis maps, and emits unary or
+binary contraction stages. Generated C++ has no runtime subscript parser, dynamic
+shape dispatch, or path search.
+
+Optimization modes:
+
+- `False` / `"none"`: left-to-right, matching NumPy's default;
+- `True` / `"greedy"`: local work/intermediate minimization;
+- `"optimal"`: exhaustive path search through eight operands, then greedy fallback.
+
+Contiguous reductions use fixed-size bulk loads and FMA loops. General mapped loops
+handle arbitrary rank, permutation, repeated-label diagonals, scalar operands,
+ellipsis broadcasting, and arbitrary reduction axes. Raw tensors remain mmap-backed;
+Cat and RBF matrices remain lazy; only selected path intermediates use fixed tensor
+scratch.
+
+A header-only external tensor library was evaluated but not adopted. Einsums' generic
+optimized API operates on copies rather than views, while Eigen Tensor/TBLIS would
+add heavier dependency and materialization requirements. Static generated loops fit
+the backend's small compile-time row tensors and lazy-source architecture directly.
+
+## `flows.riskmodel.roll_rets`: 5M x 9 after generic einsum
+
+The exact `flows.riskmodel.roll_rets` expression was rerun in the same full workflow:
 
 ```text
-rows             5,000,000
-instruments      9
-warmup           1
-measured runs    10
-median           0.855752 M rows/s
-mean             0.855213 M rows/s
-best             0.856243 M rows/s
+median           0.865675 M rows/s
+mean             0.865757 M rows/s
+best             0.866333 M rows/s
+runtime median   5.776 seconds
 checksum        -0.790555667227
 tail finite      100%
 ```
 
-Ten measured runs:
+Ten runs:
 
 ```text
-0.855827, 0.854544, 0.856243, 0.855371, 0.856076,
-0.852580, 0.856137, 0.855779, 0.853851, 0.855725 M rows/s
+0.865751, 0.865643, 0.865157, 0.864431, 0.864792,
+0.866333, 0.866177, 0.866128, 0.865896, 0.866262 M rows/s
 ```
 
-The median corresponds to approximately:
+The prior baseline was 0.855752 M rows/s, so generic einsum did not regress the flow;
+the new median is 1.16% higher. The plan remains 50 scalar/vector scratch slots and
+one six-wide coefficient-matrix scratch slot. RBF and future-RBF features remain
+lazy and feed the contiguous reduction kernel.
 
-```text
-5.842 seconds per 5,000,000 rows
-7.702 million instrument observations/second
-```
+## Correctness coverage
 
-The run distribution is tight: the slowest and fastest measurements differ by less
-than 0.43% of the median. The benchmark output tail was entirely finite, so the
-result is not an all-NaN or masked-output artifact.
+The focused suite passed 32 tests before the full benchmarks. Coverage includes:
 
-### Correctness reference
+- implicit and explicit output;
+- arbitrary case-sensitive labels;
+- scalar operands and scalar reductions;
+- ellipsis expansion and broadcasting;
+- rejection of ordinary-label broadcasting without ellipsis;
+- repeated-label diagonals;
+- transposes and outer products;
+- raw rank-2 and rank-4 mmap operands;
+- nested arbitrary tensor scratch;
+- n-ary greedy and optimal paths;
+- the exact `roll_rets` graph compared against JAX-flat with finite-output checks,
+  `rtol=2e-9`, `atol=2e-9`, and equal-NaN semantics.
 
-The focused suite imports the same `roll_rets` object and runs it through both
-cpp_stream and JAX-flat on identical session/tradability/missing-value data. It
-asserts that each output contains finite values and then compares with:
+## Timestamp-derived grouping
 
-```text
-rtol = 2e-9
-atol = 2e-9
-equal_nan = true
-```
+The earlier apparent groupby regression was caused by representing `_ev_ts -> minute`
+as nine float64 lanes and hashing it, not by the generic grouped execution scope.
+The production `.npy` path preserves native `int64` arithmetic, row-scalar width,
+and bounded dense routing. Recent workflow runs measured approximately 21.8 M
+rows/s for typed scalar/dense routing versus approximately 4.4 M rows/s for the old
+vector/hash representation.
 
-The full focused suite passed 18 tests before the benchmark step.
+## Cat and Ridge reference
 
-## Generic implementation choices used by `roll_rets`
+Representative 5M×9 medians from the same class of hosted runner:
 
-The implementation remains operator- and formula-agnostic:
-
-- backend-neutral named stateless calls carry a stable native policy name;
-- RBF values are lazy compile-time-width feature sources;
-- nested Cat and basis values flatten into `FeatureList<Sources...>`;
-- only the coefficient matrix needed by einsum is materialized;
-- history nodes use `Execution::state_index` and fixed arrays;
-- direct and grouped plans use the same node classes;
-- explicit NaN/infinity source types avoid invalid generated C++ literals;
-- no Python per-row execution and no heap allocation in operator `on_data`.
-
-No `GroupedInstrumentBasisMean`, grouped history variants, or `roll_rets`-specific
-native node was added.
+| Case | Median throughput |
+| --- | ---: |
+| Cat root, output width 27 | 11.307 M rows/s |
+| Stateful K=3 Ridge predictions | 6.377 M rows/s |
+| Stateless K=3 Ridge beta | 9.169 M rows/s |
+| One-group grouped stateful predictions | 6.176 M rows/s |
+| Three-group grouped stateful predictions | 2.787 M rows/s |
 
 ## Regression methodology
 
@@ -159,7 +170,5 @@ native node was added.
 4. Report every run and a checksum, not only the best.
 5. Verify finite/nontrivial output before accepting throughput.
 6. Compare against an independent backend when available.
-7. Prefer generic compile-time policy and layout changes over formula-specific code.
-
-Hosted performance thresholds should be supplied through environment variables
-rather than hard-coded globally because CPU model, filesystem, and contention vary.
+7. Record contraction work and largest intermediate alongside wall throughput.
+8. Prefer generic compile-time policy and layout changes over pattern-specific code.
