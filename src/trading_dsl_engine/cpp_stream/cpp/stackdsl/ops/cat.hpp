@@ -54,13 +54,11 @@ struct CatNode<N, FeatureList<Sources...>, Out, Execution> {
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        constexpr bool matrix_slot = requires { Out::matrix_slot_index; };
-        constexpr std::size_t stride = matrix_slot ? Context::matrix_scratch_width : K;
         for (std::size_t lane = 0; lane < N; ++lane) {
             std::array<double, K> values{};
             load_features(ctx, lane, values, FeatureList<Sources...>{});
             for (std::size_t feature = 0; feature < K; ++feature) {
-                out[lane * stride + feature] = values[feature];
+                out[lane * K + feature] = values[feature];
             }
         }
     }
