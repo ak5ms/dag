@@ -30,7 +30,7 @@ When `input_types` is omitted, raw inputs are row-major `float64` with `n_instru
 
 ## Typed mmap `.npy` API
 
-`compile_npy_formula` reads each NumPy header before native compilation. Dtype and row width become compile-time C++ template arguments; execution then maps the payload and passes its pointer directly to C++ without copying.
+`compile_npy_formula` reads each NumPy header before native compilation. Dtype and row width become compile-time C++ template arguments; execution maps the payload and passes its pointer directly to C++ without copying.
 
 ```python
 from trading_dsl_engine.cpp_stream import compile_npy_formula
@@ -56,9 +56,25 @@ Supported input dtypes are `float32`, `float64`, `int32`, `int64`, `uint32`, and
 
 `inspect_npy` exposes `dtype`, `shape`, `data_offset`, `rows`, `row_width`, and `row_scalar`. `mmap_npy` returns the metadata plus a live `np.memmap` payload view.
 
+## Native expression types
+
+Mapped values are not eagerly converted to `double`. Generated source descriptors carry their scalar type:
+
+```cpp
+InputSrc<Index, ValueType, RowWidth>
+SlotSrc<Index, ValueType, RowScalar>
+SlotDst<Index, ValueType>
+```
+
+`RowContext::read_native<Source>()` returns that exact type. Stateless arithmetic is templated on its result type, and typed scratch preserves intermediate values. Same-typed integer arithmetic therefore remains integer from mmap load through key resolution.
+
+Mixed-type operations promote only because the operation result requires promotion. For example, `float64 + int64` has a `float64` result, but the `int64` input is still loaded natively and promoted inside `AddOp`, not in `RowContext`.
+
+Stateful/statistical operations such as cumsum, EWM, and rank currently define float64 semantics. Groupby lhs/captures and the root output file also remain float64. These are explicit operator/output boundaries rather than implicit conversions on every input read.
+
 ## Per-key descriptors
 
-Each dynamic group key can carry its own semantic and physical hints:
+Each dynamic group key can carry its own semantic and physical metadata:
 
 ```python
 from trading_dsl_engine import Key
@@ -79,14 +95,26 @@ groupby(
 )
 ```
 
-The hints do not change key equality semantics:
+The parameters mean:
 
-- `num_keys=K` declares consecutive integer categories `[offset, offset + K)`;
-- `offset` sets the first valid category;
-- `row_scalar=True` asserts lane invariance;
-- `dtype` records the semantic/input type expectation.
+- `expr`: the dynamic key expression;
+- `num_keys=K`: exactly `K` consecutive non-NaN integer categories;
+- `offset`: the first valid category, so valid values are `[offset, offset + K)` and dense digit is `value - offset`;
+- `row_scalar=True`: one key value applies to every lane in the row;
+- `row_scalar=None`: infer lane invariance from shapes and dependencies;
+- `dtype`: the expected native type of the completed key expression.
 
-NaN remains an additional valid category. An out-of-range, nonintegral, or infinite value fails native execution rather than silently aliasing another state slot.
+Examples of `offset`:
+
+```python
+Key(var("minute"), num_keys=60, offset=0)  # 0..59
+Key(var("month"),  num_keys=12, offset=1)  # 1..12
+Key(var("venue"),  num_keys=3,  offset=10) # 10, 11, 12
+```
+
+`dtype` is validated; it does not authorize a cast. A direct mapped input must exactly match it. An explicitly integral derived key graph requires matching integral input leaves, while constants are compiled at that type only after exact integrality and range checks.
+
+NaN remains an additional valid category for floating-point keys. An out-of-range, nonintegral, or infinite dense value fails native execution rather than silently aliasing another state slot.
 
 A tuple can contain independently described keys:
 
@@ -102,17 +130,19 @@ groupby(
 )
 ```
 
-If every dynamic key has `num_keys`, lowering uses one mixed-radix dense slot. The capacity is:
+If every dynamic key has `num_keys`, lowering uses one mixed-radix dense slot with capacity:
 
 ```text
 product(num_keys_i + 1)
 ```
 
-where each `+1` reserves that key's NaN digit. Otherwise, the complete tuple is stored exactly in the fixed-capacity hash resolver.
+Each `+1` reserves that floating key's NaN digit. Otherwise, the complete tuple is stored exactly in the fixed-capacity hash resolver. Native `int64`/`uint64` keys are never routed through `double`, so values above `2^53` remain distinct.
 
-When every key in a tuple is row-scalar, group resolution evaluates the tuple once and broadcasts one slot. For `.npy` inputs, shape-derived row-scalar information is propagated through pure arithmetic. Thus `_ev_ts -> minute` stages compile with lane count one instead of computing the same calendar expression for every instrument.
+When every key in a tuple is row-scalar, group resolution evaluates the tuple once and broadcasts one slot. For `.npy` inputs, shape-derived row-scalar information propagates through pure arithmetic and those producer stages instantiate at width one.
 
 The older global `key_cardinalities` argument remains for compatibility with direct input keys, but `Key(...)` is the preferred interface because metadata remains attached to the exact key expression and supports composite tuples.
+
+See [`KEYS_AND_NPY.md`](KEYS_AND_NPY.md) for the complete typing, validation, and routing contract.
 
 ## Calendar fields
 
@@ -122,9 +152,24 @@ Calendar aliases are derived from the canonical `_ev_ts` microseconds-since-epoc
 var("minute")
 ```
 
-expands to the existing DSL `minute(_ev_ts)` expression. The current definition is minute within the hour (`0..59`). With an `int64 (rows,)` `_ev_ts.npy` input and the `Key` descriptor above, the input is loaded once per row, calendar stages execute at width one, and dense resolution avoids hashing.
+expands to the existing DSL `minute(_ev_ts)` expression. The current definition is minute within the hour (`0..59`). With an `int64 (rows,)` `_ev_ts.npy` and:
 
-Input loads preserve the `.npy` element type, while the current arithmetic operator layer converts numeric values to `float64`. Fully typed integer calendar arithmetic is a subsequent IR/codegen extension; the reader already supplies the dtype information needed for it.
+```python
+Key(var("minute"), num_keys=60, row_scalar=True, dtype="int64")
+```
+
+the generic expanded graph remains native `int64`:
+
+```text
+int64 _ev_ts
+  -> int64 modulo
+  -> int64 floor-division
+  -> int64 floor identity
+  -> int64 modulo
+  -> dense group slot
+```
+
+No calendar-specific C++ node or grouped-operator fast path is required.
 
 ## Code generation
 
@@ -161,7 +206,15 @@ The default benchmark uses typed `.npy` inputs and the hinted timestamp-minute k
 python scripts/benchmark_cpp_stream.py
 ```
 
-Other cases are selected through `CPP_STREAM_BENCH_CASE`. An environment-specific regression threshold can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology and architecture comparisons are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
+A same-run GitHub-hosted comparison after native integer lowering measured:
+
+```text
+vector float64 calendar + hash:       4.349 M rows/s median
+typed int64 row-scalar + dense:      22.244 M rows/s median
+speedup:                               5.11x
+```
+
+Hosted CPUs vary, so absolute throughput is not a universal threshold. Other cases are selected through `CPP_STREAM_BENCH_CASE`, and an environment-specific floor can be supplied through `CPP_STREAM_BENCH_MIN_MROWS`. Detailed methodology and architecture comparisons are documented in [`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Backend-neutral IR
 
