@@ -2,9 +2,13 @@ from pathlib import Path
 import importlib
 import importlib.util
 
-from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
-from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall, StatelessJaxFunction, rolling, stateless
-from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
+from trading_dsl_engine.jax_flat.custom import (
+    RollingJaxCall,
+    StatelessJaxCall,
+    StatelessJaxFunction,
+    rolling,
+    stateless,
+)
 from trading_dsl_engine._native_build import ensure_native_extension_current
 
 
@@ -20,10 +24,26 @@ def _load_cpp_flat():
 def __getattr__(name: str):
     if name == "_cpp_flat":
         return _load_cpp_flat()
+    if name in {"JaxFlatRuntime", "compile_formula"}:
+        from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
+
+        return JaxFlatRuntime if name == "JaxFlatRuntime" else compile_formula
     if name == "CppFlatRuntime":
         from trading_dsl_engine.jax_flat.engine_cpp import CppFlatRuntime
 
         return CppFlatRuntime
+    if name in {
+        "MetadataConfig",
+        "NodeMetadata",
+        "TypeRelationGraph",
+        "UnitInfo",
+        "ValueRange",
+        "field",
+        "metadata",
+    }:
+        from trading_dsl_engine.base import metadata as metadata_module
+
+        return getattr(metadata_module, name)
     raise AttributeError(name)
 
 
