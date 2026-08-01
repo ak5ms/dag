@@ -46,7 +46,11 @@ def _run(
 
 def _rowwise(subscripts: str, *arrays: np.ndarray, optimize=True) -> np.ndarray:
     values = [
-        np.einsum(subscripts, *(array[row] for array in arrays), optimize=optimize)
+        np.einsum(
+            subscripts,
+            *(array[row] for array in arrays),
+            optimize=optimize,
+        )
         for row in range(ROWS)
     ]
     return np.asarray(values)
@@ -56,11 +60,11 @@ def test_scalar_reduction_and_arbitrary_labels(tmp_path: Path) -> None:
     data = _data()
     output, runtime = _run(
         tmp_path,
-        einsum("Aq,Aq->", var("x"), var("y")),
+        einsum("Q,Q->", var("x"), var("y")),
         {"x": data["x"], "y": data["y"]},
         "scalar_dot",
     )
-    expected = _rowwise("Aq,Aq->", data["x"][:, :, None], data["y"][:, :, None])
+    expected = _rowwise("Q,Q->", data["x"], data["y"])
     np.testing.assert_allclose(output, expected, rtol=1e-13, atol=1e-13)
     generated = runtime.generated_cpp.read_text()
     assert "BinaryEinsumNode" in generated
@@ -106,7 +110,9 @@ def test_unary_transpose_and_diagonal_tensor_slot(tmp_path: Path) -> None:
         {"x": data["x"], "y": data["y"]},
         "diagonal",
     )
-    np.testing.assert_allclose(output, data["x"] * data["y"], rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(
+        output, data["x"] * data["y"], rtol=1e-13, atol=1e-13
+    )
     generated = runtime.generated_cpp.read_text()
     assert "UnaryEinsumNode" in generated
     assert "TensorSlotSrc" in generated
@@ -146,7 +152,9 @@ def test_implicit_scalar_output_and_scalar_operand(tmp_path: Path) -> None:
         {"x": data["x"]},
         "scalar_operand",
     )
-    np.testing.assert_allclose(scaled, 2.5 * data["x"], rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(
+        scaled, 2.5 * data["x"], rtol=1e-13, atol=1e-13
+    )
 
 
 def test_nary_optimal_contraction_matches_numpy(tmp_path: Path) -> None:
@@ -166,9 +174,13 @@ def test_nary_optimal_contraction_matches_numpy(tmp_path: Path) -> None:
     middle_np = np.stack((data["y"], data["z"]), axis=-1)
     right_np = _rowwise("k,l->kl", data["z"], data["w"])
     expected = _rowwise(
-        "ij,kj,kl->il", left_np, middle_np, right_np, optimize="optimal"
+        "ij,kj,kl->il",
+        left_np,
+        middle_np,
+        right_np,
+        optimize="optimal",
     )
     np.testing.assert_allclose(output, expected, rtol=2e-13, atol=2e-13)
     stages = [stage for stage in runtime.plan.stages if stage.kind == "einsum"]
-    assert len(stages) == 3  # inner outer product plus two planned contractions
+    assert len(stages) == 3
     assert runtime.plan.matrix_scratch_slots >= 2
