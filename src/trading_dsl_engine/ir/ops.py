@@ -15,7 +15,10 @@ class InputOp:
 
 @dataclass(frozen=True, slots=True)
 class LiteralOp:
-    value: float
+    # Preserve whether the user wrote/provided an integer or floating literal.
+    # Physical backends may therefore keep integer expressions integer instead
+    # of eagerly converting every constant and input to float64.
+    value: int | float
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +47,21 @@ class XsRankOp:
 
 @dataclass(frozen=True, slots=True)
 class GroupKeySpec:
-    """Semantic group-key metadata aligned with a GroupBy node's key children.
+    """Metadata aligned with one dynamic child of a ``GroupByOp``.
 
-    ``num_keys`` means consecutive integer categories in
-    ``[offset, offset + num_keys)``. NaN remains a valid category. ``row_scalar``
-    asserts that the key expression is lane invariant and may be evaluated once
-    per input row. ``dtype`` preserves a caller- or input-derived type hint.
+    ``num_keys`` describes a bounded consecutive integer domain. When it is
+    present, valid non-NaN values are exactly
+    ``[offset, offset + num_keys)``. Dense routing uses ``value - offset`` as
+    that key's zero-based mixed-radix digit. For example, ``num_keys=12`` and
+    ``offset=1`` describe months 1 through 12. NaN is one additional category
+    for floating-point keys.
+
+    ``row_scalar`` says one key value applies to every lane in an input row.
+    ``None`` means infer it; ``True`` is an assertion that permits one evaluation
+    and one group-slot lookup per row.
+
+    ``dtype`` is the expected native scalar type of the completed key expression.
+    It is validated, not used as permission to cast the expression.
     """
 
     num_keys: int | None = None
