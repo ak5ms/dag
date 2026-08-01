@@ -3,6 +3,7 @@
 #include "stackdsl/utils.hpp"
 #include "stackdsl/engine.hpp"
 #include "stackdsl/io.hpp"
+#include "stackdsl/ops/literal.hpp"
 #include "stackdsl/ops/naryop.hpp"
 #include "stackdsl/ops/cat.hpp"
 #include "stackdsl/ops/cumsum.hpp"
