@@ -16,6 +16,22 @@ struct FeatureList {
 };
 
 template <class Source, class Context>
+STACKDSL_HOT double read_source_feature(
+    const Context& ctx,
+    std::size_t lane,
+    std::size_t feature
+) noexcept {
+    if constexpr (requires { Source::read_feature(ctx, lane, feature); }) {
+        return Source::read_feature(ctx, lane, feature);
+    } else if constexpr (source_width_v<Source> == 1) {
+        (void)feature;
+        return ctx.template read<Source>(lane);
+    } else {
+        return ctx.template read_feature<Source>(lane, feature);
+    }
+}
+
+template <class Source, class Context>
 STACKDSL_HOT void load_source_features(
     const Context& ctx,
     std::size_t lane,
@@ -25,9 +41,34 @@ STACKDSL_HOT void load_source_features(
         Source::load_features(ctx, lane, out);
     } else {
         for (std::size_t feature = 0; feature < source_width_v<Source>; ++feature) {
-            out[feature] = ctx.template read_feature<Source>(lane, feature);
+            out[feature] = read_source_feature<Source>(ctx, lane, feature);
         }
     }
+}
+
+template <class Context>
+STACKDSL_HOT double read_feature_at(
+    const Context&, std::size_t, std::size_t, FeatureList<>
+) noexcept {
+    return kNaN;
+}
+
+template <class Context, class First, class... Rest>
+STACKDSL_HOT double read_feature_at(
+    const Context& ctx,
+    std::size_t lane,
+    std::size_t feature,
+    FeatureList<First, Rest...>
+) noexcept {
+    if (feature < source_width_v<First>) {
+        return read_source_feature<First>(ctx, lane, feature);
+    }
+    return read_feature_at(
+        ctx,
+        lane,
+        feature - source_width_v<First>,
+        FeatureList<Rest...>{}
+    );
 }
 
 template <class Context, class... Sources>
