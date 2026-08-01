@@ -15,7 +15,11 @@ from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
-from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec, NpyArrayInfo, inspect_npy_mapping
+from trading_dsl_engine.cpp_stream.python.npy import (
+    InputTypeSpec,
+    NpyArrayInfo,
+    inspect_npy_mapping,
+)
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
 from trading_dsl_engine.ir.frontend import compile_ir
 from trading_dsl_engine.ir.ops import CatOp, GroupByOp, InputOp, LiteralOp, NaryOp
@@ -28,14 +32,20 @@ def _cpp_root() -> Path:
 
 def _cache_root() -> Path:
     configured = os.environ.get("TRADING_DSL_ENGINE_CPP_STREAM_CACHE")
-    return Path(configured).expanduser() if configured else Path.home() / ".cache/trading_dsl_engine/cpp_stream"
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".cache/trading_dsl_engine/cpp_stream"
+    )
 
 
 def _compiler() -> str:
     requested = os.environ.get("CXX", "g++")
     compiler = shutil.which(requested)
     if compiler is None:
-        raise RuntimeError(f"cpp_stream requires a C++20 compiler; could not find {requested!r}")
+        raise RuntimeError(
+            f"cpp_stream requires a C++20 compiler; could not find {requested!r}"
+        )
     return compiler
 
 
@@ -43,17 +53,39 @@ def _flags() -> tuple[list[str], list[str]]:
     if os.name == "nt":
         raise RuntimeError("cpp_stream currently targets POSIX/Linux")
     compile_flags = [
-        "-std=c++20", "-O3", "-DNDEBUG", "-fPIC", "-shared",
-        "-fno-math-errno", "-funroll-loops",
+        "-std=c++20",
+        "-O3",
+        "-DNDEBUG",
+        "-fPIC",
+        "-shared",
+        "-fno-math-errno",
+        "-funroll-loops",
     ]
     if sys.platform.startswith("linux"):
         compile_flags.append("-D_GNU_SOURCE")
-    if os.environ.get("TRADING_DSL_ENGINE_CPP_NATIVE", "1").lower() not in {"0", "false", "no", "off"}:
+    if os.environ.get("TRADING_DSL_ENGINE_CPP_NATIVE", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
         compile_flags += ["-march=native", "-mtune=native"]
-    if os.environ.get("TRADING_DSL_ENGINE_CPP_LTO", "1").lower() not in {"0", "false", "no", "off"}:
+    if os.environ.get("TRADING_DSL_ENGINE_CPP_LTO", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
         compile_flags.append("-flto")
-    compile_flags += shlex.split(os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS", ""))
-    link_flags = ["-Wl,-O3", *shlex.split(os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", ""))]
+    compile_flags += shlex.split(
+        os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS", "")
+    )
+    link_flags = [
+        "-Wl,-O3",
+        *shlex.split(
+            os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", "")
+        ),
+    ]
     return compile_flags, link_flags
 
 
@@ -64,10 +96,14 @@ def _build_shared(source: str) -> tuple[Path, Path]:
     for header in sorted(_cpp_root().rglob("*.hpp")):
         digest.update(header.relative_to(_cpp_root()).as_posix().encode())
         digest.update(header.read_bytes())
-    version = subprocess.run([compiler, "--version"], capture_output=True, text=True, check=False)
+    version = subprocess.run(
+        [compiler, "--version"], capture_output=True, text=True, check=False
+    )
     digest.update((version.stdout or version.stderr).encode())
     digest.update("\0".join((*compile_flags, *link_flags)).encode())
-    digest.update(f"{platform.platform()}|{platform.machine()}|{sys.implementation.cache_tag}".encode())
+    digest.update(
+        f"{platform.platform()}|{platform.machine()}|{sys.implementation.cache_tag}".encode()
+    )
     build_dir = _cache_root() / digest.hexdigest()
     cpp_path = build_dir / "formula.cpp"
     so_path = build_dir / "formula.so"
@@ -77,16 +113,32 @@ def _build_shared(source: str) -> tuple[Path, Path]:
     temporary_cpp = build_dir / f"formula.{os.getpid()}.cpp"
     temporary_so = build_dir / f"formula.{os.getpid()}.so"
     temporary_cpp.write_text(source)
-    command = [compiler, *compile_flags, f"-I{_cpp_root()}", str(temporary_cpp), *link_flags, "-o", str(temporary_so)]
+    command = [
+        compiler,
+        *compile_flags,
+        f"-I{_cpp_root()}",
+        str(temporary_cpp),
+        *link_flags,
+        "-o",
+        str(temporary_so),
+    ]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
-        raise RuntimeError("cpp_stream native compilation failed\n" + " ".join(command) + "\n" + result.stdout + result.stderr)
+        raise RuntimeError(
+            "cpp_stream native compilation failed\n"
+            + " ".join(command)
+            + "\n"
+            + result.stdout
+            + result.stderr
+        )
     temporary_cpp.replace(cpp_path)
     temporary_so.replace(so_path)
     return so_path, cpp_path
 
 
-def _row_scalar_analysis(program: Program, input_types: tuple[InputTypeSpec, ...]):
+def _row_scalar_analysis(
+    program: Program, input_types: tuple[InputTypeSpec, ...]
+):
     memo: dict[int, bool] = {}
 
     def visit(node_id: int) -> bool:
@@ -109,7 +161,9 @@ def _row_scalar_analysis(program: Program, input_types: tuple[InputTypeSpec, ...
     return visit
 
 
-def _apply_input_key_hints(program: Program, input_types: tuple[InputTypeSpec, ...]) -> Program:
+def _apply_input_key_hints(
+    program: Program, input_types: tuple[InputTypeSpec, ...]
+) -> Program:
     is_row_scalar = _row_scalar_analysis(program, input_types)
     nodes: list[Node] = []
     for node in program.nodes:
@@ -120,14 +174,21 @@ def _apply_input_key_hints(program: Program, input_types: tuple[InputTypeSpec, .
         for index, spec in enumerate(node.op.key_specs):
             child_id = node.child_ids[index]
             child_op = program.nodes[child_id].op
-            row_scalar = is_row_scalar(child_id) if spec.row_scalar is None else spec.row_scalar
+            row_scalar = (
+                is_row_scalar(child_id)
+                if spec.row_scalar is None
+                else spec.row_scalar
+            )
             dtype = spec.dtype
             if isinstance(child_op, InputOp):
                 actual = input_types[child_op.input_index].dtype
                 if dtype is None:
                     dtype = actual
                 elif dtype != actual:
-                    raise TypeError(f"Key dtype {dtype!r} does not match input {child_op.name!r} dtype {actual!r}")
+                    raise TypeError(
+                        f"Key dtype {dtype!r} does not match input "
+                        f"{child_op.name!r} dtype {actual!r}"
+                    )
             specs.append(replace(spec, row_scalar=row_scalar, dtype=dtype))
         nodes.append(replace(node, op=replace(node.op, key_specs=tuple(specs))))
     return replace(program, nodes=tuple(nodes))
@@ -144,8 +205,10 @@ def _compile_program(
 ) -> CppStreamRuntime:
     root_kind = program.nodes[program.output_id].value_type.kind
     if root_kind == "object":
-        raise ValueError("project Ridge with get_beta(...) or get_preds(...) before output")
-    if root_kind not in {"scalar", "vector", "matrix", "fixed"}:
+        raise ValueError(
+            "project Ridge with get_beta(...) or get_preds(...) before output"
+        )
+    if root_kind not in {"scalar", "vector", "matrix", "fixed", "tensor"}:
         raise ValueError(f"unsupported cpp_stream root kind {root_kind!r}")
     program = _apply_input_key_hints(program, input_types)
     scalar = _row_scalar_analysis(program, input_types)
@@ -154,10 +217,17 @@ def _compile_program(
         n_instruments=n_instruments,
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
-        row_scalar_nodes=frozenset(i for i in range(len(program.nodes)) if scalar(i)),
+        row_scalar_nodes=frozenset(
+            index for index in range(len(program.nodes)) if scalar(index)
+        ),
         input_dtypes=tuple(spec.dtype for spec in input_types),
     )
-    generated = render_translation_unit(plan, n_instruments=n_instruments, prefetch_rows=prefetch_rows, input_types=input_types)
+    generated = render_translation_unit(
+        plan,
+        n_instruments=n_instruments,
+        prefetch_rows=prefetch_rows,
+        input_types=input_types,
+    )
     library_path, cpp_path = _build_shared(generated.text)
     return CppStreamRuntime(
         program=program,
@@ -182,14 +252,21 @@ def compile_formula(
 ) -> CppStreamRuntime:
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
-    program = compile_ir(formula, dsl_registry=dsl_registry, column_names=column_names)
+    program = compile_ir(
+        formula, dsl_registry=dsl_registry, column_names=column_names
+    )
     if input_types is None:
-        ordered = tuple(InputTypeSpec("float64", n_instruments) for _ in program.input_names)
+        ordered = tuple(
+            InputTypeSpec("float64", n_instruments)
+            for _ in program.input_names
+        )
     else:
         missing = [name for name in program.input_names if name not in input_types]
         extra = sorted(set(input_types) - set(program.input_names))
         if missing or extra:
-            raise KeyError(f"input_types mismatch: missing={missing}, extra={extra}")
+            raise KeyError(
+                f"input_types mismatch: missing={missing}, extra={extra}"
+            )
         ordered = tuple(input_types[name] for name in program.input_names)
     return _compile_program(
         program,
@@ -202,15 +279,25 @@ def compile_formula(
 
 
 def _infer_n(infos: Mapping[str, NpyArrayInfo], requested: int | None) -> int:
-    vector_widths = {info.row_width for info in infos.values() if info.row_width > 1}
+    vector_widths = {
+        info.row_width for info in infos.values() if info.row_width > 1
+    }
     if requested is None:
         if len(vector_widths) != 1:
-            raise ValueError("pass n_instruments when .npy vector width is not unique")
+            raise ValueError(
+                "pass n_instruments when .npy vector width is not unique"
+            )
         requested = next(iter(vector_widths))
     n = int(requested)
-    bad = {name: info.row_width for name, info in infos.items() if info.row_width not in (1, n)}
+    bad = {
+        name: info.row_width
+        for name, info in infos.items()
+        if info.row_width not in (1, n)
+    }
     if n <= 0 or bad:
-        raise ValueError(f"invalid n_instruments={n}; incompatible row widths={bad}")
+        raise ValueError(
+            f"invalid n_instruments={n}; incompatible row widths={bad}"
+        )
     return n
 
 
@@ -225,12 +312,16 @@ def compile_npy_formula(
     key_cardinalities: Mapping[str, int] | None = None,
     prefetch_rows: int = 16,
 ) -> CppStreamRuntime:
-    program = compile_ir(formula, dsl_registry=dsl_registry, column_names=column_names)
+    program = compile_ir(
+        formula, dsl_registry=dsl_registry, column_names=column_names
+    )
     missing = [name for name in program.input_names if name not in data]
     extra = sorted(set(data) - set(program.input_names))
     if missing or extra:
         raise KeyError(f".npy input mismatch: missing={missing}, extra={extra}")
-    infos = inspect_npy_mapping({name: data[name] for name in program.input_names})
+    infos = inspect_npy_mapping(
+        {name: data[name] for name in program.input_names}
+    )
     if len({info.rows for info in infos.values()}) != 1:
         raise ValueError(".npy inputs have different row counts")
     n = _infer_n(infos, n_instruments)
