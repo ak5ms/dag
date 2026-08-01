@@ -7,56 +7,10 @@ from typing import Mapping
 
 import numpy as np
 
-
-_SUPPORTED_DTYPES: dict[str, str] = {
-    "float32": "float",
-    "float64": "double",
-    "int32": "std::int32_t",
-    "int64": "std::int64_t",
-    "uint32": "std::uint32_t",
-    "uint64": "std::uint64_t",
-}
-
-
-@dataclass(frozen=True, slots=True)
-class InputTypeSpec:
-    dtype: str
-    row_width: int
-    row_shape: tuple[int, ...] | None = None
-
-    def __post_init__(self) -> None:
-        dtype = str(self.dtype).lower()
-        if dtype not in _SUPPORTED_DTYPES:
-            raise TypeError(
-                f"unsupported cpp_stream input dtype {dtype!r}; expected one of "
-                f"{sorted(_SUPPORTED_DTYPES)}"
-            )
-        row_width = int(self.row_width)
-        if row_width <= 0:
-            raise ValueError("input row_width must be > 0")
-        if self.row_shape is None:
-            row_shape = () if row_width == 1 else (row_width,)
-        else:
-            row_shape = tuple(int(extent) for extent in self.row_shape)
-            if any(extent <= 0 for extent in row_shape):
-                raise ValueError("input row_shape extents must be > 0")
-            shape_width = prod(row_shape) if row_shape else 1
-            if shape_width != row_width:
-                raise ValueError(
-                    f"row_shape {row_shape} has width {shape_width}, "
-                    f"expected row_width={row_width}"
-                )
-        object.__setattr__(self, "dtype", dtype)
-        object.__setattr__(self, "row_width", row_width)
-        object.__setattr__(self, "row_shape", row_shape)
-
-    @property
-    def cpp_type(self) -> str:
-        return _SUPPORTED_DTYPES[self.dtype]
-
-    @property
-    def row_scalar(self) -> bool:
-        return self.row_shape == ()
+from trading_dsl_engine.cpp_stream.python.source_types import (
+    InputTypeSpec,
+    SUPPORTED_DTYPES,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +30,7 @@ class NpyArrayInfo:
 
     @property
     def cpp_type(self) -> str:
-        return _SUPPORTED_DTYPES[self.dtype]
+        return SUPPORTED_DTYPES[self.dtype]
 
     @property
     def input_type(self) -> InputTypeSpec:
@@ -117,10 +71,10 @@ def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
             "cpp_stream currently requires native/little-endian .npy data"
         )
     dtype_name = dtype.name
-    if dtype_name not in _SUPPORTED_DTYPES:
+    if dtype_name not in SUPPORTED_DTYPES:
         raise TypeError(
             f"unsupported cpp_stream .npy dtype {dtype_name!r}; expected one of "
-            f"{sorted(_SUPPORTED_DTYPES)}"
+            f"{sorted(SUPPORTED_DTYPES)}"
         )
     if not array.flags.c_contiguous:
         raise ValueError("cpp_stream requires C-order .npy arrays")
@@ -130,7 +84,6 @@ def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
     rows = shape[0]
     raw_row_shape = shape[1:]
     row_width = prod(raw_row_shape) if raw_row_shape else 1
-    # Preserve the existing contract that (rows,) and (rows,1) are row scalars.
     row_shape = () if row_width == 1 else raw_row_shape
     if rows < 0 or row_width <= 0:
         raise ValueError(f"invalid .npy shape {shape}")
@@ -185,7 +138,6 @@ def inspect_npy_mapping(
 
 
 __all__ = [
-    "InputTypeSpec",
     "NpyArrayInfo",
     "NpyMMap",
     "inspect_npy",
