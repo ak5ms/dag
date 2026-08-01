@@ -6,6 +6,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from trading_dsl_engine.cpp_stream.python.lowering import GroupStage, Plan, Source, Stage, double_bits
+from trading_dsl_engine.ir.ops import GroupKeySpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +84,9 @@ def _source_type(source: Source) -> CppType:
 
 
 def _dest_type(stage: Stage) -> CppType:
-    return Name("stackdsl::OutputDst") if stage.out.slot is None else tmpl("stackdsl::SlotDst", IntArg(stage.out.slot))
+    return Name("stackdsl::OutputDst") if stage.out.slot is None else tmpl(
+        "stackdsl::SlotDst", IntArg(stage.out.slot)
+    )
 
 
 _BINARY_POLICIES = {
@@ -100,11 +103,7 @@ _UNARY_POLICIES = {
 
 
 def _stage_type(stage: Stage, n: CppType, execution: CppType) -> CppType:
-    """Render one operator type independent of whether its plan is grouped.
-
-    Grouping changes only ``execution``. There are no Grouped* operator names or
-    per-operator grouped branches in code generation.
-    """
+    """Render one operator type independent of whether its plan is grouped."""
     inputs = tuple(_source_type(source) for source in stage.inputs)
     out = _dest_type(stage)
     if stage.kind == "copy":
@@ -154,6 +153,25 @@ def _source_list(sources: tuple[Source, ...]) -> CppType:
     return tmpl("stackdsl::SourceList", *(_source_type(source) for source in sources))
 
 
+def _key_type(source: Source, spec: GroupKeySpec) -> CppType:
+    return tmpl(
+        "stackdsl::KeySpec",
+        _source_type(source),
+        IntArg(0 if spec.num_keys is None else int(spec.num_keys)),
+        IntArg(int(spec.offset)),
+        BoolArg(bool(spec.row_scalar)),
+    )
+
+
+def _key_list(group: GroupStage) -> tuple[CppType, ...]:
+    if len(group.key_sources) != len(group.key_specs):
+        raise ValueError("group key source/spec length mismatch")
+    return tuple(
+        _key_type(source, spec)
+        for source, spec in zip(group.key_sources, group.key_specs)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StageView:
     index: int
@@ -186,22 +204,18 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
 
 
 def _group_type(group_name: str, group: GroupStage, stage: Stage, n: int) -> CppType:
-    if not group.key_sources:
+    keys = _key_list(group)
+    if not keys:
         resolver = tmpl("stackdsl::NoKeyResolver", IntArg(n))
-    elif group.dense_cardinality is not None:
-        resolver = tmpl(
-            "stackdsl::DenseGroupResolver",
-            IntArg(n),
-            IntArg(group.dense_cardinality),
-            IntArg(group.dense_offset),
-        )
+    elif group.dense:
+        resolver = tmpl("stackdsl::DenseTupleGroupResolver", IntArg(n), *keys)
     else:
         resolver = tmpl(
             "stackdsl::HashGroupResolver",
             IntArg(n),
-            IntArg(len(group.key_sources)),
             IntArg(group.capacity),
             IntArg(group.hash_capacity),
+            *keys,
         )
     partitions = tmpl(
         "stackdsl::StaticPartitions",
@@ -209,6 +223,7 @@ def _group_type(group_name: str, group: GroupStage, stage: Stage, n: int) -> Cpp
         *(IntArg(value) for value in group.partitions),
     )
     inner = tmpl(group_name, IntArg(n), Name(f"{resolver.render()}::capacity"))
+    key_list = tmpl("stackdsl::KeyList", *keys)
     return tmpl(
         "stackdsl::GroupByNode",
         IntArg(n),
@@ -216,7 +231,7 @@ def _group_type(group_name: str, group: GroupStage, stage: Stage, n: int) -> Cpp
         partitions,
         inner,
         _dest_type(stage),
-        _source_list(group.key_sources),
+        key_list,
         _source_list(group.feed_sources),
     )
 
