@@ -24,6 +24,7 @@ from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
 from trading_dsl_engine.ir.frontend import compile_ir
 from trading_dsl_engine.ir.ops import CatOp, GroupByOp, InputOp, LiteralOp, NaryOp
 from trading_dsl_engine.ir.program import Node, Program
+from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 
 def _cpp_root() -> Path:
@@ -134,6 +135,16 @@ def _build_shared(source: str) -> tuple[Path, Path]:
     temporary_cpp.replace(cpp_path)
     temporary_so.replace(so_path)
     return so_path, cpp_path
+
+
+def _input_value_type(spec: InputTypeSpec, n_instruments: int) -> ValueType:
+    shape = tuple(spec.row_shape or ())
+    if not shape:
+        return SCALAR
+    logical_shape = (
+        (None,) + shape[1:] if shape[0] == n_instruments else shape
+    )
+    return tensor(logical_shape, dtype=spec.dtype)
 
 
 def _row_scalar_analysis(
@@ -252,8 +263,19 @@ def compile_formula(
 ) -> CppStreamRuntime:
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
+    input_value_types = (
+        {
+            name: _input_value_type(spec, n_instruments)
+            for name, spec in input_types.items()
+        }
+        if input_types is not None
+        else None
+    )
     program = compile_ir(
-        formula, dsl_registry=dsl_registry, column_names=column_names
+        formula,
+        dsl_registry=dsl_registry,
+        column_names=column_names,
+        input_value_types=input_value_types,
     )
     if input_types is None:
         ordered = tuple(
@@ -279,25 +301,20 @@ def compile_formula(
 
 
 def _infer_n(infos: Mapping[str, NpyArrayInfo], requested: int | None) -> int:
-    vector_widths = {
-        info.row_width for info in infos.values() if info.row_width > 1
-    }
     if requested is None:
+        vector_widths = {
+            info.row_shape[0]
+            for info in infos.values()
+            if len(info.row_shape) == 1 and info.row_shape[0] > 1
+        }
         if len(vector_widths) != 1:
             raise ValueError(
-                "pass n_instruments when .npy vector width is not unique"
+                "pass n_instruments when no unique rank-one .npy row width exists"
             )
         requested = next(iter(vector_widths))
     n = int(requested)
-    bad = {
-        name: info.row_width
-        for name, info in infos.items()
-        if info.row_width not in (1, n)
-    }
-    if n <= 0 or bad:
-        raise ValueError(
-            f"invalid n_instruments={n}; incompatible row widths={bad}"
-        )
+    if n <= 0:
+        raise ValueError(f"invalid n_instruments={n}")
     return n
 
 
@@ -312,19 +329,23 @@ def compile_npy_formula(
     key_cardinalities: Mapping[str, int] | None = None,
     prefetch_rows: int = 16,
 ) -> CppStreamRuntime:
+    infos = inspect_npy_mapping(data)
+    if len({info.rows for info in infos.values()}) != 1:
+        raise ValueError(".npy inputs have different row counts")
+    n = _infer_n(infos, n_instruments)
     program = compile_ir(
-        formula, dsl_registry=dsl_registry, column_names=column_names
+        formula,
+        dsl_registry=dsl_registry,
+        column_names=column_names,
+        input_value_types={
+            name: _input_value_type(info.input_type, n)
+            for name, info in infos.items()
+        },
     )
     missing = [name for name in program.input_names if name not in data]
     extra = sorted(set(data) - set(program.input_names))
     if missing or extra:
         raise KeyError(f".npy input mismatch: missing={missing}, extra={extra}")
-    infos = inspect_npy_mapping(
-        {name: data[name] for name in program.input_names}
-    )
-    if len({info.rows for info in infos.values()}) != 1:
-        raise ValueError(".npy inputs have different row counts")
-    n = _infer_n(infos, n_instruments)
     return _compile_program(
         program,
         n_instruments=n,
