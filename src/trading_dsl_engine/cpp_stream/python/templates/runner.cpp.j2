@@ -14,7 +14,13 @@ thread_local std::string g_last_error;
 {% for inner in inners %}
 template <std::size_t N, std::size_t Capacity, std::size_t PartitionCount>
 struct {{ inner.name }} {
-    stackdsl::GroupRowContext<N, {{ inner.input_count }}, {{ inner.scratch_slots }}> ctx{};
+    stackdsl::GroupRowContext<
+        N,
+        {{ inner.input_count }},
+        {{ inner.scratch_slots }},
+        {{ inner.matrix_scratch_slots }},
+        {{ inner.matrix_scratch_width }}
+    > ctx{};
 {% for stage in inner.stages %}
     {{ stage.cpp_type }} s{{ stage.index }}{};
 {% endfor %}
@@ -55,7 +61,13 @@ int run_bound_inputs(
     output.advise_sequential();
     auto* STACKDSL_RESTRICT out = static_cast<double*>(output.data());
 
-    stackdsl::RowContext<N, {{ input_count }}, {{ scratch_slots }}> ctx{};
+    stackdsl::RowContext<
+        N,
+        {{ input_count }},
+        {{ scratch_slots }},
+        {{ matrix_scratch_slots }},
+        {{ matrix_scratch_width }}
+    > ctx{};
 {% for stage in stages %}
     {{ stage.cpp_type }} s{{ stage.index }}{};
 {% endfor %}
@@ -141,12 +153,7 @@ extern "C" int cpp_stream_run_arrays(
         bases[{{ input.index }}] = input_data[{{ input.index }}];
 {% endfor %}
         return run_bound_inputs(
-            bases,
-            rows,
-            output_path,
-            async_writeback_bytes,
-            rows_out,
-            seconds_out);
+            bases, rows, output_path, async_writeback_bytes, rows_out, seconds_out);
     } catch (const std::exception& exc) {
         g_last_error = exc.what();
         return 100;
@@ -183,12 +190,7 @@ extern "C" int cpp_stream_run_files(
         bases[{{ input.index }}] = in{{ input.index }}.data();
 {% endfor %}
         return run_bound_inputs(
-            bases,
-            rows0,
-            output_path,
-            async_writeback_bytes,
-            rows_out,
-            seconds_out);
+            bases, rows0, output_path, async_writeback_bytes, rows_out, seconds_out);
     } catch (const std::exception& exc) {
         g_last_error = exc.what();
         return 100;
