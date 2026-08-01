@@ -28,6 +28,22 @@ class NaryOp:
 
 
 @dataclass(frozen=True, slots=True)
+class CatOp:
+    """Concatenate scalar/vector/matrix values along the feature axis.
+
+    ``child_widths`` is aligned with the node's children. Scalars and vectors
+    contribute width one; matrices contribute their compile-time feature width.
+    The logical result is ``(n_instruments, sum(child_widths))`` per timestep.
+    """
+
+    child_widths: tuple[int, ...]
+
+    @property
+    def width(self) -> int:
+        return sum(self.child_widths)
+
+
+@dataclass(frozen=True, slots=True)
 class CumsumOp:
     pass
 
@@ -43,6 +59,35 @@ class EwmOp:
 @dataclass(frozen=True, slots=True)
 class XsRankOp:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class RidgeOp:
+    """Pairwise-missing weighted streaming ridge regression.
+
+    Children are ordered as feature expressions, ``y``, optional ``weights``,
+    ``hl``, and ``lambda``. Feature widths are compile-time constants and may
+    originate from vectors or matrices. ``hl == 0`` is the stateless/current-row
+    form used by the existing backends.
+    """
+
+    feature_widths: tuple[int, ...]
+    has_weights: bool
+    nonneg: bool = False
+    is_stateful: bool = True
+
+    @property
+    def coefficient_width(self) -> int:
+        return sum(self.feature_widths)
+
+
+@dataclass(frozen=True, slots=True)
+class RidgeProjectionOp:
+    field: str  # "beta" or "preds"
+
+    def __post_init__(self) -> None:
+        if self.field not in {"beta", "preds"}:
+            raise ValueError(f"unsupported Ridge projection {self.field!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,4 +136,31 @@ class GroupByOp:
         return len(self.key_specs)
 
 
-OpSpec: TypeAlias = InputOp | LiteralOp | NaryOp | CumsumOp | EwmOp | XsRankOp | GroupByOp
+OpSpec: TypeAlias = (
+    InputOp
+    | LiteralOp
+    | NaryOp
+    | CatOp
+    | CumsumOp
+    | EwmOp
+    | XsRankOp
+    | RidgeOp
+    | RidgeProjectionOp
+    | GroupByOp
+)
+
+
+__all__ = [
+    "InputOp",
+    "LiteralOp",
+    "NaryOp",
+    "CatOp",
+    "CumsumOp",
+    "EwmOp",
+    "XsRankOp",
+    "RidgeOp",
+    "RidgeProjectionOp",
+    "GroupKeySpec",
+    "GroupByOp",
+    "OpSpec",
+]
