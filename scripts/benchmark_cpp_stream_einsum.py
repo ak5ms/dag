@@ -53,17 +53,27 @@ def _cases():
     middle2 = cat(y, z)
     right2 = cat(z, w)
     return {
-        "row_dot": einsum("nf,nf->n", left6, right6),
-        "ellipsis_dot": einsum("...f,...f->...", left6, right6),
-        "scalar_reduce": einsum("n,n->", x, y),
-        "nary_none": einsum(
-            "ij,kj,kl->il", left2, middle2, right2, optimize=False
+        "row_dot": (einsum("nf,nf->n", left6, right6), ("w", "x", "y", "z")),
+        "ellipsis_dot": (
+            einsum("...f,...f->...", left6, right6),
+            ("w", "x", "y", "z"),
         ),
-        "nary_greedy": einsum(
-            "ij,kj,kl->il", left2, middle2, right2, optimize="greedy"
+        "scalar_reduce": (einsum("n,n->", x, y), ("x", "y")),
+        "nary_none": (
+            einsum("ij,kj,kl->il", left2, middle2, right2, optimize=False),
+            ("w", "x", "y", "z"),
         ),
-        "nary_optimal": einsum(
-            "ij,kj,kl->il", left2, middle2, right2, optimize="optimal"
+        "nary_greedy": (
+            einsum(
+                "ij,kj,kl->il", left2, middle2, right2, optimize="greedy"
+            ),
+            ("w", "x", "y", "z"),
+        ),
+        "nary_optimal": (
+            einsum(
+                "ij,kj,kl->il", left2, middle2, right2, optimize="optimal"
+            ),
+            ("w", "x", "y", "z"),
         ),
     }
 
@@ -84,11 +94,12 @@ def main() -> None:
         raise ValueError("rows/instruments/runs must be positive and warmups nonnegative")
     with tempfile.TemporaryDirectory(prefix="cpp_stream_einsum_") as temporary:
         root = Path(temporary)
-        paths = _build_inputs(root)
+        all_paths = _build_inputs(root)
         output_root = Path(OUTPUT_DIR) if OUTPUT_DIR else root
         output_root.mkdir(parents=True, exist_ok=True)
 
-        for name, formula in _selected_cases().items():
+        for name, (formula, input_names) in _selected_cases().items():
+            paths = {input_name: all_paths[input_name] for input_name in input_names}
             runtime = compile_npy_formula(
                 formula,
                 paths,
