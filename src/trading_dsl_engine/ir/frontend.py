@@ -3,8 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
+from trading_dsl_engine.base.keys import Key
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
-from trading_dsl_engine.ir.ops import CumsumOp, EwmOp, GroupByOp, InputOp, LiteralOp, NaryOp, XsRankOp
+from trading_dsl_engine.ir.ops import (
+    CumsumOp,
+    EwmOp,
+    GroupByOp,
+    GroupKeySpec,
+    InputOp,
+    LiteralOp,
+    NaryOp,
+    XsRankOp,
+)
 from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import SCALAR, VECTOR, ValueType
 
@@ -30,16 +40,32 @@ def _expr_key(node: Expr) -> tuple:
         return ("str", node.value)
     if isinstance(node, Universe):
         return ("univ", node.groups)
+    if isinstance(node, Key):
+        return (
+            "key",
+            _expr_key(node.expr),
+            node.num_keys,
+            node.offset,
+            node.row_scalar,
+            node.dtype,
+        )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
     if isinstance(node, Call):
-        return ("call", node.fn, tuple(_expr_key(arg) for arg in node.args), tuple((name, _expr_key(value)) for name, value in node.kwargs))
+        return (
+            "call",
+            node.fn,
+            tuple(_expr_key(arg) for arg in node.args),
+            tuple((name, _expr_key(value)) for name, value in node.kwargs),
+        )
     raise FormulaIRCompileError(f"unhandled expression for key: {node!r}")
 
 
 def _contains_self(node: Expr) -> bool:
     if isinstance(node, Identifier):
         return node.name == "self_"
+    if isinstance(node, Key):
+        return _contains_self(node.expr)
     if isinstance(node, Call):
         return any(_contains_self(arg) for arg in node.args) or any(_contains_self(v) for _, v in node.kwargs)
     if isinstance(node, KeyTuple):
@@ -72,7 +98,9 @@ def _resolve_universe_groups(universe: Universe, column_name_to_index: dict[str,
                 try:
                     index = column_name_to_index[member]
                 except KeyError as exc:
-                    raise FormulaIRCompileError(f"unknown universe column {member!r}; pass column_names when using ticker names") from exc
+                    raise FormulaIRCompileError(
+                        f"unknown universe column {member!r}; pass column_names when using ticker names"
+                    ) from exc
             if index < 0:
                 raise FormulaIRCompileError("universe column indexes must be >= 0")
             if index in seen:
@@ -93,7 +121,11 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
     names = ("x", "span", "min_periods", "ignore_na", "adjust")
     if len(call.args) > len(names):
         raise FormulaIRCompileError("ewm accepts at most five positional arguments")
-    values: dict[str, Expr] = {"min_periods": Number(0.0), "ignore_na": Number(1.0), "adjust": Number(0.0)}
+    values: dict[str, Expr] = {
+        "min_periods": Number(0.0),
+        "ignore_na": Number(1.0),
+        "adjust": Number(0.0),
+    }
     explicitly_set: set[str] = set()
     for name, value in zip(names, call.args):
         values[name] = value
@@ -118,6 +150,19 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
     return values["x"], span, min_periods, ignore_na, adjust
 
 
+def _group_key(item: Expr) -> tuple[Expr, GroupKeySpec]:
+    if isinstance(item, Key):
+        if isinstance(item.expr, Universe):
+            raise FormulaIRCompileError("Key(...) may only wrap dynamic group keys, not univ(...)")
+        return item.expr, GroupKeySpec(
+            num_keys=item.num_keys,
+            offset=item.offset,
+            row_scalar=item.row_scalar,
+            dtype=item.dtype,
+        )
+    return item, GroupKeySpec()
+
+
 @dataclass
 class _Builder:
     dsl_registry: DSLFunctionRegistry
@@ -137,8 +182,8 @@ class _Builder:
         key = _expr_key(node)
         if use_cache and key in self.memo:
             return self.memo[key]
-        if isinstance(node, Identifier) and node.name in _DERIVED_TERMINALS:
-            result = self.build(_DERIVED_TERMINALS[node.name], use_cache=use_cache)
+        if isinstance(node, Key):
+            result = self.build(node.expr, use_cache=use_cache)
             if use_cache:
                 self.memo[key] = result
             return result
@@ -155,10 +200,14 @@ class _Builder:
                         self.memo[key] = result
                     return result
         if isinstance(node, Identifier):
-            if node.name == "self_":
-                raise FormulaIRCompileError("self_ is only valid inside groupby RHS")
-            input_index = self.inputs.setdefault(node.name, len(self.inputs))
-            result = self._append(InputOp(input_index, node.name), (), VECTOR)
+            derived = _DERIVED_TERMINALS.get(node.name)
+            if derived is not None:
+                result = self.build(derived, use_cache=use_cache)
+            else:
+                if node.name == "self_":
+                    raise FormulaIRCompileError("self_ is only valid inside groupby RHS")
+                input_index = self.inputs.setdefault(node.name, len(self.inputs))
+                result = self._append(InputOp(input_index, node.name), (), VECTOR)
         elif isinstance(node, Number):
             result = self._append(LiteralOp(float(node.value)), (), SCALAR)
         elif isinstance(node, Call) and node.fn in _NARY_ARITY:
@@ -166,7 +215,11 @@ class _Builder:
             if node.kwargs or len(node.args) != arity:
                 raise FormulaIRCompileError(f"{node.fn} expects exactly {arity} positional arguments")
             child_ids = tuple(self.build(arg) for arg in node.args)
-            result = self._append(NaryOp(node.fn, arity), child_ids, _result_type([self.nodes[i] for i in child_ids]))
+            result = self._append(
+                NaryOp(node.fn, arity),
+                child_ids,
+                _result_type([self.nodes[i] for i in child_ids]),
+            )
         elif isinstance(node, Call) and node.fn == "cumsum":
             if node.kwargs or len(node.args) != 1:
                 raise FormulaIRCompileError("cumsum expects exactly one positional argument")
@@ -186,7 +239,9 @@ class _Builder:
         elif isinstance(node, Call) and node.fn == "groupby":
             result = self._build_groupby(node)
         else:
-            raise FormulaIRCompileError(f"cpp_stream neutral IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}")
+            raise FormulaIRCompileError(
+                f"cpp_stream neutral IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}"
+            )
         if use_cache:
             self.memo[key] = result
         return result
@@ -199,19 +254,33 @@ class _Builder:
         if unknown:
             raise FormulaIRCompileError(f"unsupported groupby keyword argument(s): {sorted(unknown)}")
         capacity = None if "capacity" not in kw else int(round(_literal_number(kw["capacity"], "groupby capacity")))
-        hash_capacity = None if "hash_capacity" not in kw else int(round(_literal_number(kw["hash_capacity"], "groupby hash_capacity")))
+        hash_capacity = None if "hash_capacity" not in kw else int(
+            round(_literal_number(kw["hash_capacity"], "groupby hash_capacity"))
+        )
         if capacity is not None and capacity <= 0:
             raise FormulaIRCompileError("groupby capacity must be > 0")
         if hash_capacity is not None and hash_capacity <= 0:
             raise FormulaIRCompileError("groupby hash_capacity must be > 0")
+
         key = call.args[0]
         key_items = key.items if isinstance(key, KeyTuple) else (key,)
         universes = [item for item in key_items if isinstance(item, Universe)]
         if len(universes) > 1:
             raise FormulaIRCompileError("groupby key tuple may contain at most one univ(...) element")
-        static_groups = None if not universes else _resolve_universe_groups(universes[0], self.column_name_to_index)
-        dynamic_items = [item for item in key_items if not isinstance(item, Universe)]
+        static_groups = None if not universes else _resolve_universe_groups(
+            universes[0], self.column_name_to_index
+        )
+
+        dynamic_items: list[Expr] = []
+        key_specs: list[GroupKeySpec] = []
+        for item in key_items:
+            if isinstance(item, Universe):
+                continue
+            expr, spec = _group_key(item)
+            dynamic_items.append(expr)
+            key_specs.append(spec)
         key_ids = tuple(self.build(item) for item in dynamic_items)
+
         lhs_id = self.build(call.args[1])
         if self.nodes[lhs_id].value_type.kind != "vector":
             raise FormulaIRCompileError("cpp_stream groupby lhs must be vector-valued")
@@ -220,12 +289,13 @@ class _Builder:
         inner_program = Program(
             nodes=tuple(inner_builder.nodes),
             outputs=(inner_root,),
-            input_names=("__self__",) + tuple(f"__capture_{i}__" for i in range(len(inner_builder.capture_ids))),
+            input_names=("__self__",)
+            + tuple(f"__capture_{i}__" for i in range(len(inner_builder.capture_ids))),
         )
         if inner_program.nodes[inner_root].value_type.kind != "vector":
             raise FormulaIRCompileError("cpp_stream groupby RHS must emit a vector")
         op = GroupByOp(
-            n_dynamic_keys=len(key_ids),
+            key_specs=tuple(key_specs),
             static_groups=static_groups,
             inner_program=inner_program,
             capacity=capacity,
@@ -256,6 +326,8 @@ class _InnerBuilder:
         key = _expr_key(node)
         if key in self.memo:
             return self.memo[key]
+        if isinstance(node, Key):
+            return self.build(node.expr)
         if isinstance(node, Identifier) and node.name == "self_":
             if self._self_input is None:
                 self._self_input = self._input(0, "__self__")
@@ -290,7 +362,11 @@ class _InnerBuilder:
             if node.kwargs or len(node.args) != arity:
                 raise FormulaIRCompileError(f"{node.fn} expects exactly {arity} positional arguments")
             children = tuple(self.build(arg) for arg in node.args)
-            result = self._append(NaryOp(node.fn, arity), children, _result_type([self.nodes[i] for i in children]))
+            result = self._append(
+                NaryOp(node.fn, arity),
+                children,
+                _result_type([self.nodes[i] for i in children]),
+            )
         elif isinstance(node, Call) and node.fn == "cumsum":
             if node.kwargs or len(node.args) != 1:
                 raise FormulaIRCompileError("cumsum expects exactly one positional argument")
@@ -308,7 +384,9 @@ class _InnerBuilder:
         elif isinstance(node, Call) and node.fn == "groupby":
             raise FormulaIRCompileError("nested groupby inside groupby RHS is not yet supported by cpp_stream")
         else:
-            raise FormulaIRCompileError(f"cpp_stream grouped IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}")
+            raise FormulaIRCompileError(
+                f"cpp_stream grouped IR does not yet support {getattr(node, 'fn', type(node).__name__)!r}"
+            )
         self.memo[key] = result
         return result
 
