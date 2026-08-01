@@ -16,6 +16,7 @@ class ValueType:
     ``None`` in ``shape`` denotes the instrument dimension. Existing scalar,
     vector, matrix, and fixed-width kinds retain their compatibility fields;
     arbitrary einsum outputs use ``tensor`` with an explicit logical shape.
+    Object values intentionally have no tensor shape.
     """
 
     kind: ValueKind
@@ -44,7 +45,9 @@ class ValueType:
         if shape is not None:
             normalized = tuple(shape)
             for extent in normalized:
-                if extent is not None and (not isinstance(extent, int) or extent < 0):
+                if extent is not None and (
+                    not isinstance(extent, int) or extent < 0
+                ):
                     raise ValueError(f"invalid ValueType extent {extent!r}")
             object.__setattr__(self, "shape", normalized)
 
@@ -65,13 +68,19 @@ def fixed(width: int, dtype: str = "float64") -> ValueType:
     return ValueType("fixed", width, dtype, (width,))
 
 
-def tensor(shape: tuple[Dimension, ...] | list[Dimension], dtype: str = "float64") -> ValueType:
+def tensor(
+    shape: tuple[Dimension, ...] | list[Dimension], dtype: str = "float64"
+) -> ValueType:
     normalized = tuple(shape)
     if normalized == ():
         return ValueType("scalar", 1, dtype, ())
     if normalized == (None,):
         return ValueType("vector", 1, dtype, normalized)
-    if len(normalized) == 2 and normalized[0] is None and isinstance(normalized[1], int):
+    if (
+        len(normalized) == 2
+        and normalized[0] is None
+        and isinstance(normalized[1], int)
+    ):
         return matrix(normalized[1], dtype)
     if len(normalized) == 1 and isinstance(normalized[0], int):
         return fixed(normalized[0], dtype)
@@ -86,6 +95,11 @@ def object_value(width: int, dtype: str = "float64") -> ValueType:
 def resolve_shape(value_type: ValueType, n_instruments: int) -> tuple[int, ...]:
     if n_instruments <= 0:
         raise ValueError("n_instruments must be > 0")
+    # Object nodes are compile-time handles. Physical lowering still visits them
+    # before their projection, so use an empty placeholder shape without making
+    # them valid einsum operands or materializable roots.
+    if value_type.kind == "object":
+        return ()
     return tuple(
         n_instruments if extent is None else int(extent)
         for extent in value_type.logical_shape
