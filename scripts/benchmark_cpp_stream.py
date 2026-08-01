@@ -8,7 +8,8 @@ import tempfile
 import numpy as np
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
-from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.base.keys import Key
+from trading_dsl_engine.cpp_stream import compile_formula, compile_npy_formula
 
 ROWS = int(os.environ.get("CPP_STREAM_BENCH_ROWS", "5000000"))
 N = int(os.environ.get("CPP_STREAM_BENCH_INSTRUMENTS", "9"))
@@ -16,12 +17,12 @@ RUNS = int(os.environ.get("CPP_STREAM_BENCH_RUNS", "10"))
 WARMUPS = int(os.environ.get("CPP_STREAM_BENCH_WARMUPS", "1"))
 PREFETCH_ROWS = int(os.environ.get("CPP_STREAM_BENCH_PREFETCH_ROWS", "16"))
 MIN_MROWS = float(os.environ.get("CPP_STREAM_BENCH_MIN_MROWS", "0"))
-CASE = os.environ.get("CPP_STREAM_BENCH_CASE", "minute_groupby")
+CASE = os.environ.get("CPP_STREAM_BENCH_CASE", "minute_groupby_npy")
 OUTPUT_DIR = os.environ.get("CPP_STREAM_BENCH_OUTPUT_DIR")
 
 
-def _write_matrix(path: Path, values, *, chunk_rows: int = 131072) -> None:
-    arr = np.memmap(path, mode="w+", dtype=np.float64, shape=(ROWS, N))
+def _write_raw_matrix(path: Path, values, *, dtype=np.float64, width: int = N, chunk_rows: int = 131072) -> None:
+    arr = np.memmap(path, mode="w+", dtype=dtype, shape=(ROWS, width))
     for start in range(0, ROWS, chunk_rows):
         stop = min(start + chunk_rows, ROWS)
         arr[start:stop] = values(start, stop)
@@ -29,11 +30,20 @@ def _write_matrix(path: Path, values, *, chunk_rows: int = 131072) -> None:
     del arr
 
 
-def _minute_formula(key_name: str):
+def _write_npy(path: Path, shape: tuple[int, ...], dtype, values, *, chunk_rows: int = 131072) -> None:
+    arr = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+    for start in range(0, ROWS, chunk_rows):
+        stop = min(start + chunk_rows, ROWS)
+        arr[start:stop] = values(start, stop)
+    arr.flush()
+    del arr
+
+
+def _minute_formula(key_expr):
     if N != 9:
         raise ValueError("minute groupby benchmarks use the requested 9-column univ partition")
     return groupby(
-        (univ([0], [1, 2], list(range(3, 9))), var(key_name)),
+        (univ([0], [1, 2], list(range(3, 9))), key_expr),
         var("close"),
         ewm(cumsum(self_), 3),
     )
@@ -44,18 +54,43 @@ def _write_precomputed_minute(path: Path) -> None:
         values = np.mod(np.arange(start, stop, dtype=np.float64), 60.0)
         return np.broadcast_to(values[:, None], (stop - start, N))
 
-    _write_matrix(path, minutes)
+    _write_raw_matrix(path, minutes)
 
 
 def _build_case(root: Path):
     rng = np.random.default_rng(42)
+
+    if CASE == "minute_groupby_npy":
+        close_path = root / "close.npy"
+        timestamp_path = root / "_ev_ts.npy"
+        day_us = 86_400_000_000
+        minute_us = 60_000_000
+        base = (1_700_000_000_000_000 // day_us) * day_us
+        _write_npy(
+            close_path,
+            (ROWS, N),
+            np.float64,
+            lambda start, stop: rng.lognormal(4.0, 0.12, (stop - start, N)),
+        )
+        _write_npy(
+            timestamp_path,
+            (ROWS,),
+            np.int64,
+            lambda start, stop: base + np.arange(start, stop, dtype=np.int64) * minute_us,
+        )
+        formula = _minute_formula(
+            Key(var("minute"), num_keys=60, row_scalar=True, dtype="int64")
+        )
+        paths = {"_ev_ts": timestamp_path, "close": close_path}
+        return formula, paths, True, {}
+
     close_path = root / "close.bin"
-    _write_matrix(
+    _write_raw_matrix(
         close_path,
         lambda start, stop: rng.lognormal(4.0, 0.12, (stop - start, N)),
     )
 
-    if CASE == "minute_groupby":
+    if CASE in {"minute_groupby", "minute_groupby_hinted"}:
         timestamp_path = root / "_ev_ts.bin"
         day_us = 86_400_000_000.0
         minute_us = 60_000_000.0
@@ -65,36 +100,44 @@ def _build_case(root: Path):
             row_ts = base + np.arange(start, stop, dtype=np.float64) * minute_us
             return np.broadcast_to(row_ts[:, None], (stop - start, N))
 
-        _write_matrix(timestamp_path, timestamps)
+        _write_raw_matrix(timestamp_path, timestamps)
+        key_expr = (
+            Key(var("minute"), num_keys=60, row_scalar=True, dtype="float64")
+            if CASE == "minute_groupby_hinted"
+            else var("minute")
+        )
         return (
-            _minute_formula("minute"),
+            _minute_formula(key_expr),
             {"_ev_ts": timestamp_path, "close": close_path},
+            False,
             {},
         )
 
     if CASE in {"minute_groupby_precomputed_hash", "minute_groupby_precomputed_dense"}:
         minute_path = root / "minute_key.bin"
         _write_precomputed_minute(minute_path)
-        compile_kwargs = (
-            {"key_cardinalities": {"minute_key": 60}}
+        key_expr = (
+            Key(var("minute_key"), num_keys=60, row_scalar=True, dtype="float64")
             if CASE.endswith("_dense")
-            else {}
+            else var("minute_key")
         )
         return (
-            _minute_formula("minute_key"),
+            _minute_formula(key_expr),
             {"minute_key": minute_path, "close": close_path},
-            compile_kwargs,
+            False,
+            {},
         )
 
     if CASE == "rank":
         open_path = root / "open.bin"
-        _write_matrix(
+        _write_raw_matrix(
             open_path,
             lambda start, stop: rng.lognormal(4.0, 0.12, (stop - start, N)),
         )
         return (
             "xs_rank(ewm(close / open, 21))",
             {"close": close_path, "open": open_path},
+            False,
             {},
         )
 
@@ -104,23 +147,34 @@ def _build_case(root: Path):
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cpp_stream_bench_") as tmp:
         root = Path(tmp)
-        formula, paths, compile_kwargs = _build_case(root)
-        runtime = compile_formula(
-            formula,
-            n_instruments=N,
-            prefetch_rows=PREFETCH_ROWS,
-            **compile_kwargs,
-        )
+        formula, paths, npy_mode, compile_kwargs = _build_case(root)
+        if npy_mode:
+            runtime = compile_npy_formula(
+                formula,
+                paths,
+                n_instruments=N,
+                prefetch_rows=PREFETCH_ROWS,
+                **compile_kwargs,
+            )
+            run = runtime.run_npy_files
+        else:
+            runtime = compile_formula(
+                formula,
+                n_instruments=N,
+                prefetch_rows=PREFETCH_ROWS,
+                **compile_kwargs,
+            )
+            run = runtime.run_files
 
         output_root = Path(OUTPUT_DIR) if OUTPUT_DIR else root
         output_root.mkdir(parents=True, exist_ok=True)
         out = output_root / f"cpp_stream_{CASE}.out.bin"
 
         for _ in range(WARMUPS):
-            runtime.run_files(paths, out_path=out, async_writeback_mb=0)
+            run(paths, out_path=out, async_writeback_mb=0)
 
         rates = [
-            runtime.run_files(paths, out_path=out, async_writeback_mb=0).rows_per_second
+            run(paths, out_path=out, async_writeback_mb=0).rows_per_second
             for _ in range(RUNS)
         ]
         median_mrows = median(rates) / 1e6
@@ -128,6 +182,7 @@ def main() -> None:
         print(f"rows={ROWS:,} instruments={N} warmups={WARMUPS} runs={RUNS}")
         print(f"prefetch_rows={PREFETCH_ROWS}")
         print(f"inputs={runtime.program.input_names}")
+        print(f"input_types={runtime.input_types}")
         print(f"output={out}")
         print(f"median={median_mrows:.3f} M rows/s")
         print(f"mean={mean(rates) / 1e6:.3f} M rows/s")
