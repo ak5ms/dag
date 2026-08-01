@@ -15,9 +15,6 @@ class InputOp:
 
 @dataclass(frozen=True, slots=True)
 class LiteralOp:
-    # Preserve whether the user wrote/provided an integer or floating literal.
-    # Physical backends may therefore keep integer expressions integer instead
-    # of eagerly converting every constant and input to float64.
     value: int | float
 
 
@@ -28,14 +25,19 @@ class NaryOp:
 
 
 @dataclass(frozen=True, slots=True)
-class CatOp:
-    """Concatenate scalar/vector/matrix values along the feature axis.
+class CustomCallOp:
+    """Named backend-neutral stateless call.
 
-    ``child_widths`` is aligned with the node's children. Scalars and vectors
-    contribute width one; matrices contribute their compile-time feature width.
-    The logical result is ``(n_instruments, sum(child_widths))`` per timestep.
+    Python/JAX backends may execute the original callable stored on the AST.
+    Native backends select an implementation by this stable name.
     """
 
+    name: str
+    arity: int
+
+
+@dataclass(frozen=True, slots=True)
+class CatOp:
     child_widths: tuple[int, ...]
 
     @property
@@ -46,6 +48,17 @@ class CatOp:
 @dataclass(frozen=True, slots=True)
 class CumsumOp:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class FFillOp:
+    limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ShiftOp:
+    lag: int = 1
+    max_lag: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,15 +75,38 @@ class XsRankOp:
 
 
 @dataclass(frozen=True, slots=True)
+class RbfBasisOp:
+    n_basis: int
+
+
+@dataclass(frozen=True, slots=True)
+class FutureRbfBasisSumOp:
+    n_basis: int
+    n_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class EinsumOp:
+    subscripts: str
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentBasisMeanOp:
+    feature_width: int
+    has_weights: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentBasisProjectionOp:
+    field: str  # beta or preds
+
+    def __post_init__(self) -> None:
+        if self.field not in {"beta", "preds"}:
+            raise ValueError(f"unsupported InstrumentBasisMean projection {self.field!r}")
+
+
+@dataclass(frozen=True, slots=True)
 class RidgeOp:
-    """Pairwise-missing weighted streaming ridge regression.
-
-    Children are ordered as feature expressions, ``y``, optional ``weights``,
-    ``hl``, and ``lambda``. Feature widths are compile-time constants and may
-    originate from vectors or matrices. ``hl == 0`` is the stateless/current-row
-    form used by the existing backends.
-    """
-
     feature_widths: tuple[int, ...]
     has_weights: bool
     nonneg: bool = False
@@ -83,7 +119,7 @@ class RidgeOp:
 
 @dataclass(frozen=True, slots=True)
 class RidgeProjectionOp:
-    field: str  # "beta" or "preds"
+    field: str  # beta or preds
 
     def __post_init__(self) -> None:
         if self.field not in {"beta", "preds"}:
@@ -92,23 +128,6 @@ class RidgeProjectionOp:
 
 @dataclass(frozen=True, slots=True)
 class GroupKeySpec:
-    """Metadata aligned with one dynamic child of a ``GroupByOp``.
-
-    ``num_keys`` describes a bounded consecutive integer domain. When it is
-    present, valid non-NaN values are exactly
-    ``[offset, offset + num_keys)``. Dense routing uses ``value - offset`` as
-    that key's zero-based mixed-radix digit. For example, ``num_keys=12`` and
-    ``offset=1`` describe months 1 through 12. NaN is one additional category
-    for floating-point keys.
-
-    ``row_scalar`` says one key value applies to every lane in an input row.
-    ``None`` means infer it; ``True`` is an assertion that permits one evaluation
-    and one group-slot lookup per row.
-
-    ``dtype`` is the expected native scalar type of the completed key expression.
-    It is validated, not used as permission to cast the expression.
-    """
-
     num_keys: int | None = None
     offset: int = 0
     row_scalar: bool | None = None
@@ -117,14 +136,6 @@ class GroupKeySpec:
 
 @dataclass(frozen=True, slots=True)
 class GroupByOp:
-    """Backend-neutral grouped RHS graph.
-
-    ``children`` on the owning Node are ordered as dynamic keys, lhs, then
-    captures used by ``inner_program``. ``key_specs`` is aligned with the dynamic
-    key prefix. Inner input 0 is ``self_``; inner inputs 1..N correspond to
-    captures in the same order.
-    """
-
     key_specs: tuple[GroupKeySpec, ...]
     static_groups: tuple[tuple[int, ...], ...] | None
     inner_program: "Program"
@@ -140,10 +151,18 @@ OpSpec: TypeAlias = (
     InputOp
     | LiteralOp
     | NaryOp
+    | CustomCallOp
     | CatOp
     | CumsumOp
+    | FFillOp
+    | ShiftOp
     | EwmOp
     | XsRankOp
+    | RbfBasisOp
+    | FutureRbfBasisSumOp
+    | EinsumOp
+    | InstrumentBasisMeanOp
+    | InstrumentBasisProjectionOp
     | RidgeOp
     | RidgeProjectionOp
     | GroupByOp
@@ -154,10 +173,18 @@ __all__ = [
     "InputOp",
     "LiteralOp",
     "NaryOp",
+    "CustomCallOp",
     "CatOp",
     "CumsumOp",
+    "FFillOp",
+    "ShiftOp",
     "EwmOp",
     "XsRankOp",
+    "RbfBasisOp",
+    "FutureRbfBasisSumOp",
+    "EinsumOp",
+    "InstrumentBasisMeanOp",
+    "InstrumentBasisProjectionOp",
     "RidgeOp",
     "RidgeProjectionOp",
     "GroupKeySpec",
