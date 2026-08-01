@@ -1,242 +1,169 @@
-# cpp_stream performance baseline
+# cpp_stream performance notes
 
-This document records the July 31, 2026 comparisons used while integrating and
-refactoring `trading_dsl_engine.cpp_stream`.
+Benchmarks here measure generated native execution only. Formula compilation, C++
+compilation, input generation, mmap setup, and warmup are excluded unless stated.
+Absolute throughput varies across hosted CPUs; architectural comparisons should run
+in the same process or workflow job.
 
-## Standalone comparison
+## Standard commands
 
-The first standalone prototype used simpler semantics than the repository backend:
+```bash
+python scripts/benchmark_cpp_stream.py
 
-- EWM assumed an all-finite stream and synchronized initialization.
-- `xs_rank` emitted ordinal `[0, 1]` ranks and broke ties by lane index.
+CPP_STREAM_RIDGE_CASE=all \
+python scripts/benchmark_cpp_stream_ridge.py
+```
 
-The integrated backend preserves independent per-lane initialization, NaN carry,
-`min_periods`, `ignore_na`, `adjust`, finite masking, and upper-tie normal scores.
-The earlier ~21 M rows/s headline was also measured on a different AMD EPYC host,
-so it is not an apples-to-apples threshold for this branch.
+Both scripts default to 5,000,000 rows, 9 instruments, one warmup, and ten measured
+executions.
 
-For `xs_rank(ewm(close / open, 21))` on the Intel Xeon E5-2673 v4 comparison host,
-the integrated semantic path measured 14.36 M rows/s in a pinned,
-file-I/O-excluded kernel test versus 10.43 M rows/s for the earlier standalone
-implementation on the same host.
+## Timestamp-derived grouping
 
-## Operator-agnostic group execution
+The apparent drop from roughly 20 M rows/s to roughly 4-5 M rows/s was not caused by
+the generic groupby execution scope. It came from representing `_ev_ts -> minute`
+as nine float64 lanes and hashing the result.
 
-There are no operator-specific grouped classes. In particular, the backend does
-not define any of the following:
+Same-host ablation:
+
+| Key representation | Throughput |
+| --- | ---: |
+| Precomputed dense minute | 21.71 M rows/s |
+| Precomputed minute + hash | 11.72 M rows/s |
+| Vector float calendar + hash | 4.74 M rows/s |
+| Row-scalar float calendar + dense | 12.73 M rows/s |
+| Row-scalar integer calendar + dense | 20.32 M rows/s |
+
+The production typed `.npy` path preserves `int64` timestamp arithmetic, propagates
+row-scalar width, and uses `Key(num_keys=60, ...)` for dense routing. Hosted same-run
+comparisons have measured approximately 20-25 M rows/s for native scalar/dense
+routing versus approximately 4.2 M rows/s for vector/hash routing.
+
+## Small-width rank
+
+For N=9, exact upper-rank counting is faster than sorting while preserving tie and
+NaN semantics:
+
+| Kernel | Sort | Rank count |
+| --- | ---: | ---: |
+| `xs_rank` | 6.1-6.3 M rows/s | 15.8-16.7 M rows/s |
+| grouped `xs_rank` | 5.9-6.4 M rows/s | 12.1-12.9 M rows/s |
+| `div -> EWM -> xs_rank` | 5.6-5.7 M rows/s | 10.9-11.6 M rows/s |
+
+The single `XsRankNode` uses compile-time N to choose the algorithm. There is no
+grouped rank implementation.
+
+## Cat and Ridge: 5M x 9 baseline
+
+Workflow configuration:
 
 ```text
-GroupedCumsumNode
-GroupedEwmNode
-GroupedXsRankNode
-FastGroupedFooNode
+rows              5,000,000
+instruments       9
+features          3
+input dtype       float64
+input format      mmap .npy
+warmup            1
+measured runs     10
+compiler          GCC C++20
+flags             -O3 -march=native -mtune=native -flto
+output            reused /dev/shm mmap
 ```
 
-Every generated node receives one final execution-scope template argument:
+Results from the successful full workflow run on August 1, 2026:
 
-```cpp
-DirectExecution<N>
-GroupedExecution<N, Capacity>
+| Case | Median | Mean | Best |
+| --- | ---: | ---: | ---: |
+| Cat root, output width 27 | 11.307 | 11.143 | 11.329 M rows/s |
+| Stateful K=3 predictions, `cat` syntax | 6.377 | 6.370 | 6.382 M rows/s |
+| Stateful K=3 predictions, separate args | 6.367 | 6.371 | 6.392 M rows/s |
+| Stateless K=3 beta | 9.169 | 9.168 | 9.175 M rows/s |
+| One-group grouped stateful predictions | 6.176 | 6.177 | 6.182 M rows/s |
+| Three-group grouped stateful predictions | 2.787 | 2.786 | 2.788 M rows/s |
+
+Ten-run distributions:
+
+```text
+cat_root
+11.305, 10.209, 11.034, 11.310, 11.317,
+11.273, 11.323, 11.329, 11.327, 11.007
+
+stateful_cat
+6.370, 6.382, 6.377, 6.379, 6.310,
+6.371, 6.373, 6.378, 6.377, 6.381
+
+stateful_args
+6.391, 6.392, 6.373, 6.364, 6.364,
+6.366, 6.364, 6.369, 6.353, 6.374
+
+stateless_beta
+9.169, 9.175, 9.170, 9.166, 9.164,
+9.165, 9.171, 9.168, 9.164, 9.172
+
+one_group
+6.172, 6.174, 6.175, 6.180, 6.177,
+6.182, 6.173, 6.180, 6.180, 6.176
+
+three_groups
+2.786, 2.786, 2.786, 2.786, 2.784,
+2.788, 2.787, 2.787, 2.788, 2.787
 ```
 
-The same `CumsumNode`, `EwmNode`, `XsRankNode`, `BinaryNode`, and `UnaryNode`
-types are emitted inside and outside groupby. The execution scope supplies generic
-state indexing and cross-sectional group identity. `groupby.hpp` contains no
-operator implementation.
+### Interpretation
 
-### Zero-cost refactor check
+`Ridge(cat(x1,x2,x3), ...)` and `Ridge(x1,x2,x3, ...)` produced the same generated
+C++ cache key and identical checksums. Cat therefore adds no Ridge execution cost;
+physical lowering flattens both into the same compile-time `FeatureList`.
 
-The immediately prior implementation used separate per-operator grouped classes.
-A controlled benchmark compared that implementation with the execution-scope
-version using the same state layout, recurrence, generated calendar stages, and
-output semantics.
+The one-group grouped form is 3.2% below direct execution:
 
-Workload:
-
-- 5,000,000 rows x 9 instruments
-- `_ev_ts -> time-of-day -> minute` represented as generated vector stages
-- static column groups `[0]`, `[1,2]`, `[3..8]`
-- grouped `ewm(cumsum(self_), 3)`
-- one pinned CPU
-- GCC C++20, `-O3 -march=native -mtune=native -flto`
-- Intel Xeon E5-2673 v4
-
-| Implementation | Median throughput |
-| --- | ---: |
-| Prior separate grouped operator classes | 4.647 M rows/s |
-| **Single node family + `GroupedExecution`** | **4.648 M rows/s** |
-
-Checksums were identical. The difference is below measurement noise; passing the
-execution scope as a compile-time type did not regress the hot loop.
-
-A 2,000,000-row, twelve-run alternating comparison gave the same conclusion:
-4.611 M rows/s versus 4.602 M rows/s.
-
-## Timestamp-derived minute benchmark
-
-Requested formula:
-
-```python
-groupby(
-    (univ([0], [1, 2], list(range(3, 9))), var("minute")),
-    var("close"),
-    ewm(cumsum(self_), 3),
-)
+```text
+1 - 6.176 / 6.377 = 3.15%
 ```
 
-`var("minute")` is expanded by the neutral frontend to the existing DSL
-`minute(_ev_ts)` derivation. The DSL definition is **minute within the hour**
-(`0..59`), not minute-of-day (`0..1439`). `_ev_ts` is a float64 microseconds-since-
-epoch input.
+That is the measured cost of grouped context/resolution for one static group. The
+three-group workload performs three independent moment updates and three K=3 solves
+per row. Its lower throughput is expected additional work, not an operator-specific
+groupby dispatch path.
 
-The operator-agnostic execution-scope implementation preserves the previously
-measured optimized grouped result while removing grouped operator boilerplate.
+At 6.377 M rows/s with nine instruments, stateful K=3 Ridge processes about
+57.4 million instrument observations and 6.377 million complete K=3 solves per
+second in one native row loop.
 
-## Same-host ablation against the old 21 M rows/s result
+Cat root writes 27 float64 values per row. Its median corresponds to approximately
+2.44 GB/s of output payload before input traffic:
 
-The old table used a precomputed key file and, for the 21.43 M rows/s case, direct
-dense indexing. The requested integrated formula derives the key from `_ev_ts` as
-generic vector arithmetic and then sends the result through the generic hash
-resolver. Those are materially different workloads.
-
-The following ablation used one pinned Intel Xeon E5-2673 v4 core, GCC 14 C++20,
-`-O3 -march=native -mtune=native -flto`, 2,000,000 x 9 finite rows, warmed input
-pages, and an in-memory output. The grouped `cumsum -> EWM(span=3)` state layout and
-output semantics were held constant unless the row says otherwise.
-
-| Variant | Median throughput |
-| --- | ---: |
-| Precomputed dense minute, fused inner state loop | 21.92 M rows/s |
-| Precomputed dense minute, normal separated cumsum/EWM stages | **21.71 M rows/s** |
-| Precomputed minute, current full hash resolver | 11.72 M rows/s |
-| Generated four-stage vector calendar + current hash resolver, fused inner | 5.14 M rows/s |
-| **Generated four-stage vector calendar + current hash resolver, normal separated inner** | **4.74 M rows/s** |
-| Row-scalar float calendar + dense slot, separated inner | 12.73 M rows/s |
-| Row-scalar integer calendar + dense slot, separated inner | **20.32 M rows/s** |
-
-The 4.74 M rows/s row reproduces the apparent integrated result. The 21.71 M rows/s
-control shows that the generic execution-scope groupby/state architecture still
-reaches the old dense-key throughput when key production and routing are held equal.
-
-Expressed as elapsed time per million rows:
-
-| Step | Time per million rows | Incremental cost |
-| --- | ---: | ---: |
-| Precomputed dense key | 46.1 ms | baseline |
-| Precomputed key + current hash resolver | 85.3 ms | +39.2 ms |
-| Vector calendar stages + current hash resolver | 211.0 ms | +125.7 ms |
-
-About 78% of the final row time above the dense-key baseline comes from producing and
-resolving the key, not from cumsum, EWM, `GroupedExecution`, or output handling.
-
-### Resolver ablation
-
-For a uniform minute key shared by all nine lanes:
-
-| Resolver behavior | Median throughput |
-| --- | ---: |
-| Resolve/hash once and broadcast the slot | 15.87 M rows/s |
-| Generic row-reuse loop, no per-lane temporal cache | 13.52 M rows/s |
-| Current row-reuse plus per-lane temporal cache | 11.60 M rows/s |
-
-The per-lane cache is counterproductive for this key because minute changes on every
-row. All nine lane caches miss, are rewritten, and then the same-row reuse logic
-still performs the useful sharing. That cache can help persistent per-lane keys, but
-it should not be the only generic resolver policy.
-
-### Dense resolver and semantic checks
-
-Additional isolated controls:
-
-| Change | Median throughput |
-| --- | ---: |
-| Current formula, dense row-shared slot, simplified finite-only semantics | 22.53 M rows/s |
-| Current formula, dense row-shared slot, repository NaN-safe semantics | 21.34 M rows/s |
-| Dense validation repeated independently for all nine lanes | 17.46 M rows/s |
-| Dense validation once plus row-slot broadcast | 21.63 M rows/s |
-
-Repository-safe cumsum/EWM semantics cost about 5% on all-finite data. Revalidating an
-identical dense key nine times costs about 19%. Neither accounts for the overall
-4.7-versus-21 M rows/s gap.
-
-### Calendar representation ablation
-
-The existing DSL macro expands `minute(_ev_ts)` to floating-point `mod`, division,
-`floor`, and another `mod`. The IR currently treats `_ev_ts` as a nine-lane vector,
-so those operations are repeated for every lane and materialized as separate vector
-stages.
-
-| Calendar/key representation | Median throughput |
-| --- | ---: |
-| Vector floating calendar expression, current hash resolver | 4.74 M rows/s |
-| Row-scalar floating calendar expression, dense slot | 12.73 M rows/s |
-| Row-scalar integer timestamp arithmetic, dense slot | 20.32 M rows/s |
-
-The integer row-scalar version is close to the precomputed dense control. This is the
-main architectural path to recovering the old performance without adding any
-operator-specific groupby implementation.
-
-### What is not causing the regression
-
-- `GroupedExecution` versus separate grouped operator classes: effectively zero.
-- Splitting cumsum and EWM into normal graph stages: small, roughly 1-8% depending
-  on the run and surrounding key work.
-- Output placement after warmup: anonymous output, `/dev/shm`, and a reused normal
-  `MAP_SHARED` file measured within noise of one another in the controlled test.
-- The requested formula itself: with a precomputed dense key it reaches roughly
-  21-22 M rows/s on the comparison host.
-
-## Architectural fixes indicated by the ablation
-
-1. Add a backend-neutral row-scalar or lane-invariant value kind. `_ev_ts` should
-   normally be loaded and transformed once per row, then broadcast only when a
-   downstream vector operator requires it.
-2. Preserve timestamp/integer type information. Lower `minute(_ev_ts)` to integer
-   calendar arithmetic rather than four generic floating-point vector operators.
-3. Propagate categorical domains through the neutral IR. `minute(_ev_ts)` has known
-   domain `0..59`, so groupby can select direct dense state indexing automatically.
-4. Represent uniform group slots. A row-scalar key should resolve once and expose a
-   broadcast/uniform slot rather than materializing and validating nine independent
-   slots.
-5. Make resolver caching a compile-time policy selected from key metadata. Temporal
-   per-lane caching is useful for persistent lane-specific keys; it is harmful for a
-   row-scalar key that changes every row.
-6. Add generic producer-consumer fusion for cheap stateless key graphs where useful.
-   This is a graph/lowering optimization, not a grouped EWM/cumsum fast path.
-
-## Reproducible repository benchmark
-
-The requested derived-minute formula remains the default case:
-
-```bash
-python scripts/benchmark_cpp_stream.py
+```text
+11.307e6 * 27 * 8 = 2.442e9 bytes/s
 ```
 
-The two principal key ablations are now available directly:
+## Generic optimizations used by Ridge
 
-```bash
-CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_hash \
-python scripts/benchmark_cpp_stream.py
+Performance remains one `RidgeNode` for direct and grouped execution. Optimizations
+are structural and apply to arbitrary compile-time K:
 
-CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_dense \
-python scripts/benchmark_cpp_stream.py
-```
+- compile-time feature width and fixed `std::array` state;
+- zero-copy `FeatureList` flattening for nested cat;
+- precomputed decay coefficient embedded in the generated type;
+- Cholesky-first solve with pivoted and pseudoinverse fallbacks;
+- exact `Execution::cross_group` state addressing;
+- exact compile-time static partition count;
+- finite-panel synchronized moment updates;
+- full pairwise-missing fallback when any row value is nonfinite;
+- no heap allocation in `on_data`.
 
-To match the old benchmark's output placement:
+There are no K=3-specific kernels, no `GroupedRidgeNode`, and no codegen branch that
+selects a grouped Ridge implementation.
 
-```bash
-CPP_STREAM_BENCH_OUTPUT_DIR=/dev/shm \
-CPP_STREAM_BENCH_CASE=minute_groupby_precomputed_dense \
-python scripts/benchmark_cpp_stream.py
-```
+## Regression methodology
 
-The rank benchmark remains available with:
+1. Keep semantics and workload identical.
+2. Run one warmup and at least ten measured executions.
+3. Exclude source generation and native compilation.
+4. Report every run, not only the best.
+5. Compare direct and one-group controls before blaming groupby.
+6. Use checksums/correctness tests to reject output-changing transformations.
+7. Prefer generic compile-time policy and data-layout changes over formula-specific
+   branches.
 
-```bash
-CPP_STREAM_BENCH_CASE=rank python scripts/benchmark_cpp_stream.py
-```
-
-The script defaults to one warmup and ten measured 5M x 9 runs. Do not commit a
-universal regression floor derived from one CPU or filesystem. Record host,
-compiler, CPU affinity, page-cache state, prefetch distance, and writeback settings
-with every reported result.
+Hosted thresholds should be supplied through environment variables rather than
+hard-coded globally because runner CPUs and contention vary.
