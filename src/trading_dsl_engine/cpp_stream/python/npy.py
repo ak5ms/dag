@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from typing import Mapping
 
@@ -21,6 +22,7 @@ _SUPPORTED_DTYPES: dict[str, str] = {
 class InputTypeSpec:
     dtype: str
     row_width: int
+    row_shape: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         dtype = str(self.dtype).lower()
@@ -29,10 +31,24 @@ class InputTypeSpec:
                 f"unsupported cpp_stream input dtype {dtype!r}; expected one of "
                 f"{sorted(_SUPPORTED_DTYPES)}"
             )
-        if int(self.row_width) <= 0:
+        row_width = int(self.row_width)
+        if row_width <= 0:
             raise ValueError("input row_width must be > 0")
+        if self.row_shape is None:
+            row_shape = () if row_width == 1 else (row_width,)
+        else:
+            row_shape = tuple(int(extent) for extent in self.row_shape)
+            if any(extent <= 0 for extent in row_shape):
+                raise ValueError("input row_shape extents must be > 0")
+            shape_width = prod(row_shape) if row_shape else 1
+            if shape_width != row_width:
+                raise ValueError(
+                    f"row_shape {row_shape} has width {shape_width}, "
+                    f"expected row_width={row_width}"
+                )
         object.__setattr__(self, "dtype", dtype)
-        object.__setattr__(self, "row_width", int(self.row_width))
+        object.__setattr__(self, "row_width", row_width)
+        object.__setattr__(self, "row_shape", row_shape)
 
     @property
     def cpp_type(self) -> str:
@@ -40,7 +56,7 @@ class InputTypeSpec:
 
     @property
     def row_scalar(self) -> bool:
-        return self.row_width == 1
+        return self.row_shape == ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,10 +68,11 @@ class NpyArrayInfo:
     data_offset: int
     rows: int
     row_width: int
+    row_shape: tuple[int, ...]
 
     @property
     def row_scalar(self) -> bool:
-        return self.row_width == 1
+        return self.row_shape == ()
 
     @property
     def cpp_type(self) -> str:
@@ -63,7 +80,11 @@ class NpyArrayInfo:
 
     @property
     def input_type(self) -> InputTypeSpec:
-        return InputTypeSpec(dtype=self.dtype, row_width=self.row_width)
+        return InputTypeSpec(
+            dtype=self.dtype,
+            row_width=self.row_width,
+            row_shape=self.row_shape,
+        )
 
 
 @dataclass(slots=True)
@@ -86,9 +107,15 @@ def _open_public_memmap(path: Path, mode: str) -> np.memmap:
 def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
     dtype = np.dtype(array.dtype)
     if dtype.hasobject or dtype.fields is not None or dtype.subdtype is not None:
-        raise TypeError(f"cpp_stream does not support object/structured .npy dtype {dtype}")
-    if dtype.byteorder == ">" or (dtype.byteorder == "=" and not np.little_endian):
-        raise TypeError("cpp_stream currently requires native/little-endian .npy data")
+        raise TypeError(
+            f"cpp_stream does not support object/structured .npy dtype {dtype}"
+        )
+    if dtype.byteorder == ">" or (
+        dtype.byteorder == "=" and not np.little_endian
+    ):
+        raise TypeError(
+            "cpp_stream currently requires native/little-endian .npy data"
+        )
     dtype_name = dtype.name
     if dtype_name not in _SUPPORTED_DTYPES:
         raise TypeError(
@@ -98,12 +125,13 @@ def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
     if not array.flags.c_contiguous:
         raise ValueError("cpp_stream requires C-order .npy arrays")
     shape = tuple(int(value) for value in array.shape)
-    if len(shape) == 1:
-        rows, row_width = shape[0], 1
-    elif len(shape) == 2:
-        rows, row_width = shape
-    else:
-        raise ValueError(f"cpp_stream expects a 1D or 2D .npy array, got shape={shape}")
+    if not shape:
+        raise ValueError("cpp_stream .npy inputs require a leading row dimension")
+    rows = shape[0]
+    raw_row_shape = shape[1:]
+    row_width = prod(raw_row_shape) if raw_row_shape else 1
+    # Preserve the existing contract that (rows,) and (rows,1) are row scalars.
+    row_shape = () if row_width == 1 else raw_row_shape
     if rows < 0 or row_width <= 0:
         raise ValueError(f"invalid .npy shape {shape}")
     data_offset = int(array.offset)
@@ -122,6 +150,7 @@ def _info_from_memmap(path: Path, array: np.memmap) -> NpyArrayInfo:
         data_offset=data_offset,
         rows=rows,
         row_width=row_width,
+        row_shape=row_shape,
     )
 
 
@@ -149,7 +178,9 @@ def mmap_npy(path: str | Path, *, mode: str = "r") -> NpyMMap:
     return NpyMMap(info=info, array=array)
 
 
-def inspect_npy_mapping(data: Mapping[str, str | Path]) -> dict[str, NpyArrayInfo]:
+def inspect_npy_mapping(
+    data: Mapping[str, str | Path]
+) -> dict[str, NpyArrayInfo]:
     return {name: inspect_npy(path) for name, path in data.items()}
 
 
