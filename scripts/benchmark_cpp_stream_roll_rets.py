@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 
 from flows.riskmodel import roll_rets
-from trading_dsl_engine.cpp_stream import compile_npy_formula
+from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.ir import compile_ir
 
 
@@ -48,9 +48,7 @@ def _build_inputs(root: Path) -> dict[str, Path]:
         event_ts = session_start + minute.astype(np.float64) * MINUTE_US
         session_end = session_start + DAY_US
         weekday = (np.remainder(day + 2, 7) < 5).astype(np.float64)
-        tradable_scalar = (
-            (minute >= 60) & (minute < 1380)
-        ).astype(np.float64) * weekday
+        tradable_scalar = ((minute >= 60) & (minute < 1380)).astype(np.float64) * weekday
         phase = minute.astype(np.float64)[:, None] / SESSION_MINUTES
         tradable = tradable_scalar[:, None] * np.ones((1, N))
         volume = np.maximum(
@@ -83,14 +81,14 @@ def main() -> None:
         raise ValueError("riskmodel.roll_rets currently expects the nine-instrument benchmark universe")
     with tempfile.TemporaryDirectory(prefix="cpp_stream_roll_rets_") as temporary:
         root = Path(temporary)
-        paths = _build_inputs(root)
+        data = _build_inputs(root)
         session_count = (ROWS + SESSION_MINUTES - 1) // SESSION_MINUTES
         capacity = 1
         while capacity < session_count + 16:
             capacity *= 2
-        runtime = compile_npy_formula(
+        runtime = compile_formula(
             roll_rets,
-            paths,
+            data,
             n_instruments=N,
             default_group_capacity=max(64, capacity),
             prefetch_rows=PREFETCH_ROWS,
@@ -100,9 +98,9 @@ def main() -> None:
         output = output_root / "cpp_stream_roll_rets.bin"
 
         for _ in range(WARMUPS):
-            runtime.run_npy_files(paths, out_path=output, async_writeback_mb=0)
+            runtime.run(out_path=output, async_writeback_mb=0)
         rates = [
-            runtime.run_npy_files(paths, out_path=output, async_writeback_mb=0).rows_per_second
+            runtime.run(out_path=output, async_writeback_mb=0).rows_per_second
             for _ in range(RUNS)
         ]
         values = np.memmap(output, mode="r", dtype=np.float64, shape=(ROWS, N))
