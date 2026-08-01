@@ -15,12 +15,13 @@ from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
-from trading_dsl_engine.cpp_stream.python.npy import (
-    InputTypeSpec,
-    NpyArrayInfo,
-    inspect_npy_mapping,
-)
+from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
+from trading_dsl_engine.cpp_stream.python.sources import (
+    SourceInfo,
+    SourceValue,
+    inspect_source_mapping,
+)
 from trading_dsl_engine.ir.frontend import compile_ir
 from trading_dsl_engine.ir.ops import CatOp, GroupByOp, InputOp, LiteralOp, NaryOp
 from trading_dsl_engine.ir.program import Node, Program
@@ -213,6 +214,7 @@ def _compile_program(
     default_group_capacity: int,
     key_cardinalities: Mapping[str, int] | None,
     prefetch_rows: int,
+    bound_sources: Mapping[str, SourceValue] | None,
 ) -> CppStreamRuntime:
     root_kind = program.nodes[program.output_id].value_type.kind
     if root_kind == "object":
@@ -247,69 +249,21 @@ def _compile_program(
         generated_cpp=cpp_path,
         n_instruments=n_instruments,
         input_types=input_types,
+        bound_sources=bound_sources,
     )
 
 
-def compile_formula(
-    formula: str | Expr,
-    *,
-    n_instruments: int,
-    dsl_registry: DSLFunctionRegistry | None = None,
-    column_names: list[str] | tuple[str, ...] | None = None,
-    default_group_capacity: int = 64,
-    key_cardinalities: Mapping[str, int] | None = None,
-    prefetch_rows: int = 16,
-    input_types: Mapping[str, InputTypeSpec] | None = None,
-) -> CppStreamRuntime:
-    if prefetch_rows < 0:
-        raise ValueError("prefetch_rows must be >= 0")
-    input_value_types = (
-        {
-            name: _input_value_type(spec, n_instruments)
-            for name, spec in input_types.items()
-        }
-        if input_types is not None
-        else None
-    )
-    program = compile_ir(
-        formula,
-        dsl_registry=dsl_registry,
-        column_names=column_names,
-        input_value_types=input_value_types,
-    )
-    if input_types is None:
-        ordered = tuple(
-            InputTypeSpec("float64", n_instruments)
-            for _ in program.input_names
-        )
-    else:
-        missing = [name for name in program.input_names if name not in input_types]
-        extra = sorted(set(input_types) - set(program.input_names))
-        if missing or extra:
-            raise KeyError(
-                f"input_types mismatch: missing={missing}, extra={extra}"
-            )
-        ordered = tuple(input_types[name] for name in program.input_names)
-    return _compile_program(
-        program,
-        n_instruments=n_instruments,
-        input_types=ordered,
-        default_group_capacity=default_group_capacity,
-        key_cardinalities=key_cardinalities,
-        prefetch_rows=prefetch_rows,
-    )
-
-
-def _infer_n(infos: Mapping[str, NpyArrayInfo], requested: int | None) -> int:
+def _infer_n(infos: Mapping[str, SourceInfo], requested: int | None) -> int:
     if requested is None:
         vector_widths = {
-            info.row_shape[0]
+            info.input_type.row_shape[0]
             for info in infos.values()
-            if len(info.row_shape) == 1 and info.row_shape[0] > 1
+            if len(info.input_type.row_shape or ()) == 1
+            and info.input_type.row_shape[0] > 1
         }
         if len(vector_widths) != 1:
             raise ValueError(
-                "pass n_instruments when no unique rank-one .npy row width exists"
+                "pass n_instruments when source metadata has no unique rank-one row width"
             )
         requested = next(iter(vector_widths))
     n = int(requested)
@@ -318,9 +272,21 @@ def _infer_n(infos: Mapping[str, NpyArrayInfo], requested: int | None) -> int:
     return n
 
 
-def compile_npy_formula(
+def _validate_names(
+    program: Program,
+    data: Mapping[str, object],
+    *,
+    what: str,
+) -> None:
+    missing = [name for name in program.input_names if name not in data]
+    extra = sorted(set(data) - set(program.input_names))
+    if missing or extra:
+        raise KeyError(f"{what} mismatch: missing={missing}, extra={extra}")
+
+
+def compile_formula(
     formula: str | Expr,
-    data: Mapping[str, str | Path],
+    data: Mapping[str, SourceValue] | None = None,
     *,
     n_instruments: int | None = None,
     dsl_registry: DSLFunctionRegistry | None = None,
@@ -328,29 +294,80 @@ def compile_npy_formula(
     default_group_capacity: int = 64,
     key_cardinalities: Mapping[str, int] | None = None,
     prefetch_rows: int = 16,
+    input_types: Mapping[str, InputTypeSpec] | None = None,
 ) -> CppStreamRuntime:
-    infos = inspect_npy_mapping(data)
-    if len({info.rows for info in infos.values()}) != 1:
-        raise ValueError(".npy inputs have different row counts")
-    n = _infer_n(infos, n_instruments)
-    program = compile_ir(
-        formula,
-        dsl_registry=dsl_registry,
-        column_names=column_names,
-        input_value_types={
-            name: _input_value_type(info.input_type, n)
-            for name, info in infos.items()
-        },
-    )
-    missing = [name for name in program.input_names if name not in data]
-    extra = sorted(set(data) - set(program.input_names))
-    if missing or extra:
-        raise KeyError(f".npy input mismatch: missing={missing}, extra={extra}")
+    """Compile one formula for independently inferred heterogeneous sources.
+
+    When ``data`` is provided, each input is inspected through its own adapter.
+    File extensions, URI schemes, and object types may therefore differ within the
+    same formula. The resulting runtime binds these sources, although ``run`` may
+    replace them with another compatible mapping.
+
+    Headerless raw inputs need an ``InputTypeSpec`` either in ``input_types`` or in
+    an ``InputSource`` wrapper. When ``data`` is omitted, ``n_instruments`` is
+    required and the prior explicit ``input_types`` compilation mode remains valid.
+    """
+    if prefetch_rows < 0:
+        raise ValueError("prefetch_rows must be >= 0")
+
+    if data is not None:
+        infos = inspect_source_mapping(data, expected_types=input_types)
+        if len({info.rows for info in infos.values()}) != 1:
+            details = {name: info.rows for name, info in infos.items()}
+            raise ValueError(f"cpp_stream sources have different row counts: {details}")
+        n = _infer_n(infos, n_instruments)
+        program = compile_ir(
+            formula,
+            dsl_registry=dsl_registry,
+            column_names=column_names,
+            input_value_types={
+                name: _input_value_type(info.input_type, n)
+                for name, info in infos.items()
+            },
+        )
+        _validate_names(program, data, what="source")
+        ordered = tuple(infos[name].input_type for name in program.input_names)
+        bound_sources: Mapping[str, SourceValue] | None = dict(data)
+    else:
+        if n_instruments is None:
+            raise ValueError(
+                "n_instruments is required when compile_formula is called without data"
+            )
+        n = int(n_instruments)
+        if n <= 0:
+            raise ValueError(f"invalid n_instruments={n}")
+        input_value_types = (
+            {
+                name: _input_value_type(spec, n)
+                for name, spec in input_types.items()
+            }
+            if input_types is not None
+            else None
+        )
+        program = compile_ir(
+            formula,
+            dsl_registry=dsl_registry,
+            column_names=column_names,
+            input_value_types=input_value_types,
+        )
+        if input_types is None:
+            ordered = tuple(
+                InputTypeSpec("float64", n) for _ in program.input_names
+            )
+        else:
+            _validate_names(program, input_types, what="input_types")
+            ordered = tuple(input_types[name] for name in program.input_names)
+        bound_sources = None
+
     return _compile_program(
         program,
         n_instruments=n,
-        input_types=tuple(infos[name].input_type for name in program.input_names),
+        input_types=ordered,
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
         prefetch_rows=prefetch_rows,
+        bound_sources=bound_sources,
     )
+
+
+__all__ = ["compile_formula"]
