@@ -191,3 +191,49 @@ def test_nary_optimal_contraction_matches_numpy(tmp_path: Path) -> None:
     stages = [stage for stage in runtime.plan.stages if stage.kind == "einsum"]
     assert len(stages) == 3
     assert runtime.plan.matrix_scratch_slots >= 2
+
+
+def test_raw_matrix_inputs_matmul_without_materialization(tmp_path: Path) -> None:
+    rng = np.random.default_rng(17)
+    left = rng.normal(size=(ROWS, N, 3)).astype(np.float64)
+    right = rng.normal(size=(ROWS, 3, 4)).astype(np.float64)
+    output, runtime = _run(
+        tmp_path,
+        einsum("ij,jk->ik", var("left"), var("right")),
+        {"left": left, "right": right},
+        "raw_matmul",
+    )
+    expected = _rowwise("ij,jk->ik", left, right)
+    np.testing.assert_allclose(output, expected, rtol=2e-13, atol=2e-13)
+    generated = runtime.generated_cpp.read_text()
+    assert "DenseTensorSource" in generated
+    assert "InputSrc<0, double, 15>" in generated
+    assert "InputSrc<1, double, 12>" in generated
+
+
+def test_raw_batched_ellipsis_and_fixed_vector_inputs(tmp_path: Path) -> None:
+    rng = np.random.default_rng(23)
+    left = rng.normal(size=(ROWS, 2, N, 3)).astype(np.float64)
+    right = rng.normal(size=(ROWS, 1, 3, 4)).astype(np.float64)
+    output, _ = _run(
+        tmp_path,
+        einsum("...ij,...jk->...ik", var("left"), var("right")),
+        {"left": left, "right": right},
+        "raw_batched_matmul",
+    )
+    expected = _rowwise("...ij,...jk->...ik", left, right)
+    np.testing.assert_allclose(output, expected, rtol=3e-13, atol=3e-13)
+
+    fixed_left = rng.normal(size=(ROWS, 3)).astype(np.float64)
+    fixed_right = rng.normal(size=(ROWS, 3)).astype(np.float64)
+    reduced, runtime = _run(
+        tmp_path,
+        einsum("f,f->", var("left"), var("right")),
+        {"left": fixed_left, "right": fixed_right},
+        "raw_fixed_vector",
+    )
+    fixed_expected = _rowwise("f,f->", fixed_left, fixed_right)
+    np.testing.assert_allclose(
+        reduced, fixed_expected, rtol=1e-13, atol=1e-13
+    )
+    assert runtime.plan.output_shape == ()
