@@ -73,9 +73,6 @@ struct MatrixSlotSrc {
     using value_type = double;
 };
 
-// Arbitrary fixed-shape tensors reuse matrix scratch storage. tensor_size is the
-// compact number of elements; matrix_slot_index keeps existing destination/context
-// plumbing generic.
 template <std::size_t Index, std::size_t Size>
 struct TensorSlotSrc {
     static constexpr std::size_t matrix_slot_index = Index;
@@ -92,57 +89,27 @@ struct LiteralSrc {
     static constexpr std::size_t feature_width = 1;
 };
 
-struct NaNLiteralSrc {
-    using value_type = double;
-    static constexpr double value = std::numeric_limits<double>::quiet_NaN();
-    static constexpr std::size_t feature_width = 1;
-};
-struct PositiveInfinityLiteralSrc {
-    using value_type = double;
-    static constexpr double value = std::numeric_limits<double>::infinity();
-    static constexpr std::size_t feature_width = 1;
-};
-struct NegativeInfinityLiteralSrc {
-    using value_type = double;
-    static constexpr double value = -std::numeric_limits<double>::infinity();
-    static constexpr std::size_t feature_width = 1;
-};
+struct NaNLiteralSrc { using value_type = double; static constexpr double value = std::numeric_limits<double>::quiet_NaN(); static constexpr std::size_t feature_width = 1; };
+struct PositiveInfinityLiteralSrc { using value_type = double; static constexpr double value = std::numeric_limits<double>::infinity(); static constexpr std::size_t feature_width = 1; };
+struct NegativeInfinityLiteralSrc { using value_type = double; static constexpr double value = -std::numeric_limits<double>::infinity(); static constexpr std::size_t feature_width = 1; };
 
 struct OutputDst { using value_type = double; };
 
 template <std::size_t Index, class ValueType = double>
-struct SlotDst {
-    static constexpr std::size_t slot_index = Index;
-    using value_type = ValueType;
-};
+struct SlotDst { static constexpr std::size_t slot_index = Index; using value_type = ValueType; };
 
 template <std::size_t Index, std::size_t Width>
-struct MatrixSlotDst {
-    static constexpr std::size_t matrix_slot_index = Index;
-    static constexpr std::size_t feature_width = Width;
-    using value_type = double;
-};
+struct MatrixSlotDst { static constexpr std::size_t matrix_slot_index = Index; static constexpr std::size_t feature_width = Width; using value_type = double; };
 
 template <std::size_t Index, std::size_t Size>
-struct TensorSlotDst {
-    static constexpr std::size_t matrix_slot_index = Index;
-    static constexpr std::size_t tensor_slot_index = Index;
-    static constexpr std::size_t tensor_size = Size;
-    using value_type = double;
-};
+struct TensorSlotDst { static constexpr std::size_t matrix_slot_index = Index; static constexpr std::size_t tensor_slot_index = Index; static constexpr std::size_t tensor_size = Size; using value_type = double; };
 
 template <class T> inline constexpr bool is_literal_source_v = requires { T::value; };
 template <class Src> using source_value_t = typename Src::value_type;
 template <class Dst> using destination_value_t = typename Dst::value_type;
 template <class Src> inline constexpr std::size_t source_width_v = Src::feature_width;
 
-template <
-    std::size_t N,
-    std::size_t Inputs,
-    std::size_t ScratchSlots,
-    std::size_t MatrixScratchSlots = 0,
-    std::size_t MatrixScratchWidth = 1
->
+template <std::size_t N, std::size_t Inputs, std::size_t ScratchSlots, std::size_t MatrixScratchSlots = 0, std::size_t MatrixScratchWidth = 1>
 struct alignas(64) RowContext {
     std::array<const void*, Inputs> inputs{};
     alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch_f64{};
@@ -153,6 +120,8 @@ struct alignas(64) RowContext {
     alignas(64) std::array<std::array<std::uint32_t, N>, ScratchSlots> scratch_u32{};
     alignas(64) std::array<std::array<double, N * MatrixScratchWidth>, MatrixScratchSlots> scratch_matrix_f64{};
     double* output=nullptr;
+    std::size_t lane_begin=0;
+    std::size_t lane_end=N;
 
     template <class T>
     STACKDSL_HOT auto& scratch_storage() noexcept {
@@ -190,18 +159,12 @@ struct alignas(64) RowContext {
     }
 
     template <class Src>
-    STACKDSL_HOT double read(std::size_t lane) const noexcept {
-        return static_cast<double>(read_native<Src>(lane));
-    }
+    STACKDSL_HOT double read(std::size_t lane) const noexcept { return static_cast<double>(read_native<Src>(lane)); }
 
     template <class Src>
     STACKDSL_HOT double read_feature(std::size_t lane, std::size_t feature) const noexcept {
-        if constexpr (requires { Src::matrix_slot_index; }) {
-            return scratch_matrix_f64[Src::matrix_slot_index][lane * Src::feature_width + feature];
-        } else {
-            (void)feature;
-            return read<Src>(lane);
-        }
+        if constexpr (requires { Src::matrix_slot_index; }) return scratch_matrix_f64[Src::matrix_slot_index][lane * Src::feature_width + feature];
+        else { (void)feature; return read<Src>(lane); }
     }
 
     template <class Src>
