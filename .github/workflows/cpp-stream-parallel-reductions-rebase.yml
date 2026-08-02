@@ -1,4 +1,4 @@
-name: cpp_stream parallel reductions rebase
+name: cpp_stream parallel reductions validation
 
 on:
   pull_request:
@@ -7,38 +7,80 @@ on:
       - ".github/workflows/cpp-stream-parallel-reductions-rebase.yml"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  apply-parallel-diff:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           ref: cpp-stream-parallel-reductions-rebase
           fetch-depth: 0
-      - name: Apply parallel-only changes on current backend
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Use latest backend API fix
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin cpp-stream-backend cpp-stream-parallel
-          git diff --binary \
-            5ee106600420568e5fff2b7829edb25923d68f78 \
-            c5082d9fb055a8d9f66804ee1e8b4bc397300a32 \
-            -- . ':(exclude).github/workflows/**' > /tmp/parallel.patch
-          git apply --3way /tmp/parallel.patch || true
-          # These two files need a semantic merge with final-output reductions.
-          # Keep the current backend versions here; they are replaced through the
-          # connector after the clean parallel-only changes are committed.
-          git checkout --ours -- \
-            src/trading_dsl_engine/cpp_stream/python/runtime.py \
-            src/trading_dsl_engine/cpp_stream/python/templates/runner.cpp.j2
-          git add -A
-          if git diff --name-only --diff-filter=U | grep -q .; then
-            git diff --name-only --diff-filter=U
-            exit 1
-          fi
-          git commit -m "Rebase parallel execution onto streaming reductions"
-          git push origin HEAD:cpp-stream-parallel-reductions-rebase
+          git fetch origin cpp-stream-backend
+          git checkout origin/cpp-stream-backend -- src/trading_dsl_engine/base/dsl.py
+      - name: Verify CPU allocation
+        run: |
+          lscpu
+          python - <<'PY'
+          import os
+          cpus = sorted(os.sched_getaffinity(0))
+          print("affinity_cpus=", cpus)
+          if len(cpus) < 4:
+              raise SystemExit("parallel validation requires four available CPUs")
+          PY
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba pytest jinja2 jax equinox astropy
+          includeigen pybind11 matplotlib graphviz scipy
+      - name: Run backend and parallel reduction correctness
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_reductions.py
+          tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel_auto.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel_row_scalar.py
+          tests/trading_dsl_engine/cpp_stream/test_where_broadcast.py
+          tests/trading_dsl_engine/cpp_stream/test_cat_parallel.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+          tests/trading_dsl_engine/cpp_stream/test_minute_groupby.py
+      - name: Benchmark streaming reductions
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_REDUCTION_ROWS: "1000000"
+          CPP_STREAM_REDUCTION_INSTRUMENTS: "9"
+          CPP_STREAM_REDUCTION_RUNS: "7"
+          CPP_STREAM_REDUCTION_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_reductions.py
+      - name: Benchmark Cat multicore
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_CAT_ROWS: "5000000"
+          CPP_STREAM_CAT_INSTRUMENTS: "9"
+          CPP_STREAM_CAT_RUNS: "10"
+          CPP_STREAM_CAT_WARMUPS: "1"
+          CPP_STREAM_REQUIRE_MULTICORE: "1"
+          CPP_STREAM_PIN_THREADS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_cat_parallel.py
+      - name: Run broad parallel matrix
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_PARALLEL_ROWS: "1000000"
+          CPP_STREAM_PARALLEL_ROLL_ROWS: "1000000"
+          CPP_STREAM_PARALLEL_INSTRUMENTS: "64"
+          CPP_STREAM_PARALLEL_RUNS: "5"
+          CPP_STREAM_PARALLEL_WARMUPS: "1"
+          CPP_STREAM_PARALLEL_THREADS: "1,2,4"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_parallel_matrix.py
