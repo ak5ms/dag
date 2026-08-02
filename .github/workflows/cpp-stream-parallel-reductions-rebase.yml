@@ -28,7 +28,17 @@ jobs:
             5ee106600420568e5fff2b7829edb25923d68f78 \
             c5082d9fb055a8d9f66804ee1e8b4bc397300a32 \
             -- . ':(exclude).github/workflows/**' > /tmp/parallel.patch
-          git apply --3way /tmp/parallel.patch
+          git apply --3way /tmp/parallel.patch || true
+          # These two files need a semantic merge with final-output reductions.
+          # Keep the current backend versions here; they are replaced through the
+          # connector after the clean parallel-only changes are committed.
+          git checkout --ours -- \
+            src/trading_dsl_engine/cpp_stream/python/runtime.py \
+            src/trading_dsl_engine/cpp_stream/python/templates/runner.cpp.j2
           git add -A
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
           git commit -m "Rebase parallel execution onto streaming reductions"
           git push origin HEAD:cpp-stream-parallel-reductions-rebase
