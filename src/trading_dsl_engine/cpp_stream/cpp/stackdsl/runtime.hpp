@@ -7,6 +7,7 @@
 #include "stackdsl/ops/naryop.hpp"
 #include "stackdsl/ops/cat.hpp"
 #include "stackdsl/ops/cumsum.hpp"
+#include "stackdsl/ops/reduction.hpp"
 #include "stackdsl/ops/history.hpp"
 #include "stackdsl/ops/ewm.hpp"
 #include "stackdsl/ops/basis.hpp"

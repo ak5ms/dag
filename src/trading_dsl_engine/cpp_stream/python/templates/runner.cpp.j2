@@ -57,7 +57,8 @@ int run_bound_inputs(
     constexpr std::size_t N = {{ n }};
     constexpr std::size_t output_row_width = {{ output_row_width }};
     constexpr std::size_t output_row_bytes = output_row_width * sizeof(double);
-    stackdsl::MMapFile output(output_path, true, rows * output_row_bytes);
+    const std::size_t output_rows = {% if output_mode == 'final' %}1{% else %}rows{% endif %};
+    stackdsl::MMapFile output(output_path, true, output_rows * output_row_bytes);
     output.advise_sequential();
     auto* STACKDSL_RESTRICT out = static_cast<double*>(output.data());
 
@@ -94,7 +95,11 @@ int run_bound_inputs(
             static_cast<const {{ input.cpp_type }}*>(input_data[{{ input.index }}])
                 + t * {{ input.row_width }};
 {% endfor %}
+{% if output_mode == 'final' %}
+        ctx.output = nullptr;
+{% else %}
         ctx.output = out + t * output_row_width;
+{% endif %}
 {% for stage in stages %}
 {% if stage.checked %}
         if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
@@ -102,6 +107,7 @@ int run_bound_inputs(
         s{{ stage.index }}.on_data(ctx);
 {% endif %}
 {% endfor %}
+{% if output_mode != 'final' %}
         if (async_writeback_bytes > 0) {
             const std::size_t completed = (t + 1) * output_row_bytes;
             if (completed - writeback_start >= async_writeback_bytes) {
@@ -109,9 +115,16 @@ int run_bound_inputs(
                 writeback_start = completed;
             }
         }
+{% endif %}
     }
+{% if output_mode == 'final' %}
+    ctx.output = out;
+{% for stage in stages %}{% if stage.finalizer %}
+    s{{ stage.index }}.finalize(ctx);
+{% endif %}{% endfor %}
+{% endif %}
     const auto ended = std::chrono::steady_clock::now();
-    const std::size_t output_bytes = rows * output_row_bytes;
+    const std::size_t output_bytes = output_rows * output_row_bytes;
     if (async_writeback_bytes > 0 && writeback_start < output_bytes) {
         output.request_writeback(writeback_start, output_bytes - writeback_start);
     }

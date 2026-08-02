@@ -102,3 +102,13 @@ This backend must remain independent of `jax_flat`.
 - Benchmark `optimize=False`, greedy, and optimal on the same n-ary expression. Reject an optimizer that changes the checksum or increases estimated work without a justified measured gain.
 - Re-run `scripts/benchmark_cpp_stream_roll_rets.py` after source or einsum changes to detect end-to-end regressions.
 - Do not hard-code one hosted CPU's throughput as a universal threshold; use environment-provided floors.
+
+
+## Streaming reductions
+
+- Reduction axes refer to `(time, *row_shape)`; axis 0 is temporal.
+- A temporal reduction or `emit("last")` must not allocate or write a time-sized output.
+- Row reductions remain ordinary composable stages; temporal reductions are terminal.
+- Use fixed-size accumulators only. `std` uses Welford state and no hot-path allocation.
+- Benchmarks must compare the fused native reduction with full materialization and
+  post-hoc reduction, validate output checksums, and report output byte counts.
