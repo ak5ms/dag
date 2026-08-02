@@ -1,0 +1,34 @@
+name: cpp_stream parallel reductions rebase
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths:
+      - ".github/workflows/cpp-stream-parallel-reductions-rebase.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-parallel-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-parallel-reductions-rebase
+          fetch-depth: 0
+      - name: Apply parallel-only changes on current backend
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin cpp-stream-backend cpp-stream-parallel
+          git diff --binary \
+            5ee106600420568e5fff2b7829edb25923d68f78 \
+            c5082d9fb055a8d9f66804ee1e8b4bc397300a32 \
+            -- . ':(exclude).github/workflows/**' > /tmp/parallel.patch
+          git apply --3way /tmp/parallel.patch
+          git add -A
+          git commit -m "Rebase parallel execution onto streaming reductions"
+          git push origin HEAD:cpp-stream-parallel-reductions-rebase
