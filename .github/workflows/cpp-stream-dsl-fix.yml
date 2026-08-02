@@ -1,0 +1,48 @@
+name: cpp_stream precise DSL fix
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/cpp-stream-dsl-fix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore-and-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-backend
+          fetch-depth: 0
+      - name: Restore exact DSL and apply minimal reduction fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout a07d469c922dd9dea232820da4a6c57c3ceb8403 -- src/trading_dsl_engine/base/dsl.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("src/trading_dsl_engine/base/dsl.py")
+          text = path.read_text()
+          text = text.replace(
+              "from __future__ import annotations\n\nfrom collections.abc",
+              "from __future__ import annotations\n\nimport builtins\nfrom collections.abc",
+              1,
+          )
+          old = "if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:"
+          new = "if builtins.sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:"
+          if text.count(old) != 1:
+              raise RuntimeError(f"expected one GroupedExpr sum, found {text.count(old)}")
+          text = text.replace(old, new, 1)
+          old_exports = 'sum = op("sum")\nstd = op("std")'
+          new_exports = 'sum = op("sum")\nmean = op("mean")\nstd = op("std")'
+          if text.count(old_exports) != 1:
+              raise RuntimeError(f"expected reduction exports, found {text.count(old_exports)}")
+          path.write_text(text.replace(old_exports, new_exports, 1))
+          PY
+          git add src/trading_dsl_engine/base/dsl.py
+          git commit -m "Fix reduction DSL helpers without replacing existing exports"
+          git push origin HEAD:cpp-stream-backend
