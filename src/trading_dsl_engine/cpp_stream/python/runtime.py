@@ -7,11 +7,15 @@ from typing import Mapping
 
 from trading_dsl_engine.cpp_stream.python.lowering import Plan
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
+from trading_dsl_engine.cpp_stream.python.parallel import ParallelPlan
 from trading_dsl_engine.cpp_stream.python.sources import (
     SourceValue,
     open_source_mapping,
 )
 from trading_dsl_engine.ir.program import Program
+
+
+_PARALLEL_MODES = {"serial": 0, "rows": 1, "lanes": 2}
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +26,18 @@ class RunResult:
     output_rows: int
     output_shape: tuple[int, ...]
     output_mode: str
+    cpu_seconds: float
+    threads: int
+    available_cpus: int
+    parallel_mode: str
 
     @property
     def rows_per_second(self) -> float:
         return float("inf") if self.seconds == 0.0 else self.rows / self.seconds
+
+    @property
+    def average_busy_cores(self) -> float:
+        return 0.0 if self.seconds == 0.0 else self.cpu_seconds / self.seconds
 
 
 class CppStreamRuntime:
@@ -38,6 +50,7 @@ class CppStreamRuntime:
         generated_cpp: Path,
         n_instruments: int,
         input_types: tuple[InputTypeSpec, ...],
+        parallel_plan: ParallelPlan,
         bound_sources: Mapping[str, SourceValue] | None = None,
     ) -> None:
         self.program = program
@@ -46,6 +59,7 @@ class CppStreamRuntime:
         self.generated_cpp = Path(generated_cpp)
         self.n_instruments = int(n_instruments)
         self.input_types = tuple(input_types)
+        self.parallel_plan = parallel_plan
         self.bound_sources = (
             None if bound_sources is None else dict(bound_sources)
         )
@@ -65,8 +79,14 @@ class CppStreamRuntime:
                 ctypes.c_size_t,
                 ctypes.c_char_p,
                 ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_int,
+                ctypes.c_bool,
                 ctypes.POINTER(ctypes.c_size_t),
                 ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
             ]
             lib.cpp_stream_run_arrays.restype = ctypes.c_int
             lib.cpp_stream_last_error.argtypes = []
@@ -88,6 +108,21 @@ class CppStreamRuntime:
             raise ValueError("async_writeback_mb must be >= 0")
         return int(async_writeback_mb) * 1024 * 1024
 
+    @staticmethod
+    def _validate_threads(threads: int) -> int:
+        value = int(threads)
+        if value < 0:
+            raise ValueError(
+                "threads must be >= 0; zero opts into automatic execution"
+            )
+        return value
+
+    def _resolved_request(self, threads: int) -> int:
+        value = self._validate_threads(threads)
+        if value == 0 and not self.parallel_plan.auto_multicore:
+            return 1
+        return value
+
     def _raise_native(self, code: int, lib: ctypes.CDLL) -> None:
         if code == 0:
             return
@@ -98,6 +133,7 @@ class CppStreamRuntime:
             2: "input row width validation failed",
             3: "input sources have different row counts",
             4: "group capacity exceeded or dense key fell outside its declared domain",
+            5: "lane-parallel output shape is not partitionable by instrument",
         }
         base = meanings.get(code, f"native runtime returned error code {code}")
         raise RuntimeError(f"cpp_stream: {base}" + (f": {message}" if message else ""))
@@ -108,13 +144,15 @@ class CppStreamRuntime:
         *,
         out_path: str | Path,
         async_writeback_mb: int = 0,
+        threads: int = 1,
+        pin_threads: bool = False,
     ) -> RunResult:
         """Execute compatible heterogeneous sources through one native call.
 
-        Every input is independently dispatched to a source adapter. A single run
-        may therefore mix `.npy`, headerless raw files, in-memory arrays, and custom
-        registered source types. Sources bound by ``compile_formula(..., data)`` are
-        used when ``data`` is omitted.
+        Execution is serial by default. Positive ``threads`` requests the compiler-
+        proven row or lane strategy. ``threads=0`` opts into the profitability
+        heuristic. Terminal reductions and ``emit('last')`` are always single-owner
+        final-output plans, irrespective of the requested thread count.
         """
         selected = self.bound_sources if data is None else data
         if selected is None:
@@ -124,6 +162,7 @@ class CppStreamRuntime:
             )
         self._validate_names(selected)
         writeback = self._validate_writeback(async_writeback_mb)
+        requested_threads = self._resolved_request(threads)
         prepared = open_source_mapping(
             selected,
             self.input_names,
@@ -150,6 +189,9 @@ class CppStreamRuntime:
             )
             rows = ctypes.c_size_t()
             seconds = ctypes.c_double()
+            cpu_seconds = ctypes.c_double()
+            actual_threads = ctypes.c_size_t()
+            available_cpus = ctypes.c_size_t()
             output = Path(out_path)
             output.parent.mkdir(parents=True, exist_ok=True)
             lib = self._load()
@@ -160,8 +202,14 @@ class CppStreamRuntime:
                 len(prepared),
                 str(output).encode(),
                 writeback,
+                requested_threads,
+                _PARALLEL_MODES[self.parallel_plan.mode],
+                bool(pin_threads),
                 ctypes.byref(rows),
                 ctypes.byref(seconds),
+                ctypes.byref(cpu_seconds),
+                ctypes.byref(actual_threads),
+                ctypes.byref(available_cpus),
             )
             self._raise_native(code, lib)
             processed_rows = int(rows.value)
@@ -177,6 +225,10 @@ class CppStreamRuntime:
                 output_rows=1 if self.plan.output_mode == "final" else processed_rows,
                 output_shape=logical_shape,
                 output_mode=self.plan.output_mode,
+                cpu_seconds=float(cpu_seconds.value),
+                threads=int(actual_threads.value),
+                available_cpus=int(available_cpus.value),
+                parallel_mode=self.parallel_plan.mode,
             )
         finally:
             for item in reversed(prepared):
@@ -188,6 +240,10 @@ class CppStreamRuntime:
             f"inputs={self.input_names}",
             f"input_types={self.input_types}",
             f"sources_bound={self.bound_sources is not None}",
+            f"parallel_mode={self.parallel_plan.mode}",
+            f"parallel_reason={self.parallel_plan.reason}",
+            f"parallel_auto_multicore={self.parallel_plan.auto_multicore}",
+            f"parallel_work_score={self.parallel_plan.work_score}",
             f"scratch_slots={self.plan.scratch_slots}",
             f"output_mode={self.plan.output_mode}",
             f"output_shape={self.plan.output_shape}",

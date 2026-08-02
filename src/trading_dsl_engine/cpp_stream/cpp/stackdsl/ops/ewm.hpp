@@ -62,11 +62,13 @@ private:
     template <class Context>
     STACKDSL_HOT void run_recursive_contiguous(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
         std::array<double, N> input{};
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
         bool all_finite = true;
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
 #endif
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        for (std::size_t lane = begin; lane < end; ++lane) {
             input[lane] = ctx.template read<In>(lane);
             all_finite = all_finite && finite(input[lane]);
         }
@@ -74,7 +76,7 @@ private:
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
 #endif
-            for (std::size_t lane = 0; lane < N; ++lane) {
+            for (std::size_t lane = begin; lane < end; ++lane) {
                 const double next = std::fma(alpha, input[lane] - value[lane], value[lane]);
                 value[lane] = next;
                 out[lane] = next;
@@ -86,7 +88,7 @@ private:
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
 #endif
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        for (std::size_t lane = begin; lane < end; ++lane) {
             if (finite(input[lane])) {
                 if (initialized[lane]) value[lane] = std::fma(alpha, input[lane] - value[lane], value[lane]);
                 else {
@@ -102,10 +104,12 @@ private:
 
     template <class Context>
     STACKDSL_HOT void run_recursive_indexed(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
 #endif
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const double x = ctx.template read<In>(lane);
             if (finite(x)) {
@@ -121,7 +125,9 @@ private:
 
     template <class Context>
     STACKDSL_HOT void run_general(Context& ctx, double* STACKDSL_RESTRICT out) noexcept {
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const double x = ctx.template read<In>(lane);
             const bool observation = finite(x);

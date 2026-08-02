@@ -93,9 +93,10 @@ struct CatNode<N, FeatureList<Sources...>, Out, Execution> {
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             std::array<double, K> values{};
             load_features(ctx, lane, values, FeatureList<Sources...>{});
             for (std::size_t feature = 0; feature < K; ++feature) {
