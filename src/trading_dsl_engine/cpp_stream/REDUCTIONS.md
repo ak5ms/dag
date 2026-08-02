@@ -6,6 +6,7 @@ Reductions use the same expression API as other operations:
 result = compile_formula((x * y).sum(axis=0), data).run(out_path="sum.bin")
 row_mean = x.mean(axis=1)
 feature_std = cat(x, y).std(axis=[0, 1], ddof=1)
+propagating_sum = x.sum(axis=0, ignore_na=False)
 last_cumulative = x.cumsum().emit("last")
 ```
 
