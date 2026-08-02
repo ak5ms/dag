@@ -1,0 +1,41 @@
+name: rebase cpp_stream parallel onto ignore_na backend
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths: [.github/workflows/rebase-parallel-ignore-na.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-parallel
+          fetch-depth: 0
+      - name: Rebase onto current backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin cpp-stream-backend cpp-stream-parallel
+          git rebase --onto origin/cpp-stream-backend c607a6be39d481164433c2f84c1209de7e2ae8bd cpp-stream-parallel
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/trading_dsl_engine/cpp_stream/REDUCTIONS_PARALLEL_BENCHMARK.md')
+          text = path.read_text()
+          text = text.replace(
+              'c607a6be39d481164433c2f84c1209de7e2ae8bd',
+              '7c3fc23fd03cb22ef9c9a8016b1d7048bb531c0a',
+          )
+          path.write_text(text)
+          PY
+          git add src/trading_dsl_engine/cpp_stream/REDUCTIONS_PARALLEL_BENCHMARK.md
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+          git push --force-with-lease origin HEAD:cpp-stream-parallel
