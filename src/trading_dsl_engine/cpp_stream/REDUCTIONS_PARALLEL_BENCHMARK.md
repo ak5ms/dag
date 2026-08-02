@@ -1,5 +1,7 @@
 # cpp_stream reductions and parallel benchmark
 
+The final parallel branch is based directly on `cpp-stream-backend` commit `7c3fc23fd03cb22ef9c9a8016b1d7048bb531c0a`.
+
 The reduction benchmark uses 1,000,000 rows, 9 instruments, and 3 computed features, with one warmup and seven measured runs on a four-CPU GitHub-hosted AMD EPYC runner.
 
 | Execution | Median throughput | Median runtime | Output bytes |
