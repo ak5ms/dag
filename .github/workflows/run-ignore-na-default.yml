@@ -21,20 +21,34 @@ jobs:
           python-version: '3.11'
       - name: Apply staged transformation
         run: |
-          python -m pip install --upgrade pyyaml
           python - <<'PY'
           from pathlib import Path
           import subprocess
-          import yaml
 
-          workflow = yaml.safe_load(
-              Path('.github/workflows/apply-ignore-na-default.yml').read_text()
+          lines = Path(
+              '.github/workflows/apply-ignore-na-default.yml'
+          ).read_text().splitlines()
+          marker = '      - name: Apply API and native changes'
+          start = lines.index(marker)
+          run_line = next(
+              index
+              for index in range(start + 1, len(lines))
+              if lines[index] == '        run: |'
           )
-          script = next(
-              step['run']
-              for step in workflow['jobs']['apply']['steps']
-              if step.get('name') == 'Apply API and native changes'
+          end = next(
+              (
+                  index
+                  for index in range(run_line + 1, len(lines))
+                  if lines[index].startswith('      - name: ')
+              ),
+              len(lines),
           )
+          prefix = '          '
+          script_lines = [
+              line[len(prefix):] if line.startswith(prefix) else line
+              for line in lines[run_line + 1:end]
+          ]
+          script = '\n'.join(script_lines) + '\n'
           subprocess.run(
               ['bash', '-c', 'set -euo pipefail\n' + script], check=True
           )
