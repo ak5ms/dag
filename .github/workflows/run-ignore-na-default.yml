@@ -44,10 +44,21 @@ jobs:
               len(lines),
           )
           prefix = '          '
-          script_lines = [
-              line[len(prefix):] if line.startswith(prefix) else line
-              for line in lines[run_line + 1:end]
-          ]
+          script_lines = []
+          in_triple = False
+          for line in lines[run_line + 1:end]:
+              rendered = (
+                  line
+                  if in_triple
+                  else line[len(prefix):]
+                  if line.startswith(prefix)
+                  else line
+              )
+              script_lines.append(rendered)
+              if rendered.count("'''") % 2:
+                  in_triple = not in_triple
+          if in_triple:
+              raise SystemExit('unterminated staged multiline literal')
           script = '\n'.join(script_lines) + '\n'
           subprocess.run(
               ['bash', '-c', 'set -euo pipefail\n' + script], check=True
