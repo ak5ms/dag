@@ -129,19 +129,19 @@ def test_cpp_stream_dense_mixed_groupby_matches_reference(tmp_path: Path):
     rows, cols = 96, 3
     rng = np.random.default_rng(7)
     close = rng.normal(size=(rows, cols)).astype(np.float64)
-    minute = (np.arange(rows, dtype=np.float64)[:, None] % 4.0) + np.zeros((rows, cols))
+    minute_key = (np.arange(rows, dtype=np.float64)[:, None] % 4.0) + np.zeros((rows, cols))
     close_path = tmp_path / "close.bin"
     minute_path = tmp_path / "minute.bin"
     out_path = tmp_path / "grouped.bin"
     close.tofile(close_path)
-    minute.tofile(minute_path)
-    data = {"minute": _raw(minute_path, cols), "close": _raw(close_path, cols)}
+    minute_key.tofile(minute_path)
+    data = {"minute_key": _raw(minute_path, cols), "close": _raw(close_path, cols)}
 
     runtime = compile_formula(
-        "groupby((univ([0], [1, 2]), minute), close, cumsum(self_))",
+        "groupby((univ([0], [1, 2]), minute_key), close, cumsum(self_))",
         data,
         n_instruments=cols,
-        key_cardinalities={"minute": 4},
+        key_cardinalities={"minute_key": 4},
     )
     runtime.run(out_path=out_path)
     actual = np.fromfile(out_path, dtype=np.float64).reshape(rows, cols)
@@ -150,7 +150,7 @@ def test_cpp_stream_dense_mixed_groupby_matches_reference(tmp_path: Path):
     expected = np.empty_like(close)
     for t in range(rows):
         for lane in range(cols):
-            key = (lane, int(minute[t, lane]))
+            key = (lane, int(minute_key[t, lane]))
             state[key] = state.get(key, 0.0) + close[t, lane]
             expected[t, lane] = state[key]
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
