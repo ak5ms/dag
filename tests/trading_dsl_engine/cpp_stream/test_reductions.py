@@ -103,3 +103,35 @@ def test_string_formula_accepts_list_axes(tmp_path: Path) -> None:
     actual = np.fromfile(result.output_path, dtype=np.float64)
     np.testing.assert_allclose(actual, [np.sum(x)])
     assert result.output_shape == ()
+
+@pytest.mark.parametrize(
+    ("kind", "kwargs"),
+    [
+        ("sum", {}),
+        ("mean", {}),
+        ("std", {"ddof": 1}),
+    ],
+)
+def test_ignore_na_false_propagates_missing_values(
+    tmp_path: Path, kind: str, kwargs: dict[str, int]
+) -> None:
+    x = np.arange(24, dtype=np.float64).reshape(8, 3)
+    x[2, 1] = np.nan
+    expression = getattr(var("x"), kind)(
+        axis=0, ignore_na=False, **kwargs
+    )
+    _, _, actual = _run(tmp_path, expression, {"x": x})
+    expected = getattr(np, kind)(x, axis=0, **kwargs)
+    np.testing.assert_allclose(actual, expected, equal_nan=True)
+    assert np.isfinite(actual[[0, 2]]).all()
+    assert np.isnan(actual[1])
+
+
+def test_string_reduction_ignore_na_defaults_true(tmp_path: Path) -> None:
+    x = np.arange(24, dtype=np.float64).reshape(4, 6)
+    x[1, 3] = np.nan
+    runtime = compile_formula("sum(x, axis=0)", {"x": x}, n_instruments=6)
+    result = runtime.run(out_path=tmp_path / "default-ignore-na.bin")
+    actual = np.fromfile(result.output_path, dtype=np.float64)
+    np.testing.assert_allclose(actual, np.nansum(x, axis=0))
+

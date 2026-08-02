@@ -144,7 +144,7 @@ def _axis_expr(axis) -> Expr:
     raise TypeError("axis must be an int or a non-empty list/tuple of ints")
 
 
-def reduction(name: str, x, *, axis=None, ddof=0) -> Expr:
+def reduction(name: str, x, *, axis=None, ddof=0, ignore_na=True) -> Expr:
     if name not in {"sum", "mean", "std"}:
         raise ValueError(f"unsupported reduction {name!r}")
     kwargs = []
@@ -152,6 +152,8 @@ def reduction(name: str, x, *, axis=None, ddof=0) -> Expr:
         kwargs.append(("axis", _axis_expr(axis)))
     if name == "std" and ddof != 0:
         kwargs.append(("ddof", ensure_expr(ddof)))
+    if not ignore_na:
+        kwargs.append(("ignore_na", ensure_expr(ignore_na)))
     return Call(name, (ensure_expr(x),), tuple(kwargs))
 
 
@@ -267,9 +269,19 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "cat": _dsl_signature(variadic="args"),
     "einsum": _dsl_signature(variadic="args"),
     "groupby": _dsl_signature("key_tuple", "lhs", "op_using_self_"),
-    "sum": _dsl_signature("x", "axis", defaults={"axis": None}),
-    "mean": _dsl_signature("x", "axis", defaults={"axis": None}),
-    "std": _dsl_signature("x", "axis", "ddof", defaults={"axis": None, "ddof": 0}),
+    "sum": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
+    ),
+    "mean": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
+    ),
+    "std": _dsl_signature(
+        "x",
+        "axis",
+        "ddof",
+        "ignore_na",
+        defaults={"axis": None, "ddof": 0, "ignore_na": True},
+    ),
     "emit": _dsl_signature("x", "mode", defaults={"mode": "last"}),
 }
 

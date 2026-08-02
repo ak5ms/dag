@@ -228,10 +228,16 @@ def _custom_value_type(node: StatelessCall, children: list[Node]) -> ValueType:
     raise FormulaIRCompileError(f"invalid stateless output kind {node.output_kind!r}")
 
 
-def _reduction_arguments(call: Call) -> tuple[Expr, Expr | None, int]:
+def _reduction_arguments(
+    call: Call,
+) -> tuple[Expr, Expr | None, int, bool]:
     if call.fn not in {"sum", "mean", "std"}:
         raise FormulaIRCompileError(f"invalid reduction {call.fn!r}")
-    names = ("x", "axis", "ddof") if call.fn == "std" else ("x", "axis")
+    names = (
+        ("x", "axis", "ddof", "ignore_na")
+        if call.fn == "std"
+        else ("x", "axis", "ignore_na")
+    )
     values: dict[str, Expr] = {}
     explicit: set[str] = set()
     for name, value in zip(names, call.args):
@@ -247,7 +253,10 @@ def _reduction_arguments(call: Call) -> tuple[Expr, Expr | None, int]:
     if "x" not in values:
         raise FormulaIRCompileError(f"{call.fn} requires x")
     ddof = _literal_int(values.get("ddof", Number(0.0)), "std ddof", 0)
-    return values["x"], values.get("axis"), ddof
+    ignore_na = _literal_bool(
+        values.get("ignore_na", Number(1.0)), "reduction ignore_na"
+    )
+    return values["x"], values.get("axis"), ddof, ignore_na
 
 
 def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
@@ -508,7 +517,7 @@ class _BaseBuilder:
                 ),
             )
         if node.fn in {"sum", "mean", "std"}:
-            expression, axis, ddof = _reduction_arguments(node)
+            expression, axis, ddof, ignore_na = _reduction_arguments(node)
             child = self.build(expression)
             child_type = self.nodes[child].value_type
             try:
@@ -524,7 +533,7 @@ class _BaseBuilder:
                 if full_axis not in axes
             )
             return self._append(
-                ReductionOp(node.fn, axes, ddof),
+                ReductionOp(node.fn, axes, ddof, ignore_na),
                 (child,),
                 tensor(output_shape, dtype=child_type.dtype),
             )

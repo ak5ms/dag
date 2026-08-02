@@ -17,8 +17,10 @@ input row, so they compose normally with subsequent operations.
 
 Temporal reductions and `emit("last")` are terminal because they remove the streaming
 time dimension. Row reductions can appear anywhere in the graph. `sum`, `mean`, and
-`std` ignore non-finite observations; empty groups and standard deviations with
-`count <= ddof` produce NaN. Standard deviation uses an online Welford accumulator.
+`std` use `ignore_na=True` by default and therefore skip non-finite observations.
+Passing `ignore_na=False` propagates a non-finite observation to that reduction group.
+Empty groups and standard deviations with `count <= ddof` produce NaN. Standard
+deviation uses an online Welford accumulator.
 
 `RunResult.rows` remains the number of input rows processed, preserving throughput
 reporting. `RunResult.output_rows`, `output_shape`, and `output_mode` describe the

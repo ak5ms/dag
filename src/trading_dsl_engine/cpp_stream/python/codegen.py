@@ -381,6 +381,7 @@ def _stage_type(
             tmpl("stackdsl::AxisList", *(IntArg(axis) for axis in row_axes)),
             Name(policy),
             IntArg(stage.op.ddof),
+            BoolArg(stage.op.ignore_na),
             BoolArg(stage.op.temporal),
         )
     if stage.kind == "emit_last":

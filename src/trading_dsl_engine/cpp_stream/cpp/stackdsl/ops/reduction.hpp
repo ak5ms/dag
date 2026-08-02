@@ -55,22 +55,32 @@ STACKDSL_HOT std::size_t reduced_output_index(std::size_t flat) noexcept {
     }
 }
 
-template <class Policy, std::size_t Size, std::size_t Ddof>
+template <
+    class Policy,
+    std::size_t Size,
+    std::size_t Ddof,
+    bool IgnoreNa
+>
 struct ReductionState {
     alignas(64) std::array<double, Size> total{};
     alignas(64) std::array<double, Size> mean{};
     alignas(64) std::array<double, Size> m2{};
     alignas(64) std::array<std::uint64_t, Size> count{};
+    alignas(64) std::array<bool, Size> invalid{};
 
     STACKDSL_HOT void reset() noexcept {
         total.fill(0.0);
         mean.fill(0.0);
         m2.fill(0.0);
         count.fill(0);
+        if constexpr (!IgnoreNa) invalid.fill(false);
     }
 
     STACKDSL_HOT void add(std::size_t index, double value) noexcept {
-        if (!finite(value)) return;
+        if (!finite(value)) {
+            if constexpr (!IgnoreNa) invalid[index] = true;
+            return;
+        }
         if constexpr (std::is_same_v<Policy, StdReductionPolicy>) {
             const std::uint64_t next_count = count[index] + 1;
             const double delta = value - mean[index];
@@ -85,6 +95,9 @@ struct ReductionState {
     }
 
     STACKDSL_HOT double result(std::size_t index) const noexcept {
+        if constexpr (!IgnoreNa) {
+            if (invalid[index]) return kNaN;
+        }
         if (count[index] == 0) return kNaN;
         if constexpr (std::is_same_v<Policy, SumReductionPolicy>) {
             return total[index];
@@ -104,6 +117,7 @@ template <
     class Axes,
     class Policy,
     std::size_t Ddof,
+    bool IgnoreNa,
     bool Temporal
 >
 struct ReductionNode {
@@ -118,7 +132,7 @@ struct ReductionNode {
         retains_leading_axis ? input_size / leading_extent : input_size;
     static constexpr std::size_t output_lane_width =
         retains_leading_axis ? output_size / leading_extent : output_size;
-    using State = ReductionState<Policy, output_size, Ddof>;
+    using State = ReductionState<Policy, output_size, Ddof, IgnoreNa>;
 
     State state{};
 

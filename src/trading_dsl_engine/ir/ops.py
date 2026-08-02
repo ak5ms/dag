@@ -57,6 +57,7 @@ class ReductionOp:
     kind: str
     axes: tuple[int, ...]
     ddof: int = 0
+    ignore_na: bool = True
 
     def __post_init__(self) -> None:
         if self.kind not in {"sum", "mean", "std"}:

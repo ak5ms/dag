@@ -124,20 +124,22 @@ class Expr:
     def __ge__(self, other):
         return self._call("ge", other)
 
-    def sum(self, axis=None):
+    def sum(self, axis=None, ignore_na=True):
         from trading_dsl_engine.base.dsl import reduction
 
-        return reduction("sum", self, axis=axis)
+        return reduction("sum", self, axis=axis, ignore_na=ignore_na)
 
-    def mean(self, axis=None):
+    def mean(self, axis=None, ignore_na=True):
         from trading_dsl_engine.base.dsl import reduction
 
-        return reduction("mean", self, axis=axis)
+        return reduction("mean", self, axis=axis, ignore_na=ignore_na)
 
-    def std(self, axis=None, ddof=0):
+    def std(self, axis=None, ddof=0, ignore_na=True):
         from trading_dsl_engine.base.dsl import reduction
 
-        return reduction("std", self, axis=axis, ddof=ddof)
+        return reduction(
+            "std", self, axis=axis, ddof=ddof, ignore_na=ignore_na
+        )
 
     def emit(self, mode="last"):
         from trading_dsl_engine.base.dsl import emit
