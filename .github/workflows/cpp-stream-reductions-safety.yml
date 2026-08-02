@@ -1,0 +1,71 @@
+name: cpp_stream reductions safety
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths:
+      - "scripts/_apply_cpp_stream_reductions.py"
+      - ".github/workflows/cpp-stream-reductions-safety.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-reductions-safety
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba pytest jinja2 jax equinox astropy
+          includeigen pybind11 matplotlib graphviz scipy
+      - name: Apply implementation
+        run: python scripts/_apply_cpp_stream_reductions.py
+      - name: Run IR and reduction correctness tests
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_reductions.py
+          tests/trading_dsl_engine/cpp_stream/test_codegen.py
+          tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
+          tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
+          tests/trading_dsl_engine/cpp_stream/test_einsum.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+      - name: Benchmark reductions
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_REDUCTION_ROWS: "1000000"
+          CPP_STREAM_REDUCTION_INSTRUMENTS: "9"
+          CPP_STREAM_REDUCTION_RUNS: "7"
+          CPP_STREAM_REDUCTION_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_reductions.py | tee /tmp/reductions.txt
+      - name: Write benchmark report
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          output = Path('/tmp/reductions.txt').read_text().strip()
+          Path('src/trading_dsl_engine/cpp_stream/REDUCTIONS_BENCHMARK.md').write_text(
+              '# cpp_stream streaming-reduction benchmark\n\n'
+              'GitHub-hosted runner; one warmup and seven measured runs.\n\n'
+              '```text\n' + output + '\n```\n'
+          )
+          PY
+      - name: Commit validated implementation to safety branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add composable streaming reductions" || true
+          git push origin HEAD:cpp-stream-reductions-safety
