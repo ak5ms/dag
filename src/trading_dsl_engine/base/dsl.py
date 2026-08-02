@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Callable, Sequence
 from inspect import Parameter, Signature, signature
 
@@ -170,7 +171,7 @@ class GroupedExpr:
         key_expr = ensure_expr(key)
         if not isinstance(key_expr, KeyTuple):
             key_expr = KeyTuple((key_expr,))
-        if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
+        if builtins.sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
             raise TypeError("groupby key tuple may contain at most one univ(...) element")
         self.key = key_expr
 
@@ -351,6 +352,7 @@ einsum = op("einsum")
 cat = op("cat")
 groupby = op("groupby")
 sum = op("sum")
+mean = op("mean")
 std = op("std")
 
 
@@ -406,167 +408,71 @@ def _duration_microseconds(value: str | int | float, default_unit: str = "us") -
     if not text:
         raise ValueError("Duration cannot be empty")
     idx = 0
-    while idx < len(text) and (text[idx].isdigit() or text[idx] in "+-."):
+    while idx < len(text) and (text[idx].isdigit() or text[idx] in ".+-"):
         idx += 1
-    number = float(text[:idx]) if idx else 1.0
-    return number * _unit_microseconds(text[idx:] or default_unit)
+    if idx == 0 or idx == len(text):
+        raise ValueError(f"Invalid duration {text!r}")
+    return float(text[:idx]) * _unit_microseconds(text[idx:].strip())
 
 
-def _epoch_days(x: Expr) -> Expr:
-    return floor(div(x, 86_400_000_000.0))
+def datetime_floor(ts, interval, unit="us") -> Expr:
+    step = _duration_microseconds(interval, _literal_string(unit, "Datetime unit"))
+    return floor(ensure_expr(ts) / step) * step
 
 
-def _civil_parts(x: Expr) -> tuple[Expr, Expr, Expr, Expr]:
-    z = add(_epoch_days(x), 719468.0)
-    era = floor(div(where(lt(z, 0.0), sub(z, 146096.0), z), 146097.0))
-    doe = sub(z, mul(era, 146097.0))
-    yoe = floor(
-        div(
-            add(
-                sub(doe, floor(div(doe, 1460.0))),
-                sub(floor(div(doe, 36524.0)), floor(div(doe, 146096.0))),
-            ),
-            365.0,
-        )
-    )
-    year_march = add(yoe, mul(era, 400.0))
-    doy_march = sub(
-        doe,
-        add(sub(mul(365.0, yoe), floor(div(yoe, 100.0))), floor(div(yoe, 4.0))),
-    )
-    mp = floor(div(add(mul(5.0, doy_march), 2.0), 153.0))
-    day_value = add(sub(doy_march, floor(div(add(mul(153.0, mp), 2.0), 5.0))), 1.0)
-    month_value = add(mp, where(lt(mp, 10.0), 3.0, -9.0))
-    year_value = add(year_march, where(lt(month_value, 3.0), 1.0, 0.0))
-    return year_value, month_value, day_value, doy_march
+def datetime_ceil(ts, interval, unit="us") -> Expr:
+    step = _duration_microseconds(interval, _literal_string(unit, "Datetime unit"))
+    return ceil(ensure_expr(ts) / step) * step
 
 
-def _is_leap_year_expr(year_expr: Expr) -> Expr:
-    return and_(
-        eq(mod(year_expr, 4.0), 0.0),
-        or_(ne(mod(year_expr, 100.0), 0.0), eq(mod(year_expr, 400.0), 0.0)),
-    )
+def datetime_round(ts, interval, unit="us") -> Expr:
+    step = _duration_microseconds(interval, _literal_string(unit, "Datetime unit"))
+    return floor((ensure_expr(ts) + 0.5 * step) / step) * step
 
 
-@register_dsl_function("to_dt")
-def to_dt(x: Expr, unit: str = "us") -> Expr:
-    return mul(x, _unit_microseconds(unit))
+def calendar_feature(ts, field="weekday", unit="us") -> Expr:
+    field = _literal_string(field, "Calendar field")
+    unit = _literal_string(unit, "Datetime unit")
+    micros = ensure_expr(ts) * _unit_microseconds(unit)
+    day_us = _unit_microseconds("D")
+    hour_us = _unit_microseconds("H")
+    minute_us = _unit_microseconds("T")
+    second_us = _unit_microseconds("s")
+    day = floor(micros / day_us)
+    time_us = micros - day * day_us
+    fields = {
+        "weekday": mod(day + 3.0, 7.0),
+        "hour": floor(time_us / hour_us),
+        "minute": floor(mod(time_us, hour_us) / minute_us),
+        "second": floor(mod(time_us, minute_us) / second_us),
+        "day": day,
+    }
+    try:
+        return fields[field]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported calendar field {field!r}") from exc
 
 
-@register_dsl_function("timeofday")
-def timeofday(x: Expr) -> Expr:
-    return mod(x, 86_400_000_000.0)
+for _name, _fn in {
+    "datetime_floor": datetime_floor,
+    "datetime_ceil": datetime_ceil,
+    "datetime_round": datetime_round,
+    "calendar_feature": calendar_feature,
+}.items():
+    DEFAULT_DSL_REGISTRY.register(_name, _fn)
 
 
-@register_dsl_function("hour")
-def hour(x: Expr) -> Expr:
-    return floor(div(timeofday(x), 3_600_000_000.0))
-
-
-@register_dsl_function("minute")
-def minute(x: Expr) -> Expr:
-    return mod(floor(div(timeofday(x), 60_000_000.0)), 60.0)
-
-
-@register_dsl_function("second")
-def second(x: Expr) -> Expr:
-    return mod(floor(div(timeofday(x), 1_000_000.0)), 60.0)
-
-
-@register_dsl_function("year")
-def year(x: Expr) -> Expr:
-    year_value, _, _, _ = _civil_parts(x)
-    return year_value
-
-
-@register_dsl_function("month")
-def month(x: Expr) -> Expr:
-    _, month_value, _, _ = _civil_parts(x)
-    return month_value
-
-
-@register_dsl_function("day")
-def day(x: Expr) -> Expr:
-    _, _, day_value, _ = _civil_parts(x)
-    return day_value
-
-
-@register_dsl_function("dayofweek")
-def dayofweek(x: Expr) -> Expr:
-    return mod(add(_epoch_days(x), 3.0), 7.0)
-
-
-@register_dsl_function("dayofyear")
-def dayofyear(x: Expr) -> Expr:
-    year_value, month_value, _, doy_march = _civil_parts(x)
-    return where(
-        gt(month_value, 2.0),
-        add(add(doy_march, 60.0), _is_leap_year_expr(year_value)),
-        sub(doy_march, 305.0),
-    )
-
-
-@register_dsl_function("shift")
-def shift(x: Expr, nlag: int | float = 1) -> Expr:
-    return shift(x, nlag, nlag)
-
-
-@register_dsl_function("floor")
-def floor(x: Expr, freq: str | int | float | None = None) -> Expr:
-    micros = _duration_microseconds(freq)
-    return mul(floor(div(x, micros)), micros)
-
-
-@register_dsl_function("ceil")
-def ceil(x: Expr, freq: str | int | float | None = None) -> Expr:
-    micros = _duration_microseconds(freq)
-    return mul(ceil(div(x, micros)), micros)
-
-
-@register_dsl_function("round")
-def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
-    if freq is None:
-        # Construct the builtin call directly. Calling the registered helper
-        # recursively re-enters overload dispatch for the one-argument form.
-        return call("round", x, *args)
-    if args:
-        raise TypeError("round cannot combine decimals with freq")
-    micros = _duration_microseconds(freq)
-    return mul(floor(add(div(x, micros), 0.5)), micros)
-
-
-def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noqa: N802
-    if y is None or hl is None:
-        if weights is not None:
-            raise TypeError("InstrumentBasisMean positional form cannot combine positional y/hl with keyword weights")
-        return call("InstrumentBasisMean", features)
-    if weights is None:
-        return call("InstrumentBasisMean", features, y, 1.0, hl)
-    return call("InstrumentBasisMean", features, y, weights, hl)
-
-
-def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonneg=False) -> Expr:  # noqa: N802
-    ridge_lambda = lambda_ if lambda_ is not None else lam
-    if y is None or hl is None or ridge_lambda is None:
-        if weights is not None:
-            raise TypeError("Ridge positional form cannot combine positional y/hl/lambda with keyword weights")
-        return call("Ridge", *features, 3.0 if nonneg else 2.0)
-    if weights is None:
-        return call("Ridge", *features, y, 1.0, hl, ridge_lambda, 3.0 if nonneg else 2.0)
-    return call("Ridge", *features, y, weights, hl, ridge_lambda, 3.0 if nonneg else 2.0)
-
-
-get_beta = op("get_beta")
-get_preds = op("get_preds")
-rolling_quantile = op("rolling_quantile")
-mean = op("mean")
-
-
-@register_dsl_function("ratio")
-def ratio(a: Expr, b: Expr) -> Expr:
-    return div(a, b)
-
-
-@register_dsl_function("diff")
-def diff(x: Expr, nlag=1.0, max_size=1.0) -> Expr:
-    return sub(x, shift(x, nlag, max_size))
+__all__ = [
+    "DSLFunctionRegistry",
+    "DEFAULT_DSL_REGISTRY",
+    "ensure_expr",
+    "var",
+    "call",
+    "op",
+    "register_dsl_function",
+    "get_dsl_op_signature",
+    "univ",
+    "grouped",
+    "self_",
+    "GROUPBY_VALUE_PLACEHOLDER",
+]
