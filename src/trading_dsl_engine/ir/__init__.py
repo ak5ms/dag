@@ -1,12 +1,14 @@
 from trading_dsl_engine.ir.frontend import FormulaIRCompileError, compile_ir
 from trading_dsl_engine.ir.ops import (
     CumsumOp,
+    EmitOp,
     EwmOp,
     GroupByOp,
     GroupKeySpec,
     InputOp,
     LiteralOp,
     NaryOp,
+    ReductionOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
@@ -24,6 +26,8 @@ __all__ = [
     "LiteralOp",
     "NaryOp",
     "CumsumOp",
+    "ReductionOp",
+    "EmitOp",
     "EwmOp",
     "XsRankOp",
     "GroupKeySpec",

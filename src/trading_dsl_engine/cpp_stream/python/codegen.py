@@ -15,12 +15,14 @@ from trading_dsl_engine.cpp_stream.python.lowering import (
 )
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import (
+    EmitOp,
     EwmOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupKeySpec,
     InstrumentBasisMeanOp,
     RbfBasisOp,
+    ReductionOp,
     RidgeOp,
     ShiftOp,
 )
@@ -361,6 +363,33 @@ def _stage_type(
 ) -> CppType:
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
+    if stage.kind == "reduce":
+        assert isinstance(stage.op, ReductionOp)
+        tensor_source = _tensor_source_type(
+            stage.inputs[0], n=n, input_types=input_types
+        )
+        row_axes = tuple(axis - 1 for axis in stage.op.axes if axis != 0)
+        policy = {
+            "sum": "stackdsl::SumReductionPolicy",
+            "mean": "stackdsl::MeanReductionPolicy",
+            "std": "stackdsl::StdReductionPolicy",
+        }[stage.op.kind]
+        return tmpl(
+            "stackdsl::ReductionNode",
+            tensor_source,
+            out,
+            tmpl("stackdsl::AxisList", *(IntArg(axis) for axis in row_axes)),
+            Name(policy),
+            IntArg(stage.op.ddof),
+            BoolArg(stage.op.temporal),
+        )
+    if stage.kind == "emit_last":
+        assert isinstance(stage.op, EmitOp)
+        return tmpl(
+            "stackdsl::EmitLastNode",
+            _tensor_source_type(stage.inputs[0], n=n, input_types=input_types),
+            out,
+        )
     if stage.kind == "cat":
         return tmpl(
             "stackdsl::CatNode",
@@ -606,6 +635,7 @@ class StageView:
     index: int
     cpp_type: str
     checked: bool = False
+    finalizer: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,6 +778,7 @@ def render_translation_unit(
                         input_types,
                     ).render(),
                     True,
+                    False,
                 )
             )
         else:
@@ -757,6 +788,8 @@ def render_translation_unit(
                     _stage_type(
                         stage, n, direct, input_types=input_types
                     ).render(),
+                    finalizer=stage.kind in {"reduce", "emit_last"}
+                    and plan.output_mode == "final",
                 )
             )
     if plan.input_count == 0:
@@ -770,6 +803,7 @@ def render_translation_unit(
             matrix_scratch_slots=plan.matrix_scratch_slots,
             matrix_scratch_width=plan.matrix_scratch_width,
             output_row_width=plan.output_row_width,
+            output_mode=plan.output_mode,
             prefetch_rows=prefetch_rows,
             inputs=tuple(
                 InputView(index, spec.cpp_type, spec.row_width)

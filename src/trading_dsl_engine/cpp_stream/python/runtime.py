@@ -19,6 +19,9 @@ class RunResult:
     output_path: Path
     rows: int
     seconds: float
+    output_rows: int
+    output_shape: tuple[int, ...]
+    output_mode: str
 
     @property
     def rows_per_second(self) -> float:
@@ -161,10 +164,19 @@ class CppStreamRuntime:
                 ctypes.byref(seconds),
             )
             self._raise_native(code, lib)
+            processed_rows = int(rows.value)
+            logical_shape = (
+                self.plan.output_shape
+                if self.plan.output_mode == "final"
+                else (processed_rows,) + self.plan.output_shape
+            )
             return RunResult(
                 output_path=output,
-                rows=int(rows.value),
+                rows=processed_rows,
                 seconds=float(seconds.value),
+                output_rows=1 if self.plan.output_mode == "final" else processed_rows,
+                output_shape=logical_shape,
+                output_mode=self.plan.output_mode,
             )
         finally:
             for item in reversed(prepared):
@@ -177,6 +189,8 @@ class CppStreamRuntime:
             f"input_types={self.input_types}",
             f"sources_bound={self.bound_sources is not None}",
             f"scratch_slots={self.plan.scratch_slots}",
+            f"output_mode={self.plan.output_mode}",
+            f"output_shape={self.plan.output_shape}",
         ]
         for i, stage in enumerate(self.plan.stages):
             lines.append(

@@ -10,6 +10,7 @@ from trading_dsl_engine.ir.ops import (
     CatOp,
     CumsumOp,
     CustomCallOp,
+    EmitOp,
     EinsumOp,
     EwmOp,
     FFillOp,
@@ -24,6 +25,7 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    ReductionOp,
     ShiftOp,
     XsRankOp,
 )
@@ -107,6 +109,7 @@ class Plan:
     output_width: int
     output_row_width: int
     output_shape: tuple[int, ...]
+    output_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +215,8 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         CustomCallOp,
         CatOp,
         CumsumOp,
+        ReductionOp,
+        EmitOp,
         FFillOp,
         ShiftOp,
         EwmOp,
@@ -525,6 +530,44 @@ def _build_plan(
                 )
             continue
 
+        if isinstance(op, ReductionOp):
+            if op.temporal and not is_root:
+                raise CppStreamLoweringError(
+                    "temporal reductions must be the terminal output"
+                )
+            out = value_dest(is_root, node_shape)
+            stages.append(
+                Stage(
+                    "reduce",
+                    children,
+                    out,
+                    n_instruments,
+                    output_kind=node.value_type.kind,
+                    output_width=int(node.value_type.width),
+                    op=op,
+                )
+            )
+            sources[node_id] = source_from_dest(out, node_shape)
+            continue
+
+        if isinstance(op, EmitOp):
+            if not is_root:
+                raise CppStreamLoweringError("emit('last') must be the terminal output")
+            out = value_dest(True, node_shape)
+            stages.append(
+                Stage(
+                    "emit_last",
+                    children,
+                    out,
+                    n_instruments,
+                    output_kind=node.value_type.kind,
+                    output_width=int(node.value_type.width),
+                    op=op,
+                )
+            )
+            sources[node_id] = source_from_dest(out, node_shape)
+            continue
+
         if isinstance(op, InstrumentBasisMeanOp):
             sources[node_id] = Source(
                 "instrument_basis",
@@ -804,6 +847,13 @@ def _build_plan(
         int(root_type.width),
         _output_row_width(root_type, n_instruments),
         root_shape,
+        "final"
+        if isinstance(program.nodes[root].op, EmitOp)
+        or (
+            isinstance(program.nodes[root].op, ReductionOp)
+            and program.nodes[root].op.temporal
+        )
+        else "rows",
     )
 
 

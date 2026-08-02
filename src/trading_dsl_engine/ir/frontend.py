@@ -21,6 +21,7 @@ from trading_dsl_engine.ir.ops import (
     CatOp,
     CumsumOp,
     CustomCallOp,
+    EmitOp,
     EinsumOp,
     EwmOp,
     FFillOp,
@@ -35,6 +36,7 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    ReductionOp,
     ShiftOp,
     XsRankOp,
 )
@@ -224,6 +226,65 @@ def _custom_value_type(node: StatelessCall, children: list[Node]) -> ValueType:
     if node.output_kind == "object":
         return object_value(int(node.output_width or 1))
     raise FormulaIRCompileError(f"invalid stateless output kind {node.output_kind!r}")
+
+
+def _reduction_arguments(call: Call) -> tuple[Expr, Expr | None, int]:
+    if call.fn not in {"sum", "mean", "std"}:
+        raise FormulaIRCompileError(f"invalid reduction {call.fn!r}")
+    names = ("x", "axis", "ddof") if call.fn == "std" else ("x", "axis")
+    values: dict[str, Expr] = {}
+    explicit: set[str] = set()
+    for name, value in zip(names, call.args):
+        values[name] = value
+        explicit.add(name)
+    if len(call.args) > len(names):
+        raise FormulaIRCompileError(f"{call.fn} received too many arguments")
+    for name, value in call.kwargs:
+        if name not in names or name in explicit:
+            raise FormulaIRCompileError(f"invalid {call.fn} argument {name!r}")
+        values[name] = value
+        explicit.add(name)
+    if "x" not in values:
+        raise FormulaIRCompileError(f"{call.fn} requires x")
+    ddof = _literal_int(values.get("ddof", Number(0.0)), "std ddof", 0)
+    return values["x"], values.get("axis"), ddof
+
+
+def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
+    if stream_rank <= 0:
+        raise FormulaIRCompileError("reduction stream rank must be positive")
+    items = (
+        tuple(range(stream_rank))
+        if axis is None
+        else axis.items
+        if isinstance(axis, KeyTuple)
+        else (axis,)
+    )
+    normalized: list[int] = []
+    for item in items:
+        value = _literal_int(item, "reduction axis")
+        if value < 0:
+            value += stream_rank
+        if value < 0 or value >= stream_rank:
+            raise FormulaIRCompileError(
+                f"reduction axis {value} outside rank {stream_rank}"
+            )
+        if value in normalized:
+            raise FormulaIRCompileError(f"duplicate reduction axis {value}")
+        normalized.append(value)
+    return tuple(sorted(normalized))
+
+
+def _normalize_emit(call: Call) -> tuple[Expr, str]:
+    if len(call.args) != 1:
+        raise FormulaIRCompileError("emit expects one expression")
+    values = dict(call.kwargs)
+    if len(values) != len(call.kwargs) or set(values) - {"mode"}:
+        raise FormulaIRCompileError("emit supports only the mode keyword")
+    mode = _literal_string(values.get("mode", String("last")), "emit mode")
+    if mode != "last":
+        raise FormulaIRCompileError("emit currently supports only mode='last'")
+    return call.args[0], mode
 
 
 def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
@@ -446,6 +507,33 @@ class _BaseBuilder:
                     node.fn, [self.nodes[index] for index in children]
                 ),
             )
+        if node.fn in {"sum", "mean", "std"}:
+            expression, axis, ddof = _reduction_arguments(node)
+            child = self.build(expression)
+            child_type = self.nodes[child].value_type
+            try:
+                row_shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError(
+                    f"{node.fn} cannot reduce object values"
+                ) from exc
+            axes = _reduction_axes(axis, 1 + len(row_shape))
+            output_shape = tuple(
+                extent
+                for full_axis, extent in enumerate(row_shape, start=1)
+                if full_axis not in axes
+            )
+            return self._append(
+                ReductionOp(node.fn, axes, ddof),
+                (child,),
+                tensor(output_shape, dtype=child_type.dtype),
+            )
+        if node.fn == "emit":
+            expression, mode = _normalize_emit(node)
+            child = self.build(expression)
+            return self._append(
+                EmitOp(mode), (child,), self.nodes[child].value_type
+            )
         if node.fn == "cat":
             children = tuple(self.build(arg) for arg in node.args)
             widths = tuple(
@@ -648,6 +736,13 @@ class _OuterBuilder(_BaseBuilder):
             ("__self__",)
             + tuple(f"__capture_{index}__" for index in range(len(inner.capture_ids))),
         )
+        if any(
+            isinstance(inner_node.op, (ReductionOp, EmitOp))
+            for inner_node in inner_program.nodes
+        ):
+            raise FormulaIRCompileError(
+                "reductions and emit are not yet supported inside groupby"
+            )
         op = GroupByOp(
             tuple(specs), static_groups, inner_program, capacity, hash_capacity
         )
@@ -712,6 +807,14 @@ def compile_ir(
         input_value_types or {},
     )
     root = builder.build(expression)
+    for node_id, node in enumerate(builder.nodes):
+        terminal = isinstance(node.op, EmitOp) or (
+            isinstance(node.op, ReductionOp) and node.op.temporal
+        )
+        if terminal and node_id != root:
+            raise FormulaIRCompileError(
+                "temporal reductions and emit('last') must be the terminal output"
+            )
     return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
 
 

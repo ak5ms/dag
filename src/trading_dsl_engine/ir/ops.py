@@ -53,6 +53,32 @@ class CumsumOp:
 
 
 @dataclass(frozen=True, slots=True)
+class ReductionOp:
+    kind: str
+    axes: tuple[int, ...]
+    ddof: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"sum", "mean", "std"}:
+            raise ValueError(f"unsupported reduction kind {self.kind!r}")
+        if self.ddof < 0:
+            raise ValueError("reduction ddof must be >= 0")
+
+    @property
+    def temporal(self) -> bool:
+        return 0 in self.axes
+
+
+@dataclass(frozen=True, slots=True)
+class EmitOp:
+    mode: str = "last"
+
+    def __post_init__(self) -> None:
+        if self.mode != "last":
+            raise ValueError(f"unsupported emit mode {self.mode!r}")
+
+
+@dataclass(frozen=True, slots=True)
 class FFillOp:
     limit: int | None = None
 
@@ -160,6 +186,8 @@ OpSpec: TypeAlias = (
     | CustomCallOp
     | CatOp
     | CumsumOp
+    | ReductionOp
+    | EmitOp
     | FFillOp
     | ShiftOp
     | EwmOp
@@ -182,6 +210,8 @@ __all__ = [
     "CustomCallOp",
     "CatOp",
     "CumsumOp",
+    "ReductionOp",
+    "EmitOp",
     "FFillOp",
     "ShiftOp",
     "EwmOp",
