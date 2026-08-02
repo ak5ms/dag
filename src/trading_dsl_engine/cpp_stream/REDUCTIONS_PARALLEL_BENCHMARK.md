@@ -2,7 +2,7 @@
 
 The final parallel branch is based directly on `cpp-stream-backend` commit `7c3fc23fd03cb22ef9c9a8016b1d7048bb531c0a`.
 
-The reduction benchmark uses 1,000,000 rows, 9 instruments, and 3 computed features, with one warmup and seven measured runs on a four-CPU GitHub-hosted AMD EPYC runner.
+The reduction benchmark uses 1,000,000 rows, 9 instruments, and 3 computed features, with one warmup and seven measured runs on a four-CPU GitHub-hosted AMD EPYC runner. These reductions use the default `ignore_na=True`; selecting `ignore_na=False` changes missing-value propagation but not the planner's row, lane, or terminal scheduling rules.
 
 | Execution | Median throughput | Median runtime | Output bytes |
 | --- | ---: | ---: | ---: |
