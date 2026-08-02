@@ -1,0 +1,56 @@
+name: run cpp_stream reduction ignore_na update
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/run-ignore-na-default.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-backend
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply staged transformation
+        run: |
+          python -m pip install --upgrade pyyaml
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          workflow = yaml.safe_load(
+              Path('.github/workflows/apply-ignore-na-default.yml').read_text()
+          )
+          script = next(
+              step['run']
+              for step in workflow['jobs']['apply']['steps']
+              if step.get('name') == 'Apply API and native changes'
+          )
+          subprocess.run(
+              ['bash', '-c', 'set -euo pipefail\n' + script], check=True
+          )
+          PY
+      - name: Install focused dependencies
+        run: python -m pip install --upgrade pip numpy pytest jinja2 includeigen
+      - name: Run reduction tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q -o addopts="" tests/trading_dsl_engine/cpp_stream/test_reductions.py
+      - name: Commit backend change
+        run: |
+          rm .github/workflows/apply-ignore-na-default.yml
+          rm .github/workflows/run-ignore-na-default.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Default streaming reductions to ignore_na"
+          git push origin HEAD:cpp-stream-backend
