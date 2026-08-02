@@ -68,8 +68,11 @@ _EXPERIMENTAL_STAGE_WORK = {
     "shift": 2,
     "ewm": 3,
     "cat": 2,
+<<<<<<< ours
     "reduce": 2,
     "emit_last": 1,
+=======
+>>>>>>> theirs
     "einsum": 5,
     "instrument_basis": 10,
     "ridge": 12,
@@ -89,6 +92,7 @@ def _ridge_is_stateful(stage: Stage) -> bool:
     )
 
 
+<<<<<<< ours
 def _reduction_is_temporal(stage: Stage) -> bool:
     return stage.kind == "reduce" and bool(getattr(stage.op, "temporal", False))
 
@@ -105,6 +109,8 @@ def _reduction_is_lane_local(stage: Stage, n_instruments: int) -> bool:
     return stage.inputs[0].shape[0] == n_instruments
 
 
+=======
+>>>>>>> theirs
 def _plan_work_score(plan: Plan) -> int:
     score = 0
     for stage in plan.stages:
@@ -117,12 +123,16 @@ def _plan_work_score(plan: Plan) -> int:
 
 def plan_is_row_independent(plan: Plan) -> bool:
     for stage in plan.stages:
+<<<<<<< ours
         if (
             stage.kind in _TEMPORAL_KINDS
             or _ridge_is_stateful(stage)
             or _reduction_is_temporal(stage)
             or stage.kind == "emit_last"
         ):
+=======
+        if stage.kind in _TEMPORAL_KINDS or _ridge_is_stateful(stage):
+>>>>>>> theirs
             return False
     return True
 
@@ -224,8 +234,11 @@ def _plan_is_lane_independent(
 
         if stage.kind in _LANE_LOCAL_KINDS:
             local = True
+<<<<<<< ours
         elif stage.kind == "reduce":
             local = _reduction_is_lane_local(stage, n_instruments)
+=======
+>>>>>>> theirs
         elif stage.kind == "einsum":
             local = _einsum_lane_local(
                 stage, n_instruments, scalar_slots, tensor_slots
@@ -257,6 +270,7 @@ def plan_is_lane_independent(plan: Plan, n_instruments: int) -> bool:
 
 def select_parallel_plan(plan: Plan, n_instruments: int) -> ParallelPlan:
     score = _plan_work_score(plan)
+<<<<<<< ours
     if plan.output_mode == "final":
         return ParallelPlan(
             "serial",
@@ -264,6 +278,8 @@ def select_parallel_plan(plan: Plan, n_instruments: int) -> ParallelPlan:
             False,
             score,
         )
+=======
+>>>>>>> theirs
     if plan_is_row_independent(plan):
         return ParallelPlan(
             "rows",
