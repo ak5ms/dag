@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -105,9 +107,17 @@ template <
     bool Temporal
 >
 struct ReductionNode {
-    static constexpr std::size_t input_size = Tensor::shape::size;
-    static constexpr std::size_t output_size =
-        reduced_output_size<typename Tensor::shape, Axes>();
+    using Shape = typename Tensor::shape;
+    static constexpr std::size_t input_size = Shape::size;
+    static constexpr std::size_t output_size = reduced_output_size<Shape, Axes>();
+    static constexpr bool retains_leading_axis =
+        Shape::rank > 0 && !Axes::contains(0);
+    static constexpr std::size_t leading_extent =
+        Shape::rank > 0 ? Shape::dims[0] : 1;
+    static constexpr std::size_t input_lane_width =
+        retains_leading_axis ? input_size / leading_extent : input_size;
+    static constexpr std::size_t output_lane_width =
+        retains_leading_axis ? output_size / leading_extent : output_size;
     using State = ReductionState<Policy, output_size, Ddof>;
 
     State state{};
@@ -116,14 +126,32 @@ struct ReductionNode {
 
     template <class Context>
     STACKDSL_HOT static void accumulate(State& target, const Context& ctx) noexcept {
+        if constexpr (retains_leading_axis) {
+            const std::size_t lane_begin = std::min(ctx.lane_begin, leading_extent);
+            const std::size_t lane_end = std::min(ctx.lane_end, leading_extent);
+            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
+                const std::size_t begin = lane * input_lane_width;
+                const std::size_t end = begin + input_lane_width;
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 8
 #endif
-        for (std::size_t offset = 0; offset < input_size; ++offset) {
-            target.add(
-                reduced_output_index<typename Tensor::shape, Axes>(offset),
-                Tensor::read_flat(ctx, offset)
-            );
+                for (std::size_t offset = begin; offset < end; ++offset) {
+                    target.add(
+                        reduced_output_index<Shape, Axes>(offset),
+                        Tensor::read_flat(ctx, offset)
+                    );
+                }
+            }
+        } else {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+            for (std::size_t offset = 0; offset < input_size; ++offset) {
+                target.add(
+                    reduced_output_index<Shape, Axes>(offset),
+                    Tensor::read_flat(ctx, offset)
+                );
+            }
         }
     }
 
@@ -132,8 +160,20 @@ struct ReductionNode {
         const State& source, Context& ctx
     ) noexcept {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        for (std::size_t index = 0; index < output_size; ++index) {
-            out[index] = source.result(index);
+        if constexpr (retains_leading_axis) {
+            const std::size_t lane_begin = std::min(ctx.lane_begin, leading_extent);
+            const std::size_t lane_end = std::min(ctx.lane_end, leading_extent);
+            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
+                const std::size_t begin = lane * output_lane_width;
+                const std::size_t end = begin + output_lane_width;
+                for (std::size_t index = begin; index < end; ++index) {
+                    out[index] = source.result(index);
+                }
+            }
+        } else {
+            for (std::size_t index = 0; index < output_size; ++index) {
+                out[index] = source.result(index);
+            }
         }
     }
 
