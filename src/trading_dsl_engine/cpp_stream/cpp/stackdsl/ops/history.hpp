@@ -17,7 +17,9 @@ struct FFillNode {
     void setup() noexcept { last.fill(kNaN); streak.fill(0); seen.fill(0); }
     template<class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
         auto* out=ctx.template write_ptr<Out>();
-        for(std::size_t lane=0;lane<N;++lane){
+        const std::size_t begin=execution_lane_begin<N,Execution>(ctx);
+        const std::size_t end=execution_lane_end<N,Execution>(ctx);
+        for(std::size_t lane=begin;lane<end;++lane){
             const std::size_t index=Execution::state_index(ctx,lane);
             const double value=ctx.template read<In>(lane);
             if(finite(value)){ last[index]=value; streak[index]=0; seen[index]=1; out[lane]=value; }
@@ -38,7 +40,9 @@ struct ShiftNode {
     template<class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
         auto* out=ctx.template write_ptr<Out>();
         const std::size_t read_position=(position+Capacity-Lag)%Capacity;
-        for(std::size_t lane=0;lane<N;++lane){
+        const std::size_t begin=execution_lane_begin<N,Execution>(ctx);
+        const std::size_t end=execution_lane_end<N,Execution>(ctx);
+        for(std::size_t lane=begin;lane<end;++lane){
             const std::size_t index=Execution::state_index(ctx,lane);
             const double value=ctx.template read<In>(lane);
             out[lane]=Lag==0?value:(count>=Lag?buffer[read_position][index]:kNaN);

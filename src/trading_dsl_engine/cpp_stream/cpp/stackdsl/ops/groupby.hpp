@@ -131,17 +131,25 @@ struct HashGroupResolver {
     }
 
     template <class Context>
-    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
+    bool resolve_range(
+        Context& ctx,
+        KeyList<Keys...>,
+        std::array<std::uint16_t, N>& slots,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
         if constexpr ((Keys::row_scalar && ...)) {
             const int slot = table.get_or_insert(make_key(ctx, 0));
             if (slot < 0) return false;
-            slots.fill(static_cast<std::uint16_t>(slot));
+            for (std::size_t lane = begin; lane < end; ++lane) {
+                slots[lane] = static_cast<std::uint16_t>(slot);
+            }
             return true;
         }
         KeyBits<parts> previous_key{};
         int previous_slot = -1;
         bool previous_valid = false;
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        for (std::size_t lane = begin; lane < end; ++lane) {
             const auto key = make_key(ctx, lane);
             int slot;
             if (cache_valid[lane] && cached_keys[lane] == key) slot = cached_slots[lane];
@@ -210,14 +218,22 @@ struct DenseTupleGroupResolver {
     }
 
     template <class Context>
-    bool resolve_all(Context& ctx, KeyList<Keys...>, std::array<std::uint16_t, N>& slots) noexcept {
+    bool resolve_range(
+        Context& ctx,
+        KeyList<Keys...>,
+        std::array<std::uint16_t, N>& slots,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
         if constexpr ((Keys::row_scalar && ...)) {
             std::uint16_t slot = 0;
             if (!resolve_lane(ctx, 0, slot)) return false;
-            slots.fill(slot);
+            for (std::size_t lane = begin; lane < end; ++lane) slots[lane] = slot;
             return true;
         }
-        for (std::size_t lane = 0; lane < N; ++lane) if (!resolve_lane(ctx, lane, slots[lane])) return false;
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            if (!resolve_lane(ctx, lane, slots[lane])) return false;
+        }
         return true;
     }
 };
@@ -227,7 +243,16 @@ struct NoKeyResolver {
     static constexpr std::size_t capacity = 1;
     void setup() noexcept {}
     template <class Context>
-    bool resolve_all(Context&, KeyList<>, std::array<std::uint16_t, N>& slots) noexcept { slots.fill(0); return true; }
+    bool resolve_range(
+        Context&,
+        KeyList<>,
+        std::array<std::uint16_t, N>& slots,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
+        for (std::size_t lane = begin; lane < end; ++lane) slots[lane] = 0;
+        return true;
+    }
 };
 
 template <
@@ -244,6 +269,8 @@ struct alignas(64) GroupRowContext {
     double* output = nullptr;
     const std::array<std::uint16_t, N>* group_slots = nullptr;
     const std::array<std::uint16_t, N>* partitions = nullptr;
+    std::size_t lane_begin = 0;
+    std::size_t lane_end = N;
 
     template <class Src>
     STACKDSL_HOT double read_native(std::size_t lane) const noexcept {
@@ -283,9 +310,18 @@ struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, KeyList<Keys...>, So
     void setup() noexcept { resolver.setup(); inner.setup(); }
     template <class Context>
     STACKDSL_HOT bool on_data_checked(Context& ctx) noexcept {
-        if (!resolver.resolve_all(ctx, KeyList<Keys...>{}, group_slots)) return false;
+        const std::size_t begin = ctx.lane_begin;
+        const std::size_t end = ctx.lane_end;
+        if (!resolver.resolve_range(ctx, KeyList<Keys...>{}, group_slots, begin, end)) return false;
         std::array<const double*, sizeof...(FeedSources)> feeds{ctx.template read_ptr<FeedSources>()...};
-        inner.on_data(feeds, group_slots, Partitions::values, ctx.template write_ptr<Out>());
+        inner.on_data(
+            feeds,
+            group_slots,
+            Partitions::values,
+            ctx.template write_ptr<Out>(),
+            begin,
+            end
+        );
         return true;
     }
     template <class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept { (void)on_data_checked(ctx); }

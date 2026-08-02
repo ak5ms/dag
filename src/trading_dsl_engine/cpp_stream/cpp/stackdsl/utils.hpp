@@ -153,6 +153,8 @@ struct alignas(64) RowContext {
     alignas(64) std::array<std::array<std::uint32_t, N>, ScratchSlots> scratch_u32{};
     alignas(64) std::array<std::array<double, N * MatrixScratchWidth>, MatrixScratchSlots> scratch_matrix_f64{};
     double* output=nullptr;
+    std::size_t lane_begin=0;
+    std::size_t lane_end=N;
 
     template <class T>
     STACKDSL_HOT auto& scratch_storage() noexcept {
