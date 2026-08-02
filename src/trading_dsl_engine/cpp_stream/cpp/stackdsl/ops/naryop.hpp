@@ -220,9 +220,10 @@ struct BinaryNode {
     STACKDSL_HOT void setup() noexcept {}
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         auto* out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             out[lane] = Op::template apply<Result>(
                 ctx.template read_native<Lhs>(lane),
                 ctx.template read_native<Rhs>(lane)
@@ -246,9 +247,10 @@ struct TernaryNode {
     STACKDSL_HOT void setup() noexcept {}
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         auto* out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             out[lane] = Op::template apply<Result>(
                 ctx.template read_native<A>(lane),
                 ctx.template read_native<B>(lane),
@@ -271,9 +273,10 @@ struct UnaryNode {
     STACKDSL_HOT void setup() noexcept {}
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         auto* out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             out[lane] = Op::template apply<Result>(
                 ctx.template read_native<In>(lane)
             );
@@ -291,9 +294,10 @@ struct CopyNode {
     STACKDSL_HOT void setup() noexcept {}
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         auto* out = ctx.template write_ptr<Out>();
-        for (std::size_t lane = 0; lane < N; ++lane) {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
             out[lane] = ctx.template read_native<In>(lane);
         }
     }

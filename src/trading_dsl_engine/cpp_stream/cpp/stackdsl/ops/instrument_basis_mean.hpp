@@ -34,7 +34,9 @@ struct InstrumentBasisMeanNode<N,FeatureList<FeatureSources...>,Y,Weights,Out,Al
         constexpr double alpha=std::bit_cast<double>(AlphaBits);
         auto* out=ctx.template write_ptr<Out>();
         constexpr bool beta_projection=std::is_same_v<Projection,InstrumentBasisBetaProjection>;
-        for(std::size_t lane=0;lane<N;++lane){
+        const std::size_t begin=execution_lane_begin<N,Execution>(ctx);
+        const std::size_t end=execution_lane_end<N,Execution>(ctx);
+        for(std::size_t lane=begin;lane<end;++lane){
             std::array<double,K> features{};
             load_features(ctx,lane,features,FeatureList<FeatureSources...>{});
             const double y=ctx.template read<Y>(lane);
