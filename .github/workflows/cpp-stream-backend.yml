@@ -19,7 +19,7 @@ on:
 jobs:
   focused-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,6 +44,7 @@ jobs:
           tests/trading_dsl_engine/cpp_stream/test_minute_groupby.py
           tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
           tests/trading_dsl_engine/cpp_stream/test_einsum.py
+          tests/trading_dsl_engine/cpp_stream/test_reductions.py
           tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
       - name: Compare unhinted and typed hinted minute keys
         env:
@@ -74,6 +75,15 @@ jobs:
           CPP_STREAM_EINSUM_CASE: all
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_einsum.py
+      - name: Smoke benchmark streaming reductions
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_REDUCTION_ROWS: "500000"
+          CPP_STREAM_REDUCTION_INSTRUMENTS: "9"
+          CPP_STREAM_REDUCTION_RUNS: "3"
+          CPP_STREAM_REDUCTION_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_reductions.py
       - name: Smoke benchmark riskmodel roll_rets
         env:
           PYTHONPATH: src
