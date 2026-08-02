@@ -66,12 +66,13 @@ This backend must remain independent of `jax_flat`.
 ## Ridge
 
 - Ridge is one generic `RidgeNode<..., Execution>` for direct and grouped execution. `GroupedRidgeNode` is forbidden.
-- K is compile-time. Moment state, beta state, systems, and solver workspaces use fixed `std::array` storage.
+- K is compile-time. Persistent grouped moment/beta state remains fixed `std::array` storage. Map local KxK/K workspaces into fixed-size Eigen matrices/vectors; do not use `Eigen::Dynamic` or Eigen Tensor in the row path.
+- Compile Eigen with `EIGEN_DONT_PARALLELIZE`; cpp_stream owns any outer parallelism and must not permit nested Eigen worker teams.
 - Preserve weighted pairwise-missing moments and per-moment last-update timing.
 - Positive-half-life predictions use the prior beta; `hl<=0` or nonfinite is current-row/stateless.
 - Regularization is `XX + lambda * diag(diag(XX))`, with nonnegative lambda.
-- Solver order remains Cholesky, pivoted solve, then symmetric pseudoinverse fallback.
-- Nonnegative Ridge uses the same fixed-size generic solver; do not add K-specific implementations.
+- The common SPD Ridge path keeps the allocation-free fixed-array Cholesky kernel because same-host benchmarks show a full Eigen replacement is materially slower at K=3. Singular/indefinite fallback uses fixed-size Eigen decomposition.
+- Stateless nonnegative Ridge uses the fixed-size active-set NNQP implementation adapted from the repository's `jax_ffi/nnqp` solver. Stateful nonnegative Ridge keeps its exact warm-started fixed-array coordinate solver; stateless nonnegative Ridge uses fixed-size NNQP.
 - `get_beta` and `get_preds` are projections of the neutral Ridge object. A raw object is not a file output.
 
 ## Existing performance invariants
@@ -80,7 +81,8 @@ This backend must remain independent of `jax_flat`.
 - Preserve the common recursive-EWM policy and avoid weight/count traffic when semantics permit it.
 - Row-scalar facts must propagate through pure stateless graphs.
 - Reusable output files must not be retruncated when their size already matches.
-- No operator may allocate from the heap in `on_data`; no Python per-row loop is allowed.
+- No operator may allocate from the heap in `on_data`; no Python per-row loop is allowed. Fixed-size Eigen objects are permitted, but dynamic Eigen matrices/vectors and hidden temporaries requiring heap storage are not.
+- For source/I/O changes, inspect generated C++ for one outer row loop and use Linux `strace`/`perf stat` as supporting checks (`openat`, `mmap`, `munmap`, `read`/`pread64`, page faults). `strace` verifies syscall/mapping behavior, not every userspace load or allocation, so pair it with code inspection and allocation-aware tests.
 
 ## Code generation and runtime
 

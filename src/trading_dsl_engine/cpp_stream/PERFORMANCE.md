@@ -172,3 +172,18 @@ Representative 5M×9 medians from the same class of hosted runner:
 6. Compare against an independent backend when available.
 7. Record contraction work and largest intermediate alongside wall throughput.
 8. Prefer generic compile-time policy and layout changes over pattern-specific code.
+
+## Eigen/NNQP and source-pass audit
+
+Ridge uses a hybrid allocation-free solver: its common SPD path remains the
+fixed-array Cholesky kernel, while singular/indefinite fallback and matrix maps
+use fixed-size Eigen compiled with `EIGEN_DONT_PARALLELIZE`. Stateless
+nonnegative Ridge uses fixed-size active-set NNQP; the stateful path preserves
+its exact warm-started coordinate solver. No `Eigen::Dynamic` or Eigen Tensor object is
+used in `on_data`.
+
+Use `scripts/benchmark_cpp_stream_io.py` to compare the identical repeated-field Cat
+formula over `.npy` and raw mappings. The script also asserts that generated C++ has
+one outer row loop and one current-row pointer binding per input. The benchmark is
+an architectural I/O check rather than a claim that distinct consumers perform only
+one CPU load: repeated within-row reads can occur, but there is no second file scan.

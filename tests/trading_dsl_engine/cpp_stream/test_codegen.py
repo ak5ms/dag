@@ -153,3 +153,20 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
     assert "stackdsl::BinaryNode<9," in source
     assert "stackdsl::OutputDst, double, stackdsl::AddOp" in source
     assert "cpp_stream_run_arrays" in source
+
+def test_generated_runtime_has_one_row_pass_and_cse_for_repeated_cat_branches():
+    source = _render("cat(close + 1, close + 1, close + 2)")
+    assert source.count("for (std::size_t t = 0; t < rows; ++t)") == 1
+    assert source.count("ctx.inputs[0] =") == 1
+    assert source.count("stackdsl::BinaryNode<5,") == 2
+    assert source.count("stackdsl::CatNode<") == 1
+
+
+def test_ridge_consumes_cat_as_lazy_feature_list_without_cat_materialization():
+    source = _render(
+        "get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1))",
+        n=9,
+    )
+    assert "stackdsl::RidgeNode<" in source
+    assert "stackdsl::FeatureList<" in source
+    assert "stackdsl::CatNode<" not in source

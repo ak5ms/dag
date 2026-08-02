@@ -129,3 +129,23 @@ Key(
 
 `dtype` validates the completed expression type; it does not authorize an implicit
 source cast.
+
+## Exact `.npy` and raw pointer flow
+
+A `.npy` input is opened with `np.load(..., mmap_mode="r")`. NumPy parses the
+header once and creates an `np.memmap` whose `offset` is the first payload byte.
+`NpyMMap.data_pointer` is `array.ctypes.data`, so the pointer passed to native code
+already addresses the payload rather than the `.npy` header. A raw `.bin`/`.raw`
+source uses `np.memmap` with offset zero. Both adapters then return the same
+`PreparedSource` pointer/row-count/row-width contract.
+
+The generated native entrypoint is format-agnostic. It binds each input's current
+row pointer once inside one outer `t in [0, rows)` loop and runs every lowered stage
+before advancing to the next row. It does not reopen or perform a second whole-file
+scan for Cat, Ridge, grouping, or einsum. Distinct consumers may load the same value
+again within the current row, normally from cache; that is not another mmap or disk
+pass. Identical expression branches are eliminated by IR memoization.
+
+A root Cat writes one materialized output. When Cat feeds Ridge,
+InstrumentBasisMean, or einsum, lowering flattens it into a lazy compile-time
+`FeatureList` and those consumers read the original row sources directly.

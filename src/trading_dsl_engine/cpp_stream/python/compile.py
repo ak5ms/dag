@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Mapping
 
+import includeigen
+
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
@@ -30,6 +32,10 @@ from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 def _cpp_root() -> Path:
     return Path(__file__).resolve().parents[1] / "cpp"
+
+
+def _eigen_include() -> Path:
+    return Path(includeigen.get_include()).resolve()
 
 
 def _cache_root() -> Path:
@@ -62,6 +68,8 @@ def _flags() -> tuple[list[str], list[str]]:
         "-shared",
         "-fno-math-errno",
         "-funroll-loops",
+        "-DEIGEN_DONT_PARALLELIZE",
+        "-DEIGEN_MPL2_ONLY",
     ]
     if sys.platform.startswith("linux"):
         compile_flags.append("-D_GNU_SOURCE")
@@ -98,6 +106,11 @@ def _build_shared(source: str) -> tuple[Path, Path]:
     for header in sorted(_cpp_root().rglob("*.hpp")):
         digest.update(header.relative_to(_cpp_root()).as_posix().encode())
         digest.update(header.read_bytes())
+    eigen_include = _eigen_include()
+    digest.update(str(eigen_include).encode())
+    eigen_macros = eigen_include / "Eigen" / "src" / "Core" / "util" / "Macros.h"
+    if eigen_macros.is_file():
+        digest.update(eigen_macros.read_bytes())
     version = subprocess.run(
         [compiler, "--version"], capture_output=True, text=True, check=False
     )
@@ -119,6 +132,7 @@ def _build_shared(source: str) -> tuple[Path, Path]:
         compiler,
         *compile_flags,
         f"-I{_cpp_root()}",
+        f"-I{_eigen_include()}",
         str(temporary_cpp),
         *link_flags,
         "-o",

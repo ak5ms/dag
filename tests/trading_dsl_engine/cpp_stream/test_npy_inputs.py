@@ -31,6 +31,8 @@ def test_source_inference_exposes_npy_dtype_shape_and_row_scalar(tmp_path: Path)
     mapped = open_source(path)
     try:
         assert mapped.data_pointer == mapped.owner.array.ctypes.data
+        assert mapped.owner.info.data_offset == mapped.owner.array.offset
+        assert mapped.data_pointer == int(mapped.owner.array.ctypes.data)
         np.testing.assert_array_equal(mapped.owner.array, values)
     finally:
         mapped.close()

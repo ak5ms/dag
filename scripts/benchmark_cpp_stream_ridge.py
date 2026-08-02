@@ -24,7 +24,9 @@ _ALL_CASES = (
     "cat_root",
     "stateful_cat",
     "stateful_args",
+    "stateful_nonnegative",
     "stateless_beta",
+    "stateless_nonnegative_beta",
     "grouped_one_stateful",
     "grouped_stateful",
 )
@@ -81,8 +83,12 @@ def _formula(case: str) -> str:
         return "get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1))"
     if case == "stateful_args":
         return "get_preds(Ridge(x1, x2, x3, y=y, hl=64, lambda_=0.1))"
+    if case == "stateful_nonnegative":
+        return "get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1, nonneg=True))"
     if case == "stateless_beta":
         return "get_beta(Ridge(cat(x1, x2, x3), y=y, hl=0, lambda_=0.1))"
+    if case == "stateless_nonnegative_beta":
+        return "get_beta(Ridge(cat(x1, x2, x3), y=y, hl=0, lambda_=0.1, nonneg=True))"
     if case == "grouped_one_stateful":
         if N != 9:
             raise ValueError("grouped_one_stateful benchmark requires N=9")

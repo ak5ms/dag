@@ -257,3 +257,56 @@ def test_grouped_ridge_uses_same_generic_node(tmp_path: Path) -> None:
     assert "stackdsl::RidgeNode" in generated
     assert "stackdsl::GroupedExecution" in generated
     assert "GroupedRidge" not in generated
+
+def _nnqp_reference(system: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    k = rhs.size
+    best = np.zeros(k, dtype=np.float64)
+    best_objective = np.inf
+    for mask in range(1 << k):
+        active = [index for index in range(k) if mask & (1 << index)]
+        candidate = np.zeros(k, dtype=np.float64)
+        if active:
+            submatrix = system[np.ix_(active, active)]
+            try:
+                candidate[active] = np.linalg.solve(submatrix, rhs[active])
+            except np.linalg.LinAlgError:
+                continue
+        if np.any(candidate < -1e-9):
+            continue
+        candidate = np.maximum(candidate, 0.0)
+        gradient = system @ candidate - rhs
+        inactive = [index for index in range(k) if index not in active]
+        if inactive and np.any(gradient[inactive] < -1e-8):
+            continue
+        objective = 0.5 * candidate @ system @ candidate - rhs @ candidate
+        if objective < best_objective:
+            best_objective = objective
+            best = candidate
+    return best
+
+
+def test_nonnegative_ridge_active_set_matches_bruteforce_kkt_reference(tmp_path: Path) -> None:
+    rng = np.random.default_rng(20260802)
+    rows, n, k = 20, 8, 3
+    features = rng.normal(size=(rows, n, k))
+    y = rng.normal(size=(rows, n))
+    paths = {
+        f"x{j + 1}": _save(tmp_path / f"x{j + 1}.npy", features[:, :, j])
+        for j in range(k)
+    }
+    paths["y"] = _save(tmp_path / "y_nnqp.npy", y)
+    runtime = compile_formula(
+        "get_beta(Ridge(cat(x1, x2, x3), y=y, hl=0, lambda_=0.1, nonneg=True))",
+        paths,
+        n_instruments=n,
+    )
+    output = tmp_path / "nnqp_beta.bin"
+    runtime.run(out_path=output)
+    actual = np.asarray(np.memmap(output, mode="r", dtype=np.float64, shape=(rows, k)))
+    expected = np.empty_like(actual)
+    for row in range(rows):
+        xx = features[row].T @ features[row]
+        system = xx + 0.1 * np.diag(np.diag(xx))
+        rhs = features[row].T @ y[row]
+        expected[row] = _nnqp_reference(system, rhs)
+    np.testing.assert_allclose(actual, expected, rtol=2e-8, atol=2e-8)

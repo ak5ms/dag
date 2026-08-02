@@ -11,6 +11,8 @@
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/cat.hpp"
+#include "stackdsl/ops/eigen_solvers.hpp"
+#include "stackdsl/ops/nnqp.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -27,14 +29,23 @@ STACKDSL_HOT bool finite_vector(const std::array<double, K>& values) noexcept {
 }
 
 template <std::size_t K>
-STACKDSL_HOT double dot(const std::array<double, K>& values, const double* STACKDSL_RESTRICT beta) noexcept {
+STACKDSL_HOT double dot(
+    const std::array<double, K>& values,
+    const double* STACKDSL_RESTRICT beta
+) noexcept {
     double result = 0.0;
-    for (std::size_t j = 0; j < K; ++j) result = std::fma(values[j], beta[j], result);
+    for (std::size_t j = 0; j < K; ++j) {
+        result = std::fma(values[j], beta[j], result);
+    }
     return result;
 }
 
 template <std::size_t K>
-STACKDSL_HOT bool cholesky_solve(const std::array<double, K * K>& system, const std::array<double, K>& rhs, std::array<double, K>& solution) noexcept {
+STACKDSL_HOT bool cholesky_solve(
+    const std::array<double, K * K>& system,
+    const std::array<double, K>& rhs,
+    std::array<double, K>& solution
+) noexcept {
     std::array<double, K * K> lower{};
     double scale = 0.0;
     for (std::size_t i = 0; i < K; ++i) {
@@ -47,24 +58,36 @@ STACKDSL_HOT bool cholesky_solve(const std::array<double, K * K>& system, const 
         for (std::size_t j = 0; j <= i; ++j) {
             double value = system[i * K + j];
             if (!std::isfinite(value)) return false;
-            for (std::size_t k = 0; k < j; ++k) value = std::fma(-lower[i * K + k], lower[j * K + k], value);
+            for (std::size_t k = 0; k < j; ++k) {
+                value = std::fma(
+                    -lower[i * K + k],
+                    lower[j * K + k],
+                    value
+                );
+            }
             if (i == j) {
                 if (!(value > tolerance)) return false;
                 lower[i * K + j] = std::sqrt(value);
-            } else lower[i * K + j] = value / lower[j * K + j];
+            } else {
+                lower[i * K + j] = value / lower[j * K + j];
+            }
         }
     }
     std::array<double, K> intermediate{};
     for (std::size_t i = 0; i < K; ++i) {
         double value = rhs[i];
         if (!std::isfinite(value)) return false;
-        for (std::size_t j = 0; j < i; ++j) value = std::fma(-lower[i * K + j], intermediate[j], value);
+        for (std::size_t j = 0; j < i; ++j) {
+            value = std::fma(-lower[i * K + j], intermediate[j], value);
+        }
         intermediate[i] = value / lower[i * K + i];
     }
     for (std::size_t reverse = 0; reverse < K; ++reverse) {
         const std::size_t i = K - 1 - reverse;
         double value = intermediate[i];
-        for (std::size_t j = i + 1; j < K; ++j) value = std::fma(-lower[j * K + i], solution[j], value);
+        for (std::size_t j = i + 1; j < K; ++j) {
+            value = std::fma(-lower[j * K + i], solution[j], value);
+        }
         solution[i] = value / lower[i * K + i];
         if (!std::isfinite(solution[i])) return false;
     }
@@ -72,121 +95,42 @@ STACKDSL_HOT bool cholesky_solve(const std::array<double, K * K>& system, const 
 }
 
 template <std::size_t K>
-STACKDSL_HOT bool gaussian_solve(const std::array<double, K * K>& system, const std::array<double, K>& rhs, std::array<double, K>& solution) noexcept {
-    std::array<double, K * K> matrix = system;
-    std::array<double, K> values = rhs;
-    double scale = 0.0;
-    for (double value : matrix) { if (!std::isfinite(value)) return false; scale = std::max(scale, std::abs(value)); }
-    for (double value : values) if (!std::isfinite(value)) return false;
-    const double tolerance = std::max(1e-15, scale * 1e-12);
-    for (std::size_t column = 0; column < K; ++column) {
-        std::size_t pivot = column;
-        double pivot_abs = std::abs(matrix[column * K + column]);
-        for (std::size_t row = column + 1; row < K; ++row) {
-            const double candidate = std::abs(matrix[row * K + column]);
-            if (candidate > pivot_abs) { pivot = row; pivot_abs = candidate; }
-        }
-        if (!(pivot_abs > tolerance)) return false;
-        if (pivot != column) {
-            for (std::size_t j = column; j < K; ++j) std::swap(matrix[column * K + j], matrix[pivot * K + j]);
-            std::swap(values[column], values[pivot]);
-        }
-        const double diagonal = matrix[column * K + column];
-        for (std::size_t row = column + 1; row < K; ++row) {
-            const double factor = matrix[row * K + column] / diagonal;
-            matrix[row * K + column] = 0.0;
-            for (std::size_t j = column + 1; j < K; ++j) matrix[row * K + j] = std::fma(-factor, matrix[column * K + j], matrix[row * K + j]);
-            values[row] = std::fma(-factor, values[column], values[row]);
-        }
-    }
-    for (std::size_t reverse = 0; reverse < K; ++reverse) {
-        const std::size_t row = K - 1 - reverse;
-        double residual = values[row];
-        for (std::size_t j = row + 1; j < K; ++j) residual = std::fma(-matrix[row * K + j], solution[j], residual);
-        const double diagonal = matrix[row * K + row];
-        if (!(std::abs(diagonal) > tolerance)) return false;
-        solution[row] = residual / diagonal;
-        if (!std::isfinite(solution[row])) return false;
-    }
-    return true;
-}
-
-template <std::size_t K>
-bool pseudo_inverse_solve(const std::array<double, K * K>& system, const std::array<double, K>& rhs, std::array<double, K>& solution) noexcept {
-    std::array<double, K * K> matrix = system;
-    std::array<double, K * K> eigenvectors{};
-    for (std::size_t i = 0; i < K; ++i) eigenvectors[i * K + i] = 1.0;
-    double scale = 0.0;
-    for (double value : matrix) { if (!std::isfinite(value)) return false; scale = std::max(scale, std::abs(value)); }
-    for (double value : rhs) if (!std::isfinite(value)) return false;
-    const double off_tolerance = std::max(1e-15, scale * 1e-13);
-    constexpr std::size_t max_rotations = 32 * (K > 1 ? K * K : 1);
-    for (std::size_t rotation = 0; rotation < max_rotations; ++rotation) {
-        std::size_t p = 0, q = 0;
-        double largest = 0.0;
-        for (std::size_t i = 0; i < K; ++i) for (std::size_t j = i + 1; j < K; ++j) {
-            const double magnitude = std::abs(matrix[i * K + j]);
-            if (magnitude > largest) { largest = magnitude; p = i; q = j; }
-        }
-        if (!(largest > off_tolerance)) break;
-        const double app = matrix[p * K + p], aqq = matrix[q * K + q], apq = matrix[p * K + q];
-        const double tau = (aqq - app) / (2.0 * apq);
-        const double tangent = std::copysign(1.0, tau) / (std::abs(tau) + std::sqrt(1.0 + tau * tau));
-        const double cosine = 1.0 / std::sqrt(1.0 + tangent * tangent), sine = tangent * cosine;
-        for (std::size_t k = 0; k < K; ++k) {
-            if (k == p || k == q) continue;
-            const double akp = matrix[k * K + p], akq = matrix[k * K + q];
-            matrix[k * K + p] = matrix[p * K + k] = cosine * akp - sine * akq;
-            matrix[k * K + q] = matrix[q * K + k] = sine * akp + cosine * akq;
-        }
-        matrix[p * K + p] = cosine * cosine * app - 2.0 * sine * cosine * apq + sine * sine * aqq;
-        matrix[q * K + q] = sine * sine * app + 2.0 * sine * cosine * apq + cosine * cosine * aqq;
-        matrix[p * K + q] = matrix[q * K + p] = 0.0;
-        for (std::size_t k = 0; k < K; ++k) {
-            const double vkp = eigenvectors[k * K + p], vkq = eigenvectors[k * K + q];
-            eigenvectors[k * K + p] = cosine * vkp - sine * vkq;
-            eigenvectors[k * K + q] = sine * vkp + cosine * vkq;
-        }
-    }
-    double max_eigenvalue = 0.0;
-    for (std::size_t i = 0; i < K; ++i) max_eigenvalue = std::max(max_eigenvalue, std::abs(matrix[i * K + i]));
-    const double eigen_tolerance = std::max(1e-15, max_eigenvalue * 1e-12);
-    std::array<double, K> projected{};
-    for (std::size_t eigen = 0; eigen < K; ++eigen) {
-        double value = 0.0;
-        for (std::size_t row = 0; row < K; ++row) value = std::fma(eigenvectors[row * K + eigen], rhs[row], value);
-        const double lambda = matrix[eigen * K + eigen];
-        projected[eigen] = std::abs(lambda) > eigen_tolerance ? value / lambda : 0.0;
-    }
-    for (std::size_t row = 0; row < K; ++row) {
-        double value = 0.0;
-        for (std::size_t eigen = 0; eigen < K; ++eigen) value = std::fma(eigenvectors[row * K + eigen], projected[eigen], value);
-        if (!std::isfinite(value)) return false;
-        solution[row] = value;
-    }
-    return true;
-}
-
-template <std::size_t K>
-STACKDSL_HOT bool unconstrained_solve(const std::array<double, K * K>& system, const std::array<double, K>& rhs, std::array<double, K>& solution) noexcept {
+STACKDSL_HOT bool unconstrained_solve(
+    const std::array<double, K * K>& system,
+    const std::array<double, K>& rhs,
+    std::array<double, K>& solution
+) noexcept {
     solution.fill(0.0);
     if (cholesky_solve(system, rhs, solution)) return true;
     solution.fill(0.0);
-    if (gaussian_solve(system, rhs, solution)) return true;
-    solution.fill(0.0);
-    return pseudo_inverse_solve(system, rhs, solution);
+    return eigen_detail::solve_unconstrained<K>(system, rhs, solution);
 }
 
 template <std::size_t K>
-STACKDSL_HOT bool nonnegative_solve(const std::array<double, K * K>& system, const std::array<double, K>& rhs, const std::array<double, K>& fallback, std::array<double, K>& solution) noexcept {
-    for (std::size_t j = 0; j < K; ++j) solution[j] = std::max(0.0, fallback[j]);
+STACKDSL_HOT bool coordinate_nonnegative_solve(
+    const std::array<double, K * K>& system,
+    const std::array<double, K>& rhs,
+    const std::array<double, K>& fallback,
+    std::array<double, K>& solution
+) noexcept {
+    for (std::size_t j = 0; j < K; ++j) {
+        solution[j] = std::max(0.0, fallback[j]);
+    }
     for (std::size_t sweep = 0; sweep < 64; ++sweep) {
         double max_change = 0.0;
         for (std::size_t j = 0; j < K; ++j) {
             const double diagonal = system[j * K + j];
             if (!(diagonal > 1e-18) || !std::isfinite(diagonal)) continue;
             double residual = rhs[j];
-            for (std::size_t k = 0; k < K; ++k) if (k != j) residual = std::fma(-system[j * K + k], solution[k], residual);
+            for (std::size_t k = 0; k < K; ++k) {
+                if (k != j) {
+                    residual = std::fma(
+                        -system[j * K + k],
+                        solution[k],
+                        residual
+                    );
+                }
+            }
             const double next = std::max(0.0, residual / diagonal);
             max_change = std::max(max_change, std::abs(next - solution[j]));
             solution[j] = next;
@@ -194,6 +138,17 @@ STACKDSL_HOT bool nonnegative_solve(const std::array<double, K * K>& system, con
         if (max_change <= 1e-12) break;
     }
     return finite_vector(solution);
+}
+
+template <std::size_t K>
+STACKDSL_HOT bool nnqp_nonnegative_solve(
+    const std::array<double, K * K>& system,
+    const std::array<double, K>& rhs,
+    const std::array<double, K>& fallback,
+    std::array<double, K>& solution
+) noexcept {
+    solution.fill(0.0);
+    return nnqp::solve<K>(system, rhs, fallback, solution);
 }
 
 template <std::size_t Groups, std::size_t K, bool Stateful> struct RidgeState;
@@ -357,9 +312,30 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                 }
             }
             std::array<double, K * K> system = xx;
-            for (std::size_t j = 0; j < K; ++j) system[j * K + j] = std::fma(ridge_lambda, xx[j * K + j], xx[j * K + j]);
+            for (std::size_t j = 0; j < K; ++j) {
+                system[j * K + j] = std::fma(
+                    ridge_lambda,
+                    xx[j * K + j],
+                    xx[j * K + j]
+                );
+            }
             auto& beta = solved_betas[active];
-            const bool solved = Nonnegative ? ridge_detail::nonnegative_solve(system, xy, fallback, beta) : ridge_detail::unconstrained_solve(system, xy, beta);
+            bool solved = false;
+            if constexpr (Nonnegative) {
+                if constexpr (Stateful) {
+                    solved = ridge_detail::coordinate_nonnegative_solve(
+                        system, xy, fallback, beta
+                    );
+                } else {
+                    solved = ridge_detail::nnqp_nonnegative_solve(
+                        system, xy, fallback, beta
+                    );
+                }
+            } else {
+                solved = ridge_detail::unconstrained_solve(
+                    system, xy, beta
+                );
+            }
             if (!solved) beta = fallback;
             if constexpr (Stateful) for (std::size_t j = 0; j < K; ++j) state.beta[group * K + j] = beta[j];
         }
