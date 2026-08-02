@@ -175,9 +175,9 @@ Representative 5M×9 medians from the same class of hosted runner:
 
 ## Eigen/NNQP and source-pass audit
 
-Ridge uses a hybrid allocation-free solver: its common SPD path remains the
-fixed-array Cholesky kernel, while singular/indefinite fallback and matrix maps
-use fixed-size Eigen compiled with `EIGEN_DONT_PARALLELIZE`. Stateless
+Ridge preserves the allocation-free fixed-array Cholesky, pivoted Gaussian,
+and Jacobi pseudoinverse chain for unconstrained solves. Fixed-size Eigen is
+compiled with `EIGEN_DONT_PARALLELIZE` and used by stateless NNQP. Stateless
 nonnegative Ridge uses fixed-size active-set NNQP; the stateful path preserves
 its exact warm-started coordinate solver. No `Eigen::Dynamic` or Eigen Tensor object is
 used in `on_data`.

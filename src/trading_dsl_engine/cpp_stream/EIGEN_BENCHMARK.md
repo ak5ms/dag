@@ -1,23 +1,23 @@
 # cpp_stream Eigen/NNQP refactor benchmark
 
-Same GitHub-hosted runner; 1,000,000 rows x 9 instruments; one warmup and five measured executions.
+Same GitHub-hosted runner; 1,000,000 rows x 9 instruments; one warmup and seven measured executions.
 
-| Case | Before | After | Ratio |
+| Case | Original backend | Final backend | Ratio |
 | --- | ---: | ---: | ---: |
-| `stateful_cat` | 5.873543 M rows/s | 6.130991 M rows/s | 1.044x |
-| `stateless_beta` | 9.101382 M rows/s | 8.708761 M rows/s | 0.957x |
-| `grouped_one_stateful` | 6.111490 M rows/s | 5.900436 M rows/s | 0.965x |
-| `grouped_stateful` | 2.765531 M rows/s | 2.715668 M rows/s | 0.982x |
-| `stateful_nonnegative` | 4.746722 M rows/s | 4.741463 M rows/s | 0.999x |
-| `stateless_nonnegative_beta` | 2.677686 M rows/s | 4.642962 M rows/s | 1.734x |
-| `roll_rets` | 0.888963 M rows/s | 0.890017 M rows/s | 1.001x |
+| `stateful_cat` | 7.856398 M rows/s | 7.801014 M rows/s | 0.993x |
+| `stateless_beta` | 10.557726 M rows/s | 10.485059 M rows/s | 0.993x |
+| `grouped_one_stateful` | 7.718430 M rows/s | 7.667669 M rows/s | 0.993x |
+| `grouped_stateful` | 3.155419 M rows/s | 3.155425 M rows/s | 1.000x |
+| `stateful_nonnegative` | 6.311343 M rows/s | 6.278696 M rows/s | 0.995x |
+| `stateless_nonnegative_beta` | 3.474131 M rows/s | 5.736041 M rows/s | 1.651x |
+| `roll_rets` | 1.161185 M rows/s | 1.163170 M rows/s | 1.002x |
 
 ## Repeated-field Cat / source-format audit
 
 ```text
-format=npy median=6.140916 M rows/s checksum=55216.0230234
-format=raw median=6.275379 M rows/s checksum=55216.0230234
-raw_to_npy_ratio=1.021896
+format=npy median=11.367258 M rows/s checksum=55216.0230234
+format=raw median=11.722402 M rows/s checksum=55216.0230234
+raw_to_npy_ratio=1.031243
 ```
 
-The audit formula is `cat(x + 1, x + 2, x + 3)`. It asserts one generated outer row loop, one row-pointer binding for the source, and identical `.npy`/raw checksums. `strace` syscall totals are retained in the workflow log.
+The audit formula is `cat(x + 1, x + 2, x + 3)`. It asserts one generated outer row loop, one row-pointer binding for the source, and identical `.npy`/raw checksums.

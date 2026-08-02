@@ -71,7 +71,7 @@ This backend must remain independent of `jax_flat`.
 - Preserve weighted pairwise-missing moments and per-moment last-update timing.
 - Positive-half-life predictions use the prior beta; `hl<=0` or nonfinite is current-row/stateless.
 - Regularization is `XX + lambda * diag(diag(XX))`, with nonnegative lambda.
-- The common SPD Ridge path keeps the allocation-free fixed-array Cholesky kernel because same-host benchmarks show a full Eigen replacement is materially slower at K=3. Singular/indefinite fallback uses fixed-size Eigen decomposition.
+- Unconstrained Ridge keeps the allocation-free fixed-array Cholesky, pivoted Gaussian, and Jacobi pseudoinverse chain because same-host benchmarks show a full Eigen replacement is materially slower at K=3. Fixed-size Eigen is used by the stateless NNQP path and may be used for cold numeric helpers only when benchmarks show no hot-path regression.
 - Stateless nonnegative Ridge uses the fixed-size active-set NNQP implementation adapted from the repository's `jax_ffi/nnqp` solver. Stateful nonnegative Ridge keeps its exact warm-started fixed-array coordinate solver; stateless nonnegative Ridge uses fixed-size NNQP.
 - `get_beta` and `get_preds` are projections of the neutral Ridge object. A raw object is not a file output.
 
