@@ -133,6 +133,7 @@ int run_bound_inputs(
     const std::array<const void*, {{ input_count }}>& input_data,
     std::size_t rows,
     const char* output_path,
+    std::size_t output_offset_bytes,
     std::size_t async_writeback_bytes,
     std::size_t requested_threads,
     int parallel_mode,
@@ -146,9 +147,17 @@ int run_bound_inputs(
     constexpr std::size_t output_row_width = {{ output_row_width }};
     constexpr std::size_t output_row_bytes = output_row_width * sizeof(double);
     const std::size_t output_rows = {% if output_mode == 'final' %}1{% else %}rows{% endif %};
-    stackdsl::MMapFile output(output_path, true, output_rows * output_row_bytes);
+    const std::size_t output_payload_bytes = output_rows * output_row_bytes;
+    if (output_offset_bytes % alignof(double) != 0) return 6;
+    stackdsl::MMapFile output(
+        output_path,
+        true,
+        output_offset_bytes + output_payload_bytes
+    );
     output.advise_sequential();
-    auto* STACKDSL_RESTRICT out = static_cast<double*>(output.data());
+    auto* STACKDSL_RESTRICT out = reinterpret_cast<double*>(
+        static_cast<std::byte*>(output.data()) + output_offset_bytes
+    );
 
     const std::size_t available_cpus = stackdsl::available_cpu_count();
     if (available_cpus_out) *available_cpus_out = available_cpus;
@@ -215,9 +224,8 @@ int run_bound_inputs(
     const int code = error.load(std::memory_order_relaxed);
     if (code != 0) return code;
 
-    const std::size_t output_bytes = output_rows * output_row_bytes;
-    if (async_writeback_bytes > 0 && output_bytes > 0) {
-        output.request_writeback(0, output_bytes);
+    if (async_writeback_bytes > 0 && output_payload_bytes > 0) {
+        output.request_writeback(output_offset_bytes, output_payload_bytes);
     }
     if (rows_out) *rows_out = rows;
     if (seconds_out) {
@@ -241,6 +249,7 @@ extern "C" int cpp_stream_run_arrays(
     const std::size_t* input_widths,
     std::size_t input_count,
     const char* output_path,
+    std::size_t output_offset_bytes,
     std::size_t async_writeback_bytes,
     std::size_t requested_threads,
     int parallel_mode,
@@ -272,6 +281,7 @@ extern "C" int cpp_stream_run_arrays(
             bases,
             rows,
             output_path,
+            output_offset_bytes,
             async_writeback_bytes,
             requested_threads,
             parallel_mode,
