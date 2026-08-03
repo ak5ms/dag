@@ -23,6 +23,26 @@ The fused temporal sum is **2.079x faster** than writing the full computed resul
 
 The final focused parallel suite passed 31 tests, including temporal reduction ownership, row sharding, lane-local feature reduction, final emission, Cat, groupby, `where`, and `roll_rets`.
 
+## Dedicated reduction scaling benchmark
+
+The permanent `scripts/benchmark_cpp_stream_parallel_reductions.py` benchmark uses 1,000,000 rows and 64 instruments. It performs one warmup and seven measured runs for 1, 2, and 4 requested threads. Thread-count order alternates forward and backward between repetitions, workers are pinned, output files are pre-sized, and asynchronous writeback is disabled.
+
+The row-sharded cases construct eight stateless features and reduce across the instrument axis. The lane-sharded cases construct six independent EWM feature streams and reduce only the feature axis, retaining instrument-local temporal state.
+
+Every parallel output is compared exactly with the serial output, including its NaN mask. CI requires every measured multicore count—not only the largest one—to exceed serial throughput. The minimum accepted median speedups are 1.15x for row-sharded reductions and 1.05x for lane-sharded reductions.
+
+| Reduction graph | Planner | 1 thread | 2 threads | 2-thread speedup | 4 threads | 4-thread speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Stateless feature `sum` | rows | 1.057190 M rows/s | 1.995096 M rows/s | **1.887x** | 2.148176 M rows/s | **2.032x** |
+| Stateless feature `mean` | rows | 0.974521 M rows/s | 2.020273 M rows/s | **2.073x** | 2.139966 M rows/s | **2.196x** |
+| Stateless feature `std` | rows | 0.749377 M rows/s | 1.564722 M rows/s | **2.088x** | 1.633382 M rows/s | **2.180x** |
+| EWM feature `sum` | lanes | 0.697127 M rows/s | 1.020304 M rows/s | **1.464x** | 0.921344 M rows/s | **1.322x** |
+| EWM feature `std` | lanes | 0.378995 M rows/s | 0.639478 M rows/s | **1.687x** | 0.690828 M rows/s | **1.823x** |
+
+The runner exposes four logical CPUs as two physical cores with SMT. The initial benchmark revealed that numerical CPU order placed a two-thread run on sibling hardware threads of one physical core. Worker pinning now orders one logical CPU from each physical core before adding SMT siblings. On that topology, the selected order is `0, 2, 1, 3`, making the two-thread measurements use both physical cores.
+
+The EWM feature sum peaks at two threads on this runner because the four-thread configuration adds SMT contention and writes a 512 MB output. It nevertheless remains 1.322x faster than serial and passes the permanent CI floor.
+
 ## Existing parallel workloads after reduction integration
 
 | Graph | 1 thread | 4 threads | Speedup |
