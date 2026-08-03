@@ -17,9 +17,66 @@ jobs:
           ref: cpp-stream-parallel
           fetch-depth: 0
       - name: Rebase onto current backend
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git fetch origin cpp-stream-backend
-          git rebase origin/cpp-stream-backend
+
+          set +e
+          GIT_EDITOR=true git rebase origin/cpp-stream-backend
+          status=$?
+          set -e
+          while [ "$status" -ne 0 ]; do
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            expected="src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/naryop.hpp"
+            if [ "$conflicts" != "$expected" ]; then
+              echo "unexpected rebase conflicts:"
+              printf '%s\n' "$conflicts"
+              exit 1
+            fi
+
+            # During a rebase, --ours is the new backend base. Preserve its
+            # NaN-compatible predicates, then restore the parallel lane bounds.
+            git checkout --ours -- "$expected"
+            python - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/naryop.hpp"
+          )
+          text = path.read_text()
+          old = """        (void)sizeof(Execution);
+                  auto* out = ctx.template write_ptr<Out>();
+                  for (std::size_t lane = 0; lane < N; ++lane) {
+          """
+          new = """        auto* out = ctx.template write_ptr<Out>();
+                  const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+                  const std::size_t end = execution_lane_end<N, Execution>(ctx);
+                  for (std::size_t lane = begin; lane < end; ++lane) {
+          """
+          count = text.count(old)
+          if count != 4:
+              raise SystemExit(f"expected four direct node loops, found {count}")
+          path.write_text(text.replace(old, new))
+          PY
+            git add "$expected"
+
+            set +e
+            GIT_EDITOR=true git rebase --continue
+            status=$?
+            set -e
+          done
+
+          python - <<'PY'
+          from pathlib import Path
+
+          text = Path(
+              "src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/naryop.hpp"
+          ).read_text()
+          assert "predicate_result<R>" in text
+          assert text.count("execution_lane_begin<N, Execution>(ctx)") == 4
+          assert text.count("execution_lane_end<N, Execution>(ctx)") == 4
+          PY
           git push --force-with-lease origin HEAD:cpp-stream-parallel
