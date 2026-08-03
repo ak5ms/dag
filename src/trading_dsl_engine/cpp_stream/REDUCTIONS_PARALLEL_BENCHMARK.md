@@ -2,6 +2,83 @@
 
 The parallel branch is based directly on `cpp-stream-backend` commit `a21928f57b79573b8985edf65a8b97d950d87905`.
 
+## Full DSL reduction composition
+
+Numeric outputs from reductions now retain their complete logical shape and may feed ordinary elementwise DSL operators, `cumsum`, `ewm`, `ffill`, and `shift`. Temporal reductions may also feed downstream algebra. A downstream graph that depends on a temporal reduction is evaluated cumulatively in one pass and implicitly emits only its final value.
+
+The exact alpha-search topology is covered end to end:
+
+```python
+features = [xs_rank(ewm(returns, i)) for i in range(1, 5)]
+pnls = cat(*[
+    default_alpha_pnl(
+        feature,
+        roll_rets=returns,
+        is_tradable=var("is_tradable_out0"),
+        hl=1440,
+    )
+    for feature in features
+])
+pnl = pnls.sum(axis=[1])
+
+path_sharpe = (
+    pnl.cumsum() / (pnl ** 2).cumsum().pow(0.5)
+).emit("last")
+
+reduced_sharpe = pnl.sum(axis=[0, 1]) / pnl.std(axis=[0, 1])
+```
+
+Both forms compile and run as final-output streaming plans. Explicit `emit("last")` remains terminal; the implicit final emission applies only to downstream graphs that depend on a temporal reduction.
+
+## Automatic shapes and direct NumPy output
+
+The public compiler infers `n_instruments` from source row shapes. It selects the unique most frequent non-scalar leading row extent and rejects ambiguous ties or scalar-only mappings instead of guessing.
+
+`runtime.run()` now creates a valid temporary `.npy` file when no output path is supplied. A supplied `.npy` path is also written directly: C++ maps the complete file and writes at the NumPy payload offset, so there is no conversion or full-output copy. `RunResult.load()` opens either `.npy` or raw output using the recorded complete logical shape.
+
+Full 5M × 9 output benchmark, one warmup and ten alternating measured runs:
+
+| Output | Native median | End-to-end median |
+| --- | ---: | ---: |
+| Raw mmap | 0.215533 s | 0.231861 s |
+| Direct `.npy` | 0.213737 s | 0.229781 s |
+
+The `.npy` payload began at byte 128. Direct `.npy` throughput was **1.0084x** raw for native execution and **1.0091x** raw end to end, so the shape-aware format added no performance regression.
+
+## Key-hinted `roll_rets`
+
+`flows.roll_rets_keys` wraps the redundantly lane-repeated `session_start0` key with:
+
+```python
+key(session_start0, row_scalar=True, dtype="float64")
+```
+
+No `num_keys` hint is used because absolute session timestamps have an unbounded domain. `row_scalar=True` allows one group lookup per row rather than repeating the same lookup for every instrument.
+
+Full 5M × 9 `roll_rets` benchmark, one warmup and ten alternating runs:
+
+| Threads | Baseline | Keyed | Keyed speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 6.286373 s | 5.722270 s | **1.0986x** |
+| 4 | 3.918679 s | 3.796296 s | **1.0322x** |
+
+Baseline and keyed outputs were bitwise equivalent with checksum `-344.029681514`.
+
+## Eigen release and allocation benchmark
+
+cpp_stream release builds now define `EIGEN_NO_DEBUG` explicitly in addition to `NDEBUG` and `EIGEN_DONT_PARALLELIZE`. Fixed-size Eigen expressions use `noalias()` where appropriate.
+
+Following the `stulp/eigenrealtime` guidance, a separate allocation-audit build defines `EIGEN_RUNTIME_NO_MALLOC` and disables malloc inside the fixed-size solver. `EIGEN_NO_DEBUG` is intentionally absent from that audit build because it disables Eigen's runtime assertions. The audit passed 10,000 solves without a dynamic allocation.
+
+Full benchmark: 5M rows × 9 instruments, one 3×3 SPD solve per row, one warmup and ten alternating runs:
+
+| Solver | Median | Throughput |
+| --- | ---: | ---: |
+| Custom fixed-size Cholesky | 0.502774 s | 9.9448 M rows/s |
+| Eigen fixed-size solver | 0.680973 s | 7.3424 M rows/s |
+
+Eigen achieved **0.7383x** custom throughput; the custom hot-path solver remained approximately **1.354x faster**. Both produced checksum `12685927.6694`.
+
 ## Streaming terminal reductions
 
 The terminal-reduction benchmark uses 5,000,000 rows, 9 instruments, and 3 computed features, with one warmup and ten measured runs. These reductions use the default `ignore_na=True`; selecting `ignore_na=False` changes missing-value propagation but not the planner's row, lane, or terminal scheduling rules.
@@ -55,21 +132,19 @@ Use `sum(axis=0)` when the requested operation is a reduction over time. Use `em
 
 The permanent `scripts/benchmark_cpp_stream_parallel_reductions.py` benchmark uses 5,000,000 rows and 9 instruments. It performs one warmup and ten measured runs for 1, 2, and 4 requested threads. Thread-count order alternates forward and backward between repetitions, workers are pinned, output files are pre-sized, and asynchronous writeback is disabled. This matches the established 5M × 9 benchmark scale so fixed setup and scheduling costs are amortized consistently.
 
-The row-sharded cases construct eight stateless features and reduce across the instrument axis. The lane-sharded cases construct six independent EWM feature streams and reduce only the feature axis, retaining instrument-local temporal state.
+The row-sharded cases construct eight stateless features and reduce across the instrument axis. The lane-sharded cases use sixteen compute-heavy independent EWM feature streams and reduce only the feature axis. This intentionally tests the profitable lane-parallel regime; lightweight lane graphs remain subject to automatic serial fallback.
 
-Every parallel output is compared exactly with the serial output, including its NaN mask. CI requires every measured multicore count—not only the largest one—to exceed serial throughput. The hosted-runner median floors are 1.15x for row-sharded reductions and 1.01x for lane-sharded reductions. The lower lane floor is deliberate: with only 9 lanes on a two-core/four-thread runner, the four-thread EWM sum is bandwidth- and SMT-limited and has repeatedly measured about 1.04–1.06x, while the two-thread physical-core configuration is materially faster.
+Every parallel output is compared exactly with the serial output, including its NaN mask. CI requires every measured multicore count—not only the largest one—to exceed serial throughput. The accepted median floors remain 1.15x for row-sharded reductions and 1.01x for lane-sharded reductions.
 
 | Reduction graph | Planner | 1 thread | 2 threads | 2-thread speedup | 4 threads | 4-thread speedup |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Stateless feature `sum` | rows | 5.818830 M rows/s | 10.471180 M rows/s | **1.800x** | 11.684285 M rows/s | **2.008x** |
-| Stateless feature `mean` | rows | 5.849669 M rows/s | 10.148507 M rows/s | **1.735x** | 11.255023 M rows/s | **1.924x** |
-| Stateless feature `std` | rows | 3.968740 M rows/s | 7.742193 M rows/s | **1.951x** | 8.621725 M rows/s | **2.172x** |
-| EWM feature `sum` | lanes | 4.728132 M rows/s | 5.478824 M rows/s | **1.159x** | 5.004119 M rows/s | **1.058x** |
-| EWM feature `std` | lanes | 2.587637 M rows/s | 3.913019 M rows/s | **1.512x** | 3.927134 M rows/s | **1.518x** |
+| Stateless feature `sum` | rows | 5.910180 M rows/s | 10.344889 M rows/s | **1.750x** | 11.638776 M rows/s | **1.969x** |
+| Stateless feature `mean` | rows | 5.622389 M rows/s | 9.931293 M rows/s | **1.766x** | 11.207479 M rows/s | **1.993x** |
+| Stateless feature `std` | rows | 3.861272 M rows/s | 7.583330 M rows/s | **1.964x** | 8.603668 M rows/s | **2.228x** |
+| EWM feature `sum` | lanes | 0.937276 M rows/s | 1.419829 M rows/s | **1.515x** | 1.272564 M rows/s | **1.358x** |
+| EWM feature `std` | lanes | 0.607844 M rows/s | 0.947984 M rows/s | **1.560x** | 1.041905 M rows/s | **1.714x** |
 
 The runner exposes four logical CPUs as two physical cores with SMT. Worker pinning orders one logical CPU from each physical core before adding SMT siblings. On this topology, the selected order is `0, 2, 1, 3`, making the two-thread measurements use both physical cores.
-
-The EWM feature sum peaks at two threads because its 360 MB output and relatively light per-value computation become bandwidth/SMT constrained. Four threads remain faster than serial, but only narrowly; two threads are the preferred configuration for this graph on the hosted runner.
 
 ## Existing parallel workloads after reduction integration
 
