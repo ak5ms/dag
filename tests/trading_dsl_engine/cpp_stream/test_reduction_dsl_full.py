@@ -65,3 +65,42 @@ def test_fixed_tensor_elementwise_broadcasting_after_reduction(
     np.testing.assert_allclose(actual, expected)
     assert result.output_mode == "rows"
     assert result.output_shape == (5, 4)
+
+
+def test_default_output_is_direct_shape_aware_npy() -> None:
+    x = np.arange(90, dtype=np.float64).reshape(5, 6, 3)
+    runtime = compile_formula(var("x").sum(axis=1), {"x": x})
+    result = runtime.run()
+    try:
+        actual = result.load()
+        assert isinstance(actual, np.memmap)
+        assert result.output_path.suffix == ".npy"
+        assert actual.shape == (5, 3)
+        assert actual.dtype == np.float64
+        assert result.data_offset == actual.offset
+        np.testing.assert_allclose(actual, np.sum(x, axis=1))
+    finally:
+        result.output_path.unlink(missing_ok=True)
+
+
+def test_n_instruments_uses_dominant_leading_row_extent(tmp_path: Path) -> None:
+    rows = 11
+    x = np.arange(rows * 6 * 4, dtype=np.float64).reshape(rows, 6, 4)
+    y = np.ones((rows, 6), dtype=np.float64)
+    fixed = np.ones((rows, 4), dtype=np.float64)
+    expression = var("x").sum(axis=2) + var("y")
+
+    runtime = compile_formula(
+        expression,
+        {"x": x, "y": y, "fixed": fixed},
+    )
+    # Extra sources remain invalid at execution/compilation, so compile only the
+    # inputs used by the expression while verifying the inference helper through
+    # the public API's source-shape logic.
+    assert runtime.n_instruments == 6
+    result = runtime.run(
+        {"x": x, "y": y},
+        out_path=tmp_path / "automatic-n.npy",
+    )
+    actual = result.load()
+    np.testing.assert_allclose(actual, np.sum(x, axis=2) + y)
