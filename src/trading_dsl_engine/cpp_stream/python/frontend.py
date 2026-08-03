@@ -144,14 +144,17 @@ def compile_ir(
 
 FormulaIRCompileError = neutral_frontend.FormulaIRCompileError
 
-# compile.py imports this module before importing lower_program from lowering.
-# Replace that module attribute after its base definitions are loaded, while the
-# full lowerer continues to reuse its public plan/source/stage data structures.
+# compile.py imports codegen first, then this module, then lower_program. Patch
+# the already-loaded modules before those imported callables are used.
 from trading_dsl_engine.cpp_stream.python import lowering as _lowering  # noqa: E402
+from trading_dsl_engine.cpp_stream.python.codegen_full import (  # noqa: E402
+    install as _install_full_codegen,
+)
 from trading_dsl_engine.cpp_stream.python.lowering_full import (  # noqa: E402
     lower_program as _full_lower_program,
 )
 
+_install_full_codegen()
 _lowering.lower_program = _full_lower_program
 
 
