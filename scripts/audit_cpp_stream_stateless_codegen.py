@@ -22,6 +22,10 @@ FORMULA = os.environ.get(
 N_INSTRUMENTS = int(
     os.environ.get("CPP_STREAM_STATELESS_AUDIT_INSTRUMENTS", "9")
 )
+_ROW_LOOP_HEADERS = (
+    "for (std::size_t t = 0; t < rows; ++t) {",
+    "for (std::size_t t = row_begin; t < row_end; ++t) {",
+)
 
 
 def _stage_types(source: str) -> list[tuple[int, str]]:
@@ -38,13 +42,13 @@ def _stage_types(source: str) -> list[tuple[int, str]]:
 
 
 def _row_loop(source: str, stage_count: int) -> str:
-    start = source.index("    for (std::size_t t = 0; t < rows; ++t) {")
-    last_call = source.index(
-        f"        s{stage_count - 1}.on_data(ctx);",
-        start,
-    )
-    end = source.index("\n    }\n", last_call) + len("\n    }\n")
-    return source[start:end]
+    matches = [header for header in _ROW_LOOP_HEADERS if header in source]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one generated row-loop form, got {matches!r}")
+    start = source.index(matches[0])
+    last_call_text = f"s{stage_count - 1}.on_data(ctx);"
+    last_call = source.index(last_call_text, start)
+    return source[start : last_call + len(last_call_text)]
 
 
 def _kernel_source(
@@ -150,7 +154,7 @@ def main() -> None:
 
     row_loop = _row_loop(generated, len(stages))
     stage_calls = re.findall(
-        r"^        s(\d+)\.on_data\(ctx\);$",
+        r"^\s+s(\d+)\.on_data\(ctx\);$",
         row_loop,
         re.MULTILINE,
     )
