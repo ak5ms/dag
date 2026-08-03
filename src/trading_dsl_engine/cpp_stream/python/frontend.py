@@ -14,7 +14,9 @@ from trading_dsl_engine.ir.types import ValueType, tensor
 _COMPILE_LOCK = RLock()
 
 
-def _broadcast_shapes(shapes: tuple[tuple[int | None, ...], ...]) -> tuple[int | None, ...]:
+def _broadcast_shapes(
+    shapes: tuple[tuple[int | None, ...], ...],
+) -> tuple[int | None, ...]:
     rank = max((len(shape) for shape in shapes), default=0)
     result: list[int | None] = []
     for output_axis in range(rank):
@@ -51,7 +53,11 @@ def _nary_result_type(name: str, children: list[Node]) -> ValueType:
         raise neutral_frontend.FormulaIRCompileError(
             "elementwise operators require numeric tensor values"
         ) from exc
-    dtype = "float64" if len({child.value_type.dtype for child in children}) > 1 else children[0].value_type.dtype
+    dtype = (
+        "float64"
+        if len({child.value_type.dtype for child in children}) > 1
+        else children[0].value_type.dtype
+    )
     return tensor(shape, dtype=dtype)
 
 
@@ -137,6 +143,16 @@ def compile_ir(
 
 
 FormulaIRCompileError = neutral_frontend.FormulaIRCompileError
+
+# compile.py imports this module before importing lower_program from lowering.
+# Replace that module attribute after its base definitions are loaded, while the
+# full lowerer continues to reuse its public plan/source/stage data structures.
+from trading_dsl_engine.cpp_stream.python import lowering as _lowering  # noqa: E402
+from trading_dsl_engine.cpp_stream.python.lowering_full import (  # noqa: E402
+    lower_program as _full_lower_program,
+)
+
+_lowering.lower_program = _full_lower_program
 
 
 __all__ = ["FormulaIRCompileError", "compile_ir"]
