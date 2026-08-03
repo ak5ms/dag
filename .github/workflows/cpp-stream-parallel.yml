@@ -18,7 +18,7 @@ on:
 jobs:
   multicore-tests-and-cat-benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,9 +54,9 @@ jobs:
       - name: Benchmark streaming reductions
         env:
           PYTHONPATH: src
-          CPP_STREAM_REDUCTION_ROWS: "1000000"
+          CPP_STREAM_REDUCTION_ROWS: "5000000"
           CPP_STREAM_REDUCTION_INSTRUMENTS: "9"
-          CPP_STREAM_REDUCTION_RUNS: "7"
+          CPP_STREAM_REDUCTION_RUNS: "10"
           CPP_STREAM_REDUCTION_WARMUPS: "1"
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_reductions.py
