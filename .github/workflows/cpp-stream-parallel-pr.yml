@@ -12,6 +12,7 @@ on:
       - "tests/trading_dsl_engine/ir/**"
       - "tests/trading_dsl_engine/cpp_stream/**"
       - "scripts/benchmark_cpp_stream_parallel_matrix.py"
+      - "scripts/audit_cpp_stream_stateless_codegen.py"
       - ".github/workflows/cpp-stream-parallel-pr.yml"
   workflow_dispatch:
 
@@ -45,6 +46,8 @@ jobs:
           JAX_ENABLE_X64: "1"
         run: >-
           python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_codegen.py
+          tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
           tests/trading_dsl_engine/cpp_stream/test_reductions.py
           tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py
           tests/trading_dsl_engine/cpp_stream/test_parallel.py
@@ -52,6 +55,10 @@ jobs:
           tests/trading_dsl_engine/cpp_stream/test_parallel_row_scalar.py
           tests/trading_dsl_engine/cpp_stream/test_where_broadcast.py
           tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+      - name: Inspect optimized stateless assembly
+        env:
+          PYTHONPATH: src
+        run: python scripts/audit_cpp_stream_stateless_codegen.py
       - name: Run broad pinned multicore benchmark matrix
         env:
           PYTHONPATH: src
