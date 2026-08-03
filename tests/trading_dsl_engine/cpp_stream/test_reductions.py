@@ -87,13 +87,16 @@ def test_row_then_temporal_reduction_composes(tmp_path: Path) -> None:
     assert result.output_path.stat().st_size == 8
 
 
-def test_temporal_reduction_and_emit_must_be_terminal() -> None:
+def test_temporal_reduction_composes_but_emit_remains_terminal(tmp_path: Path) -> None:
+    x_values = np.arange(12, dtype=np.float64).reshape(4, 3)
     x = var("x")
-    data = {"x": np.ones((4, 3), dtype=np.float64)}
+
+    _, result, actual = _run(tmp_path, x.sum(axis=0) + 1.0, {"x": x_values})
+    np.testing.assert_allclose(actual, np.sum(x_values, axis=0) + 1.0)
+    assert result.output_mode == "final"
+
     with pytest.raises(FormulaIRCompileError, match="terminal output"):
-        compile_formula(x.sum(axis=0) + 1.0, data, n_instruments=3)
-    with pytest.raises(FormulaIRCompileError, match="terminal output"):
-        compile_formula(x.emit("last") + 1.0, data, n_instruments=3)
+        compile_formula(x.emit("last") + 1.0, {"x": x_values}, n_instruments=3)
 
 
 def test_string_formula_accepts_list_axes(tmp_path: Path) -> None:
@@ -103,6 +106,7 @@ def test_string_formula_accepts_list_axes(tmp_path: Path) -> None:
     actual = np.fromfile(result.output_path, dtype=np.float64)
     np.testing.assert_allclose(actual, [np.sum(x)])
     assert result.output_shape == ()
+
 
 @pytest.mark.parametrize(
     ("kind", "kwargs"),
@@ -134,4 +138,3 @@ def test_string_reduction_ignore_na_defaults_true(tmp_path: Path) -> None:
     result = runtime.run(out_path=tmp_path / "default-ignore-na.bin")
     actual = np.fromfile(result.output_path, dtype=np.float64)
     np.testing.assert_allclose(actual, np.nansum(x, axis=0))
-
