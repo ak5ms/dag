@@ -32,6 +32,10 @@ _TEMPORAL_KINDS = {
     "ffill",
     "shift",
     "ewm",
+    "tensor_cumsum",
+    "tensor_ffill",
+    "tensor_shift",
+    "tensor_ewm",
     "instrument_basis",
     "groupby",
 }
@@ -48,6 +52,14 @@ _LANE_LOCAL_KINDS = {
     "ewm",
     "cat",
     "instrument_basis",
+    "tensor_copy",
+    "tensor_unary",
+    "tensor_binary",
+    "tensor_ternary",
+    "tensor_cumsum",
+    "tensor_ffill",
+    "tensor_shift",
+    "tensor_ewm",
 }
 
 _LANE_AUTO_MULTICORE_MIN_SCORE = 16
@@ -62,6 +74,14 @@ _EXPERIMENTAL_STAGE_WORK = {
     "ffill": 2,
     "shift": 2,
     "ewm": 3,
+    "tensor_copy": 1,
+    "tensor_unary": 1,
+    "tensor_binary": 1,
+    "tensor_ternary": 1,
+    "tensor_cumsum": 2,
+    "tensor_ffill": 2,
+    "tensor_shift": 2,
+    "tensor_ewm": 3,
     "cat": 2,
     "reduce": 2,
     "emit_last": 1,
@@ -85,7 +105,9 @@ def _ridge_is_stateful(stage: Stage) -> bool:
 
 
 def _reduction_is_temporal(stage: Stage) -> bool:
-    return stage.kind == "reduce" and bool(getattr(stage.op, "temporal", False))
+    return stage.kind == "reduce" and bool(
+        getattr(stage.op, "temporal", False)
+    )
 
 
 def _reduction_is_lane_local(stage: Stage, n_instruments: int) -> bool:
@@ -189,6 +211,23 @@ def _group_lane_local(stage: Stage, n_instruments: int) -> bool:
     )
 
 
+def _tensor_stage_lane_local(stage: Stage, n_instruments: int) -> bool:
+    """Tensor stages are lane-local only with an instrument-leading shape."""
+    return bool(
+        stage.out.shape
+        and stage.out.shape[0] == n_instruments
+        and stage.out.size % n_instruments == 0
+        and all(
+            source.shape == ()
+            or (
+                source.shape
+                and source.shape[0] in {1, n_instruments}
+            )
+            for source in stage.inputs
+        )
+    )
+
+
 def _plan_is_lane_independent(
     plan: Plan,
     n_instruments: int,
@@ -213,7 +252,9 @@ def _plan_is_lane_independent(
         if not inputs_ready:
             return False
 
-        if stage.kind in _LANE_LOCAL_KINDS:
+        if stage.kind.startswith("tensor_"):
+            local = _tensor_stage_lane_local(stage, n_instruments)
+        elif stage.kind in _LANE_LOCAL_KINDS:
             local = True
         elif stage.kind == "reduce":
             local = _reduction_is_lane_local(stage, n_instruments)
