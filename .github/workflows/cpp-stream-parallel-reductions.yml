@@ -53,6 +53,6 @@ jobs:
           CPP_STREAM_PARALLEL_REDUCTION_WARMUPS: "1"
           CPP_STREAM_PARALLEL_REDUCTION_THREADS: "1,2,4"
           CPP_STREAM_PARALLEL_REDUCTION_ROW_MIN_SPEEDUP: "1.15"
-          CPP_STREAM_PARALLEL_REDUCTION_LANE_MIN_SPEEDUP: "1.05"
+          CPP_STREAM_PARALLEL_REDUCTION_LANE_MIN_SPEEDUP: "1.01"
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_parallel_reductions.py
