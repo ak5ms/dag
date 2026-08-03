@@ -5,6 +5,7 @@ on:
     branches: [cpp-stream-backend]
     paths: [.github/workflows/audit-cpp-stream-stateless.yml]
 
+# Temporary validation workflow; removed before the backend branch is advanced.
 jobs:
   audit:
     runs-on: ubuntu-24.04
