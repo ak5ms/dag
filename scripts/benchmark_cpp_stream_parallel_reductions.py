@@ -297,17 +297,19 @@ def benchmark(workload: Workload, counts: tuple[int, ...]) -> list[dict[str, obj
             }
         )
 
-    multicore = rows[-1]
-    if float(multicore["speedup"]) < workload.minimum_speedup:
-        raise RuntimeError(
-            f"{workload.name} multicore reduction did not meet speedup floor: "
-            f"{multicore['speedup']:.4f}x < {workload.minimum_speedup:.4f}x"
-        )
-    if float(multicore["median_busy"]) <= 1.10:
-        raise RuntimeError(
-            f"{workload.name} did not demonstrate multicore execution: "
-            f"median_busy_cores={multicore['median_busy']:.3f}"
-        )
+    for multicore in rows[1:]:
+        if float(multicore["speedup"]) < workload.minimum_speedup:
+            raise RuntimeError(
+                f"{workload.name} requested_threads={multicore['requested']} "
+                f"did not meet speedup floor: {multicore['speedup']:.4f}x < "
+                f"{workload.minimum_speedup:.4f}x"
+            )
+        if float(multicore["median_busy"]) <= 1.10:
+            raise RuntimeError(
+                f"{workload.name} requested_threads={multicore['requested']} "
+                f"did not demonstrate multicore execution: "
+                f"median_busy_cores={multicore['median_busy']:.3f}"
+            )
 
     for path in outputs.values():
         path.unlink(missing_ok=True)
