@@ -10,6 +10,10 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
+#if defined(STACKDSL_EIGEN_RUNTIME_NO_MALLOC) && defined(EIGEN_NO_DEBUG)
+#error "Eigen runtime allocation assertions require EIGEN_NO_DEBUG to be absent"
+#endif
+
 namespace stackdsl::eigen_detail {
 
 template <std::size_t K>
@@ -34,13 +38,6 @@ using ConstVectorMap = Eigen::Map<const Vector<K>>;
 
 template <std::size_t K>
 using VectorMap = Eigen::Map<Vector<K>>;
-
-#if defined(STACKDSL_EIGEN_RUNTIME_NO_MALLOC)
-static_assert(
-    !defined(EIGEN_NO_DEBUG),
-    "Eigen runtime allocation assertions require EIGEN_NO_DEBUG to be absent"
-);
-#endif
 
 struct MallocAuditGuard {
     MallocAuditGuard() noexcept {
