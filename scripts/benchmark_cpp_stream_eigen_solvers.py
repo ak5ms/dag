@@ -104,7 +104,7 @@ void build_row(
     }
 }
 
-int main(int argc, char** argv) {
+int benchmark_main(int argc, char** argv) {
     if (argc != 3) return 2;
     const std::string mode = argv[1];
     const std::size_t rows = static_cast<std::size_t>(std::strtoull(argv[2], nullptr, 10));
@@ -135,6 +135,10 @@ int main(int argc, char** argv) {
               << "checksum=" << checksum << "\n";
     return 0;
 }
+}  // namespace
+
+int main(int argc, char** argv) {
+    return benchmark_main(argc, argv);
 }
 '''.replace("__N__", str(N))
 
@@ -218,7 +222,11 @@ def main() -> None:
         timings = {"custom": [], "eigen": []}
         checksums = {"custom": [], "eigen": []}
         for repetition in range(RUNS):
-            order = ("custom", "eigen") if repetition % 2 == 0 else ("eigen", "custom")
+            order = (
+                ("custom", "eigen")
+                if repetition % 2 == 0
+                else ("eigen", "custom")
+            )
             for mode in order:
                 seconds, checksum = execute(benchmark, mode, ROWS)
                 timings[mode].append(seconds)
@@ -234,8 +242,14 @@ def main() -> None:
 
         custom = median(timings["custom"])
         eigen = median(timings["eigen"])
-        print("custom_runs=" + ", ".join(f"{value:.6f}" for value in timings["custom"]))
-        print("eigen_runs=" + ", ".join(f"{value:.6f}" for value in timings["eigen"]))
+        print(
+            "custom_runs="
+            + ", ".join(f"{value:.6f}" for value in timings["custom"])
+        )
+        print(
+            "eigen_runs="
+            + ", ".join(f"{value:.6f}" for value in timings["eigen"])
+        )
         print(f"custom_median_seconds={custom:.6f}")
         print(f"eigen_median_seconds={eigen:.6f}")
         print(f"custom_rows_per_second={ROWS / custom:.6f}")
