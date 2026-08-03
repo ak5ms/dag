@@ -1,0 +1,25 @@
+name: rebase cpp_stream parallel onto NaN-compatible backend
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths: [.github/workflows/rebase-parallel-stateless-audit.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-parallel
+          fetch-depth: 0
+      - name: Rebase onto current backend
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin cpp-stream-backend
+          git rebase origin/cpp-stream-backend
+          git push --force-with-lease origin HEAD:cpp-stream-parallel
