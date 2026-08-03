@@ -1,0 +1,180 @@
+name: audit cpp_stream stateless codegen
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths: [.github/workflows/audit-cpp-stream-stateless.yml]
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cpp-stream-stateless-nan-audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba pytest jinja2 jax equinox astropy
+          includeigen pybind11 matplotlib graphviz
+      - name: Compare NaN semantics and inspect optimized assembly
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: '1'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import subprocess
+          import tempfile
+
+          import includeigen
+          import numpy as np
+
+          from trading_dsl_engine.cpp_stream import compile_formula as compile_cpp
+          from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
+          from trading_dsl_engine.cpp_stream.python.lowering import lower_program
+          from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
+          from trading_dsl_engine.ir import compile_ir
+          from trading_dsl_engine.jax_flat import engine as jax_flat
+
+          data = {
+              'x': np.array(
+                  [
+                      [1.0, np.nan, 3.0, 3.0, -2.0, 7.0, np.inf, 0.0, 5.0],
+                      [np.nan, np.nan, 2.0, 2.0, 4.0, -1.0, 8.0, 8.0, 0.0],
+                  ],
+                  dtype=np.float64,
+              ),
+              'y': np.array(
+                  [
+                      [0.5, 4.0, np.nan, 1.0, -2.0, 2.0, 1.0, np.nan, 5.0],
+                      [1.0, np.nan, 2.0, 3.0, np.nan, -1.0, 1.0, 7.0, 0.0],
+                  ],
+                  dtype=np.float64,
+              ),
+          }
+
+          def run_cpp(formula: str) -> np.ndarray:
+              with tempfile.TemporaryDirectory() as tmp:
+                  runtime = compile_cpp(formula, data, n_instruments=9)
+                  result = runtime.run(out_path=Path(tmp) / 'out.bin')
+                  return np.fromfile(result.output_path, dtype=np.float64).reshape(result.output_shape)
+
+          def run_jax(formula: str) -> np.ndarray:
+              runtime = jax_flat.compile_formula(formula, cpp=False)
+              _, out = runtime.run_batch(data)
+              return np.asarray(out)
+
+          formulas = [
+              'xs_rank((x + 5 + y) * 3)',
+              'x > y',
+              'x == y',
+              'x & y',
+              'fillna(x, y)',
+              'where(x, y, 0)',
+          ]
+          for formula in formulas:
+              cpp = run_cpp(formula)
+              jax = run_jax(formula)
+              equal = np.allclose(cpp, jax, rtol=0.0, atol=0.0, equal_nan=True)
+              print(f'FORMULA {formula!r} equal={equal}')
+              if not equal:
+                  print('cpp=', cpp)
+                  print('jax=', jax)
+
+          cpp_mean = run_cpp('mean(x, axis=1)')
+          jax_mean = run_jax('mean(x)')
+          print('ROW_MEAN equal=', np.allclose(cpp_mean, jax_mean, rtol=0.0, atol=0.0, equal_nan=True))
+          print('cpp_mean=', cpp_mean)
+          print('jax_mean=', jax_mean)
+
+          formula = 'xs_rank((x + 5 + y) * 3)'
+          n = 9
+          program = compile_ir(formula)
+          input_types = (InputTypeSpec('float64', n), InputTypeSpec('float64', n))
+          plan = lower_program(
+              program,
+              n_instruments=n,
+              input_dtypes=tuple(spec.dtype for spec in input_types),
+          )
+          source = render_translation_unit(
+              plan,
+              n_instruments=n,
+              prefetch_rows=16,
+              input_types=input_types,
+          ).text
+          loop_start = source.index('    for (std::size_t t = 0; t < rows; ++t) {')
+          loop_end = source.index('    }\n', loop_start) + 6
+          print('\nGENERATED ROW LOOP\n', source[loop_start:loop_end])
+
+          stage_types = []
+          for match in re.finditer(r'^    (stackdsl::.+) s(\d+)\{\};$', source, re.MULTILINE):
+              stage_types.append((int(match.group(2)), match.group(1)))
+          stage_types.sort()
+          print('STAGE COUNT', len(stage_types))
+          for index, cpp_type in stage_types:
+              print(f's{index}: {cpp_type}')
+
+          cpp_root = Path('src/trading_dsl_engine/cpp_stream/cpp').resolve()
+          eigen = Path(includeigen.get_include()).resolve()
+          kernel = [
+              '#include <cstddef>',
+              '#include "stackdsl/runtime.hpp"',
+              'struct AuditKernel {',
+          ]
+          for index, cpp_type in stage_types:
+              kernel.append(f'    {cpp_type} s{index}{{}};')
+          kernel.append('    void setup() noexcept {')
+          for index, _ in stage_types:
+              kernel.append(f'        s{index}.setup();')
+          kernel.extend([
+              '    }',
+              '    __attribute__((noinline)) void run(const double* x, const double* y, double* out) noexcept {',
+              f'        stackdsl::RowContext<{n}, 2, {plan.scratch_slots}, {plan.matrix_scratch_slots}, {plan.matrix_scratch_width}> ctx{{}};',
+              '        ctx.inputs[0] = x;',
+              '        ctx.inputs[1] = y;',
+              '        ctx.output = out;',
+          ])
+          for index, _ in stage_types:
+              kernel.append(f'        s{index}.on_data(ctx);')
+          kernel.extend([
+              '    }',
+              '};',
+              'extern "C" __attribute__((noinline)) void stateless_kernel(AuditKernel* kernel, const double* x, const double* y, double* out) noexcept {',
+              '    kernel->run(x, y, out);',
+              '}',
+          ])
+          kernel_path = Path('/tmp/stateless_kernel.cpp')
+          asm_path = Path('/tmp/stateless_kernel.s')
+          opt_path = Path('/tmp/stateless_kernel.opt')
+          vec_path = Path('/tmp/stateless_kernel.vec')
+          kernel_path.write_text('\n'.join(kernel) + '\n')
+          command = [
+              os.environ.get('CXX', 'g++'),
+              '-std=c++20', '-O3', '-DNDEBUG', '-fno-math-errno', '-funroll-loops',
+              '-march=native', '-mtune=native', '-masm=intel', '-S',
+              f'-I{cpp_root}', f'-I{eigen}',
+              f'-fopt-info-vec-optimized={vec_path}',
+              str(kernel_path), '-o', str(asm_path),
+          ]
+          print('COMPILE', ' '.join(command))
+          subprocess.run(command, check=True)
+          assembly = asm_path.read_text()
+          match = re.search(
+              r'(?ms)^_ZN11AuditKernel3runEPKdS1_Pd(?:\.constprop\.\d+)?:.*?^\s*\.size\s+_ZN11AuditKernel3runEPKdS1_Pd(?:\.constprop\.\d+)?,',
+              assembly,
+          )
+          if match is None:
+              match = re.search(r'(?ms)^stateless_kernel:.*?^\s*\.size\s+stateless_kernel,', assembly)
+          body = match.group(0) if match else assembly
+          print('\nASSEMBLY KERNEL\n', body[:30000])
+          print('\nVECTOR REPORT\n', vec_path.read_text() if vec_path.exists() else '<none>')
+          print('CALL INSTRUCTIONS', len(re.findall(r'^\s*call\s', body, re.MULTILINE)))
+          print('SCRATCH SLOT COUNT', plan.scratch_slots)
+          PY
