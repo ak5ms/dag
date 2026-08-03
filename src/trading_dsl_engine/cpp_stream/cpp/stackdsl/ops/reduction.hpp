@@ -195,6 +195,13 @@ struct ReductionNode {
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         if constexpr (Temporal) {
             accumulate(state, ctx);
+            // A terminal temporal reduction writes only during finalize(). When it
+            // feeds downstream DSL nodes, Out is scratch storage and the current
+            // cumulative value is exposed on every row. A terminal downstream
+            // expression is implicitly wrapped in emit('last') by the frontend.
+            if constexpr (!std::is_same_v<Out, OutputDst>) {
+                write_result(state, ctx);
+            }
         } else {
             State row{};
             row.reset();
@@ -205,7 +212,7 @@ struct ReductionNode {
 
     template <class Context>
     STACKDSL_HOT void finalize(Context& ctx) noexcept {
-        write_result(state, ctx);
+        if constexpr (Temporal) write_result(state, ctx);
     }
 };
 
