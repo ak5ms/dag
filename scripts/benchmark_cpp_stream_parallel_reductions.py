@@ -12,9 +12,9 @@ from trading_dsl_engine.base.dsl import cat, ewm, var
 from trading_dsl_engine.cpp_stream import compile_formula
 
 
-ROWS = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_ROWS", "1000000"))
-N = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_INSTRUMENTS", "64"))
-RUNS = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_RUNS", "7"))
+ROWS = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_ROWS", "5000000"))
+N = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_INSTRUMENTS", "9"))
+RUNS = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_RUNS", "10"))
 WARMUPS = int(os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_WARMUPS", "1"))
 THREAD_TEXT = os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_THREADS", "1,2,4")
 CASE_TEXT = os.environ.get("CPP_STREAM_PARALLEL_REDUCTION_CASE", "all")
