@@ -9,6 +9,7 @@ on:
       - "tests/trading_dsl_engine/cpp_stream/test_cat_parallel.py"
       - "tests/trading_dsl_engine/cpp_stream/test_reductions.py"
       - "tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py"
+      - "tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py"
       - "scripts/benchmark_cpp_stream_cat_parallel.py"
       - "scripts/benchmark_cpp_stream_reductions.py"
       - ".github/workflows/cpp-stream-parallel.yml"
@@ -45,6 +46,7 @@ jobs:
           JAX_ENABLE_X64: "1"
         run: >-
           python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
           tests/trading_dsl_engine/cpp_stream/test_reductions.py
           tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py
           tests/trading_dsl_engine/cpp_stream/test_parallel.py
