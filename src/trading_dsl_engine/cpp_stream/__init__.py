@@ -8,6 +8,7 @@ from trading_dsl_engine.cpp_stream.python import (
     SourceAdapter,
     SourceInfo,
     compile_formula,
+    infer_n_instruments,
     inspect_source,
     inspect_source_mapping,
     open_source,
@@ -17,6 +18,7 @@ from trading_dsl_engine.cpp_stream.python import (
 
 __all__ = [
     "compile_formula",
+    "infer_n_instruments",
     "CppStreamRuntime",
     "RunResult",
     "Key",
