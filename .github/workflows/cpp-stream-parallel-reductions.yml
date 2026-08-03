@@ -23,6 +23,7 @@ jobs:
       - name: Verify multicore runner
         run: |
           lscpu
+          lscpu -e=CPU,CORE,SOCKET,NODE
           python - <<'PY'
           import os
           affinity = tuple(sorted(os.sched_getaffinity(0)))
