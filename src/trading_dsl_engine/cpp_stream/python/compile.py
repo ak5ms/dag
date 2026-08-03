@@ -16,6 +16,7 @@ import includeigen
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
+from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.parallel import select_parallel_plan
@@ -25,7 +26,6 @@ from trading_dsl_engine.cpp_stream.python.sources import (
     SourceValue,
     inspect_source_mapping,
 )
-from trading_dsl_engine.ir.frontend import compile_ir
 from trading_dsl_engine.ir.ops import (
     CumsumOp,
     EwmOp,
@@ -36,10 +36,9 @@ from trading_dsl_engine.ir.ops import (
     ShiftOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
-from trading_dsl_engine.ir.types import SCALAR, VECTOR, ValueType, matrix, tensor
+from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 
-_LOGICAL_NARY = {"eq", "ne", "lt", "gt", "le", "ge", "and_", "or_", "xor"}
 _LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp)
 
 
@@ -77,6 +76,7 @@ def _flags() -> tuple[list[str], list[str]]:
         "-std=c++20",
         "-O3",
         "-DNDEBUG",
+        "-DEIGEN_NO_DEBUG",
         "-fPIC",
         "-shared",
         "-pthread",
@@ -177,58 +177,43 @@ def _input_value_type(spec: InputTypeSpec, n_instruments: int) -> ValueType:
     return tensor(logical_shape, dtype=spec.dtype)
 
 
+def _broadcast_shapes(shapes: tuple[tuple[int | None, ...], ...]) -> tuple[int | None, ...]:
+    rank = max((len(shape) for shape in shapes), default=0)
+    result: list[int | None] = []
+    for output_axis in range(rank):
+        aligned: list[int | None] = []
+        for shape in shapes:
+            input_axis = output_axis - (rank - len(shape))
+            aligned.append(1 if input_axis < 0 else shape[input_axis])
+        chosen: int | None = 1
+        for extent in aligned:
+            if extent == 1:
+                continue
+            if chosen == 1:
+                chosen = extent
+            elif extent != chosen:
+                raise TypeError(
+                    f"operands could not be broadcast together in cpp_stream: {shapes!r}"
+                )
+        result.append(chosen)
+    return tuple(result)
+
+
 def _broadcast_result_type(name: str, children: tuple[Node, ...]) -> ValueType:
-    """Infer scalar/vector/matrix broadcasting from every operand.
-
-    NumPy-style selection includes the condition in shape broadcasting. This is
-    important for ``where(vector_condition, scalar, scalar)`` and for macros such
-    as ``mask`` whose vector condition feeds scalar branches.
-    """
-
-    if name in _LOGICAL_NARY:
-        if any(child.value_type.kind == "matrix" for child in children):
-            raise TypeError(f"{name} matrix values are unsupported in cpp_stream")
-        return (
-            VECTOR
-            if any(child.value_type.kind == "vector" for child in children)
-            else SCALAR
-        )
-
-    matrices = [
-        child.value_type
-        for child in children
-        if child.value_type.kind == "matrix"
-    ]
-    vectors = [child for child in children if child.value_type.kind == "vector"]
-    unsupported = [
-        child.value_type.kind
-        for child in children
-        if child.value_type.kind not in {"scalar", "vector", "matrix"}
-    ]
-    if unsupported:
-        raise TypeError(
-            f"{name} cannot consume object/fixed/tensor values in cpp_stream: "
-            f"{unsupported}"
-        )
-    if matrices:
-        widths = {value.width for value in matrices}
-        if len(widths) != 1 or vectors:
-            raise TypeError(
-                f"{name} matrix broadcasting requires equal-width matrices and scalars"
-            )
-        return matrix(next(iter(widths)))
-    return VECTOR if vectors else SCALAR
+    del name
+    if any(child.value_type.kind == "object" for child in children):
+        raise TypeError("elementwise operators cannot consume object values")
+    shapes = tuple(child.value_type.logical_shape for child in children)
+    dtype = (
+        children[0].value_type.dtype
+        if len({child.value_type.dtype for child in children}) == 1
+        else "float64"
+    )
+    return tensor(_broadcast_shapes(shapes), dtype=dtype)
 
 
 def _repair_value_types(program: Program) -> Program:
-    """Propagate corrected broadcasting through downstream temporal nodes.
-
-    The reversible parallel branch cannot safely lane-shard a graph if an upstream
-    vector is still labelled scalar. Recompute affected types in topological order,
-    and recurse into groupby inner programs. The shared frontend should ultimately
-    own this inference; this pass keeps cpp_stream correct while the parallel work
-    remains isolated on its subbranch.
-    """
+    """Propagate tensor broadcasting and shape-preserving temporal operators."""
 
     nodes: list[Node] = []
     for original in program.nodes:
@@ -255,10 +240,9 @@ def _repair_value_types(program: Program) -> Program:
                     f"{type(op).__name__} expected one child, got {len(child_nodes)}"
                 )
             child_type = child_nodes[0].value_type
-            if child_type.kind not in {"scalar", "vector"}:
+            if child_type.kind == "object":
                 raise TypeError(
-                    f"{type(op).__name__} requires scalar/vector input, "
-                    f"got {child_type.kind!r}"
+                    f"{type(op).__name__} cannot consume object values"
                 )
             node = replace(node, value_type=child_type)
         nodes.append(node)
