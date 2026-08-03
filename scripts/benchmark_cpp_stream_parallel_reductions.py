@@ -119,6 +119,12 @@ def build_workloads(root: Path) -> dict[str, Workload]:
 
     # Reducing axis 2 removes only the feature dimension. The EWM state stays
     # instrument-local, so workers can own disjoint lane ranges for all rows.
+    #
+    # Six lightweight EWMs are not reliably profitable at N=9 because lane
+    # sharding has to advance the complete time axis in every worker. Use a
+    # realistic compute-heavy reduction graph here so the permanent benchmark
+    # tests the planner's intended profitable lane-parallel regime rather than
+    # asserting that explicitly forced parallelism must accelerate every graph.
     temporal_features = cat(
         ewm(x * 1.01 + y, 8),
         ewm(x - y * 0.1, 12),
@@ -126,6 +132,16 @@ def build_workloads(root: Path) -> dict[str, Workload]:
         ewm((x + y) * 0.5, 24),
         ewm((x - z) ** 2, 32),
         ewm(y / (z * z + 0.25), 48),
+        ewm((x + z) * (y - 0.25), 56),
+        ewm((x * x + y * y) / (z * z + 0.5), 64),
+        ewm((x - y) * (x + z), 72),
+        ewm((y - z) ** 2 + x * 0.01, 80),
+        ewm((x + 2.0 * y - z) / (x * x + 1.0), 96),
+        ewm((x * z - y) ** 2, 112),
+        ewm((x + y + z) * 0.3333333333333333, 128),
+        ewm((x - 0.5 * y) / (z * z + 1.0), 144),
+        ewm((x * y * z) / (x * x + y * y + 1.0), 160),
+        ewm((x + z) ** 2 - y * 0.25, 192),
     )
 
     return {
