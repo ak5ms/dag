@@ -180,10 +180,15 @@ def test_ridge_consumes_cat_as_lazy_feature_list_without_cat_materialization():
 def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
     source = _render("xs_rank((x + 5 + y) * 3)", n=9)
     loop_start = source.index("    for (std::size_t t = 0; t < rows; ++t) {")
-    loop_end = source.index("    }\n", loop_start) + 6
+    last_call = source.index("        s3.on_data(ctx);", loop_start)
+    loop_end = source.index("\n    }\n", last_call) + len("\n    }\n")
     row_loop = source[loop_start:loop_end]
 
-    stage_calls = re.findall(r"^        s(\d+)\.on_data\(ctx\);$", row_loop, re.MULTILINE)
+    stage_calls = re.findall(
+        r"^        s(\d+)\.on_data\(ctx\);$",
+        row_loop,
+        re.MULTILINE,
+    )
     assert stage_calls == ["0", "1", "2", "3"]
     assert source.count("stackdsl::BinaryNode<9,") == 3
     assert source.count("stackdsl::XsRankNode<9,") == 1
