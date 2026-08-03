@@ -87,20 +87,16 @@ def test_n_instruments_uses_dominant_leading_row_extent(tmp_path: Path) -> None:
     rows = 11
     x = np.arange(rows * 6 * 4, dtype=np.float64).reshape(rows, 6, 4)
     y = np.ones((rows, 6), dtype=np.float64)
-    fixed = np.ones((rows, 4), dtype=np.float64)
-    expression = var("x").sum(axis=2) + var("y")
+    fixed = np.arange(rows * 4, dtype=np.float64).reshape(rows, 4)
+    fixed_row_scalar = var("fixed").sum(axis=1)
+    expression = var("x").sum(axis=2) + var("y") + fixed_row_scalar
 
     runtime = compile_formula(
         expression,
         {"x": x, "y": y, "fixed": fixed},
     )
-    # Extra sources remain invalid at execution/compilation, so compile only the
-    # inputs used by the expression while verifying the inference helper through
-    # the public API's source-shape logic.
     assert runtime.n_instruments == 6
-    result = runtime.run(
-        {"x": x, "y": y},
-        out_path=tmp_path / "automatic-n.npy",
-    )
+    result = runtime.run(out_path=tmp_path / "automatic-n.npy")
     actual = result.load()
-    np.testing.assert_allclose(actual, np.sum(x, axis=2) + y)
+    expected = np.sum(x, axis=2) + y + np.sum(fixed, axis=1)[:, None]
+    np.testing.assert_allclose(actual, expected)
