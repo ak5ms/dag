@@ -9,10 +9,22 @@ from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir import compile_ir
 
 
+_ROW_LOOP_HEADERS = (
+    "for (std::size_t t = 0; t < rows; ++t) {",
+    "for (std::size_t t = row_begin; t < row_end; ++t) {",
+)
+
+
 def _render(formula, *, n: int = 5) -> str:
     program = compile_ir(formula)
     plan = lower_program(program, n_instruments=n)
     return render_translation_unit(plan, n_instruments=n, prefetch_rows=16).text
+
+
+def _generated_row_loop_header(source: str) -> str:
+    matches = [header for header in _ROW_LOOP_HEADERS if header in source]
+    assert len(matches) == 1, matches
+    return matches[0]
 
 
 def test_cpp_stream_codegen_uses_packaged_jinja_template():
@@ -161,7 +173,9 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
 
 def test_generated_runtime_has_one_row_pass_and_cse_for_repeated_cat_branches():
     source = _render("cat(close + 1, close + 1, close + 2)")
-    assert source.count("for (std::size_t t = 0; t < rows; ++t)") == 1
+    header = _generated_row_loop_header(source)
+    assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
+    assert source.count(header) == 1
     assert source.count("ctx.inputs[0] =") == 1
     assert source.count("stackdsl::BinaryNode<5,") == 2
     assert source.count("stackdsl::CatNode<") == 1
@@ -179,19 +193,20 @@ def test_ridge_consumes_cat_as_lazy_feature_list_without_cat_materialization():
 
 def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
     source = _render("xs_rank((x + 5 + y) * 3)", n=9)
-    loop_start = source.index("    for (std::size_t t = 0; t < rows; ++t) {")
-    last_call = source.index("        s3.on_data(ctx);", loop_start)
-    loop_end = source.index("\n    }\n", last_call) + len("\n    }\n")
-    row_loop = source[loop_start:loop_end]
+    header = _generated_row_loop_header(source)
+    loop_start = source.index(header)
+    last_call_text = "s3.on_data(ctx);"
+    last_call = source.index(last_call_text, loop_start)
+    row_loop_prefix = source[loop_start : last_call + len(last_call_text)]
 
     stage_calls = re.findall(
-        r"^        s(\d+)\.on_data\(ctx\);$",
-        row_loop,
+        r"^\s+s(\d+)\.on_data\(ctx\);$",
+        row_loop_prefix,
         re.MULTILINE,
     )
     assert stage_calls == ["0", "1", "2", "3"]
     assert source.count("stackdsl::BinaryNode<9,") == 3
     assert source.count("stackdsl::XsRankNode<9,") == 1
-    assert source.count("for (std::size_t t = 0; t < rows; ++t)") == 1
-    assert row_loop.count("ctx.inputs[0] =") == 1
-    assert row_loop.count("ctx.inputs[1] =") == 1
+    assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
+    assert row_loop_prefix.count("ctx.inputs[0] =") == 1
+    assert row_loop_prefix.count("ctx.inputs[1] =") == 1
