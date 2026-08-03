@@ -41,11 +41,16 @@ jobs:
           tests/trading_dsl_engine/cpp_stream/test_sources.py
           tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
           tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+          tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
           tests/trading_dsl_engine/cpp_stream/test_minute_groupby.py
           tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
           tests/trading_dsl_engine/cpp_stream/test_einsum.py
           tests/trading_dsl_engine/cpp_stream/test_reductions.py
           tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+      - name: Inspect optimized stateless assembly
+        env:
+          PYTHONPATH: src
+        run: python scripts/audit_cpp_stream_stateless_codegen.py
       - name: Compare unhinted and typed hinted minute keys
         env:
           PYTHONPATH: src
