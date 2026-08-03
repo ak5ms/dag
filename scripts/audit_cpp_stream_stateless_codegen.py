@@ -144,7 +144,9 @@ def main() -> None:
     ).text
     stages = _stage_types(generated)
     if len(stages) != 4:
-        raise AssertionError(f"expected three arithmetic stages plus rank, got {stages!r}")
+        raise AssertionError(
+            f"expected three arithmetic stages plus rank, got {stages!r}"
+        )
 
     row_loop = _row_loop(generated, len(stages))
     stage_calls = re.findall(
@@ -201,14 +203,23 @@ def main() -> None:
             else ""
         )
 
-    call_count = len(re.findall(r"(?m)^\s*call\s", assembly))
-    if call_count != 0:
+    calls = re.findall(r"(?m)^\s*call\s+([^\s]+)", assembly)
+    unexpected_calls = [
+        target
+        for target in calls
+        if not target.startswith("__stack_chk_fail")
+    ]
+    if unexpected_calls:
         raise AssertionError(
-            "stateless hot kernel contains out-of-line calls:\n" + assembly
+            "stateless hot kernel contains operator/stage calls "
+            f"{unexpected_calls!r}:\n{assembly}"
         )
 
-    packed_add = re.search(r"\bv(?:f?m)?add[^\s]*pd\b|\bvaddpd\b", assembly)
-    packed_mul = re.search(r"\bvmul[^\s]*pd\b|\bvfm(?:add|sub)[^\s]*pd\b", assembly)
+    packed_add = re.search(r"\bvaddpd\b", assembly)
+    packed_mul = re.search(
+        r"\bvmulpd\b|\bvfm(?:add|sub)[^\s]*pd\b",
+        assembly,
+    )
     scalar_add = re.search(r"\bvaddsd\b|\baddsd\b", assembly)
     scalar_mul = re.search(r"\bvmulsd\b|\bmulsd\b", assembly)
     add_match = packed_add or scalar_add
@@ -227,7 +238,8 @@ def main() -> None:
     print(f"instruments: {N_INSTRUMENTS}")
     print(f"scratch slots in logical plan: {plan.scratch_slots}")
     print(f"adjacent generated stage calls: {stage_calls}")
-    print(f"out-of-line calls in optimized row kernel: {call_count}")
+    print(f"all assembly call targets: {calls}")
+    print(f"operator/stage calls in optimized row kernel: {unexpected_calls}")
     print("vectorization report:")
     print(vector_report.strip() or "<compiler emitted no vectorization remarks>")
     print("optimized AuditKernel::run assembly:")
