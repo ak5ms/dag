@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <fstream>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -11,6 +14,71 @@
 #endif
 
 namespace stackdsl {
+
+#if defined(__linux__)
+inline bool read_cpu_topology_value(
+    unsigned cpu,
+    const char* field,
+    int& value
+) {
+    const std::string path =
+        "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+        "/topology/" + field;
+    std::ifstream input(path);
+    return static_cast<bool>(input >> value);
+}
+
+inline std::vector<unsigned> physical_core_first_order(
+    const std::vector<unsigned>& cpus
+) {
+    struct CpuLocation {
+        unsigned cpu;
+        int package;
+        int core;
+    };
+
+    std::vector<CpuLocation> locations;
+    locations.reserve(cpus.size());
+    for (const unsigned cpu : cpus) {
+        int package = 0;
+        int core = 0;
+        if (
+            !read_cpu_topology_value(cpu, "physical_package_id", package) ||
+            !read_cpu_topology_value(cpu, "core_id", core)
+        ) {
+            return cpus;
+        }
+        locations.push_back({cpu, package, core});
+    }
+
+    std::vector<std::pair<int, int>> seen_cores;
+    seen_cores.reserve(locations.size());
+    std::vector<unsigned> primary_threads;
+    std::vector<unsigned> sibling_threads;
+    primary_threads.reserve(locations.size());
+    sibling_threads.reserve(locations.size());
+
+    for (const CpuLocation& location : locations) {
+        const std::pair<int, int> key{location.package, location.core};
+        if (
+            std::find(seen_cores.begin(), seen_cores.end(), key) ==
+            seen_cores.end()
+        ) {
+            seen_cores.push_back(key);
+            primary_threads.push_back(location.cpu);
+        } else {
+            sibling_threads.push_back(location.cpu);
+        }
+    }
+
+    primary_threads.insert(
+        primary_threads.end(),
+        sibling_threads.begin(),
+        sibling_threads.end()
+    );
+    return primary_threads;
+}
+#endif
 
 inline std::vector<unsigned> allowed_cpu_ids() {
     std::vector<unsigned> result;
@@ -21,6 +89,7 @@ inline std::vector<unsigned> allowed_cpu_ids() {
         for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
             if (CPU_ISSET(cpu, &set)) result.push_back(cpu);
         }
+        result = physical_core_first_order(result);
     }
 #endif
     if (result.empty()) {
