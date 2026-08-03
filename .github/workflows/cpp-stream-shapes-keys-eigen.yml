@@ -8,6 +8,7 @@ on:
       - "src/trading_dsl_engine/base/keys.py"
       - "src/flows/pov.py"
       - "src/flows/riskmodel.py"
+      - "src/flows/alpha_search.py"
       - "src/flows/roll_rets_keys.py"
       - "tests/trading_dsl_engine/cpp_stream/test_reduction_dsl_full.py"
       - "scripts/benchmark_cpp_stream_npy_output.py"
@@ -36,7 +37,7 @@ jobs:
       - name: Install focused dependencies
         run: >-
           python -m pip install --upgrade
-          pip numpy numba pytest jinja2 jax equinox astropy
+          pip numpy numba pytest jinja2 jax equinox astropy deap
           includeigen pybind11
       - name: Test full reduction DSL and automatic shapes
         env:
