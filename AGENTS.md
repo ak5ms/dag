@@ -16,6 +16,9 @@ Priorities, in order:
 ## Key invariants
 
 - Every operation should follow strict `on_data(...)` + `emit(...)` behavior (including stateless ops).
+- In `cpp_stream`, an omitted reduction axis means all logical axes. Temporal
+  reductions accumulate per row but project their result and run any dependent
+  suffix only once during finalization; never materialize cumulative results per row.
 - Live updates must be incremental; do not recompute full history in update paths.
 - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
@@ -62,6 +65,7 @@ Priorities, in order:
 ## Performance guardrails
 
 - Do not add Python-level per-timestep loops in runtime hot paths.
+- For native hot-path work, prefer fixed-size Eigen types and compile Eigen single-threaded when the runtime owns outer parallelism. Use syscall tools such as `strace` only as supporting evidence for mmap/open/read behavior; verify one-pass generated loops and use allocator-aware tooling for heap claims.
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
 - Prefer clear NumPy/Numba slice and vectorized operations over unnecessary scalar loops, especially nested loops that only copy or assign contiguous rows, columns, or blocks (for example, use `dst[:] = src`, `dst[:, i:j] = block`, or `out[t, :] = values` where supported).

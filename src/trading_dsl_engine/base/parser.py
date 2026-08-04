@@ -124,6 +124,28 @@ class Expr:
     def __ge__(self, other):
         return self._call("ge", other)
 
+    def sum(self, axis=None, ignore_na=True):
+        from trading_dsl_engine.base.dsl import reduction
+
+        return reduction("sum", self, axis=axis, ignore_na=ignore_na)
+
+    def mean(self, axis=None, ignore_na=True):
+        from trading_dsl_engine.base.dsl import reduction
+
+        return reduction("mean", self, axis=axis, ignore_na=ignore_na)
+
+    def std(self, axis=None, ddof=0, ignore_na=True):
+        from trading_dsl_engine.base.dsl import reduction
+
+        return reduction(
+            "std", self, axis=axis, ddof=ddof, ignore_na=ignore_na
+        )
+
+    def emit(self, mode="last"):
+        from trading_dsl_engine.base.dsl import emit
+
+        return emit(self, mode=mode)
+
     def groupby(self, key, rhs=None, *args):
         from trading_dsl_engine.base.dsl import grouped
 
@@ -238,9 +260,9 @@ class _AstParser:
         if isinstance(node, ast.BinOp):
             op_name = self._binop_name(node.op)
             return Call(op_name, (self._expr(node.left), self._expr(node.right)))
-        if isinstance(node, ast.Tuple):
+        if isinstance(node, (ast.Tuple, ast.List)):
             if len(node.elts) == 0:
-                raise FormulaParseError("Key tuples cannot be empty")
+                raise FormulaParseError("Expression lists cannot be empty")
             return KeyTuple(tuple(self._expr(item) for item in node.elts))
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:

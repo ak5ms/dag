@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Callable, Sequence
 from inspect import Parameter, Signature, signature
 
@@ -90,7 +91,7 @@ DEFAULT_DSL_REGISTRY = DSLFunctionRegistry()
 def ensure_expr(value) -> Expr:
     if isinstance(value, Expr):
         return value
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, list)):
         if len(value) == 0:
             raise TypeError("Key tuples cannot be empty")
         return KeyTuple(tuple(ensure_expr(item) for item in value))
@@ -131,6 +132,37 @@ def call(name: str, *args, **kwargs) -> Expr:
     )
 
 
+def _axis_expr(axis) -> Expr:
+    if isinstance(axis, Expr):
+        return axis
+    if isinstance(axis, (int, float)):
+        return Number(float(axis))
+    if isinstance(axis, (tuple, list)):
+        if not axis:
+            raise ValueError("axis cannot be empty")
+        return KeyTuple(tuple(_axis_expr(item) for item in axis))
+    raise TypeError("axis must be an int or a non-empty list/tuple of ints")
+
+
+def reduction(name: str, x, *, axis=None, ddof=0, ignore_na=True) -> Expr:
+    if name not in {"sum", "mean", "std"}:
+        raise ValueError(f"unsupported reduction {name!r}")
+    kwargs = []
+    if axis is not None:
+        kwargs.append(("axis", _axis_expr(axis)))
+    if name == "std" and ddof != 0:
+        kwargs.append(("ddof", ensure_expr(ddof)))
+    if not ignore_na:
+        kwargs.append(("ignore_na", ensure_expr(ignore_na)))
+    return Call(name, (ensure_expr(x),), tuple(kwargs))
+
+
+def emit(x, *, mode="last") -> Expr:
+    if mode != "last":
+        raise ValueError("emit currently supports only mode='last'")
+    return Call("emit", (ensure_expr(x),), (("mode", String(mode)),))
+
+
 GROUPBY_VALUE_PLACEHOLDER = "self_"
 self_ = var(GROUPBY_VALUE_PLACEHOLDER)
 
@@ -141,7 +173,7 @@ class GroupedExpr:
         key_expr = ensure_expr(key)
         if not isinstance(key_expr, KeyTuple):
             key_expr = KeyTuple((key_expr,))
-        if sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
+        if builtins.sum(1 for item in key_expr.items if isinstance(item, Universe)) > 1:
             raise TypeError("groupby key tuple may contain at most one univ(...) element")
         self.key = key_expr
 
@@ -194,7 +226,6 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "get_preds",
             "xs_sort",
             "xstd",
-            "mean",
             "outer",
             "cumsum",
         }
@@ -238,6 +269,20 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "cat": _dsl_signature(variadic="args"),
     "einsum": _dsl_signature(variadic="args"),
     "groupby": _dsl_signature("key_tuple", "lhs", "op_using_self_"),
+    "sum": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
+    ),
+    "mean": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
+    ),
+    "std": _dsl_signature(
+        "x",
+        "axis",
+        "ddof",
+        "ignore_na",
+        defaults={"axis": None, "ddof": 0, "ignore_na": True},
+    ),
+    "emit": _dsl_signature("x", "mode", defaults={"mode": "last"}),
 }
 
 
@@ -318,6 +363,9 @@ einsum = op("einsum")
 
 cat = op("cat")
 groupby = op("groupby")
+sum = op("sum")
+mean = op("mean")
+std = op("std")
 
 
 def _literal_string(value, name: str) -> str:

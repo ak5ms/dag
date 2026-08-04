@@ -77,6 +77,14 @@ ext_modules = [
 setup(
     packages=find_packages("src"),
     package_dir={"": "src"},
+    package_data={
+        "trading_dsl_engine.cpp_stream": [
+            "cpp/stackdsl/*.hpp",
+            "cpp/stackdsl/ops/*.hpp",
+            "python/templates/*.j2",
+        ],
+    },
+    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
 )
