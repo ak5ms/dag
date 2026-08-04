@@ -166,6 +166,27 @@ struct TensorCopyNode {
     }
 };
 
+template <class Input, class Out, std::size_t Index, class Execution>
+struct TensorColumnNode {
+    using Shape = typename Input::shape;
+    static_assert(Shape::rank > 0);
+    static constexpr std::size_t Width = Shape::dims[Shape::rank - 1];
+    static constexpr std::size_t OutputSize = Shape::size / Width;
+    static_assert(Index < Width);
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const auto [begin, end] =
+            execution_output_range<OutputSize, Execution>(ctx);
+        for (std::size_t output = begin; output < end; ++output) {
+            out[output] = Input::read_flat(ctx, output * Width + Index);
+        }
+    }
+};
+
 template <class Input, class Out, class Execution>
 struct TensorCumsumNode {
     using Shape = typename Input::shape;

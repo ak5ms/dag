@@ -193,14 +193,14 @@ def test_ridge_consumes_cat_as_lazy_feature_list_without_cat_materialization():
 
 def test_statistics_codegen_selects_specialized_allocation_free_nodes():
     source = _render(
-        "cat(xs_pct_rank(x), ewm_cov(x, y, halflife=3), "
+        "cat(xs_pct_rank(x), ewm_cov(x, y, span=3), "
         "rolling_max(x, periods=5), "
         "rolling_theilsen(y, x, periods=5))",
         n=9,
     )
     assert "stackdsl::XsPctRankNode<" in source
-    assert "stackdsl::EwmStatsNode<" in source
-    assert "stackdsl::EwmCovarianceProjection" in source
+    assert source.count("stackdsl::EwmNode<") >= 3
+    assert "stackdsl::EwmStatsNode<" not in source
     assert "stackdsl::RollingExtremaNode<" in source
     assert "stackdsl::RollingTheilSenNode<" in source
 

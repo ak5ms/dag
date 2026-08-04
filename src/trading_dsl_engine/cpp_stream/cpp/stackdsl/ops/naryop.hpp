@@ -124,6 +124,179 @@ struct FloorOp {
         else return std::floor(static_cast<R>(a));
     }
 };
+struct AbsOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::abs(static_cast<double>(a)));
+    }
+};
+struct CeilOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::ceil(static_cast<double>(a)));
+    }
+};
+struct ExpOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::exp(static_cast<double>(a)));
+    }
+};
+struct LogOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::log(static_cast<double>(a)));
+    }
+};
+struct RoundOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::nearbyint(static_cast<double>(a)));
+    }
+};
+struct SignOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const double value = static_cast<double>(a);
+        if (std::isnan(value)) {
+            return std::numeric_limits<R>::quiet_NaN();
+        }
+        return static_cast<R>((value > 0.0) - (value < 0.0));
+    }
+};
+struct FractionOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const double value = static_cast<double>(a);
+        return static_cast<R>(std::copysign(
+            std::abs(value) - std::floor(std::abs(value)), value
+        ));
+    }
+};
+struct PurifyOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const double value = static_cast<double>(a);
+        return std::isfinite(value)
+            ? static_cast<R>(value)
+            : std::numeric_limits<R>::quiet_NaN();
+    }
+};
+struct AtanOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::atan(static_cast<double>(a)));
+    }
+};
+struct AcosOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::acos(static_cast<double>(a)));
+    }
+};
+struct AsinOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::asin(static_cast<double>(a)));
+    }
+};
+struct SinOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::sin(static_cast<double>(a)));
+    }
+};
+struct CosOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::cos(static_cast<double>(a)));
+    }
+};
+struct TanOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::tan(static_cast<double>(a)));
+    }
+};
+struct TanhOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::tanh(static_cast<double>(a)));
+    }
+};
+struct SqrtOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(std::sqrt(static_cast<double>(a)));
+    }
+};
+struct IsNanOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(is_nan_value(a));
+    }
+};
+struct IsFiniteOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        if constexpr (std::is_floating_point_v<A>) {
+            return static_cast<R>(std::isfinite(a));
+        }
+        return R{1};
+    }
+};
+struct LogicalNotOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return predicate_result<R>(a == A{0}, a);
+    }
+};
+struct NormInvOp {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        return static_cast<R>(norm_inv(static_cast<double>(a)));
+    }
+};
+struct MinOp {
+    static constexpr int arity = 2;
+    template <class R, class A, class B>
+    STACKDSL_HOT static R apply(A a, B b) noexcept {
+        if (is_nan_value(a) || is_nan_value(b)) {
+            return std::numeric_limits<R>::quiet_NaN();
+        }
+        return std::min(static_cast<R>(a), static_cast<R>(b));
+    }
+};
+struct MaxOp {
+    static constexpr int arity = 2;
+    template <class R, class A, class B>
+    STACKDSL_HOT static R apply(A a, B b) noexcept {
+        if (is_nan_value(a) || is_nan_value(b)) {
+            return std::numeric_limits<R>::quiet_NaN();
+        }
+        return std::max(static_cast<R>(a), static_cast<R>(b));
+    }
+};
 struct EqOp {
     static constexpr int arity = 2;
     template <class R, class A, class B>

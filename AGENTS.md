@@ -32,6 +32,9 @@ Priorities, in order:
 - Grouped execution must use a single canonical form: `groupby(key_tuple, lhs, op_using_self_)` (or Python sugar `lhs.groupby(key_tuple).apply(op(self_, *others))`). Delete all legacy groupby forms and alternate flow paths. `key_tuple` must support arbitrary-length composite keys and may contain at most one `univ(...)` element.
 - Keep Python-composed formulas feature-complete with string formulas: every builtin op should have a Python helper, expression nodes should preserve infix operator composition, grouping sugar such as `lhs.groupby(key).apply(...)` should lower to the same AST forms as strings, and `compile_formula`/`build_engine` should accept composed `Expr` objects as well as strings.
 - Keep op-specific private helper functions on the relevant operator class as `@staticmethod`; these static methods may be reused from another class when that is the cleanest shared implementation.
+- In `cpp_stream`, derived exponentially weighted statistics must compose through
+  the canonical `ewm` operator and preserve its `span`, `min_periods`, `ignore_na`,
+  and `adjust` semantics rather than introducing a parallel EWM state workflow.
 - Formula metadata must stay static and off the compiled hot path: unit/type/range propagation should run at compile time, expose runtime inspection methods such as `get_units()`/`get_range()`, and avoid changing streaming tick or batch semantics.
 - Formula alpha generation/search belongs at Python compile/search time; keep DEAP evolution, objective orchestration, and candidate filtering outside JAX-flat live/batch hot paths.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).

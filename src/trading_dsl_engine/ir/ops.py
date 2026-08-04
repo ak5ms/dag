@@ -61,7 +61,7 @@ class ReductionOp:
     ignore_na: bool = True
 
     def __post_init__(self) -> None:
-        if self.kind not in {"sum", "mean", "std"}:
+        if self.kind not in {"sum", "mean", "std", "min", "max"}:
             raise ValueError(f"unsupported reduction kind {self.kind!r}")
         if self.ddof < 0:
             raise ValueError("reduction ddof must be >= 0")
@@ -110,44 +110,59 @@ class XsPctRankOp:
 
 
 @dataclass(frozen=True, slots=True)
-class EwmStatsOp:
-    """Pairwise-complete exponentially weighted moment/statistic."""
-
+class XsAggregateOp:
     kind: str
-    halflife: float
-    min_periods: int = 0
-    order: int = 0
+    quantile: float = 0.5
 
     def __post_init__(self) -> None:
-        supported = {
-            "moment",
-            "var",
-            "std",
-            "skewness",
-            "kurtosis",
-            "cov",
-            "corr",
-            "co_skewness",
-            "co_kurtosis",
-            "triple_corr",
-            "partial_corr",
-        }
-        if self.kind not in supported:
-            raise ValueError(f"unsupported EWM statistic {self.kind!r}")
-        if not math.isfinite(self.halflife) or not self.halflife > 0.0:
-            raise ValueError("EWM statistic halflife must be finite and > 0")
-        if self.min_periods < 0:
-            raise ValueError("EWM statistic min_periods must be >= 0")
-        if self.kind == "moment" and not 1 <= self.order <= 4:
-            raise ValueError("ewm_moment currently supports orders 1 through 4")
+        if self.kind not in {
+            "count", "sum", "mean", "std", "min", "max", "quantile"
+        }:
+            raise ValueError(f"unsupported cross-sectional aggregate {self.kind!r}")
+        if not 0.0 <= self.quantile <= 1.0:
+            raise ValueError("cross-sectional quantile must be in [0, 1]")
 
-    @property
-    def arity(self) -> int:
-        if self.kind in {"cov", "corr", "co_skewness", "co_kurtosis"}:
-            return 2
-        if self.kind in {"triple_corr", "partial_corr"}:
-            return 3
-        return 1
+
+@dataclass(frozen=True, slots=True)
+class XsWeightedMeanOp:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class XsProjectionOp:
+    intercept: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class XsGeneralizedRankOp:
+    power: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.power) or self.power < 0.0:
+            raise ValueError("generalized-rank power must be finite and >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class XsDensifyOp:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class VectorQuantileOp:
+    quantile: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.quantile <= 1.0:
+            raise ValueError("vector quantile must be in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnOp:
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise ValueError("column index must be >= 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +210,95 @@ class TheilSenOp:
             raise ValueError("Theil-Sen periods must be >= 2")
         if not 2 <= self.min_periods <= self.periods:
             raise ValueError("Theil-Sen min_periods must be in [2, periods]")
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodsSinceChangeOp:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class HumpOp:
+    threshold: float
+    relative: bool = False
+    move_by_threshold: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.threshold) or self.threshold < 0.0:
+            raise ValueError("hump threshold must be finite and >= 0")
+
+
+@dataclass(frozen=True, slots=True)
+class TradeWhenOp:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class LinearFilterOp:
+    feedforward: tuple[float, ...]
+    recursive: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.feedforward:
+            raise ValueError("filter requires at least one feed-forward weight")
+        if not all(math.isfinite(value) for value in self.feedforward + self.recursive):
+            raise ValueError("filter weights must be finite")
+
+
+@dataclass(frozen=True, slots=True)
+class RollingProductOp:
+    periods: int
+    min_periods: int
+
+    def __post_init__(self) -> None:
+        if self.periods < 1 or not 0 <= self.min_periods <= self.periods:
+            raise ValueError("invalid rolling-product periods/min_periods")
+
+
+@dataclass(frozen=True, slots=True)
+class RollingKthOp:
+    periods: int
+    min_periods: int
+    k: int = 1
+    ignore_zero: bool = True
+
+    def __post_init__(self) -> None:
+        if self.periods < 1 or not 0 <= self.min_periods <= self.periods:
+            raise ValueError("invalid rolling-kth periods/min_periods")
+        if not 1 <= self.k <= self.periods:
+            raise ValueError("rolling-kth k must be in [1, periods]")
+
+
+@dataclass(frozen=True, slots=True)
+class RollingPrevDiffOp:
+    periods: int
+
+    def __post_init__(self) -> None:
+        if self.periods < 2:
+            raise ValueError("rolling previous-different periods must be >= 2")
+
+
+@dataclass(frozen=True, slots=True)
+class RollingDecayOp:
+    periods: int
+    min_periods: int
+
+    def __post_init__(self) -> None:
+        if self.periods < 1 or not 0 <= self.min_periods <= self.periods:
+            raise ValueError("invalid rolling-decay periods/min_periods")
+
+
+@dataclass(frozen=True, slots=True)
+class RollingEntropyOp:
+    periods: int
+    min_periods: int
+    buckets: int = 10
+
+    def __post_init__(self) -> None:
+        if self.periods < 1 or not 0 <= self.min_periods <= self.periods:
+            raise ValueError("invalid rolling-entropy periods/min_periods")
+        if self.buckets < 1:
+            raise ValueError("rolling-entropy buckets must be >= 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,9 +415,24 @@ OpSpec: TypeAlias = (
     | EwmOp
     | XsRankOp
     | XsPctRankOp
-    | EwmStatsOp
+    | XsAggregateOp
+    | XsWeightedMeanOp
+    | XsProjectionOp
+    | XsGeneralizedRankOp
+    | XsDensifyOp
+    | VectorQuantileOp
+    | ColumnOp
     | RollingOp
     | TheilSenOp
+    | PeriodsSinceChangeOp
+    | HumpOp
+    | TradeWhenOp
+    | LinearFilterOp
+    | RollingProductOp
+    | RollingKthOp
+    | RollingPrevDiffOp
+    | RollingDecayOp
+    | RollingEntropyOp
     | RbfBasisOp
     | FutureRbfBasisSumOp
     | EinsumOp
@@ -339,9 +458,24 @@ __all__ = [
     "EwmOp",
     "XsRankOp",
     "XsPctRankOp",
-    "EwmStatsOp",
+    "XsAggregateOp",
+    "XsWeightedMeanOp",
+    "XsProjectionOp",
+    "XsGeneralizedRankOp",
+    "XsDensifyOp",
+    "VectorQuantileOp",
+    "ColumnOp",
     "RollingOp",
     "TheilSenOp",
+    "PeriodsSinceChangeOp",
+    "HumpOp",
+    "TradeWhenOp",
+    "LinearFilterOp",
+    "RollingProductOp",
+    "RollingKthOp",
+    "RollingPrevDiffOp",
+    "RollingDecayOp",
+    "RollingEntropyOp",
     "RbfBasisOp",
     "FutureRbfBasisSumOp",
     "EinsumOp",

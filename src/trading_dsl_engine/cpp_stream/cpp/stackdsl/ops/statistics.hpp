@@ -15,295 +15,6 @@
 
 namespace stackdsl {
 
-namespace stats_detail {
-
-STACKDSL_HOT double variance(double first, double second) noexcept {
-    const double value = second - first * first;
-    return value > 0.0 ? value : 0.0;
-}
-
-STACKDSL_HOT double ratio(double numerator, double denominator) noexcept {
-    return denominator > 0.0 && std::isfinite(denominator)
-        ? numerator / denominator
-        : kNaN;
-}
-
-template <std::size_t Arity>
-STACKDSL_HOT double monomial(
-    const std::array<double, Arity>& inputs,
-    const std::array<std::uint8_t, 3>& powers
-) noexcept {
-    double result = 1.0;
-    for (std::size_t input = 0; input < Arity; ++input) {
-        for (std::uint8_t power = 0; power < powers[input]; ++power) {
-            result *= inputs[input];
-        }
-    }
-    return result;
-}
-
-template <std::size_t Order>
-struct EwmMomentProjection {
-    static_assert(Order >= 1 && Order <= 4);
-    static constexpr std::size_t arity = 1;
-    static constexpr std::size_t term_count = Order;
-    static constexpr auto powers = [] {
-        std::array<std::array<std::uint8_t, 3>, term_count> result{};
-        for (std::size_t order = 0; order < term_count; ++order) {
-            result[order][0] = static_cast<std::uint8_t>(order + 1);
-        }
-        return result;
-    }();
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double mean = raw[0];
-        if constexpr (Order == 1) return 0.0;
-        if constexpr (Order == 2) return variance(mean, raw[1]);
-        if constexpr (Order == 3) {
-            return raw[2] - 3.0 * mean * raw[1] + 2.0 * mean * mean * mean;
-        }
-        return raw[3] - 4.0 * mean * raw[2]
-            + 6.0 * mean * mean * raw[1]
-            - 3.0 * mean * mean * mean * mean;
-    }
-};
-
-struct EwmVarianceProjection : EwmMomentProjection<2> {};
-
-struct EwmStdProjection : EwmMomentProjection<2> {
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        return std::sqrt(EwmVarianceProjection::project(raw));
-    }
-};
-
-struct EwmSkewnessProjection : EwmMomentProjection<3> {
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double var = variance(raw[0], raw[1]);
-        const double central = EwmMomentProjection<3>::project(raw);
-        return ratio(central, var * std::sqrt(var));
-    }
-};
-
-struct EwmKurtosisProjection : EwmMomentProjection<4> {
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double var = variance(raw[0], raw[1]);
-        return ratio(EwmMomentProjection<4>::project(raw), var * var);
-    }
-};
-
-struct EwmCovarianceProjection {
-    static constexpr std::size_t arity = 2;
-    static constexpr std::size_t term_count = 3;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        return raw[2] - raw[0] * raw[1];
-    }
-};
-
-struct EwmCorrelationProjection {
-    static constexpr std::size_t arity = 2;
-    static constexpr std::size_t term_count = 5;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{2, 0, 0}}, {{0, 2, 0}}, {{1, 1, 0}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double vx = variance(raw[0], raw[2]);
-        const double vy = variance(raw[1], raw[3]);
-        return ratio(raw[4] - raw[0] * raw[1], std::sqrt(vx * vy));
-    }
-};
-
-// Inputs follow the source definition: (y, x).
-struct EwmCoSkewnessProjection {
-    static constexpr std::size_t arity = 2;
-    static constexpr std::size_t term_count = 6;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{2, 0, 0}}, {{0, 2, 0}},
-        {{1, 1, 0}}, {{1, 2, 0}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double my = raw[0], mx = raw[1];
-        const double vy = variance(my, raw[2]), vx = variance(mx, raw[3]);
-        const double central = raw[5] - 2.0 * mx * raw[4]
-            - my * raw[3] + 2.0 * my * mx * mx;
-        return ratio(central, std::sqrt(vy) * vx);
-    }
-};
-
-// Inputs follow the source definition: (y, x).
-struct EwmCoKurtosisProjection {
-    static constexpr std::size_t arity = 2;
-    static constexpr std::size_t term_count = 9;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{2, 0, 0}}, {{0, 2, 0}},
-        {{1, 1, 0}}, {{0, 3, 0}}, {{1, 2, 0}}, {{1, 3, 0}}, {{0, 4, 0}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double my = raw[0], mx = raw[1];
-        const double vy = variance(my, raw[2]), vx = variance(mx, raw[3]);
-        const double central = raw[7] - 3.0 * mx * raw[6]
-            + 3.0 * mx * mx * raw[4] - my * raw[5]
-            + 3.0 * my * mx * raw[3] - 3.0 * my * mx * mx * mx;
-        return ratio(central, std::sqrt(vy) * vx * std::sqrt(vx));
-    }
-};
-
-struct EwmTripleCorrelationProjection {
-    static constexpr std::size_t arity = 3;
-    static constexpr std::size_t term_count = 10;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{0, 0, 1}},
-        {{2, 0, 0}}, {{0, 2, 0}}, {{0, 0, 2}},
-        {{1, 1, 0}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double mx = raw[0], my = raw[1], mz = raw[2];
-        const double vx = variance(mx, raw[3]);
-        const double vy = variance(my, raw[4]);
-        const double vz = variance(mz, raw[5]);
-        const double central = raw[9] - mx * raw[8] - my * raw[7]
-            - mz * raw[6] + 2.0 * mx * my * mz;
-        return ratio(central, std::sqrt(vx * vy * vz));
-    }
-};
-
-struct EwmPartialCorrelationProjection {
-    static constexpr std::size_t arity = 3;
-    static constexpr std::size_t term_count = 9;
-    static constexpr std::array<std::array<std::uint8_t, 3>, term_count> powers{{
-        {{1, 0, 0}}, {{0, 1, 0}}, {{0, 0, 1}},
-        {{2, 0, 0}}, {{0, 2, 0}}, {{0, 0, 2}},
-        {{1, 1, 0}}, {{1, 0, 1}}, {{0, 1, 1}},
-    }};
-    STACKDSL_HOT static double project(
-        const std::array<double, term_count>& raw
-    ) noexcept {
-        const double vx = variance(raw[0], raw[3]);
-        const double vy = variance(raw[1], raw[4]);
-        const double vz = variance(raw[2], raw[5]);
-        const double rxy = ratio(raw[6] - raw[0] * raw[1], std::sqrt(vx * vy));
-        const double rxz = ratio(raw[7] - raw[0] * raw[2], std::sqrt(vx * vz));
-        const double ryz = ratio(raw[8] - raw[1] * raw[2], std::sqrt(vy * vz));
-        return ratio(
-            rxy - rxz * ryz,
-            std::sqrt(std::max(0.0, 1.0 - rxz * rxz))
-                * std::sqrt(std::max(0.0, 1.0 - ryz * ryz))
-        );
-    }
-};
-
-}  // namespace stats_detail
-
-using stats_detail::EwmCoKurtosisProjection;
-using stats_detail::EwmCoSkewnessProjection;
-using stats_detail::EwmCorrelationProjection;
-using stats_detail::EwmCovarianceProjection;
-using stats_detail::EwmKurtosisProjection;
-using stats_detail::EwmMomentProjection;
-using stats_detail::EwmPartialCorrelationProjection;
-using stats_detail::EwmSkewnessProjection;
-using stats_detail::EwmStdProjection;
-using stats_detail::EwmTripleCorrelationProjection;
-using stats_detail::EwmVarianceProjection;
-
-template <
-    std::size_t N,
-    class Features,
-    class Out,
-    std::uint64_t AlphaBits,
-    int MinPeriods,
-    class Projection,
-    class Execution = DirectExecution<N>
->
-struct EwmStatsNode;
-
-template <
-    std::size_t N,
-    class Out,
-    std::uint64_t AlphaBits,
-    int MinPeriods,
-    class Projection,
-    class Execution,
-    class... Sources
->
-struct EwmStatsNode<
-    N, FeatureList<Sources...>, Out, AlphaBits, MinPeriods, Projection, Execution
-> {
-    static constexpr std::size_t Arity = sizeof...(Sources);
-    static constexpr std::size_t Terms = Projection::term_count;
-    static_assert(Arity == Projection::arity);
-    static_assert(MinPeriods >= 0);
-    static constexpr double alpha = std::bit_cast<double>(AlphaBits);
-    static_assert(alpha > 0.0 && alpha <= 1.0);
-
-    alignas(64) std::array<double, Execution::state_size * Terms> raw{};
-    alignas(64) std::array<std::uint64_t, Execution::state_size> count{};
-    alignas(64) std::array<std::uint8_t, Execution::state_size> initialized{};
-
-    void setup() noexcept {
-        raw.fill(0.0);
-        count.fill(0);
-        initialized.fill(0);
-    }
-
-    template <class Context>
-    STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
-        const std::size_t end = execution_lane_end<N, Execution>(ctx);
-        for (std::size_t lane = begin; lane < end; ++lane) {
-            const std::size_t index = Execution::state_index(ctx, lane);
-            std::array<double, Arity> inputs{};
-            load_features(ctx, lane, inputs, FeatureList<Sources...>{});
-            bool valid = true;
-            for (double input : inputs) valid = valid && finite(input);
-            if (valid) {
-                for (std::size_t term = 0; term < Terms; ++term) {
-                    const double observation = stats_detail::monomial(
-                        inputs, Projection::powers[term]
-                    );
-                    double& value = raw[index * Terms + term];
-                    value = initialized[index]
-                        ? std::fma(alpha, observation - value, value)
-                        : observation;
-                }
-                initialized[index] = 1;
-                ++count[index];
-            }
-            if (
-                !initialized[index] ||
-                (MinPeriods > 0 && count[index] < static_cast<std::uint64_t>(MinPeriods))
-            ) {
-                out[lane] = kNaN;
-                continue;
-            }
-            std::array<double, Terms> values{};
-            for (std::size_t term = 0; term < Terms; ++term) {
-                values[term] = raw[index * Terms + term];
-            }
-            out[lane] = Projection::project(values);
-        }
-    }
-};
 
 struct RollingSumProjection {};
 struct RollingMeanProjection {};
@@ -551,6 +262,61 @@ struct RollingOrderNode {
                     out[lane] = lower_value + (position - static_cast<double>(lower))
                         * (upper_value - lower_value);
                 }
+            }
+        }
+    }
+};
+
+template <
+    std::size_t N,
+    class Tensor,
+    class Out,
+    std::uint64_t QuantileBits,
+    class Execution = DirectExecution<N>
+>
+struct VectorQuantileNode {
+    using Shape = typename Tensor::shape;
+    static_assert(Shape::rank > 0);
+    static constexpr std::size_t Width = Shape::dims[Shape::rank - 1];
+    static constexpr std::size_t OutputSize = Shape::size / Width;
+    static constexpr double quantile = std::bit_cast<double>(QuantileBits);
+    static_assert(quantile >= 0.0 && quantile <= 1.0);
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const auto [begin, end] =
+            execution_output_range<OutputSize, Execution>(ctx);
+        for (std::size_t output = begin; output < end; ++output) {
+            std::array<double, Width> values{};
+            std::size_t count = 0;
+            const std::size_t input_begin = output * Width;
+            for (std::size_t offset = 0; offset < Width; ++offset) {
+                const double value = Tensor::read_flat(ctx, input_begin + offset);
+                if (finite(value)) values[count++] = value;
+            }
+            if (count == 0) {
+                out[output] = kNaN;
+                continue;
+            }
+            const double position = quantile * static_cast<double>(count - 1);
+            const std::size_t lower = static_cast<std::size_t>(position);
+            const std::size_t upper = std::min(count - 1, lower + 1);
+            std::nth_element(
+                values.begin(), values.begin() + lower, values.begin() + count
+            );
+            const double lower_value = values[lower];
+            if (lower == upper) {
+                out[output] = lower_value;
+            } else {
+                const double upper_value = *std::min_element(
+                    values.begin() + lower + 1, values.begin() + count
+                );
+                out[output] = lower_value
+                    + (position - static_cast<double>(lower))
+                        * (upper_value - lower_value);
             }
         }
     }

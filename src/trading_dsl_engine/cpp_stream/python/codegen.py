@@ -17,17 +17,31 @@ from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import (
     EmitOp,
     EwmOp,
-    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
+    HumpOp,
     GroupKeySpec,
     InstrumentBasisMeanOp,
+    LinearFilterOp,
+    PeriodsSinceChangeOp,
     RbfBasisOp,
     ReductionOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    RollingKthOp,
     RidgeOp,
     RollingOp,
+    RollingPrevDiffOp,
+    RollingProductOp,
     ShiftOp,
     TheilSenOp,
+    TradeWhenOp,
+    VectorQuantileOp,
+    XsAggregateOp,
+    XsDensifyOp,
+    XsGeneralizedRankOp,
+    XsProjectionOp,
+    XsWeightedMeanOp,
 )
 
 
@@ -104,7 +118,13 @@ class DoubleArg(CppType):
     value: float
 
     def render(self) -> str:
-        text = repr(float(self.value))
+        value = float(self.value)
+        if math.isnan(value):
+            return "std::numeric_limits<double>::quiet_NaN()"
+        if math.isinf(value):
+            sign = "-" if value < 0.0 else ""
+            return f"{sign}std::numeric_limits<double>::infinity()"
+        text = repr(value)
         return text if any(char in text for char in ".eE") else text + ".0"
 
 
@@ -251,6 +271,13 @@ def _tensor_shape(shape: tuple[int, ...]) -> CppType:
     return tmpl("stackdsl::TensorShape", *(IntArg(extent) for extent in shape))
 
 
+def _double_list(values: tuple[float, ...]) -> CppType:
+    return tmpl(
+        "stackdsl::DoubleList",
+        *(UInt64Arg(double_bits(value)) for value in values),
+    )
+
+
 def _index_map(labels: tuple[str, ...], loop_labels: tuple[str, ...]) -> CppType:
     positions = {label: index for index, label in enumerate(loop_labels)}
     return tmpl(
@@ -330,6 +357,8 @@ _BINARY_POLICIES = {
     "div": "stackdsl::DivOp",
     "mod": "stackdsl::ModOp",
     "pow": "stackdsl::PowOp",
+    "minimum": "stackdsl::MinOp",
+    "maximum": "stackdsl::MaxOp",
     "eq": "stackdsl::EqOp",
     "ne": "stackdsl::NeOp",
     "lt": "stackdsl::LtOp",
@@ -341,7 +370,29 @@ _BINARY_POLICIES = {
     "xor": "stackdsl::XorOp",
     "fillna": "stackdsl::FillNaOp",
 }
-_UNARY_POLICIES = {"floor": "stackdsl::FloorOp"}
+_UNARY_POLICIES = {
+    "abs": "stackdsl::AbsOp",
+    "ceil": "stackdsl::CeilOp",
+    "floor": "stackdsl::FloorOp",
+    "exp": "stackdsl::ExpOp",
+    "ln": "stackdsl::LogOp",
+    "round": "stackdsl::RoundOp",
+    "sign": "stackdsl::SignOp",
+    "fraction": "stackdsl::FractionOp",
+    "purify": "stackdsl::PurifyOp",
+    "arctan": "stackdsl::AtanOp",
+    "acos": "stackdsl::AcosOp",
+    "asin": "stackdsl::AsinOp",
+    "sin": "stackdsl::SinOp",
+    "cos": "stackdsl::CosOp",
+    "tan": "stackdsl::TanOp",
+    "tanh": "stackdsl::TanhOp",
+    "sqrt": "stackdsl::SqrtOp",
+    "isnan": "stackdsl::IsNanOp",
+    "isfinite": "stackdsl::IsFiniteOp",
+    "logical_not": "stackdsl::LogicalNotOp",
+    "norm_inv": "stackdsl::NormInvOp",
+}
 _TERNARY_POLICIES = {"where": "stackdsl::WhereOp"}
 _CUSTOM_POLICIES = {
     "volume_for_fit_session": "stackdsl::VolumeForFitSessionPolicy",
@@ -376,6 +427,8 @@ def _stage_type(
             "sum": "stackdsl::SumReductionPolicy",
             "mean": "stackdsl::MeanReductionPolicy",
             "std": "stackdsl::StdReductionPolicy",
+            "min": "stackdsl::MinReductionPolicy",
+            "max": "stackdsl::MaxReductionPolicy",
         }[stage.op.kind]
         return tmpl(
             "stackdsl::ReductionNode",
@@ -530,36 +583,168 @@ def _stage_type(
             BoolArg(stage.op.adjust),
             execution,
         )
+    if stage.kind == "periods_since_change":
+        assert isinstance(stage.op, PeriodsSinceChangeOp)
+        return tmpl(
+            "stackdsl::PeriodsSinceChangeNode",
+            stage_n,
+            inputs[0],
+            out,
+            execution,
+        )
+    if stage.kind == "hump":
+        assert isinstance(stage.op, HumpOp)
+        return tmpl(
+            "stackdsl::HumpNode",
+            stage_n,
+            inputs[0],
+            out,
+            UInt64Arg(double_bits(stage.op.threshold)),
+            BoolArg(stage.op.relative),
+            BoolArg(stage.op.move_by_threshold),
+            execution,
+        )
+    if stage.kind == "trade_when":
+        assert isinstance(stage.op, TradeWhenOp)
+        return tmpl(
+            "stackdsl::TradeWhenNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            out,
+            execution,
+        )
+    if stage.kind == "linear_filter":
+        assert isinstance(stage.op, LinearFilterOp)
+        return tmpl(
+            "stackdsl::LinearFilterNode",
+            stage_n,
+            inputs[0],
+            out,
+            _double_list(stage.op.feedforward),
+            _double_list(stage.op.recursive),
+            execution,
+        )
+    if stage.kind == "rolling_product":
+        assert isinstance(stage.op, RollingProductOp)
+        return tmpl(
+            "stackdsl::RollingProductNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "rolling_kth":
+        assert isinstance(stage.op, RollingKthOp)
+        return tmpl(
+            "stackdsl::RollingKthNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            IntArg(stage.op.k),
+            BoolArg(stage.op.ignore_zero),
+            execution,
+        )
+    if stage.kind == "rolling_prev_diff":
+        assert isinstance(stage.op, RollingPrevDiffOp)
+        return tmpl(
+            "stackdsl::RollingPrevDiffNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            execution,
+        )
+    if stage.kind == "rolling_decay":
+        assert isinstance(stage.op, RollingDecayOp)
+        return tmpl(
+            "stackdsl::RollingLinearDecayNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "rolling_entropy":
+        assert isinstance(stage.op, RollingEntropyOp)
+        return tmpl(
+            "stackdsl::RollingEntropyNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            IntArg(stage.op.buckets),
+            execution,
+        )
     if stage.kind == "xs_rank":
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
     if stage.kind == "xs_pct_rank":
         return tmpl("stackdsl::XsPctRankNode", stage_n, inputs[0], out, execution)
-    if stage.kind == "ewm_stats":
-        assert isinstance(stage.op, EwmStatsOp)
-        policy: CppType
-        if stage.op.kind == "moment":
-            policy = tmpl("stackdsl::EwmMomentProjection", IntArg(stage.op.order))
-        else:
-            policy = Name({
-                "var": "stackdsl::EwmVarianceProjection",
-                "std": "stackdsl::EwmStdProjection",
-                "skewness": "stackdsl::EwmSkewnessProjection",
-                "kurtosis": "stackdsl::EwmKurtosisProjection",
-                "cov": "stackdsl::EwmCovarianceProjection",
-                "corr": "stackdsl::EwmCorrelationProjection",
-                "co_skewness": "stackdsl::EwmCoSkewnessProjection",
-                "co_kurtosis": "stackdsl::EwmCoKurtosisProjection",
-                "triple_corr": "stackdsl::EwmTripleCorrelationProjection",
-                "partial_corr": "stackdsl::EwmPartialCorrelationProjection",
-            }[stage.op.kind])
+    if stage.kind == "xs_aggregate":
+        assert isinstance(stage.op, XsAggregateOp)
+        policy = Name({
+            "count": "stackdsl::XsCountProjection",
+            "sum": "stackdsl::XsSumProjection",
+            "mean": "stackdsl::XsMeanProjection",
+            "std": "stackdsl::XsStdProjection",
+            "min": "stackdsl::XsMinProjection",
+            "max": "stackdsl::XsMaxProjection",
+            "quantile": "stackdsl::XsQuantileProjection",
+        }[stage.op.kind])
         return tmpl(
-            "stackdsl::EwmStatsNode",
+            "stackdsl::XsAggregateNode",
             stage_n,
-            _feature_list(stage.inputs, n=n, input_types=input_types),
+            inputs[0],
             out,
-            UInt64Arg(double_bits(_stateful_alpha(stage.op.halflife))),
-            IntArg(stage.op.min_periods),
             policy,
+            UInt64Arg(double_bits(stage.op.quantile)),
+            execution,
+        )
+    if stage.kind == "xs_weighted_mean":
+        assert isinstance(stage.op, XsWeightedMeanOp)
+        return tmpl(
+            "stackdsl::XsWeightedMeanNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            execution,
+        )
+    if stage.kind == "xs_projection":
+        assert isinstance(stage.op, XsProjectionOp)
+        return tmpl(
+            "stackdsl::XsProjectionNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            BoolArg(stage.op.intercept),
+            execution,
+        )
+    if stage.kind == "xs_generalized_rank":
+        assert isinstance(stage.op, XsGeneralizedRankOp)
+        return tmpl(
+            "stackdsl::XsGeneralizedRankNode",
+            stage_n,
+            inputs[0],
+            out,
+            UInt64Arg(double_bits(stage.op.power)),
+            execution,
+        )
+    if stage.kind == "xs_densify":
+        assert isinstance(stage.op, XsDensifyOp)
+        return tmpl(
+            "stackdsl::XsDensifyNode",
+            stage_n,
+            inputs[0],
+            out,
             execution,
         )
     if stage.kind == "rolling":
@@ -620,6 +805,16 @@ def _stage_type(
             out,
             IntArg(stage.op.periods),
             IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "vector_quantile":
+        assert isinstance(stage.op, VectorQuantileOp)
+        return tmpl(
+            "stackdsl::VectorQuantileNode",
+            stage_n,
+            _tensor_source_type(stage.inputs[0], n=n, input_types=input_types),
+            out,
+            UInt64Arg(double_bits(stage.op.quantile)),
             execution,
         )
     if stage.kind == "instrument_basis":

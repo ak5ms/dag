@@ -28,12 +28,16 @@ def _ewm_expectations(
     arrays: Sequence[np.ndarray],
     powers: Sequence[Sequence[int]],
     *,
-    halflife: float,
+    span: float,
     min_periods: int,
+    ignore_na: bool,
+    adjust: bool,
 ) -> np.ndarray:
     rows, lanes = arrays[0].shape
-    alpha = 1.0 - np.exp(np.log(0.5) / halflife)
+    alpha = 2.0 / (span + 1.0)
+    old_weight_factor = 1.0 - alpha
     state = np.zeros((lanes, len(powers)), dtype=np.float64)
+    weight = np.zeros(lanes, dtype=np.float64)
     count = np.zeros(lanes, dtype=np.int64)
     initialized = np.zeros(lanes, dtype=bool)
     result = np.full((rows, lanes, len(powers)), np.nan, dtype=np.float64)
@@ -42,7 +46,11 @@ def _ewm_expectations(
             observations = np.array(
                 [values[row, lane] for values in arrays], dtype=np.float64
             )
-            if np.all(np.isfinite(observations)):
+            valid = bool(np.all(np.isfinite(observations)))
+            old_weight = weight[lane]
+            if initialized[lane] and (valid or not ignore_na):
+                old_weight *= old_weight_factor
+            if valid:
                 monomials = np.array(
                     [
                         np.prod(
@@ -52,11 +60,19 @@ def _ewm_expectations(
                     ]
                 )
                 if initialized[lane]:
-                    state[lane] += alpha * (monomials - state[lane])
+                    new_weight = 1.0 if adjust else alpha
+                    if not adjust and abs(alpha - 0.5) <= 1e-12:
+                        new_weight = 1.0 - old_weight
+                    state[lane] = (
+                        old_weight * state[lane] + new_weight * monomials
+                    ) / (old_weight + new_weight)
+                    old_weight = old_weight + new_weight if adjust else 1.0
                 else:
                     state[lane] = monomials
                     initialized[lane] = True
+                    old_weight = 1.0
                 count[lane] += 1
+            weight[lane] = old_weight
             if initialized[lane] and count[lane] >= min_periods:
                 result[row, lane] = state[lane]
     return result
@@ -101,21 +117,23 @@ def test_ewm_moment_family_matches_shared_complete_case_reference(
     x[3, 1] = np.nan
     y[7, 2] = np.nan
     z[11, 0] = np.nan
-    halflife = 3.5
+    span = 3.5
     min_periods = 3
+    ignore_na = False
+    adjust = True
     formula = (
         "cat("
-        "ewm_moment(x, halflife=3.5, k=3, min_periods=3),"
-        "ewm_var(x, halflife=3.5, min_periods=3),"
-        "ewm_std(x, halflife=3.5, min_periods=3),"
-        "ewm_skewness(x, halflife=3.5, min_periods=3),"
-        "ewm_kurtosis(x, halflife=3.5, min_periods=3),"
-        "ewm_cov(x, y, halflife=3.5, min_periods=3),"
-        "ewm_corr(x, y, halflife=3.5, min_periods=3),"
-        "ewm_co_skewness(y, x, halflife=3.5, min_periods=3),"
-        "ewm_co_kurtosis(y, x, halflife=3.5, min_periods=3),"
-        "ewm_triple_corr(x, y, z, halflife=3.5, min_periods=3),"
-        "ewm_partial_corr(x, y, z, halflife=3.5, min_periods=3))"
+        "ewm_moment(x, span=3.5, k=3, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_var(x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_std(x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_skewness(x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_kurtosis(x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_cov(x, y, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_corr(x, y, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_co_skewness(y, x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_co_kurtosis(y, x, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_triple_corr(x, y, z, span=3.5, min_periods=3, ignore_na=False, adjust=True),"
+        "ewm_partial_corr(x, y, z, span=3.5, min_periods=3, ignore_na=False, adjust=True))"
     )
     actual, runtime = _run(
         formula,
@@ -128,8 +146,10 @@ def test_ewm_moment_family_matches_shared_complete_case_reference(
     univariate = _ewm_expectations(
         (x,),
         ((1,), (2,), (3,), (4,)),
-        halflife=halflife,
+        span=span,
         min_periods=min_periods,
+        ignore_na=ignore_na,
+        adjust=adjust,
     )
     mean_x, second_x, third_x, fourth_x = np.moveaxis(univariate, -1, 0)
     variance_x = np.maximum(0.0, second_x - mean_x * mean_x)
@@ -144,8 +164,10 @@ def test_ewm_moment_family_matches_shared_complete_case_reference(
     pair_xy = _ewm_expectations(
         (x, y),
         ((1, 0), (0, 1), (2, 0), (0, 2), (1, 1)),
-        halflife=halflife,
+        span=span,
         min_periods=min_periods,
+        ignore_na=ignore_na,
+        adjust=adjust,
     )
     mx, my, x2, y2, xy = np.moveaxis(pair_xy, -1, 0)
     vx = np.maximum(0.0, x2 - mx * mx)
@@ -165,8 +187,10 @@ def test_ewm_moment_family_matches_shared_complete_case_reference(
             (1, 3),
             (0, 4),
         ),
-        halflife=halflife,
+        span=span,
         min_periods=min_periods,
+        ignore_na=ignore_na,
+        adjust=adjust,
     )
     myc, mxc, y2c, x2c, yx, x3c, yx2, yx3, _ = np.moveaxis(
         pair_yx, -1, 0
@@ -199,8 +223,10 @@ def test_ewm_moment_family_matches_shared_complete_case_reference(
             (0, 1, 1),
             (1, 1, 1),
         ),
-        halflife=halflife,
+        span=span,
         min_periods=min_periods,
+        ignore_na=ignore_na,
+        adjust=adjust,
     )
     tx, ty, tz, tx2, ty2, tz2, txy, txz, tyz, txyz = np.moveaxis(
         triple, -1, 0
