@@ -11,6 +11,7 @@
 #include "stackdsl/ops/reduction.hpp"
 #include "stackdsl/ops/history.hpp"
 #include "stackdsl/ops/ewm.hpp"
+#include "stackdsl/ops/statistics.hpp"
 #include "stackdsl/ops/basis.hpp"
 #include "stackdsl/ops/instrument_basis_mean.hpp"
 #include "stackdsl/ops/einsum.hpp"

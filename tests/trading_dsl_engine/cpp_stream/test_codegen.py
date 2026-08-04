@@ -191,6 +191,39 @@ def test_ridge_consumes_cat_as_lazy_feature_list_without_cat_materialization():
     assert "stackdsl::CatNode<" not in source
 
 
+def test_statistics_codegen_selects_specialized_allocation_free_nodes():
+    source = _render(
+        "cat(xs_pct_rank(x), ewm_cov(x, y, halflife=3), "
+        "rolling_max(x, periods=5), "
+        "rolling_theilsen(y, x, periods=5))",
+        n=9,
+    )
+    assert "stackdsl::XsPctRankNode<" in source
+    assert "stackdsl::EwmStatsNode<" in source
+    assert "stackdsl::EwmCovarianceProjection" in source
+    assert "stackdsl::RollingExtremaNode<" in source
+    assert "stackdsl::RollingTheilSenNode<" in source
+
+
+def test_statistics_and_ridge_projections_keep_generic_execution_nodes():
+    grouped = _render(
+        "groupby(key, x, rolling_max(self_, periods=5))",
+        n=9,
+    )
+    assert "stackdsl::RollingExtremaNode<" in grouped
+    assert "stackdsl::GroupedExecution<N, Capacity, PartitionCount>" in grouped
+    assert "GroupedRolling" not in grouped
+
+    ridge = _render(
+        "get_standard_error("
+        "Ridge(cat(x1, x2), y=y, weights=w, hl=8, lambda_=0.2), 1)",
+        n=9,
+    )
+    assert "stackdsl::RidgeNode<" in ridge
+    assert "stackdsl::RidgeStandardErrorProjection<1>" in ridge
+    assert "GroupedRidge" not in ridge
+
+
 def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
     source = _render("xs_rank((x + 5 + y) * 3)", n=9)
     header = _generated_row_loop_header(source)

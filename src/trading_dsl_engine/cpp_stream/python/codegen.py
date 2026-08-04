@@ -17,6 +17,7 @@ from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.ir.ops import (
     EmitOp,
     EwmOp,
+    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupKeySpec,
@@ -24,7 +25,9 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     ReductionOp,
     RidgeOp,
+    RollingOp,
     ShiftOp,
+    TheilSenOp,
 )
 
 
@@ -529,6 +532,96 @@ def _stage_type(
         )
     if stage.kind == "xs_rank":
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
+    if stage.kind == "xs_pct_rank":
+        return tmpl("stackdsl::XsPctRankNode", stage_n, inputs[0], out, execution)
+    if stage.kind == "ewm_stats":
+        assert isinstance(stage.op, EwmStatsOp)
+        policy: CppType
+        if stage.op.kind == "moment":
+            policy = tmpl("stackdsl::EwmMomentProjection", IntArg(stage.op.order))
+        else:
+            policy = Name({
+                "var": "stackdsl::EwmVarianceProjection",
+                "std": "stackdsl::EwmStdProjection",
+                "skewness": "stackdsl::EwmSkewnessProjection",
+                "kurtosis": "stackdsl::EwmKurtosisProjection",
+                "cov": "stackdsl::EwmCovarianceProjection",
+                "corr": "stackdsl::EwmCorrelationProjection",
+                "co_skewness": "stackdsl::EwmCoSkewnessProjection",
+                "co_kurtosis": "stackdsl::EwmCoKurtosisProjection",
+                "triple_corr": "stackdsl::EwmTripleCorrelationProjection",
+                "partial_corr": "stackdsl::EwmPartialCorrelationProjection",
+            }[stage.op.kind])
+        return tmpl(
+            "stackdsl::EwmStatsNode",
+            stage_n,
+            _feature_list(stage.inputs, n=n, input_types=input_types),
+            out,
+            UInt64Arg(double_bits(_stateful_alpha(stage.op.halflife))),
+            IntArg(stage.op.min_periods),
+            policy,
+            execution,
+        )
+    if stage.kind == "rolling":
+        assert isinstance(stage.op, RollingOp)
+        if stage.op.kind in {"sum", "mean", "std"}:
+            projection = Name({
+                "sum": "stackdsl::RollingSumProjection",
+                "mean": "stackdsl::RollingMeanProjection",
+                "std": "stackdsl::RollingStdProjection",
+            }[stage.op.kind])
+            return tmpl(
+                "stackdsl::RollingMomentsNode",
+                stage_n,
+                inputs[0],
+                out,
+                IntArg(stage.op.periods),
+                IntArg(stage.op.min_periods),
+                IntArg(stage.op.ddof),
+                projection,
+                execution,
+            )
+        if stage.op.kind in {"min", "max", "argmin", "argmax"}:
+            return tmpl(
+                "stackdsl::RollingExtremaNode",
+                stage_n,
+                inputs[0],
+                out,
+                IntArg(stage.op.periods),
+                IntArg(stage.op.min_periods),
+                BoolArg(stage.op.kind in {"max", "argmax"}),
+                BoolArg(stage.op.kind in {"argmin", "argmax"}),
+                execution,
+            )
+        projection = Name(
+            "stackdsl::RollingPctRankProjection"
+            if stage.op.kind == "pct_rank"
+            else "stackdsl::RollingQuantileProjection"
+        )
+        quantile = 0.5 if stage.op.kind == "median" else stage.op.quantile
+        return tmpl(
+            "stackdsl::RollingOrderNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            UInt64Arg(double_bits(quantile)),
+            projection,
+            execution,
+        )
+    if stage.kind == "theilsen":
+        assert isinstance(stage.op, TheilSenOp)
+        return tmpl(
+            "stackdsl::RollingTheilSenNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
     if stage.kind == "instrument_basis":
         assert isinstance(stage.op, InstrumentBasisMeanOp)
         assert stage.projection in {"beta", "preds"}
@@ -553,7 +646,7 @@ def _stage_type(
         )
     if stage.kind == "ridge":
         assert isinstance(stage.op, RidgeOp)
-        assert stage.projection in {"beta", "preds"}
+        assert stage.projection is not None
         assert stage.half_life is not None and stage.ridge_lambda is not None
         features = stage.inputs[:-2]
         y_source, weight_source = stage.inputs[-2:]
@@ -562,11 +655,28 @@ def _stage_type(
             and math.isfinite(stage.half_life)
             and stage.half_life > 0.0
         )
-        projection = (
-            "stackdsl::RidgeBetaProjection"
-            if stage.projection == "beta"
-            else "stackdsl::RidgePredsProjection"
-        )
+        component = stage.projection_component
+        if stage.projection in {"coefficient", "standard_error", "tstat"}:
+            assert component is not None
+            projection = tmpl({
+                "coefficient": "stackdsl::RidgeCoefficientProjection",
+                "standard_error": "stackdsl::RidgeStandardErrorProjection",
+                "tstat": "stackdsl::RidgeTStatProjection",
+            }[stage.projection], IntArg(component))
+        else:
+            projection = Name({
+                "beta": "stackdsl::RidgeBetaProjection",
+                "preds": "stackdsl::RidgePredsProjection",
+                "residuals": "stackdsl::RidgeResidualsProjection",
+                "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
+                "tstats": "stackdsl::RidgeTStatsProjection",
+                "sse": "stackdsl::RidgeSseProjection",
+                "sst": "stackdsl::RidgeSstProjection",
+                "r2": "stackdsl::RidgeR2Projection",
+                "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
+                "effective_df": "stackdsl::RidgeEffectiveDfProjection",
+                "effective_n": "stackdsl::RidgeEffectiveNProjection",
+            }[stage.projection])
         return tmpl(
             "stackdsl::RidgeNode",
             n,
@@ -578,7 +688,7 @@ def _stage_type(
             UInt64Arg(double_bits(stage.ridge_lambda)),
             BoolArg(stage.op.nonneg),
             BoolArg(stateful),
-            Name(projection),
+            projection,
             execution,
         )
     if stage.kind == "groupby":

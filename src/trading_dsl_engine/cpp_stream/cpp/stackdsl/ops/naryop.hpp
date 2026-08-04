@@ -313,10 +313,11 @@ template <
     std::size_t N,
     class In,
     class Out,
+    class Score,
     class Execution = DirectExecution<N>
 >
-struct XsRankNode {
-    RankScoreTable<N> scores{};
+struct XsRankNodeImpl {
+    Score scores{};
     void setup() noexcept { scores.setup(); }
 
     template <class Context>
@@ -405,5 +406,49 @@ private:
         }
     }
 };
+
+template <std::size_t N>
+struct NormalRankScore {
+    RankScoreTable<N> table{};
+    void setup() noexcept { table.setup(); }
+    STACKDSL_HOT double get(
+        std::size_t count,
+        std::size_t upper_minus_one
+    ) const noexcept {
+        return table.get(count, upper_minus_one);
+    }
+};
+
+template <std::size_t N>
+struct PctRankScore {
+    STACKDSL_HOT void setup() noexcept {}
+    STACKDSL_HOT double get(
+        std::size_t count,
+        std::size_t upper_minus_one
+    ) const noexcept {
+        return static_cast<double>(upper_minus_one + 1) /
+            static_cast<double>(count + 1);
+    }
+};
+
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
+struct XsRankNode : XsRankNodeImpl<
+    N, In, Out, NormalRankScore<N>, Execution
+> {};
+
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
+struct XsPctRankNode : XsRankNodeImpl<
+    N, In, Out, PctRankScore<N>, Execution
+> {};
 
 }  // namespace stackdsl

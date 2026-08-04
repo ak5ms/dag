@@ -222,12 +222,27 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "norm_inv",
             "xs_norm",
             "xs_rank",
-            "get_beta",
-            "get_preds",
+            "xs_pct_rank",
             "xs_sort",
             "xstd",
             "outer",
             "cumsum",
+        }
+    },
+    **{
+        name: _dsl_signature("model")
+        for name in {
+            "get_beta",
+            "get_preds",
+            "get_residuals",
+            "get_sse",
+            "get_sst",
+            "get_r2",
+            "get_residual_variance",
+            "get_standard_errors",
+            "get_tstats",
+            "get_effective_df",
+            "get_effective_n",
         }
     },
     **{
@@ -256,7 +271,118 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
     "ewm": _dsl_signature("x", "span", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
-    "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
+    "ewm_moment": _dsl_signature(
+        "x",
+        "halflife",
+        "k",
+        "min_periods",
+        defaults={"k": 2, "min_periods": 0},
+    ),
+    **{
+        name: _dsl_signature(
+            "x", "halflife", "min_periods", defaults={"min_periods": 0}
+        )
+        for name in {"ewm_var", "ewm_std", "ewm_skewness", "ewm_kurtosis"}
+    },
+    **{
+        name: _dsl_signature(
+            "x", "y", "halflife", "min_periods", defaults={"min_periods": 0}
+        )
+        for name in {"ewm_cov", "ewm_corr"}
+    },
+    **{
+        name: _dsl_signature(
+            "y", "x", "halflife", "min_periods", defaults={"min_periods": 0}
+        )
+        for name in {"ewm_co_skewness", "ewm_co_kurtosis"}
+    },
+    **{
+        name: _dsl_signature(
+            "x",
+            "y",
+            "z",
+            "halflife",
+            "min_periods",
+            defaults={"min_periods": 0},
+        )
+        for name in {"ewm_triple_corr", "ewm_partial_corr"}
+    },
+    "roll_mean": _dsl_signature(
+        "x", "periods", "min_periods", defaults={"min_periods": None}
+    ),
+    **{
+        name: _dsl_signature(
+            "x", "periods", "min_periods", defaults={"min_periods": None}
+        )
+        for name in {
+            "rolling_sum",
+            "rolling_mean",
+            "rolling_min",
+            "rolling_max",
+            "rolling_median",
+            "rolling_pct_rank",
+            "rolling_argmin",
+            "rolling_argmax",
+        }
+    },
+    "rolling_std": _dsl_signature(
+        "x",
+        "periods",
+        "min_periods",
+        "ddof",
+        defaults={"min_periods": None, "ddof": 0},
+    ),
+    "rolling_quantile": _dsl_signature(
+        "x",
+        "periods",
+        "q",
+        "min_periods",
+        defaults={"q": 0.5, "min_periods": None},
+    ),
+    "rolling_theilsen": _dsl_signature(
+        "y", "x", "periods", "min_periods", defaults={"min_periods": None}
+    ),
+    **{
+        name: _dsl_signature("x")
+        for name in {"xs_demean", "xs_zscore", "xs_direction"}
+    },
+    "xs_scale": _dsl_signature("x", "scale", defaults={"scale": 1.0}),
+    **{
+        name: _dsl_signature("x", "y")
+        for name in {"xs_vector_proj", "xs_vector_neut"}
+    },
+    **{
+        name: _dsl_signature(
+            "x", "periods", "min_periods", defaults={"min_periods": None}
+        )
+        for name in {"rolling_range", "rolling_zscore"}
+    },
+    "rolling_scale": _dsl_signature(
+        "x",
+        "periods",
+        "constant",
+        "min_periods",
+        defaults={"constant": 0.0, "min_periods": None},
+    ),
+    "ts_regression": _dsl_signature(
+        "y",
+        "x",
+        "periods",
+        "lag",
+        "rettype",
+        "weights",
+        "lambda_",
+        defaults={
+            "lag": 0,
+            "rettype": "residual",
+            "weights": 1.0,
+            "lambda_": 0.0,
+        },
+    ),
+    **{
+        name: _dsl_signature("model", "component")
+        for name in {"get_coefficient", "get_standard_error", "get_tstat"}
+    },
     "ffill": _dsl_signature("x", "limit"),
     "shift": _dsl_signature("x", "lag", "max_lag", defaults={"lag": 1, "max_lag": None}),
     "buffer": _dsl_signature("shift_expr", "min", "max"),
@@ -350,6 +476,7 @@ buffer = op("buffer")
 ewm = op("ewm")
 roll_mean = op("roll_mean")
 xs_rank = op("xs_rank")
+xs_pct_rank = op("xs_pct_rank")
 norm_inv = op("norm_inv")
 xs_norm = op("xs_norm")
 clip = op("clip")
@@ -360,6 +487,28 @@ rbf_basis = op("rbf_basis")
 future_rbf_basis_sum = op("future_rbf_basis_sum")
 col = op("col")
 einsum = op("einsum")
+ewm_moment = op("ewm_moment")
+ewm_var = op("ewm_var")
+ewm_std = op("ewm_std")
+ewm_skewness = op("ewm_skewness")
+ewm_kurtosis = op("ewm_kurtosis")
+ewm_cov = op("ewm_cov")
+ewm_corr = op("ewm_corr")
+ewm_co_skewness = op("ewm_co_skewness")
+ewm_co_kurtosis = op("ewm_co_kurtosis")
+ewm_triple_corr = op("ewm_triple_corr")
+ewm_partial_corr = op("ewm_partial_corr")
+rolling_sum = op("rolling_sum")
+rolling_mean = op("rolling_mean")
+rolling_std = op("rolling_std")
+rolling_min = op("rolling_min")
+rolling_max = op("rolling_max")
+rolling_median = op("rolling_median")
+rolling_quantile = op("rolling_quantile")
+rolling_pct_rank = op("rolling_pct_rank")
+rolling_argmin = op("rolling_argmin")
+rolling_argmax = op("rolling_argmax")
+rolling_theilsen = op("rolling_theilsen")
 
 cat = op("cat")
 groupby = op("groupby")
@@ -572,7 +721,18 @@ def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonn
 
 get_beta = op("get_beta")
 get_preds = op("get_preds")
-rolling_quantile = op("rolling_quantile")
+get_residuals = op("get_residuals")
+get_coefficient = op("get_coefficient")
+get_sse = op("get_sse")
+get_sst = op("get_sst")
+get_r2 = op("get_r2")
+get_residual_variance = op("get_residual_variance")
+get_standard_errors = op("get_standard_errors")
+get_standard_error = op("get_standard_error")
+get_tstats = op("get_tstats")
+get_tstat = op("get_tstat")
+get_effective_df = op("get_effective_df")
+get_effective_n = op("get_effective_n")
 mean = op("mean")
 
 
