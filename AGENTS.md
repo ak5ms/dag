@@ -16,6 +16,9 @@ Priorities, in order:
 ## Key invariants
 
 - Every operation should follow strict `on_data(...)` + `emit(...)` behavior (including stateless ops).
+- In `cpp_stream`, an omitted reduction axis means all logical axes. Temporal
+  reductions accumulate per row but project their result and run any dependent
+  suffix only once during finalization; never materialize cumulative results per row.
 - Live updates must be incremental; do not recompute full history in update paths.
 - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
 - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.

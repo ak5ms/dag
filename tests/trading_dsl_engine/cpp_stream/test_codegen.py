@@ -3,10 +3,10 @@ import re
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
 from trading_dsl_engine.base.keys import Key
+from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.ir import compile_ir
 
 
 _ROW_LOOP_HEADERS = (
@@ -210,3 +210,28 @@ def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
     assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
     assert row_loop_prefix.count("ctx.inputs[0] =") == 1
     assert row_loop_prefix.count("ctx.inputs[1] =") == 1
+
+
+def test_temporal_reduction_suffix_runs_once_during_finalization():
+    source = _render(var("x").sum(axis=0) + 1.0, n=5)
+    loop_start = source.index(_generated_row_loop_header(source))
+    loop_end = source.index("        return 0;\n    }", loop_start)
+    row_loop = source[loop_start:loop_end]
+
+    # s0 accumulates the temporal reduction. Its result consumers are omitted
+    # from the row loop rather than projecting the cumulative result every row.
+    assert re.findall(
+        r"^\s+s(\d+)\.on_data\(ctx\);$", row_loop, re.MULTILINE
+    ) == ["0"]
+
+    final_start = source.index("    int finalize(")
+    final_end = source.index("        return 0;\n    }", final_start)
+    final_phase = source[final_start:final_end]
+    calls = (
+        "s0.finalize(ctx);",
+        "s1.on_data(ctx);",
+        "s2.on_data(ctx);",
+        "s2.finalize(ctx);",
+    )
+    positions = [final_phase.index(call) for call in calls]
+    assert positions == sorted(positions)

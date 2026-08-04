@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Mapping
 
 from trading_dsl_engine.cpp_stream.python import lowering as base
@@ -116,10 +117,16 @@ def _build_plan(
         shape: tuple[int, ...],
         *,
         dtype: str = "float64",
+        final_only: bool = False,
     ) -> Source:
         if dest.slot is None:
             return Source(
-                "output", -1, dtype=dtype, width=max(1, dest.width), shape=shape
+                "output",
+                -1,
+                dtype=dtype,
+                width=max(1, dest.width),
+                shape=shape,
+                final_only=final_only,
             )
         if dest.tensor:
             return Source(
@@ -128,6 +135,7 @@ def _build_plan(
                 dtype=dtype,
                 width=dest.size,
                 shape=shape,
+                final_only=final_only,
             )
         if dest.matrix:
             return Source(
@@ -136,6 +144,7 @@ def _build_plan(
                 dtype=dtype,
                 width=dest.width,
                 shape=shape,
+                final_only=final_only,
             )
         return Source(
             "slot",
@@ -144,6 +153,7 @@ def _build_plan(
             dtype=dtype,
             width=1,
             shape=shape,
+            final_only=final_only,
         )
 
     def scalar_width_shape(shape: tuple[int, ...]) -> bool:
@@ -178,6 +188,7 @@ def _build_plan(
             continue
 
         children = tuple(sources[child] for child in node.child_ids)
+        final_only = any(child.final_only for child in children)
         is_root = node_id == root
 
         if isinstance(op, RbfBasisOp):
@@ -187,6 +198,7 @@ def _build_plan(
                 shape=node_shape,
                 parts=children,
                 op=op,
+                final_only=final_only,
             )
             sources[node_id] = source
             if is_root:
@@ -198,6 +210,7 @@ def _build_plan(
                         n_instruments,
                         output_kind="matrix",
                         output_width=op.n_basis,
+                        final_only=final_only,
                     )
                 )
             continue
@@ -209,6 +222,7 @@ def _build_plan(
                 shape=node_shape,
                 parts=children,
                 op=op,
+                final_only=final_only,
             )
             sources[node_id] = source
             if is_root:
@@ -220,6 +234,7 @@ def _build_plan(
                         n_instruments,
                         output_kind="matrix",
                         output_width=op.n_basis,
+                        final_only=final_only,
                     )
                 )
             continue
@@ -235,6 +250,7 @@ def _build_plan(
                 shape=node_shape,
                 parts=tuple(parts),
                 op=op,
+                final_only=final_only,
             )
             sources[node_id] = source
             if is_root:
@@ -246,6 +262,7 @@ def _build_plan(
                         n_instruments,
                         output_kind="matrix",
                         output_width=width,
+                        final_only=final_only,
                     )
                 )
             continue
@@ -261,9 +278,14 @@ def _build_plan(
                     output_kind=node.value_type.kind,
                     output_width=int(node.value_type.width),
                     op=op,
+                    final_only=final_only,
                 )
             )
-            sources[node_id] = source_from_dest(out, node_shape)
+            sources[node_id] = source_from_dest(
+                out,
+                node_shape,
+                final_only=final_only or op.temporal,
+            )
             continue
 
         if isinstance(op, EmitOp):
@@ -281,9 +303,12 @@ def _build_plan(
                     output_kind=node.value_type.kind,
                     output_width=int(node.value_type.width),
                     op=op,
+                    final_only=final_only,
                 )
             )
-            sources[node_id] = source_from_dest(out, node_shape)
+            sources[node_id] = source_from_dest(
+                out, node_shape, final_only=final_only
+            )
             continue
 
         if isinstance(op, InstrumentBasisMeanOp):
@@ -293,6 +318,7 @@ def _build_plan(
                 shape=(),
                 parts=children,
                 op=op,
+                final_only=final_only,
             )
             if is_root:
                 raise CppStreamLoweringError(
@@ -307,6 +333,7 @@ def _build_plan(
                 shape=(),
                 parts=children,
                 op=op,
+                final_only=final_only,
             )
             if is_root:
                 raise CppStreamLoweringError("Ridge object must be projected")
@@ -347,9 +374,12 @@ def _build_plan(
                     op=basis_op,
                     projection=op.field,
                     half_life=half_life,
+                    final_only=final_only,
                 )
             )
-            sources[node_id] = source_from_dest(out, node_shape)
+            sources[node_id] = source_from_dest(
+                out, node_shape, final_only=final_only
+            )
             continue
 
         if isinstance(op, RidgeProjectionOp):
@@ -392,9 +422,12 @@ def _build_plan(
                     projection=op.field,
                     half_life=half_life,
                     ridge_lambda=ridge_lambda,
+                    final_only=final_only,
                 )
             )
-            sources[node_id] = source_from_dest(out, node_shape)
+            sources[node_id] = source_from_dest(
+                out, node_shape, final_only=final_only
+            )
             continue
 
         if isinstance(op, EinsumOp):
@@ -425,6 +458,7 @@ def _build_plan(
                         ),
                         op=op,
                         einsum_step=step,
+                        final_only=final_only,
                     )
                 )
                 selected_positions = set(step.operand_positions)
@@ -433,7 +467,11 @@ def _build_plan(
                     for position, term in enumerate(terms)
                     if position not in selected_positions
                 ]
-                final_source = source_from_dest(out, step.output_shape)
+                final_source = source_from_dest(
+                    out,
+                    step.output_shape,
+                    final_only=final_only,
+                )
                 terms.append(final_source)
             assert final_source is not None
             sources[node_id] = final_source
@@ -589,9 +627,14 @@ def _build_plan(
                 f"unsupported IR op {type(op).__name__}"
             )
 
+        if final_only:
+            stage = replace(stage, final_only=True)
         stages.append(stage)
         sources[node_id] = source_from_dest(
-            stage.out, node_shape, dtype=stage.dtype
+            stage.out,
+            node_shape,
+            dtype=stage.dtype,
+            final_only=final_only,
         )
 
     root_type = program.nodes[root].value_type
@@ -609,6 +652,7 @@ def _build_plan(
                 dtype=source.dtype,
                 output_kind=root_type.kind,
                 output_width=int(root_type.width),
+                final_only=source.final_only,
             )
         )
 

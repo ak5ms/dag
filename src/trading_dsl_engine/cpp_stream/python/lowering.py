@@ -58,6 +58,7 @@ class Source:
     shape: tuple[int, ...] = ()
     parts: tuple["Source", ...] = ()
     op: object | None = None
+    final_only: bool = False
 
     @property
     def is_scalar_width(self) -> bool:
@@ -96,6 +97,7 @@ class Stage:
     ridge_lambda: float | None = None
     group: "GroupStage | None" = None
     einsum_step: ContractionStep | None = None
+    final_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -99,6 +99,23 @@ The native API does not yet implement NumPy's integer-sublist calling form,
 precomputed path lists, `out=`, `dtype=`, `order=`, `casting=`, or writeable-view
 semantics. Native einsum accumulation/output is currently `float64`.
 
+## Streaming reductions
+
+Reduction axes address `(time, *row_shape)`, so axis `0` is time. Omitting `axis`
+matches NumPy and reduces all logical axes. Row-only reductions remain composable
+per-row stages. Temporal `sum`, `mean`, and `std` update fixed-size state for every
+row but call the result projection only once during finalization; any downstream
+algebraic suffix also runs once from that final value. Neither a temporal reduction
+nor `emit("last")` allocates or writes a time-sized output.
+
+```python
+features = cat(x, y, z)
+per_instrument = features.sum(axis=2)
+one_scalar = features.sum()
+```
+
+See `REDUCTIONS.md` for NaN, `ddof`, shape, and output-mode semantics.
+
 ## Execution model
 
 Every operator has one native implementation and receives its execution scope as

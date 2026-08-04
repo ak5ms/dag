@@ -36,6 +36,19 @@ consteval std::size_t reduced_output_size() {
 }
 
 template <class Shape, class Axes>
+consteval bool reduces_contiguous_suffix() {
+    bool reduction_started = false;
+    for (std::size_t axis = 0; axis < Shape::rank; ++axis) {
+        if (Axes::contains(axis)) {
+            reduction_started = true;
+        } else if (reduction_started) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <class Shape, class Axes>
 STACKDSL_HOT std::size_t reduced_output_index(std::size_t flat) noexcept {
     if constexpr (Axes::size == 0) {
         return flat;
@@ -69,9 +82,12 @@ struct ReductionState {
     alignas(64) std::array<bool, Size> invalid{};
 
     STACKDSL_HOT void reset() noexcept {
-        total.fill(0.0);
-        mean.fill(0.0);
-        m2.fill(0.0);
+        if constexpr (std::is_same_v<Policy, StdReductionPolicy>) {
+            mean.fill(0.0);
+            m2.fill(0.0);
+        } else {
+            total.fill(0.0);
+        }
         count.fill(0);
         if constexpr (!IgnoreNa) invalid.fill(false);
     }
@@ -91,6 +107,42 @@ struct ReductionState {
         } else {
             total[index] += value;
             ++count[index];
+        }
+    }
+
+    STACKDSL_HOT void merge_block(
+        std::size_t index,
+        double block_total,
+        double block_mean,
+        double block_m2,
+        std::uint64_t block_count,
+        bool block_invalid
+    ) noexcept {
+        if constexpr (!IgnoreNa) {
+            if (block_invalid) invalid[index] = true;
+        }
+        if (block_count == 0) return;
+        if constexpr (std::is_same_v<Policy, StdReductionPolicy>) {
+            if (count[index] == 0) {
+                mean[index] = block_mean;
+                m2[index] = block_m2;
+                count[index] = block_count;
+                return;
+            }
+            const std::uint64_t previous_count = count[index];
+            const std::uint64_t combined_count = previous_count + block_count;
+            const double delta = block_mean - mean[index];
+            mean[index] += delta * static_cast<double>(block_count)
+                / static_cast<double>(combined_count);
+            m2[index] += block_m2
+                + delta * delta
+                    * static_cast<double>(previous_count)
+                    * static_cast<double>(block_count)
+                    / static_cast<double>(combined_count);
+            count[index] = combined_count;
+        } else {
+            total[index] += block_total;
+            count[index] += block_count;
         }
     }
 
@@ -132,6 +184,10 @@ struct ReductionNode {
         retains_leading_axis ? input_size / leading_extent : input_size;
     static constexpr std::size_t output_lane_width =
         retains_leading_axis ? output_size / leading_extent : output_size;
+    static constexpr bool contiguous_suffix =
+        reduces_contiguous_suffix<Shape, Axes>();
+    static constexpr std::size_t contiguous_reduction_width =
+        contiguous_suffix ? input_size / output_size : 1;
     using State = ReductionState<Policy, output_size, Ddof, IgnoreNa>;
 
     State state{};
@@ -140,7 +196,98 @@ struct ReductionNode {
 
     template <class Context>
     STACKDSL_HOT static void accumulate(State& target, const Context& ctx) noexcept {
-        if constexpr (retains_leading_axis) {
+        if constexpr (contiguous_suffix) {
+            std::size_t output_begin = 0;
+            std::size_t output_end = output_size;
+            if constexpr (retains_leading_axis) {
+                const std::size_t lane_begin =
+                    std::min(ctx.lane_begin, leading_extent);
+                const std::size_t lane_end =
+                    std::min(ctx.lane_end, leading_extent);
+                output_begin = lane_begin * output_lane_width;
+                output_end = lane_end * output_lane_width;
+            }
+            for (
+                std::size_t output = output_begin;
+                output < output_end;
+                ++output
+            ) {
+                const std::size_t input_begin =
+                    output * contiguous_reduction_width;
+                if constexpr (
+                    contiguous_reduction_width > 1
+                    && !std::is_same_v<Policy, StdReductionPolicy>
+                ) {
+                    std::array<double, 4> partial{};
+                    std::uint64_t block_count = 0;
+                    bool block_invalid = false;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+                    for (
+                        std::size_t reduction = 0;
+                        reduction < contiguous_reduction_width;
+                        ++reduction
+                    ) {
+                        const double value =
+                            Tensor::read_flat(ctx, input_begin + reduction);
+                        if (finite(value)) {
+                            partial[reduction & 3U] += value;
+                            ++block_count;
+                        } else if constexpr (!IgnoreNa) {
+                            block_invalid = true;
+                        }
+                    }
+                    const double block_total =
+                        (partial[0] + partial[1])
+                        + (partial[2] + partial[3]);
+                    target.merge_block(
+                        output,
+                        block_total,
+                        0.0,
+                        0.0,
+                        block_count,
+                        block_invalid
+                    );
+                } else if constexpr (contiguous_reduction_width > 1) {
+                    double block_mean = 0.0;
+                    double block_m2 = 0.0;
+                    std::uint64_t block_count = 0;
+                    bool block_invalid = false;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+                    for (
+                        std::size_t reduction = 0;
+                        reduction < contiguous_reduction_width;
+                        ++reduction
+                    ) {
+                        const double value =
+                            Tensor::read_flat(ctx, input_begin + reduction);
+                        if (!finite(value)) {
+                            if constexpr (!IgnoreNa) block_invalid = true;
+                            continue;
+                        }
+                        const std::uint64_t next_count = block_count + 1;
+                        const double delta = value - block_mean;
+                        block_mean += delta / static_cast<double>(next_count);
+                        const double delta2 = value - block_mean;
+                        block_m2 = std::fma(delta, delta2, block_m2);
+                        block_count = next_count;
+                    }
+                    target.merge_block(
+                        output,
+                        0.0,
+                        block_mean,
+                        block_m2,
+                        block_count,
+                        block_invalid
+                    );
+                } else {
+                    target.add(output, Tensor::read_flat(ctx, input_begin));
+                }
+            }
+        } else if constexpr (retains_leading_axis) {
             const std::size_t lane_begin = std::min(ctx.lane_begin, leading_extent);
             const std::size_t lane_end = std::min(ctx.lane_end, leading_extent);
             for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
@@ -195,18 +342,13 @@ struct ReductionNode {
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
         if constexpr (Temporal) {
             accumulate(state, ctx);
-            // A terminal temporal reduction writes only during finalize(). When it
-            // feeds downstream DSL nodes, Out is scratch storage and the current
-            // cumulative value is exposed on every row. A terminal downstream
-            // expression is implicitly wrapped in emit('last') by the frontend.
-            if constexpr (!std::is_same_v<Out, OutputDst>) {
-                write_result(state, ctx);
-            }
+            // Temporal state is projected only by finalize(). If this reduction
+            // feeds downstream algebra, codegen schedules that complete suffix in
+            // the final phase after this accumulator has written its result once.
         } else {
-            State row{};
-            row.reset();
-            accumulate(row, ctx);
-            write_result(row, ctx);
+            state.reset();
+            accumulate(state, ctx);
+            write_result(state, ctx);
         }
     }
 

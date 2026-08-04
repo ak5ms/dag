@@ -97,9 +97,9 @@ def compile_ir(
 ) -> Program:
     """Compile cpp_stream IR with tensor broadcasting and composable reductions.
 
-    A temporal reduction used inside a larger expression exposes its cumulative
-    value on each row. The complete downstream expression is implicitly wrapped
-    in ``emit('last')`` so only the final value is materialized.
+    A temporal reduction accumulates in the row loop but projects its result only
+    during finalization. The complete downstream suffix is evaluated once from
+    that final value and is implicitly wrapped in ``emit('last')``.
     """
 
     expression = parse_formula(formula) if isinstance(formula, str) else formula

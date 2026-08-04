@@ -4,7 +4,7 @@ The parallel branch is based directly on `cpp-stream-backend` commit `a21928f57b
 
 ## Full DSL reduction composition
 
-Numeric outputs from reductions now retain their complete logical shape and may feed ordinary elementwise DSL operators, `cumsum`, `ewm`, `ffill`, and `shift`. Temporal reductions may also feed downstream algebra. A downstream graph that depends on a temporal reduction is evaluated cumulatively in one pass and implicitly emits only its final value.
+Numeric outputs from reductions retain their complete logical shape and may feed ordinary elementwise DSL operators, `cumsum`, `ewm`, `ffill`, and `shift`. Temporal reductions may also feed downstream algebra. The temporal accumulator updates in the row loop, projects its result only once during finalization, and then evaluates the dependent suffix once before the implicit final emission. Omitting `axis` reduces every logical axis, including time, matching NumPy.
 
 The exact alpha-search topology is covered end to end:
 
@@ -95,6 +95,36 @@ The terminal-reduction benchmark uses 5,000,000 rows, 9 instruments, and 3 compu
 The fused 3-feature temporal sum is **2.072x faster** than writing the full computed result. Including a NumPy post-hoc reduction of the materialized result, the fused native path is **4.993x faster** (`0.186290 s` versus `0.930111 s`).
 
 The earlier table compared the simple one-feature cumsum/emit graph with a three-feature computed reduction, so its apparent large `emit` advantage was not an apples-to-apples operator comparison. On the same finite input, `cumsum(x).emit("last")` produced the same values as `x.sum(axis=0)` but was slightly slower: **0.987x** the sum throughput.
+
+### Cat materialization versus fused reduction
+
+`scripts/benchmark_cpp_stream_cat_parallel.py` now measures the same lazy
+`cat(x1, x2, x3)` graph both as complete output and with reductions. This run used
+5,000,000 rows, 9 instruments, one warmup, ten measured runs, pinned workers, and
+9 available physical cores. The feature-axis case is `cat(...).sum(axis=2)`; the
+all-axis case is `cat(...).sum()` and verifies the NumPy-style omitted-axis default.
+
+| Graph | Threads | Median | Mean | Best | Median time | Output bytes | Versus matching full output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Full Cat | 1 | 16.448 M rows/s | 16.415 | 16.620 | 0.303988 s | 1,080,000,000 | — |
+| Feature-axis sum | 1 | 18.596 M rows/s | 18.579 | 18.849 | 0.268868 s | 360,000,000 | **1.131x** |
+| Full Cat | 9 automatic | 77.891 M rows/s | 77.497 | 83.098 | 0.064192 s | 1,080,000,000 | — |
+| Feature-axis sum | 9 automatic | 102.387 M rows/s | 102.092 | 104.033 | 0.048834 s | 360,000,000 | **1.314x** |
+| All-axis sum | 1 | 27.064 M rows/s | 27.074 | 27.590 | 0.184744 s | 8 | **1.645x** versus serial full Cat |
+
+Every measured throughput sample, in M rows/s:
+
+- Full Cat, serial: `16.142, 16.111, 16.452, 16.388, 16.444, 16.524, 16.567, 16.596, 16.620, 16.306`
+- Feature-axis sum, serial: `18.149, 18.595, 18.598, 18.470, 18.550, 18.684, 18.667, 18.587, 18.849, 18.644`
+- Full Cat, automatic: `67.237, 77.837, 77.946, 74.729, 73.568, 75.899, 81.227, 81.419, 83.098, 82.007`
+- Feature-axis sum, automatic: `104.033, 102.544, 102.168, 103.465, 102.828, 100.769, 102.230, 102.595, 100.832, 99.454`
+- All-axis sum, serial: `27.350, 27.418, 27.020, 27.590, 27.296, 27.109, 26.930, 26.994, 26.606, 26.432`
+
+The all-axis native checksum was `25130.3621726`, matching the post-hoc NumPy sum
+of the full file. NumPy's post-hoc pass took `0.075390 s`; fused all-axis reduction
+was **2.054x faster** than serial full output plus that pass. The benchmark raises
+if either feature-axis mode or the all-axis mode fails to beat its full-output
+comparison.
 
 ### `emit("last")` semantics
 

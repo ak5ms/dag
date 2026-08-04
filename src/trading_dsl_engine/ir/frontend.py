@@ -279,13 +279,9 @@ def _reduction_arguments(
 def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
     if stream_rank <= 0:
         raise FormulaIRCompileError("reduction stream rank must be positive")
-    items = (
-        tuple(range(stream_rank))
-        if axis is None
-        else axis.items
-        if isinstance(axis, KeyTuple)
-        else (axis,)
-    )
+    if axis is None:
+        return tuple(range(stream_rank))
+    items = axis.items if isinstance(axis, KeyTuple) else (axis,)
     normalized: list[int] = []
     for item in items:
         value = _literal_int(item, "reduction axis")

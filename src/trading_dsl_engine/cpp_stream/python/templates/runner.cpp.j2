@@ -109,10 +109,12 @@ struct CppStreamPlanRunner {
             ctx.output = out + t * output_row_width;
 {% endif %}
 {% for stage in stages %}
+{% if not stage.final_on_data %}
 {% if stage.checked %}
             if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
 {% else %}
             s{{ stage.index }}.on_data(ctx);
+{% endif %}
 {% endif %}
 {% endfor %}
         }
@@ -120,11 +122,21 @@ struct CppStreamPlanRunner {
     }
 
 {% if output_mode == 'final' %}
-    void finalize(double* STACKDSL_RESTRICT out) noexcept {
+    int finalize(double* STACKDSL_RESTRICT out) noexcept {
         ctx.output = out;
-{% for stage in stages %}{% if stage.finalizer %}
+{% for stage in stages %}
+{% if stage.final_on_data %}
+{% if stage.checked %}
+        if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
+{% else %}
+        s{{ stage.index }}.on_data(ctx);
+{% endif %}
+{% endif %}
+{% if stage.finalizer %}
         s{{ stage.index }}.finalize(ctx);
-{% endif %}{% endfor %}
+{% endif %}
+{% endfor %}
+        return 0;
     }
 {% endif %}
 };
@@ -188,11 +200,11 @@ int run_bound_inputs(
     const auto started = std::chrono::steady_clock::now();
 
     if (threads == 1) {
-        const int code = runners[0]->run(input_data, 0, rows, out, 0, N);
-        if (code != 0) error.store(code, std::memory_order_relaxed);
+        int code = runners[0]->run(input_data, 0, rows, out, 0, N);
 {% if output_mode == 'final' %}
-        if (code == 0) runners[0]->finalize(out);
+        if (code == 0) code = runners[0]->finalize(out);
 {% endif %}
+        if (code != 0) error.store(code, std::memory_order_relaxed);
     } else {
         std::vector<std::thread> workers;
         workers.reserve(threads);

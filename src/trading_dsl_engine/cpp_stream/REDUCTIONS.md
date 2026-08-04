@@ -6,6 +6,7 @@ Reductions use the same expression API as other operations:
 result = compile_formula((x * y).sum(axis=0), data).run(out_path="sum.bin")
 row_mean = x.mean(axis=1)
 feature_std = cat(x, y).std(axis=[0, 1], ddof=1)
+all_sum = cat(x, y).sum()
 propagating_sum = x.sum(axis=0, ignore_na=False)
 last_cumulative = x.cumsum().emit("last")
 ```
@@ -16,12 +17,16 @@ emits one final output; it never creates the intermediate time-sized result. Axe
 that do not contain `0` reduce the current row and continue to emit one result per
 input row, so they compose normally with subsequent operations.
 
-Temporal reductions and `emit("last")` are terminal because they remove the streaming
-time dimension. Row reductions can appear anywhere in the graph. `sum`, `mean`, and
-`std` use `ignore_na=True` by default and therefore skip non-finite observations.
-Passing `ignore_na=False` propagates a non-finite observation to that reduction group.
-Empty groups and standard deviations with `count <= ddof` produce NaN. Standard
-deviation uses an online Welford accumulator.
+Omitting `axis` matches NumPy and reduces every logical axis, including time. A
+temporal reduction may feed downstream algebra: its accumulator is updated on each
+row, but its result is projected only once during finalization and the dependent
+suffix runs once from that final value. `emit("last")` remains terminal. Row
+reductions can appear anywhere in the graph.
+
+`sum`, `mean`, and `std` use `ignore_na=True` by default and therefore skip
+non-finite observations. Passing `ignore_na=False` propagates a non-finite
+observation to that reduction group. Empty groups and standard deviations with
+`count <= ddof` produce NaN. Standard deviation uses an online Welford accumulator.
 
 `RunResult.rows` remains the number of input rows processed, preserving throughput
 reporting. `RunResult.output_rows`, `output_shape`, and `output_mode` describe the

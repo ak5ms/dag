@@ -108,6 +108,35 @@ def test_string_formula_accepts_list_axes(tmp_path: Path) -> None:
     assert result.output_shape == ()
 
 
+@pytest.mark.parametrize("kind", ["sum", "mean", "std"])
+def test_method_reduction_without_axis_defaults_to_all_axes(
+    tmp_path: Path, kind: str
+) -> None:
+    x = np.arange(120, dtype=np.float64).reshape(5, 6, 4)
+    expression = getattr(var("x"), kind)()
+    _, result, actual = _run(tmp_path, expression, {"x": x})
+    expected = getattr(np, kind)(x)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+    assert result.output_mode == "final"
+    assert result.output_shape == ()
+    assert result.output_path.stat().st_size == np.dtype(np.float64).itemsize
+
+
+@pytest.mark.parametrize("kind", ["sum", "mean", "std"])
+def test_string_reduction_without_axis_defaults_to_all_axes(
+    tmp_path: Path, kind: str
+) -> None:
+    x = np.arange(72, dtype=np.float64).reshape(4, 6, 3)
+    runtime = compile_formula(f"{kind}(x)", {"x": x}, n_instruments=6)
+    result = runtime.run(out_path=tmp_path / f"{kind}-all.bin")
+    actual = np.fromfile(result.output_path, dtype=np.float64)
+
+    np.testing.assert_allclose(actual, [getattr(np, kind)(x)])
+    assert result.output_mode == "final"
+    assert result.output_shape == ()
+
+
 @pytest.mark.parametrize(
     ("kind", "kwargs"),
     [
