@@ -107,8 +107,12 @@ This backend must remain independent of `jax_flat`.
 ## Streaming reductions
 
 - Reduction axes refer to `(time, *row_shape)`; axis 0 is temporal.
+- An omitted reduction axis means every logical axis, matching NumPy.
 - A temporal reduction or `emit("last")` must not allocate or write a time-sized output.
-- Row reductions remain ordinary composable stages; temporal reductions are terminal.
+- A temporal accumulator must project its result only during finalization. If it
+  feeds downstream algebra, schedule that complete suffix once in finalization;
+  never expose a cumulative reduction result on every row.
+- Row reductions remain ordinary composable stages; `emit("last")` is terminal.
 - Use fixed-size accumulators only. `std` uses Welford state and no hot-path allocation.
 - Benchmarks must compare the fused native reduction with full materialization and
   post-hoc reduction, validate output checksums, and report output byte counts.

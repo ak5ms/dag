@@ -636,6 +636,7 @@ class StageView:
     index: int
     cpp_type: str
     checked: bool = False
+    final_on_data: bool = False
     finalizer: bool = False
 
 
@@ -778,8 +779,8 @@ def render_translation_unit(
                         n_instruments,
                         input_types,
                     ).render(),
-                    True,
-                    False,
+                    checked=True,
+                    final_on_data=stage.final_only,
                 )
             )
         else:
@@ -789,6 +790,7 @@ def render_translation_unit(
                     _stage_type(
                         stage, n, direct, input_types=input_types
                     ).render(),
+                    final_on_data=stage.final_only,
                     finalizer=stage.kind in {"reduce", "emit_last"}
                     and plan.output_mode == "final",
                 )

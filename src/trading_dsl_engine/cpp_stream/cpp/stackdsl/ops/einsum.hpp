@@ -240,12 +240,13 @@ struct UnaryEinsumNode {
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const auto [output_begin, output_end] =
+            execution_output_range<output_size, Execution>(ctx);
 
         if constexpr (is_full_identity_mapping<Tensor, Map, LoopShape>()) {
             std::array<double, reduction_size> values{};
-            for (std::size_t output = 0; output < output_size; ++output) {
+            for (std::size_t output = output_begin; output < output_end; ++output) {
                 const std::size_t base = output * reduction_size;
                 Tensor::load_contiguous(
                     ctx, base, reduction_size, values.data()
@@ -264,7 +265,7 @@ struct UnaryEinsumNode {
         }
 
         std::array<std::size_t, LoopShape::rank> indexes{};
-        for (std::size_t output = 0; output < output_size; ++output) {
+        for (std::size_t output = output_begin; output < output_end; ++output) {
             unravel_range<LoopShape>(output, 0, OutputRank, indexes);
             double value = 0.0;
             if constexpr (reduction_rank == 0) {
@@ -321,8 +322,9 @@ struct BinaryEinsumNode {
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const auto [output_begin, output_end] =
+            execution_output_range<output_size, Execution>(ctx);
 
         if constexpr (
             is_full_identity_mapping<Left, LeftMap, LoopShape>() &&
@@ -330,7 +332,7 @@ struct BinaryEinsumNode {
         ) {
             std::array<double, reduction_size> left_values{};
             std::array<double, reduction_size> right_values{};
-            for (std::size_t output = 0; output < output_size; ++output) {
+            for (std::size_t output = output_begin; output < output_end; ++output) {
                 const std::size_t base = output * reduction_size;
                 Left::load_contiguous(
                     ctx, base, reduction_size, left_values.data()
@@ -356,7 +358,7 @@ struct BinaryEinsumNode {
         }
 
         std::array<std::size_t, LoopShape::rank> indexes{};
-        for (std::size_t output = 0; output < output_size; ++output) {
+        for (std::size_t output = output_begin; output < output_end; ++output) {
             unravel_range<LoopShape>(output, 0, OutputRank, indexes);
             double value = 0.0;
             if constexpr (reduction_rank == 0) {

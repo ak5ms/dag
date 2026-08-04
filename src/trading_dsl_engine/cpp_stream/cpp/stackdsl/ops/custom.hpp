@@ -44,9 +44,10 @@ struct StatelessNode {
     static_assert(sizeof...(Inputs)==Policy::arity);
     STACKDSL_HOT void setup() noexcept {}
     template<class Context> STACKDSL_HOT void on_data(Context& ctx) noexcept {
-        (void)sizeof(Execution);
         auto* out=ctx.template write_ptr<Out>();
-        for(std::size_t lane=0;lane<N;++lane)out[lane]=Policy::apply(ctx.template read<Inputs>(lane)...);
+        const std::size_t begin=execution_lane_begin<N,Execution>(ctx);
+        const std::size_t end=execution_lane_end<N,Execution>(ctx);
+        for(std::size_t lane=begin;lane<end;++lane)out[lane]=Policy::apply(ctx.template read<Inputs>(lane)...);
     }
 };
 

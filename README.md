@@ -22,6 +22,8 @@ Current development targets the `trading_dsl_engine.jax_flat` runtime plus share
   - Deprecated non-flat JAX + Equinox runtime.
 - `src/trading_dsl_engine/jax_flat/`
   - Active JAX-flat runtime that lowers supported DSL expressions to a flat operator DAG and executes live ticks/batch scans through JIT-compiled JAX functions.
+- `src/trading_dsl_engine/cpp_stream/`
+  - Formula-specialized C++20 streaming backend with typed source adapters, generated native row loops, and fixed-size streaming reductions.
 - `tests/numba/`
   - Deprecated Numba runtime tests; do not run or update unless explicitly requested.
 - `tests/jax/`
@@ -83,6 +85,12 @@ The module includes compositional fitness helpers for the initial Sharpe-style o
 - Optional `column_names` passed to `compile_formula(...)`/`build_engine(...)` maps universe ticker names to input column positions for static column grouping.
 - Live `update` expects 1D vectors with shape `(n_instruments,)`.
 - Some ops may emit matrix outputs (e.g., `outer`, `bspline`), with shape `(n_instruments, width)` where `width` can differ from `n_instruments`.
+
+The independent `trading_dsl_engine.cpp_stream` backend interprets reduction axes
+against `(time, *row_shape)`. Its `sum`, `mean`, and `std` methods default to all
+logical axes when `axis` is omitted, matching NumPy. Temporal reductions update
+fixed-size state per row and project the result, plus any dependent algebraic
+suffix, only once during finalization.
 
 ## NaN semantics (current)
 

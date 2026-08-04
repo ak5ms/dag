@@ -10,6 +10,10 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/LU>
 
+#if defined(STACKDSL_EIGEN_RUNTIME_NO_MALLOC) && defined(EIGEN_NO_DEBUG)
+#error "Eigen runtime allocation assertions require EIGEN_NO_DEBUG to be absent"
+#endif
+
 namespace stackdsl::eigen_detail {
 
 template <std::size_t K>
@@ -35,6 +39,19 @@ using ConstVectorMap = Eigen::Map<const Vector<K>>;
 template <std::size_t K>
 using VectorMap = Eigen::Map<Vector<K>>;
 
+struct MallocAuditGuard {
+    MallocAuditGuard() noexcept {
+#if defined(STACKDSL_EIGEN_RUNTIME_NO_MALLOC)
+        Eigen::internal::set_is_malloc_allowed(false);
+#endif
+    }
+    ~MallocAuditGuard() {
+#if defined(STACKDSL_EIGEN_RUNTIME_NO_MALLOC)
+        Eigen::internal::set_is_malloc_allowed(true);
+#endif
+    }
+};
+
 template <std::size_t K>
 inline bool solve_matrix(
     const Matrix<K>& matrix,
@@ -43,8 +60,11 @@ inline bool solve_matrix(
 ) noexcept {
     static_assert(Matrix<K>::SizeAtCompileTime != Eigen::Dynamic);
     static_assert(Vector<K>::SizeAtCompileTime != Eigen::Dynamic);
+    MallocAuditGuard allocation_audit;
     if (!matrix.allFinite() || !rhs.allFinite()) return false;
 
+    // All matrices are fixed-size. noalias() prevents avoidable expression
+    // temporaries; decomposition workspaces remain stack-resident.
     Eigen::LLT<Matrix<K>> llt(matrix);
     if (llt.info() == Eigen::Success) {
         solution.noalias() = llt.solve(rhs);
@@ -64,7 +84,8 @@ inline bool solve_matrix(
     const auto& eigenvalues = eig.eigenvalues();
     const double max_eigenvalue = eigenvalues.cwiseAbs().maxCoeff();
     const double tolerance = std::max(1e-15, max_eigenvalue * 1e-12);
-    Vector<K> projected = eig.eigenvectors().transpose() * rhs;
+    Vector<K> projected;
+    projected.noalias() = eig.eigenvectors().transpose() * rhs;
     for (std::size_t i = 0; i < K; ++i) {
         const double value = eigenvalues[static_cast<int>(i)];
         projected[static_cast<int>(i)] =

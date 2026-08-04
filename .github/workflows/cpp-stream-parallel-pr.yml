@@ -1,0 +1,72 @@
+name: cpp_stream parallel branch
+
+on:
+  pull_request:
+    branches: [cpp-stream-backend]
+    paths:
+      - "src/trading_dsl_engine/base/**"
+      - "src/trading_dsl_engine/ir/**"
+      - "src/trading_dsl_engine/cpp_stream/**"
+      - "src/flows/pov.py"
+      - "src/flows/riskmodel.py"
+      - "tests/trading_dsl_engine/ir/**"
+      - "tests/trading_dsl_engine/cpp_stream/**"
+      - "scripts/benchmark_cpp_stream_parallel_matrix.py"
+      - "scripts/audit_cpp_stream_stateless_codegen.py"
+      - ".github/workflows/cpp-stream-parallel-pr.yml"
+  workflow_dispatch:
+
+jobs:
+  multicore-tests-and-benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Show CPU allocation
+        run: |
+          lscpu
+          python - <<'PY'
+          import os
+          cpus = sorted(os.sched_getaffinity(0))
+          print("affinity_cpus=", cpus)
+          if len(cpus) < 2:
+              raise SystemExit("parallel benchmark requires at least two available CPUs")
+          PY
+      - name: Install focused dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba pytest jinja2 jax equinox astropy
+          includeigen pybind11 matplotlib graphviz
+      - name: Run multicore correctness suite
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_codegen.py
+          tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
+          tests/trading_dsl_engine/cpp_stream/test_reductions.py
+          tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel_auto.py
+          tests/trading_dsl_engine/cpp_stream/test_parallel_row_scalar.py
+          tests/trading_dsl_engine/cpp_stream/test_where_broadcast.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+      - name: Inspect optimized stateless assembly
+        env:
+          PYTHONPATH: src
+        run: python scripts/audit_cpp_stream_stateless_codegen.py
+      - name: Run broad pinned multicore benchmark matrix
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_PARALLEL_ROWS: "1000000"
+          CPP_STREAM_PARALLEL_ROLL_ROWS: "1000000"
+          CPP_STREAM_PARALLEL_INSTRUMENTS: "64"
+          CPP_STREAM_PARALLEL_RUNS: "5"
+          CPP_STREAM_PARALLEL_WARMUPS: "1"
+          CPP_STREAM_PARALLEL_THREADS: "1,2,4"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_parallel_matrix.py

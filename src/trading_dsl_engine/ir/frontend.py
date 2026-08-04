@@ -191,8 +191,25 @@ def _feature_width(value_type: ValueType) -> int:
     raise FormulaIRCompileError(f"{value_type.kind!r} cannot be used as a feature")
 
 
+def _lane_state_result_type(name: str, child: Node) -> ValueType:
+    """Return the shape-preserving type of a per-lane temporal operator.
+
+    Cumulative/history/EWM operators apply independently to each logical lane. A
+    row-scalar input therefore remains a row scalar; a vector remains a vector.
+    Matrices, tensors, and object values require a separate explicit operator.
+    """
+
+    if child.value_type.kind not in {"scalar", "vector"}:
+        raise FormulaIRCompileError(
+            f"{name} requires a scalar or vector input, got {child.value_type.kind!r}"
+        )
+    return child.value_type
+
+
 def _nary_result_type(name: str, children: list[Node]) -> ValueType:
-    values = children[1:] if name == "where" else children
+    # Every where operand participates in broadcast shape. A vector condition
+    # with scalar branches therefore produces a vector, matching NumPy/JAX.
+    values = children
     if name in _LOGICAL_OPS:
         if any(child.value_type.kind == "matrix" for child in values):
             raise FormulaIRCompileError(f"{name} matrix values are unsupported")
@@ -262,13 +279,9 @@ def _reduction_arguments(
 def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
     if stream_rank <= 0:
         raise FormulaIRCompileError("reduction stream rank must be positive")
-    items = (
-        tuple(range(stream_rank))
-        if axis is None
-        else axis.items
-        if isinstance(axis, KeyTuple)
-        else (axis,)
-    )
+    if axis is None:
+        return tuple(range(stream_rank))
+    items = axis.items if isinstance(axis, KeyTuple) else (axis,)
     normalized: list[int] = []
     for item in items:
         value = _literal_int(item, "reduction axis")
@@ -368,8 +381,6 @@ def _normalize_einsum(call: Call) -> tuple[str, tuple[Expr, ...], object]:
         if operands and isinstance(operands[-1], String):
             raise FormulaIRCompileError("einsum received multiple subscript strings")
     elif isinstance(call.args[-1], String):
-        # Backward-compatible project syntax. NumPy-style first-string syntax is
-        # canonical and is used by all new code.
         subscripts = call.args[-1].value
         operands = call.args[:-1]
     else:
@@ -550,17 +561,35 @@ class _BaseBuilder:
             )
             return self._append(CatOp(widths), children, matrix(sum(widths)))
         if node.fn == "cumsum":
-            return self._append(CumsumOp(), (self.build(node.args[0]),), VECTOR)
+            child = self.build(node.args[0])
+            return self._append(
+                CumsumOp(),
+                (child,),
+                _lane_state_result_type("cumsum", self.nodes[child]),
+            )
         if node.fn == "ffill":
             x, limit = _normalize_ffill(node)
-            return self._append(FFillOp(limit), (self.build(x),), VECTOR)
+            child = self.build(x)
+            return self._append(
+                FFillOp(limit),
+                (child,),
+                _lane_state_result_type("ffill", self.nodes[child]),
+            )
         if node.fn == "shift":
             x, lag, maximum = _normalize_shift(node)
-            return self._append(ShiftOp(lag, maximum), (self.build(x),), VECTOR)
+            child = self.build(x)
+            return self._append(
+                ShiftOp(lag, maximum),
+                (child,),
+                _lane_state_result_type("shift", self.nodes[child]),
+            )
         if node.fn == "ewm":
             x, span, minimum, ignore, adjust = _normalize_ewm(node)
+            child = self.build(x)
             return self._append(
-                EwmOp(span, minimum, ignore, adjust), (self.build(x),), VECTOR
+                EwmOp(span, minimum, ignore, adjust),
+                (child,),
+                _lane_state_result_type("ewm", self.nodes[child]),
             )
         if node.fn == "xs_rank":
             return self._append(XsRankOp(), (self.build(node.args[0]),), VECTOR)

@@ -16,18 +16,30 @@ import includeigen
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
+from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
 from trading_dsl_engine.cpp_stream.python.lowering import lower_program
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
+from trading_dsl_engine.cpp_stream.python.parallel import select_parallel_plan
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
 from trading_dsl_engine.cpp_stream.python.sources import (
     SourceInfo,
     SourceValue,
     inspect_source_mapping,
 )
-from trading_dsl_engine.ir.frontend import compile_ir
-from trading_dsl_engine.ir.ops import CatOp, GroupByOp, InputOp, LiteralOp, NaryOp
+from trading_dsl_engine.ir.ops import (
+    CumsumOp,
+    EwmOp,
+    FFillOp,
+    GroupByOp,
+    InputOp,
+    NaryOp,
+    ShiftOp,
+)
 from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
+
+
+_LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp)
 
 
 def _cpp_root() -> Path:
@@ -64,8 +76,10 @@ def _flags() -> tuple[list[str], list[str]]:
         "-std=c++20",
         "-O3",
         "-DNDEBUG",
+        "-DEIGEN_NO_DEBUG",
         "-fPIC",
         "-shared",
+        "-pthread",
         "-fno-math-errno",
         "-funroll-loops",
         "-DEIGEN_DONT_PARALLELIZE",
@@ -92,6 +106,7 @@ def _flags() -> tuple[list[str], list[str]]:
     )
     link_flags = [
         "-Wl,-O3",
+        "-pthread",
         *shlex.split(
             os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", "")
         ),
@@ -162,23 +177,96 @@ def _input_value_type(spec: InputTypeSpec, n_instruments: int) -> ValueType:
     return tensor(logical_shape, dtype=spec.dtype)
 
 
+def _broadcast_shapes(shapes: tuple[tuple[int | None, ...], ...]) -> tuple[int | None, ...]:
+    rank = max((len(shape) for shape in shapes), default=0)
+    result: list[int | None] = []
+    for output_axis in range(rank):
+        aligned: list[int | None] = []
+        for shape in shapes:
+            input_axis = output_axis - (rank - len(shape))
+            aligned.append(1 if input_axis < 0 else shape[input_axis])
+        chosen: int | None = 1
+        for extent in aligned:
+            if extent == 1:
+                continue
+            if chosen == 1:
+                chosen = extent
+            elif extent != chosen:
+                raise TypeError(
+                    f"operands could not be broadcast together in cpp_stream: {shapes!r}"
+                )
+        result.append(chosen)
+    return tuple(result)
+
+
+def _broadcast_result_type(name: str, children: tuple[Node, ...]) -> ValueType:
+    del name
+    if any(child.value_type.kind == "object" for child in children):
+        raise TypeError("elementwise operators cannot consume object values")
+    shapes = tuple(child.value_type.logical_shape for child in children)
+    dtype = (
+        children[0].value_type.dtype
+        if len({child.value_type.dtype for child in children}) == 1
+        else "float64"
+    )
+    return tensor(_broadcast_shapes(shapes), dtype=dtype)
+
+
+def _repair_value_types(program: Program) -> Program:
+    """Propagate tensor broadcasting and shape-preserving temporal operators."""
+
+    nodes: list[Node] = []
+    for original in program.nodes:
+        node = original
+        op = node.op
+        if isinstance(op, GroupByOp):
+            inner = _repair_value_types(op.inner_program)
+            op = replace(op, inner_program=inner)
+            node = replace(
+                node,
+                op=op,
+                value_type=inner.nodes[inner.output_id].value_type,
+            )
+
+        child_nodes = tuple(nodes[child_id] for child_id in node.child_ids)
+        if isinstance(op, NaryOp):
+            node = replace(
+                node,
+                value_type=_broadcast_result_type(op.name, child_nodes),
+            )
+        elif isinstance(op, _LANE_STATE_OPS):
+            if len(child_nodes) != 1:
+                raise TypeError(
+                    f"{type(op).__name__} expected one child, got {len(child_nodes)}"
+                )
+            child_type = child_nodes[0].value_type
+            if child_type.kind == "object":
+                raise TypeError(
+                    f"{type(op).__name__} cannot consume object values"
+                )
+            node = replace(node, value_type=child_type)
+        nodes.append(node)
+    return replace(program, nodes=tuple(nodes))
+
+
 def _row_scalar_analysis(
-    program: Program, input_types: tuple[InputTypeSpec, ...]
+    program: Program,
+    input_types: tuple[InputTypeSpec, ...],
 ):
+    """Return whether an outer-plan node has one value for the complete row."""
+
     memo: dict[int, bool] = {}
 
     def visit(node_id: int) -> bool:
         if node_id in memo:
             return memo[node_id]
         node = program.nodes[node_id]
-        if isinstance(node.op, InputOp):
-            value = input_types[node.op.input_index].row_scalar
-        elif isinstance(node.op, LiteralOp):
-            value = True
-        elif isinstance(node.op, NaryOp):
-            value = all(visit(child) for child in node.child_ids)
-        elif isinstance(node.op, CatOp):
+        if isinstance(node.op, GroupByOp):
             value = False
+        elif node.value_type.kind == "scalar":
+            value = True
+        elif isinstance(node.op, InputOp):
+            value = input_types[node.op.input_index].row_scalar
         else:
             value = False
         memo[node_id] = value
@@ -188,10 +276,11 @@ def _row_scalar_analysis(
 
 
 def _apply_input_key_hints(
-    program: Program, input_types: tuple[InputTypeSpec, ...]
+    program: Program,
+    input_types: tuple[InputTypeSpec, ...],
 ) -> Program:
     is_row_scalar = _row_scalar_analysis(program, input_types)
-    nodes: list[Node] = []
+    nodes = []
     for node in program.nodes:
         if not isinstance(node.op, GroupByOp):
             nodes.append(node)
@@ -230,6 +319,7 @@ def _compile_program(
     prefetch_rows: int,
     bound_sources: Mapping[str, SourceValue] | None,
 ) -> CppStreamRuntime:
+    program = _repair_value_types(program)
     root_kind = program.nodes[program.output_id].value_type.kind
     if root_kind == "object":
         raise ValueError(
@@ -239,16 +329,18 @@ def _compile_program(
         raise ValueError(f"unsupported cpp_stream root kind {root_kind!r}")
     program = _apply_input_key_hints(program, input_types)
     scalar = _row_scalar_analysis(program, input_types)
+    row_scalar_nodes = frozenset(
+        index for index in range(len(program.nodes)) if scalar(index)
+    )
     plan = lower_program(
         program,
         n_instruments=n_instruments,
         default_group_capacity=default_group_capacity,
         key_cardinalities=key_cardinalities,
-        row_scalar_nodes=frozenset(
-            index for index in range(len(program.nodes)) if scalar(index)
-        ),
+        row_scalar_nodes=row_scalar_nodes,
         input_dtypes=tuple(spec.dtype for spec in input_types),
     )
+    parallel_plan = select_parallel_plan(plan, n_instruments)
     generated = render_translation_unit(
         plan,
         n_instruments=n_instruments,
@@ -264,6 +356,7 @@ def _compile_program(
         n_instruments=n_instruments,
         input_types=input_types,
         bound_sources=bound_sources,
+        parallel_plan=parallel_plan,
     )
 
 
@@ -310,17 +403,7 @@ def compile_formula(
     prefetch_rows: int = 16,
     input_types: Mapping[str, InputTypeSpec] | None = None,
 ) -> CppStreamRuntime:
-    """Compile one formula for independently inferred heterogeneous sources.
-
-    When ``data`` is provided, each input is inspected through its own adapter.
-    File extensions, URI schemes, and object types may therefore differ within the
-    same formula. The resulting runtime binds these sources, although ``run`` may
-    replace them with another compatible mapping.
-
-    Headerless raw inputs need an ``InputTypeSpec`` either in ``input_types`` or in
-    an ``InputSource`` wrapper. When ``data`` is omitted, ``n_instruments`` is
-    required and the prior explicit ``input_types`` compilation mode remains valid.
-    """
+    """Compile a formula for independently inferred heterogeneous sources."""
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
 
