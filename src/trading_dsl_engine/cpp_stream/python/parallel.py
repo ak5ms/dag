@@ -32,6 +32,9 @@ _TEMPORAL_KINDS = {
     "ffill",
     "shift",
     "ewm",
+    "ewm_stats",
+    "rolling",
+    "theilsen",
     "tensor_cumsum",
     "tensor_ffill",
     "tensor_shift",
@@ -50,6 +53,9 @@ _LANE_LOCAL_KINDS = {
     "ffill",
     "shift",
     "ewm",
+    "ewm_stats",
+    "rolling",
+    "theilsen",
     "cat",
     "instrument_basis",
     "tensor_copy",
@@ -74,6 +80,9 @@ _EXPERIMENTAL_STAGE_WORK = {
     "ffill": 2,
     "shift": 2,
     "ewm": 3,
+    "ewm_stats": 6,
+    "rolling": 6,
+    "theilsen": 16,
     "tensor_copy": 1,
     "tensor_unary": 1,
     "tensor_binary": 1,
@@ -89,6 +98,7 @@ _EXPERIMENTAL_STAGE_WORK = {
     "instrument_basis": 10,
     "ridge": 12,
     "xs_rank": 8,
+    "xs_pct_rank": 8,
 }
 
 

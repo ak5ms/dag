@@ -29,6 +29,7 @@ from trading_dsl_engine.cpp_stream.python.sources import (
 from trading_dsl_engine.ir.ops import (
     CumsumOp,
     EwmOp,
+    RollingOp,
     FFillOp,
     GroupByOp,
     InputOp,
@@ -39,7 +40,7 @@ from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 
-_LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp)
+_LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp, RollingOp)
 
 
 def _cpp_root() -> Path:

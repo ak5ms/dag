@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, TypeAlias
 
 from trading_dsl_engine.ir.einsum import EinsumSpec
@@ -104,6 +105,99 @@ class XsRankOp:
 
 
 @dataclass(frozen=True, slots=True)
+class XsPctRankOp:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class EwmStatsOp:
+    """Pairwise-complete exponentially weighted moment/statistic."""
+
+    kind: str
+    halflife: float
+    min_periods: int = 0
+    order: int = 0
+
+    def __post_init__(self) -> None:
+        supported = {
+            "moment",
+            "var",
+            "std",
+            "skewness",
+            "kurtosis",
+            "cov",
+            "corr",
+            "co_skewness",
+            "co_kurtosis",
+            "triple_corr",
+            "partial_corr",
+        }
+        if self.kind not in supported:
+            raise ValueError(f"unsupported EWM statistic {self.kind!r}")
+        if not math.isfinite(self.halflife) or not self.halflife > 0.0:
+            raise ValueError("EWM statistic halflife must be finite and > 0")
+        if self.min_periods < 0:
+            raise ValueError("EWM statistic min_periods must be >= 0")
+        if self.kind == "moment" and not 1 <= self.order <= 4:
+            raise ValueError("ewm_moment currently supports orders 1 through 4")
+
+    @property
+    def arity(self) -> int:
+        if self.kind in {"cov", "corr", "co_skewness", "co_kurtosis"}:
+            return 2
+        if self.kind in {"triple_corr", "partial_corr"}:
+            return 3
+        return 1
+
+
+@dataclass(frozen=True, slots=True)
+class RollingOp:
+    """Fixed-period rolling statistic over observations/rows."""
+
+    kind: str
+    periods: int
+    min_periods: int
+    ddof: int = 0
+    quantile: float = 0.5
+
+    def __post_init__(self) -> None:
+        supported = {
+            "sum",
+            "mean",
+            "std",
+            "min",
+            "max",
+            "median",
+            "quantile",
+            "pct_rank",
+            "argmin",
+            "argmax",
+        }
+        if self.kind not in supported:
+            raise ValueError(f"unsupported rolling statistic {self.kind!r}")
+        if self.periods < 1:
+            raise ValueError("rolling periods must be >= 1")
+        if not 0 <= self.min_periods <= self.periods:
+            raise ValueError("rolling min_periods must be in [0, periods]")
+        if self.ddof < 0:
+            raise ValueError("rolling ddof must be >= 0")
+        if not 0.0 <= self.quantile <= 1.0:
+            raise ValueError("rolling quantile must be in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class TheilSenOp:
+    periods: int
+    min_periods: int
+
+    def __post_init__(self) -> None:
+        if self.periods < 2:
+            raise ValueError("Theil-Sen periods must be >= 2")
+        if not 2 <= self.min_periods <= self.periods:
+            raise ValueError("Theil-Sen min_periods must be in [2, periods]")
+
+
+@dataclass(frozen=True, slots=True)
 class RbfBasisOp:
     n_basis: int
 
@@ -152,11 +246,34 @@ class RidgeOp:
 
 @dataclass(frozen=True, slots=True)
 class RidgeProjectionOp:
-    field: str  # beta or preds
+    field: str
+    component: int | None = None
 
     def __post_init__(self) -> None:
-        if self.field not in {"beta", "preds"}:
+        supported = {
+            "beta",
+            "preds",
+            "residuals",
+            "coefficient",
+            "standard_errors",
+            "standard_error",
+            "tstats",
+            "tstat",
+            "sse",
+            "sst",
+            "r2",
+            "residual_variance",
+            "effective_df",
+            "effective_n",
+        }
+        if self.field not in supported:
             raise ValueError(f"unsupported Ridge projection {self.field!r}")
+        component_fields = {"coefficient", "standard_error", "tstat"}
+        if self.field in component_fields:
+            if self.component is None or self.component < 0:
+                raise ValueError(f"Ridge {self.field} requires a nonnegative component")
+        elif self.component is not None:
+            raise ValueError(f"Ridge {self.field} does not accept a component")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +310,10 @@ OpSpec: TypeAlias = (
     | ShiftOp
     | EwmOp
     | XsRankOp
+    | XsPctRankOp
+    | EwmStatsOp
+    | RollingOp
+    | TheilSenOp
     | RbfBasisOp
     | FutureRbfBasisSumOp
     | EinsumOp
@@ -217,6 +338,10 @@ __all__ = [
     "ShiftOp",
     "EwmOp",
     "XsRankOp",
+    "XsPctRankOp",
+    "EwmStatsOp",
+    "RollingOp",
+    "TheilSenOp",
     "RbfBasisOp",
     "FutureRbfBasisSumOp",
     "EinsumOp",

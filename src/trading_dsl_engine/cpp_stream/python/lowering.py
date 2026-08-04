@@ -13,6 +13,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupByOp,
@@ -25,8 +26,11 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingOp,
     ReductionOp,
     ShiftOp,
+    TheilSenOp,
+    XsPctRankOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
@@ -93,6 +97,7 @@ class Stage:
     op_name: str | None = None
     op: object | None = None
     projection: str | None = None
+    projection_component: int | None = None
     half_life: float | None = None
     ridge_lambda: float | None = None
     group: "GroupStage | None" = None
@@ -222,7 +227,11 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         FFillOp,
         ShiftOp,
         EwmOp,
+        EwmStatsOp,
+        RollingOp,
+        TheilSenOp,
         XsRankOp,
+        XsPctRankOp,
         RbfBasisOp,
         FutureRbfBasisSumOp,
         EinsumOp,

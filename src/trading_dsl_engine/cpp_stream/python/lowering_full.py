@@ -21,6 +21,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupByOp,
@@ -33,7 +34,10 @@ from trading_dsl_engine.ir.ops import (
     ReductionOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingOp,
     ShiftOp,
+    TheilSenOp,
+    XsPctRankOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
@@ -420,6 +424,7 @@ def _build_plan(
                     output_width=int(node.value_type.width),
                     op=ridge_op,
                     projection=op.field,
+                    projection_component=op.component,
                     half_life=half_life,
                     ridge_lambda=ridge_lambda,
                     final_only=final_only,
@@ -561,6 +566,45 @@ def _build_plan(
                 lane_count,
                 op=op,
             )
+        elif isinstance(op, EwmStatsOp):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    f"{op.kind} currently requires scalar/vector inputs"
+                )
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "ewm_stats",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
+        elif isinstance(op, RollingOp):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    f"rolling_{op.kind} currently requires a scalar/vector input"
+                )
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "rolling",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
+        elif isinstance(op, TheilSenOp):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    "rolling_theilsen currently requires scalar/vector inputs"
+                )
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "theilsen",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
         elif isinstance(op, XsRankOp):
             if node_shape != (n_instruments,):
                 raise CppStreamLoweringError(
@@ -568,6 +612,13 @@ def _build_plan(
                 )
             out = scalar_dest(is_root, node_shape)
             stage = Stage("xs_rank", children, out, lane_count, op=op)
+        elif isinstance(op, XsPctRankOp):
+            if node_shape != (n_instruments,):
+                raise CppStreamLoweringError(
+                    "xs_pct_rank requires an instrument vector"
+                )
+            out = scalar_dest(is_root, node_shape)
+            stage = Stage("xs_pct_rank", children, out, lane_count, op=op)
         elif isinstance(op, GroupByOp):
             if grouped:
                 raise CppStreamLoweringError("nested groupby is not supported")

@@ -22,6 +22,21 @@ from trading_dsl_engine.cpp_stream.python.sources import (
     register_source_adapter,
     source,
 )
+from trading_dsl_engine.cpp_stream.python.utils import (
+    ewm_kurtosis,
+    ewm_skewness,
+    ewm_std,
+    rolling_range,
+    rolling_scale,
+    rolling_zscore,
+    ts_regression,
+    xs_demean,
+    xs_direction,
+    xs_scale,
+    xs_vector_neut,
+    xs_vector_proj,
+    xs_zscore,
+)
 
 
 def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
@@ -99,4 +114,17 @@ __all__ = [
     "open_source",
     "register_source_adapter",
     "source",
+    "ewm_std",
+    "ewm_skewness",
+    "ewm_kurtosis",
+    "xs_demean",
+    "xs_zscore",
+    "xs_scale",
+    "xs_direction",
+    "xs_vector_proj",
+    "xs_vector_neut",
+    "rolling_range",
+    "rolling_zscore",
+    "rolling_scale",
+    "ts_regression",
 ]

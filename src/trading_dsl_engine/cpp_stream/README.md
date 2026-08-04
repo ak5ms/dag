@@ -116,6 +116,90 @@ one_scalar = features.sum()
 
 See `REDUCTIONS.md` for NaN, `ddof`, shape, and output-mode semantics.
 
+## Cross-sectional and streaming statistics
+
+All lookbacks are expressed as `periods`, meaning input rows. Cross-sectional
+percentile rank is exposed as `xs_pct_rank`; finite ties receive their shared upper
+rank and nonfinite lanes remain NaN.
+
+Statistics with a natural exponentially weighted definition use a half-life in
+rows:
+
+```python
+ewm_moment(x, halflife=32, k=3, min_periods=8)
+ewm_var(x, halflife=32)
+ewm_std(x, halflife=32)
+ewm_skewness(x, halflife=32)
+ewm_kurtosis(x, halflife=32)
+ewm_cov(x, y, halflife=32)
+ewm_corr(x, y, halflife=32)
+ewm_co_skewness(y, x, halflife=32)
+ewm_co_kurtosis(y, x, halflife=32)
+ewm_triple_corr(x, y, z, halflife=32)
+ewm_partial_corr(x, y, z, halflife=32)
+```
+
+Multivariate statistics use shared complete observations. A missing tuple leaves
+that lane's state unchanged. Variance and standardized higher moments are population
+statistics; kurtosis is not excess kurtosis.
+
+Statistics without a useful EWM definition use fixed-row windows:
+
+```python
+rolling_sum(x, periods=20)
+rolling_mean(x, periods=20)
+rolling_std(x, periods=20, ddof=0)
+rolling_min(x, periods=20)
+rolling_max(x, periods=20)
+rolling_median(x, periods=20)
+rolling_quantile(x, periods=20, q=0.25)
+rolling_pct_rank(x, periods=20)
+rolling_argmin(x, periods=20)
+rolling_argmax(x, periods=20)
+rolling_theilsen(y, x, periods=63)
+```
+
+Rolling moments use removable stable state, min/max and their relative indices use
+monotonic deques, and order statistics use fixed scratch. Theil-Sen uses exact
+pairwise median selection for ordinary windows and a fixed-memory subquadratic
+inversion-count selector for windows above 256 rows. No implementation allocates in
+`on_data`.
+
+Cheap formulas such as `ewm_std`, `ewm_skewness`, `ewm_kurtosis`, `xs_zscore`,
+`xs_scale`, `xs_vector_neut`, `rolling_range`, `rolling_zscore`, and `rolling_scale`
+live in `cpp_stream.python.utils` and expand to the native primitives above.
+
+## Ridge projections and named regression results
+
+`Ridge(...)` remains the model object. Native projection functions expose its fitted
+values and inference without introducing a second regression implementation:
+
+```python
+from trading_dsl_engine import cat
+import trading_dsl_engine.cpp_stream as cpp
+
+model = cpp.Ridge(cat(1.0, x1, x2), y=y, weights=w, hl=32, lambda_=0.1)
+cpp.get_beta(model)
+cpp.get_preds(model)
+cpp.get_residuals(model)
+cpp.get_r2(model)
+cpp.get_standard_errors(model)
+cpp.get_tstats(model)
+cpp.get_effective_df(model)
+```
+
+SSE, SST, R-squared, residual variance, individual coefficients/standard errors/
+t-statistics, and effective sample size are also available. Inference uses positive,
+finite, complete-case weights. Ridge covariance is
+`sigma^2 A^-1 X'WX A^-1`, where `A` is this backend's regularized system, and its
+residual degrees of freedom account for both `trace(H)` and `trace(H^2)`. Constrained
+nonnegative Ridge exposes fit metrics but returns NaN for covariance-based inference.
+
+`ts_regression` is an EWM weighted-Ridge composition. Its `periods` argument is the
+half-life in rows, and `rettype` accepts descriptive values such as `"residual"`,
+`"prediction"`, `"intercept"`, `"beta"`, `"r2"`, `"beta_stderr"`, and
+`"beta_tstat"`; numeric selectors are rejected.
+
 ## Execution model
 
 Every operator has one native implementation and receives its execution scope as

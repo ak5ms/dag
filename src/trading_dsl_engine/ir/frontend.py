@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 
 from trading_dsl_engine.base.custom import StatelessCall
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -24,6 +25,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupByOp,
@@ -36,8 +38,11 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingOp,
     ReductionOp,
     ShiftOp,
+    TheilSenOp,
+    XsPctRankOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
@@ -339,6 +344,154 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
     )
 
 
+_EWM_STATS_KIND = {
+    "ewm_moment": "moment",
+    "ewm_var": "var",
+    "ewm_std": "std",
+    "ewm_skewness": "skewness",
+    "ewm_kurtosis": "kurtosis",
+    "ewm_cov": "cov",
+    "ewm_corr": "corr",
+    "ewm_co_skewness": "co_skewness",
+    "ewm_co_kurtosis": "co_kurtosis",
+    "ewm_triple_corr": "triple_corr",
+    "ewm_partial_corr": "partial_corr",
+}
+
+
+def _bind_literal_call(
+    call: Call,
+    names: tuple[str, ...],
+    defaults: dict[str, Expr],
+) -> dict[str, Expr]:
+    if len(call.args) > len(names):
+        raise FormulaIRCompileError(f"{call.fn} received too many arguments")
+    values = dict(defaults)
+    explicit: set[str] = set()
+    for name, value in zip(names, call.args):
+        values[name] = value
+        explicit.add(name)
+    for name, value in call.kwargs:
+        if name not in names or name in explicit:
+            raise FormulaIRCompileError(f"invalid {call.fn} argument {name!r}")
+        values[name] = value
+        explicit.add(name)
+    return values
+
+
+def _normalize_ewm_stats(
+    call: Call,
+) -> tuple[tuple[Expr, ...], EwmStatsOp]:
+    kind = _EWM_STATS_KIND[call.fn]
+    arity = 3 if kind in {"triple_corr", "partial_corr"} else 2 if kind in {
+        "cov",
+        "corr",
+        "co_skewness",
+        "co_kurtosis",
+    } else 1
+    input_names = (
+        ("y", "x")
+        if kind in {"co_skewness", "co_kurtosis"}
+        else ("x", "y", "z")[:arity]
+    )
+    names = (
+        input_names + ("halflife", "k", "min_periods")
+        if kind == "moment"
+        else input_names + ("halflife", "min_periods")
+    )
+    defaults = {"min_periods": Number(0.0)}
+    if kind == "moment":
+        defaults["k"] = Number(2.0)
+    values = _bind_literal_call(call, names, defaults)
+    missing = [name for name in input_names + ("halflife",) if name not in values]
+    if missing:
+        raise FormulaIRCompileError(f"{call.fn} missing {', '.join(missing)}")
+    halflife = _literal_number(values["halflife"], f"{call.fn} halflife")
+    if not math.isfinite(halflife) or halflife <= 0.0:
+        raise FormulaIRCompileError(
+            f"{call.fn} halflife must be finite and > 0"
+        )
+    order = (
+        _literal_int(values["k"], "ewm_moment k", 1)
+        if kind == "moment"
+        else 0
+    )
+    if kind == "moment" and order > 4:
+        raise FormulaIRCompileError("ewm_moment k must be in [1, 4]")
+    op = EwmStatsOp(
+        kind,
+        halflife,
+        _literal_int(values["min_periods"], f"{call.fn} min_periods", 0),
+        order,
+    )
+    return tuple(values[name] for name in input_names), op
+
+
+_ROLLING_KIND = {
+    "roll_mean": "mean",
+    "rolling_sum": "sum",
+    "rolling_mean": "mean",
+    "rolling_std": "std",
+    "rolling_min": "min",
+    "rolling_max": "max",
+    "rolling_median": "median",
+    "rolling_quantile": "quantile",
+    "rolling_pct_rank": "pct_rank",
+    "rolling_argmin": "argmin",
+    "rolling_argmax": "argmax",
+}
+
+
+def _normalize_rolling(call: Call) -> tuple[Expr, RollingOp]:
+    kind = _ROLLING_KIND[call.fn]
+    if kind == "quantile":
+        names = ("x", "periods", "q", "min_periods")
+        defaults = {"q": Number(0.5)}
+    elif kind == "std":
+        names = ("x", "periods", "min_periods", "ddof")
+        defaults = {"ddof": Number(0.0)}
+    else:
+        names = ("x", "periods", "min_periods")
+        defaults = {}
+    values = _bind_literal_call(call, names, defaults)
+    if "x" not in values or "periods" not in values:
+        raise FormulaIRCompileError(f"{call.fn} requires x and periods")
+    periods = _literal_int(values["periods"], f"{call.fn} periods", 1)
+    minimum = _literal_int(
+        values.get("min_periods", Number(float(periods))),
+        f"{call.fn} min_periods",
+        0,
+    )
+    if minimum > periods:
+        raise FormulaIRCompileError(f"{call.fn} min_periods exceeds periods")
+    return values["x"], RollingOp(
+        kind,
+        periods,
+        minimum,
+        _literal_int(values.get("ddof", Number(0.0)), f"{call.fn} ddof", 0),
+        _literal_number(values.get("q", Number(0.5)), f"{call.fn} q"),
+    )
+
+
+def _normalize_theilsen(call: Call) -> tuple[Expr, Expr, TheilSenOp]:
+    values = _bind_literal_call(
+        call,
+        ("y", "x", "periods", "min_periods"),
+        {},
+    )
+    if any(name not in values for name in ("y", "x", "periods")):
+        raise FormulaIRCompileError("rolling_theilsen requires y, x, and periods")
+    periods = _literal_int(values["periods"], "rolling_theilsen periods", 2)
+    minimum = _literal_int(
+        values.get("min_periods", Number(float(periods))),
+        "rolling_theilsen min_periods",
+        2,
+    )
+    if minimum > periods:
+        raise FormulaIRCompileError("rolling_theilsen min_periods exceeds periods")
+    return values["y"], values["x"], TheilSenOp(periods, minimum)
+
+
 def _normalize_shift(call: Call) -> tuple[Expr, int, int]:
     if call.kwargs or not 1 <= len(call.args) <= 3:
         raise FormulaIRCompileError("shift expects x[,lag[,max_lag]]")
@@ -591,8 +744,38 @@ class _BaseBuilder:
                 (child,),
                 _lane_state_result_type("ewm", self.nodes[child]),
             )
+        if node.fn in _EWM_STATS_KIND:
+            expressions, op = _normalize_ewm_stats(node)
+            children = tuple(self.build(expression) for expression in expressions)
+            return self._append(
+                op,
+                children,
+                _nary_result_type(
+                    node.fn, [self.nodes[index] for index in children]
+                ),
+            )
+        if node.fn in _ROLLING_KIND:
+            expression, op = _normalize_rolling(node)
+            child = self.build(expression)
+            return self._append(
+                op,
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn == "rolling_theilsen":
+            y, x, op = _normalize_theilsen(node)
+            children = (self.build(y), self.build(x))
+            return self._append(
+                op,
+                children,
+                _nary_result_type(
+                    node.fn, [self.nodes[index] for index in children]
+                ),
+            )
         if node.fn == "xs_rank":
             return self._append(XsRankOp(), (self.build(node.args[0]),), VECTOR)
+        if node.fn == "xs_pct_rank":
+            return self._append(XsPctRankOp(), (self.build(node.args[0]),), VECTOR)
         if node.fn == "rbf_basis":
             width = _literal_int(node.args[3], "n_basis", 1)
             return self._append(
@@ -659,20 +842,59 @@ class _BaseBuilder:
             return self._append(
                 op, tuple(children), object_value(op.coefficient_width)
             )
-        if node.fn in {"get_beta", "get_preds"}:
-            child = self.build(node.args[0])
-            child_node = self.nodes[child]
-            field = "beta" if node.fn == "get_beta" else "preds"
-            if isinstance(child_node.op, RidgeOp):
-                value_type = (
-                    matrix(child_node.op.coefficient_width)
-                    if field == "beta" and self.grouped
-                    else fixed(child_node.op.coefficient_width)
-                    if field == "beta"
-                    else VECTOR
+        ridge_projections = {
+            "get_beta": "beta",
+            "get_preds": "preds",
+            "get_residuals": "residuals",
+            "get_coefficient": "coefficient",
+            "get_sse": "sse",
+            "get_sst": "sst",
+            "get_r2": "r2",
+            "get_residual_variance": "residual_variance",
+            "get_standard_errors": "standard_errors",
+            "get_standard_error": "standard_error",
+            "get_tstats": "tstats",
+            "get_tstat": "tstat",
+            "get_effective_df": "effective_df",
+            "get_effective_n": "effective_n",
+        }
+        if node.fn in ridge_projections:
+            component_fields = {"coefficient", "standard_error", "tstat"}
+            field = ridge_projections[node.fn]
+            names = ("model", "component") if field in component_fields else ("model",)
+            values = _bind_literal_call(node, names, {})
+            missing = [name for name in names if name not in values]
+            if missing:
+                raise FormulaIRCompileError(
+                    f"{node.fn} missing {', '.join(missing)}"
                 )
-                return self._append(RidgeProjectionOp(field), (child,), value_type)
+            child = self.build(values["model"])
+            child_node = self.nodes[child]
+            component = (
+                _literal_int(values["component"], f"{node.fn} component", 0)
+                if field in component_fields
+                else None
+            )
+            if isinstance(child_node.op, RidgeOp):
+                width = child_node.op.coefficient_width
+                if component is not None and component >= width:
+                    raise FormulaIRCompileError(
+                        f"{node.fn} component {component} outside coefficient width {width}"
+                    )
+                if field in {"beta", "standard_errors", "tstats"}:
+                    value_type = matrix(width) if self.grouped else fixed(width)
+                elif field in {"preds", "residuals"}:
+                    value_type = VECTOR
+                else:
+                    value_type = VECTOR if self.grouped else SCALAR
+                return self._append(
+                    RidgeProjectionOp(field, component), (child,), value_type
+                )
             if isinstance(child_node.op, InstrumentBasisMeanOp):
+                if field not in {"beta", "preds"}:
+                    raise FormulaIRCompileError(
+                        f"{node.fn} requires Ridge rather than InstrumentBasisMean"
+                    )
                 return self._append(
                     InstrumentBasisProjectionOp(field),
                     (child,),
