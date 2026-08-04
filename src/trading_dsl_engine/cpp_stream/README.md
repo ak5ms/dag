@@ -122,26 +122,28 @@ All lookbacks are expressed as `periods`, meaning input rows. Cross-sectional
 percentile rank is exposed as `xs_pct_rank`; finite ties receive their shared upper
 rank and nonfinite lanes remain NaN.
 
-Statistics with a natural exponentially weighted definition use a half-life in
-rows:
+Statistics with a natural exponentially weighted definition are compositions of
+the existing `ewm` operator. They use its `span`, `min_periods`, `ignore_na`, and
+`adjust` conventions, so there is only one EWM state machine to maintain:
 
 ```python
-ewm_moment(x, halflife=32, k=3, min_periods=8)
-ewm_var(x, halflife=32)
-ewm_std(x, halflife=32)
-ewm_skewness(x, halflife=32)
-ewm_kurtosis(x, halflife=32)
-ewm_cov(x, y, halflife=32)
-ewm_corr(x, y, halflife=32)
-ewm_co_skewness(y, x, halflife=32)
-ewm_co_kurtosis(y, x, halflife=32)
-ewm_triple_corr(x, y, z, halflife=32)
-ewm_partial_corr(x, y, z, halflife=32)
+ewm_moment(x, span=32, k=3, min_periods=8, ignore_na=True, adjust=False)
+ewm_var(x, span=32)
+ewm_std(x, span=32)
+ewm_skewness(x, span=32)
+ewm_kurtosis(x, span=32)
+ewm_cov(x, y, span=32)
+ewm_corr(x, y, span=32)
+ewm_co_skewness(y, x, span=32)
+ewm_co_kurtosis(y, x, span=32)
+ewm_triple_corr(x, y, z, span=32)
+ewm_partial_corr(x, y, z, span=32)
 ```
 
-Multivariate statistics use shared complete observations. A missing tuple leaves
-that lane's state unchanged. Variance and standardized higher moments are population
-statistics; kurtosis is not excess kurtosis.
+Multivariate statistics use shared complete observations: any incomplete tuple is
+passed to every component `ewm` as one missing observation, and its effect follows
+the selected `ignore_na` mode. Variance and standardized higher moments are
+population statistics; kurtosis is not excess kurtosis.
 
 Statistics without a useful EWM definition use fixed-row windows:
 

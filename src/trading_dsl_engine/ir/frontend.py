@@ -20,12 +20,12 @@ from trading_dsl_engine.base.parser import (
 from trading_dsl_engine.ir.einsum import EinsumParseError, parse_einsum
 from trading_dsl_engine.ir.ops import (
     CatOp,
+    ColumnOp,
     CumsumOp,
     CustomCallOp,
     EmitOp,
     EinsumOp,
     EwmOp,
-    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupByOp,
@@ -42,7 +42,22 @@ from trading_dsl_engine.ir.ops import (
     ReductionOp,
     ShiftOp,
     TheilSenOp,
+    PeriodsSinceChangeOp,
+    HumpOp,
+    TradeWhenOp,
+    LinearFilterOp,
+    RollingProductOp,
+    RollingKthOp,
+    RollingPrevDiffOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    VectorQuantileOp,
     XsPctRankOp,
+    XsAggregateOp,
+    XsWeightedMeanOp,
+    XsProjectionOp,
+    XsGeneralizedRankOp,
+    XsDensifyOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
@@ -62,13 +77,40 @@ class FormulaIRCompileError(ValueError):
 
 
 _NARY_ARITY = {
-    "floor": 1,
+    **{
+        name: 1
+        for name in {
+            "abs",
+            "ceil",
+            "floor",
+            "exp",
+            "ln",
+            "round",
+            "sign",
+            "fraction",
+            "purify",
+            "arctan",
+            "acos",
+            "asin",
+            "sin",
+            "cos",
+            "tan",
+            "tanh",
+            "sqrt",
+            "isnan",
+            "isfinite",
+            "logical_not",
+            "norm_inv",
+        }
+    },
     "add": 2,
     "sub": 2,
     "mul": 2,
     "div": 2,
     "mod": 2,
     "pow": 2,
+    "minimum": 2,
+    "maximum": 2,
     "eq": 2,
     "ne": 2,
     "lt": 2,
@@ -172,6 +214,16 @@ def _literal_string(node: Expr, name: str) -> str:
     return node.value
 
 
+def _literal_float_tuple(node: Expr, name: str) -> tuple[float, ...]:
+    if isinstance(node, Number):
+        return (float(node.value),)
+    text = _literal_string(node, name).replace(",", " ")
+    try:
+        return tuple(float(value) for value in text.split())
+    except ValueError as exc:
+        raise FormulaIRCompileError(f"{name} contains a non-numeric weight") from exc
+
+
 def _literal_optimize(node: Expr) -> object:
     if isinstance(node, String):
         return node.value
@@ -252,8 +304,15 @@ def _custom_value_type(node: StatelessCall, children: list[Node]) -> ValueType:
 
 def _reduction_arguments(
     call: Call,
-) -> tuple[Expr, Expr | None, int, bool]:
-    if call.fn not in {"sum", "mean", "std"}:
+) -> tuple[str, Expr, Expr | None, int, bool]:
+    kinds = {
+        "sum": "sum",
+        "mean": "mean",
+        "std": "std",
+        "reduce_min": "min",
+        "reduce_max": "max",
+    }
+    if call.fn not in kinds:
         raise FormulaIRCompileError(f"invalid reduction {call.fn!r}")
     names = (
         ("x", "axis", "ddof", "ignore_na")
@@ -278,7 +337,7 @@ def _reduction_arguments(
     ignore_na = _literal_bool(
         values.get("ignore_na", Number(1.0)), "reduction ignore_na"
     )
-    return values["x"], values.get("axis"), ddof, ignore_na
+    return kinds[call.fn], values["x"], values.get("axis"), ddof, ignore_na
 
 
 def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
@@ -344,21 +403,6 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
     )
 
 
-_EWM_STATS_KIND = {
-    "ewm_moment": "moment",
-    "ewm_var": "var",
-    "ewm_std": "std",
-    "ewm_skewness": "skewness",
-    "ewm_kurtosis": "kurtosis",
-    "ewm_cov": "cov",
-    "ewm_corr": "corr",
-    "ewm_co_skewness": "co_skewness",
-    "ewm_co_kurtosis": "co_kurtosis",
-    "ewm_triple_corr": "triple_corr",
-    "ewm_partial_corr": "partial_corr",
-}
-
-
 def _bind_literal_call(
     call: Call,
     names: tuple[str, ...],
@@ -379,54 +423,6 @@ def _bind_literal_call(
     return values
 
 
-def _normalize_ewm_stats(
-    call: Call,
-) -> tuple[tuple[Expr, ...], EwmStatsOp]:
-    kind = _EWM_STATS_KIND[call.fn]
-    arity = 3 if kind in {"triple_corr", "partial_corr"} else 2 if kind in {
-        "cov",
-        "corr",
-        "co_skewness",
-        "co_kurtosis",
-    } else 1
-    input_names = (
-        ("y", "x")
-        if kind in {"co_skewness", "co_kurtosis"}
-        else ("x", "y", "z")[:arity]
-    )
-    names = (
-        input_names + ("halflife", "k", "min_periods")
-        if kind == "moment"
-        else input_names + ("halflife", "min_periods")
-    )
-    defaults = {"min_periods": Number(0.0)}
-    if kind == "moment":
-        defaults["k"] = Number(2.0)
-    values = _bind_literal_call(call, names, defaults)
-    missing = [name for name in input_names + ("halflife",) if name not in values]
-    if missing:
-        raise FormulaIRCompileError(f"{call.fn} missing {', '.join(missing)}")
-    halflife = _literal_number(values["halflife"], f"{call.fn} halflife")
-    if not math.isfinite(halflife) or halflife <= 0.0:
-        raise FormulaIRCompileError(
-            f"{call.fn} halflife must be finite and > 0"
-        )
-    order = (
-        _literal_int(values["k"], "ewm_moment k", 1)
-        if kind == "moment"
-        else 0
-    )
-    if kind == "moment" and order > 4:
-        raise FormulaIRCompileError("ewm_moment k must be in [1, 4]")
-    op = EwmStatsOp(
-        kind,
-        halflife,
-        _literal_int(values["min_periods"], f"{call.fn} min_periods", 0),
-        order,
-    )
-    return tuple(values[name] for name in input_names), op
-
-
 _ROLLING_KIND = {
     "roll_mean": "mean",
     "rolling_sum": "sum",
@@ -439,6 +435,17 @@ _ROLLING_KIND = {
     "rolling_pct_rank": "pct_rank",
     "rolling_argmin": "argmin",
     "rolling_argmax": "argmax",
+}
+
+_XS_AGGREGATE_KIND = {
+    "xs_count": "count",
+    "xs_sum": "sum",
+    "xs_mean": "mean",
+    "xs_std": "std",
+    "xs_min": "min",
+    "xs_max": "max",
+    "xs_median": "quantile",
+    "xs_quantile_value": "quantile",
 }
 
 
@@ -680,8 +687,8 @@ class _BaseBuilder:
                     node.fn, [self.nodes[index] for index in children]
                 ),
             )
-        if node.fn in {"sum", "mean", "std"}:
-            expression, axis, ddof, ignore_na = _reduction_arguments(node)
+        if node.fn in {"sum", "mean", "std", "reduce_min", "reduce_max"}:
+            kind, expression, axis, ddof, ignore_na = _reduction_arguments(node)
             child = self.build(expression)
             child_type = self.nodes[child].value_type
             try:
@@ -697,7 +704,7 @@ class _BaseBuilder:
                 if full_axis not in axes
             )
             return self._append(
-                ReductionOp(node.fn, axes, ddof, ignore_na),
+                ReductionOp(kind, axes, ddof, ignore_na),
                 (child,),
                 tensor(output_shape, dtype=child_type.dtype),
             )
@@ -744,16 +751,6 @@ class _BaseBuilder:
                 (child,),
                 _lane_state_result_type("ewm", self.nodes[child]),
             )
-        if node.fn in _EWM_STATS_KIND:
-            expressions, op = _normalize_ewm_stats(node)
-            children = tuple(self.build(expression) for expression in expressions)
-            return self._append(
-                op,
-                children,
-                _nary_result_type(
-                    node.fn, [self.nodes[index] for index in children]
-                ),
-            )
         if node.fn in _ROLLING_KIND:
             expression, op = _normalize_rolling(node)
             child = self.build(expression)
@@ -772,10 +769,256 @@ class _BaseBuilder:
                     node.fn, [self.nodes[index] for index in children]
                 ),
             )
+        if node.fn == "periods_since_last_change":
+            values = _bind_literal_call(node, ("x",), {})
+            if "x" not in values:
+                raise FormulaIRCompileError("periods_since_last_change requires x")
+            child = self.build(values["x"])
+            return self._append(
+                PeriodsSinceChangeOp(),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn in {"hump", "hump_decay"}:
+            if node.fn == "hump":
+                values = _bind_literal_call(
+                    node, ("x", "hump"), {"hump": Number(0.01)}
+                )
+                values["threshold"] = values["hump"]
+                relative = False
+                move = True
+            else:
+                values = _bind_literal_call(
+                    node,
+                    ("x", "p", "relative"),
+                    {"p": Number(0.1), "relative": Number(0.0)},
+                )
+                values["threshold"] = values["p"]
+                relative = _literal_bool(values["relative"], "hump_decay relative")
+                move = False
+            if "x" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x")
+            child = self.build(values["x"])
+            return self._append(
+                HumpOp(
+                    _literal_number(values["threshold"], f"{node.fn} threshold"),
+                    relative,
+                    move,
+                ),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn == "trade_when":
+            values = _bind_literal_call(
+                node, ("trigger", "alpha", "exit"), {}
+            )
+            if any(name not in values for name in ("trigger", "alpha", "exit")):
+                raise FormulaIRCompileError("trade_when requires trigger, alpha, exit")
+            children = tuple(self.build(values[name]) for name in ("trigger", "alpha", "exit"))
+            return self._append(
+                TradeWhenOp(),
+                children,
+                _nary_result_type(
+                    node.fn, [self.nodes[index] for index in children]
+                ),
+            )
+        if node.fn == "filter":
+            values = _bind_literal_call(
+                node,
+                ("x", "h", "t"),
+                {"h": String("1,2,3,4"), "t": String("0.5")},
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("filter requires x")
+            child = self.build(values["x"])
+            return self._append(
+                LinearFilterOp(
+                    _literal_float_tuple(values["h"], "filter h"),
+                    _literal_float_tuple(values["t"], "filter t"),
+                ),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn in {
+            "rolling_product",
+            "rolling_kth",
+            "rolling_prev_diff",
+            "rolling_decay_linear",
+            "rolling_entropy",
+        }:
+            if node.fn == "rolling_kth":
+                names = ("x", "periods", "k", "ignore", "min_periods")
+                defaults = {"k": Number(1.0), "ignore": String("NAN 0")}
+            elif node.fn == "rolling_entropy":
+                names = ("x", "periods", "buckets", "min_periods")
+                defaults = {"buckets": Number(10.0)}
+            elif node.fn == "rolling_prev_diff":
+                names = ("x", "periods")
+                defaults = {}
+            else:
+                names = ("x", "periods", "min_periods")
+                defaults = {}
+            values = _bind_literal_call(node, names, defaults)
+            if "x" not in values or "periods" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x and periods")
+            periods = _literal_int(values["periods"], f"{node.fn} periods", 1)
+            default_minimum = (
+                _literal_int(values.get("k", Number(1.0)), "rolling_kth k", 1)
+                if node.fn == "rolling_kth"
+                else periods
+            )
+            minimum = _literal_int(
+                values.get("min_periods", Number(float(default_minimum))),
+                f"{node.fn} min_periods",
+                0,
+            )
+            if minimum > periods:
+                raise FormulaIRCompileError(f"{node.fn} min_periods exceeds periods")
+            child = self.build(values["x"])
+            if node.fn == "rolling_product":
+                op = RollingProductOp(periods, minimum)
+            elif node.fn == "rolling_kth":
+                ignored = {
+                    value.upper()
+                    for value in _literal_string(values["ignore"], "rolling_kth ignore")
+                    .replace(",", " ")
+                    .split()
+                }
+                unsupported = ignored - {"NAN", "NA", "0", "0.0"}
+                if unsupported:
+                    raise FormulaIRCompileError(
+                        f"rolling_kth unsupported ignore values {sorted(unsupported)}"
+                    )
+                op = RollingKthOp(
+                    periods,
+                    minimum,
+                    _literal_int(values["k"], "rolling_kth k", 1),
+                    bool(ignored & {"0", "0.0"}),
+                )
+            elif node.fn == "rolling_prev_diff":
+                op = RollingPrevDiffOp(periods)
+            elif node.fn == "rolling_decay_linear":
+                op = RollingDecayOp(periods, minimum)
+            else:
+                op = RollingEntropyOp(
+                    periods,
+                    minimum,
+                    _literal_int(values["buckets"], "rolling_entropy buckets", 1),
+                )
+            return self._append(
+                op,
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
         if node.fn == "xs_rank":
             return self._append(XsRankOp(), (self.build(node.args[0]),), VECTOR)
         if node.fn == "xs_pct_rank":
             return self._append(XsPctRankOp(), (self.build(node.args[0]),), VECTOR)
+        if node.fn in _XS_AGGREGATE_KIND:
+            names = ("x", "q") if node.fn == "xs_quantile_value" else ("x",)
+            defaults = {"q": Number(0.5)}
+            values = _bind_literal_call(node, names, defaults)
+            if "x" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x")
+            child = self.build(values["x"])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError(f"{node.fn} requires a vector")
+            quantile = _literal_number(
+                values.get("q", Number(0.5)), f"{node.fn} q"
+            )
+            return self._append(
+                XsAggregateOp(_XS_AGGREGATE_KIND[node.fn], quantile),
+                (child,),
+                VECTOR,
+            )
+        if node.fn == "xs_weighted_mean":
+            if node.kwargs or len(node.args) != 2:
+                raise FormulaIRCompileError("xs_weighted_mean expects x, weight")
+            children = tuple(self.build(arg) for arg in node.args)
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError("xs_weighted_mean requires vectors")
+            return self._append(XsWeightedMeanOp(), children, VECTOR)
+        if node.fn in {"xs_vector_projection", "xs_regression_projection"}:
+            if node.kwargs or len(node.args) != 2:
+                raise FormulaIRCompileError(f"{node.fn} expects target, regressor")
+            children = tuple(self.build(arg) for arg in node.args)
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError(f"{node.fn} requires vectors")
+            return self._append(
+                XsProjectionOp(node.fn == "xs_regression_projection"),
+                children,
+                VECTOR,
+            )
+        if node.fn == "xs_generalized_rank":
+            values = _bind_literal_call(
+                node, ("x", "m"), {"m": Number(1.0)}
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("xs_generalized_rank requires x")
+            child = self.build(values["x"])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("xs_generalized_rank requires a vector")
+            return self._append(
+                XsGeneralizedRankOp(
+                    _literal_number(values["m"], "xs_generalized_rank m")
+                ),
+                (child,),
+                VECTOR,
+            )
+        if node.fn == "densify":
+            if node.kwargs or len(node.args) != 1:
+                raise FormulaIRCompileError("densify expects x")
+            child = self.build(node.args[0])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("densify requires a vector")
+            return self._append(XsDensifyOp(), (child,), VECTOR)
+        if node.fn == "vec_quantile":
+            values = _bind_literal_call(
+                node, ("x", "q"), {"q": Number(0.5)}
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("vec_quantile requires x")
+            child = self.build(values["x"])
+            child_type = self.nodes[child].value_type
+            try:
+                shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError(
+                    "vec_quantile requires a numeric tensor"
+                ) from exc
+            if not shape:
+                raise FormulaIRCompileError(
+                    "vec_quantile requires at least one row dimension"
+                )
+            return self._append(
+                VectorQuantileOp(
+                    _literal_number(values["q"], "vec_quantile q")
+                ),
+                (child,),
+                tensor(shape[:-1], dtype=child_type.dtype),
+            )
+        if node.fn == "col":
+            values = _bind_literal_call(node, ("matrix", "index"), {})
+            if "matrix" not in values or "index" not in values:
+                raise FormulaIRCompileError("col requires matrix and index")
+            child = self.build(values["matrix"])
+            child_type = self.nodes[child].value_type
+            try:
+                shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError("col requires a numeric tensor") from exc
+            if not shape or not isinstance(shape[-1], int):
+                raise FormulaIRCompileError("col requires a fixed final dimension")
+            index = _literal_int(values["index"], "col index", 0)
+            if index >= shape[-1]:
+                raise FormulaIRCompileError(
+                    f"col index {index} outside final dimension {shape[-1]}"
+                )
+            return self._append(
+                ColumnOp(index),
+                (child,),
+                tensor(shape[:-1], dtype=child_type.dtype),
+            )
         if node.fn == "rbf_basis":
             width = _literal_int(node.args[3], "n_basis", 1)
             return self._append(

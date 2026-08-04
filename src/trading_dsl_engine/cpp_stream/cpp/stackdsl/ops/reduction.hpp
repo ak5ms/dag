@@ -25,6 +25,8 @@ struct AxisList {
 struct SumReductionPolicy {};
 struct MeanReductionPolicy {};
 struct StdReductionPolicy {};
+struct MinReductionPolicy {};
+struct MaxReductionPolicy {};
 
 template <class Shape, class Axes>
 consteval std::size_t reduced_output_size() {
@@ -104,6 +106,16 @@ struct ReductionState {
             const double delta2 = value - mean[index];
             m2[index] = std::fma(delta, delta2, m2[index]);
             count[index] = next_count;
+        } else if constexpr (std::is_same_v<Policy, MinReductionPolicy>) {
+            total[index] = count[index] == 0
+                ? value
+                : std::min(total[index], value);
+            ++count[index];
+        } else if constexpr (std::is_same_v<Policy, MaxReductionPolicy>) {
+            total[index] = count[index] == 0
+                ? value
+                : std::max(total[index], value);
+            ++count[index];
         } else {
             total[index] += value;
             ++count[index];
@@ -140,6 +152,16 @@ struct ReductionState {
                     * static_cast<double>(block_count)
                     / static_cast<double>(combined_count);
             count[index] = combined_count;
+        } else if constexpr (std::is_same_v<Policy, MinReductionPolicy>) {
+            total[index] = count[index] == 0
+                ? block_total
+                : std::min(total[index], block_total);
+            count[index] += block_count;
+        } else if constexpr (std::is_same_v<Policy, MaxReductionPolicy>) {
+            total[index] = count[index] == 0
+                ? block_total
+                : std::max(total[index], block_total);
+            count[index] += block_count;
         } else {
             total[index] += block_total;
             count[index] += block_count;
@@ -151,7 +173,11 @@ struct ReductionState {
             if (invalid[index]) return kNaN;
         }
         if (count[index] == 0) return kNaN;
-        if constexpr (std::is_same_v<Policy, SumReductionPolicy>) {
+        if constexpr (
+            std::is_same_v<Policy, SumReductionPolicy>
+            || std::is_same_v<Policy, MinReductionPolicy>
+            || std::is_same_v<Policy, MaxReductionPolicy>
+        ) {
             return total[index];
         } else if constexpr (std::is_same_v<Policy, MeanReductionPolicy>) {
             return total[index] / static_cast<double>(count[index]);
@@ -232,15 +258,28 @@ struct ReductionNode {
                         const double value =
                             Tensor::read_flat(ctx, input_begin + reduction);
                         if (finite(value)) {
-                            partial[reduction & 3U] += value;
+                            if constexpr (std::is_same_v<Policy, MinReductionPolicy>) {
+                                partial[0] = block_count == 0
+                                    ? value
+                                    : std::min(partial[0], value);
+                            } else if constexpr (std::is_same_v<Policy, MaxReductionPolicy>) {
+                                partial[0] = block_count == 0
+                                    ? value
+                                    : std::max(partial[0], value);
+                            } else {
+                                partial[reduction & 3U] += value;
+                            }
                             ++block_count;
                         } else if constexpr (!IgnoreNa) {
                             block_invalid = true;
                         }
                     }
                     const double block_total =
-                        (partial[0] + partial[1])
-                        + (partial[2] + partial[3]);
+                        std::is_same_v<Policy, MinReductionPolicy>
+                        || std::is_same_v<Policy, MaxReductionPolicy>
+                        ? partial[0]
+                        : (partial[0] + partial[1])
+                            + (partial[2] + partial[3]);
                     target.merge_block(
                         output,
                         block_total,

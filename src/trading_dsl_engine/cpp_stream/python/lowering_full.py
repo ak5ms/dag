@@ -16,28 +16,43 @@ from trading_dsl_engine.cpp_stream.python.lowering import (
 from trading_dsl_engine.ir.einsum import build_contraction_plan
 from trading_dsl_engine.ir.ops import (
     CatOp,
+    ColumnOp,
     CumsumOp,
     CustomCallOp,
     EmitOp,
     EinsumOp,
     EwmOp,
-    EwmStatsOp,
     FFillOp,
     FutureRbfBasisSumOp,
+    HumpOp,
     GroupByOp,
     InputOp,
     InstrumentBasisMeanOp,
     InstrumentBasisProjectionOp,
     LiteralOp,
+    LinearFilterOp,
     NaryOp,
     RbfBasisOp,
+    PeriodsSinceChangeOp,
     ReductionOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    RollingKthOp,
     RollingOp,
+    RollingPrevDiffOp,
+    RollingProductOp,
     ShiftOp,
     TheilSenOp,
+    TradeWhenOp,
+    VectorQuantileOp,
     XsPctRankOp,
+    XsAggregateOp,
+    XsWeightedMeanOp,
+    XsProjectionOp,
+    XsGeneralizedRankOp,
+    XsDensifyOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
@@ -566,19 +581,37 @@ def _build_plan(
                 lane_count,
                 op=op,
             )
-        elif isinstance(op, EwmStatsOp):
+        elif isinstance(
+            op,
+            (
+                PeriodsSinceChangeOp,
+                HumpOp,
+                TradeWhenOp,
+                LinearFilterOp,
+                RollingProductOp,
+                RollingKthOp,
+                RollingPrevDiffOp,
+                RollingDecayOp,
+                RollingEntropyOp,
+            ),
+        ):
             if not scalar_width_shape(node_shape):
                 raise CppStreamLoweringError(
-                    f"{op.kind} currently requires scalar/vector inputs"
+                    f"{type(op).__name__} currently requires scalar/vector inputs"
                 )
+            stage_kind = {
+                PeriodsSinceChangeOp: "periods_since_change",
+                HumpOp: "hump",
+                TradeWhenOp: "trade_when",
+                LinearFilterOp: "linear_filter",
+                RollingProductOp: "rolling_product",
+                RollingKthOp: "rolling_kth",
+                RollingPrevDiffOp: "rolling_prev_diff",
+                RollingDecayOp: "rolling_decay",
+                RollingEntropyOp: "rolling_entropy",
+            }[type(op)]
             out = value_dest(is_root, node_shape)
-            stage = Stage(
-                "ewm_stats",
-                children,
-                out,
-                lane_count,
-                op=op,
-            )
+            stage = Stage(stage_kind, children, out, lane_count, op=op)
         elif isinstance(op, RollingOp):
             if not scalar_width_shape(node_shape):
                 raise CppStreamLoweringError(
@@ -591,6 +624,43 @@ def _build_plan(
                 out,
                 lane_count,
                 op=op,
+            )
+        elif isinstance(op, VectorQuantileOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "vector_quantile",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
+        elif isinstance(op, ColumnOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage("tensor_column", children, out, lane_count, op=op)
+        elif isinstance(op, XsAggregateOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_aggregate", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsWeightedMeanOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_weighted_mean", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsProjectionOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_projection", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsGeneralizedRankOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_generalized_rank", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsDensifyOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_densify", children, out, lane_count, op=op
             )
         elif isinstance(op, TheilSenOp):
             if not scalar_width_shape(node_shape):

@@ -92,8 +92,9 @@ This backend must remain independent of `jax_flat`.
   statistics with a natural exponentially weighted definition and `rolling_*` for
   fixed-window order/extrema operations.
 - EWM covariance, correlation, higher cross moments, triple correlation, and partial
-  correlation share one complete-case raw-moment state per output lane. Missing
-  tuples do not advance that state.
+  correlation must compose from the canonical `EwmNode` with its `span`,
+  `min_periods`, `ignore_na`, and `adjust` behavior. Complete-case masks are part of
+  the composed graph; do not add a second EWM state machine for statistics.
 - Rolling sum/mean/std use removable stable moments. Rolling extrema and relative
   arg extrema use monotonic deques. Quantiles and percentile ranks may use fixed
   compile-time scratch but must not allocate in `on_data`.

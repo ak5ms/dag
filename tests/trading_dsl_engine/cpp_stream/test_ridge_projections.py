@@ -213,6 +213,13 @@ def test_stateful_weighted_ridge_standard_errors_and_named_regression(
         halflife=4.0,
         ridge_lambda=0.2,
     )
+    span_references = _stateful_ridge_references(
+        x,
+        y,
+        weights,
+        halflife=np.log(0.5) / np.log1p(-2.0 / (4.0 + 1.0)),
+        ridge_lambda=0.2,
+    )
 
     model = "Ridge(1.0, x, y=y, weights=weights, hl=4, lambda_=0.2)"
     runtime = compile_formula(
@@ -235,7 +242,7 @@ def test_stateful_weighted_ridge_standard_errors_and_named_regression(
     output = tmp_path / "ts_regression_r2.bin"
     runtime.run(out_path=output)
     actual_r2 = np.fromfile(output, dtype=np.float64).reshape(rows)
-    expected_r2 = np.array([float(item["r2"]) for item in references])
+    expected_r2 = np.array([float(item["r2"]) for item in span_references])
     np.testing.assert_allclose(
         actual_r2, expected_r2, rtol=6e-9, atol=6e-9, equal_nan=True
     )
@@ -287,7 +294,7 @@ def test_ts_regression_validates_periods_and_elides_zero_lag() -> None:
     )
     assert any(isinstance(node.op, ShiftOp) for node in lagged.nodes)
 
-    with pytest.raises(FormulaIRCompileError, match="periods must be finite and > 0"):
+    with pytest.raises(FormulaIRCompileError, match="periods must be finite and >= 1"):
         compile_ir('ts_regression(y, x, periods=0, rettype="beta")')
 
 
