@@ -12,10 +12,64 @@ python scripts/benchmark_cpp_stream.py
 CPP_STREAM_RIDGE_CASE=all python scripts/benchmark_cpp_stream_ridge.py
 python scripts/benchmark_cpp_stream_einsum.py
 python scripts/benchmark_cpp_stream_roll_rets.py
+python scripts/benchmark_cpp_stream_operator_fusion.py --native-ceiling
 ```
 
 The full einsum and roll-rets benchmarks default to 5,000,000 rows, 9 instruments,
 one warmup, and ten measured executions.
+
+## Generic operator fusion and rolling algorithms
+
+Measured August 4, 2026 with GCC C++20, `-O3 -march=native -mtune=native -flto`,
+one execution thread, warm output, and median native-reported execution time. The
+baseline is commit `26ff5ed`; both revisions used identical generated formulas and
+data. EWM cases used 500,000 rows × 9 instruments, three warmups, eleven measured
+runs, and a reused `/dev/shm` output.
+
+| Case | Baseline | Fused | Speedup | Fused physical plan |
+| --- | ---: | ---: | ---: | --- |
+| EWM co-skewness | 0.536835 s | 0.219426 s | 2.45× | one 6-member EWM bundle |
+| EWM co-kurtosis | 0.855514 s | 0.241789 s | 3.54× | one 8-member EWM bundle |
+| adjusted co-skewness (`min_periods=10`, `ignore_na=False`) | 0.613584 s | 0.239397 s | 2.56× | one 6-member EWM bundle |
+
+The broader cases used 200,000 rows × 9 instruments (vector width 16 where
+applicable) and paired runs on the same scratch-backed output path:
+
+| Case | Baseline | Optimized | Speedup |
+| --- | ---: | ---: | ---: |
+| vector skewness | 1.273125 s | 0.184233 s | 6.91× |
+| vector kurtosis | 2.138878 s | 0.205406 s | 10.41× |
+| six projections of one Ridge model | 0.524316 s | 0.399892 s | 1.31× |
+| rolling median, 257 periods | 5.559485 s | 1.080204 s | 5.15× |
+| backfill (`k=1`), 257 periods | 1.023952 s | 0.075813 s | 13.51× |
+| previous-different, 512-row constant runs | 0.888838 s | 0.062344 s | 14.26× |
+| Theil-Sen, 257 periods | 0.533623 s | 0.065206 s | 8.18× |
+| Theil-Sen, 513 periods | 1.600831 s | 1.495389 s | 1.07× |
+
+The adaptive previous-different path does not trade away the common random-data
+case: over 21 `/dev/shm` runs it improved 0.073312 s to 0.065102 s (1.13×), while
+its run-state mode removes the old full-window worst case.
+
+### Specialized EWM ceiling and compiler diagnosis
+
+`scripts/cpp_stream_ewm_native_ceiling.cpp` is benchmark-only. It hardcodes raw
+co-moment sufficient statistics to quantify the ceiling of an operator-specific
+kernel; the backend does not include or dispatch to it. In the same 500,000×9 run,
+its medians were 0.040767 s for recursive co-skewness, 0.083134 s for recursive
+co-kurtosis, and 0.068864 s for adjusted co-skewness. Those are compute ceilings,
+not equivalent end-to-end runtimes: they omit the generated plan runner and its
+general expression/metadata machinery. The ordinary cpp_stream copy floor on this
+host was 0.146399 s.
+
+GCC's `-fopt-info-vec-all` report confirms 256-bit vectorization of the fused EWM
+component-state update. It declines to vectorize the outer lane loop because that
+loop contains consecutive nested expression/state loops and validity control flow.
+The remaining gap therefore comes from generality—typed expression-cache checks,
+pandas-compatible NaN/metadata branches, and calculation of arbitrary monomial
+graphs—not failed inlining or scalar state updates. Literal small-integer powers
+are expanded at compile time, so the generated hot path contains no runtime power
+loop. The EWM epilogue also evaluates the final scalar expression directly from
+bundle state instead of writing raw moments and launching a second physical stage.
 
 ## Generic einsum: 5M x 9
 

@@ -109,6 +109,123 @@ template <class Src> using source_value_t = typename Src::value_type;
 template <class Dst> using destination_value_t = typename Dst::value_type;
 template <class Src> inline constexpr std::size_t source_width_v = Src::feature_width;
 
+template <class... Types>
+struct TypeList {};
+
+template <class Type, class List>
+struct type_list_contains;
+
+template <class Type, class... Types>
+struct type_list_contains<Type, TypeList<Types...>>
+    : std::bool_constant<(std::is_same_v<Type, Types> || ...)> {};
+
+template <class List, class Type>
+struct type_list_append_unique;
+
+template <class... Types, class Type>
+struct type_list_append_unique<TypeList<Types...>, Type> {
+    using type = std::conditional_t<
+        (std::is_same_v<Type, Types> || ...),
+        TypeList<Types...>,
+        TypeList<Types..., Type>
+    >;
+};
+
+template <class Accumulator, class... Lists>
+struct type_list_merge;
+
+template <class Accumulator>
+struct type_list_merge<Accumulator> {
+    using type = Accumulator;
+};
+
+template <class Accumulator, class Head, class... Tail>
+struct type_list_merge_one;
+
+template <class Accumulator, class... Tail>
+struct type_list_merge_one<Accumulator, TypeList<>, Tail...> {
+    using type = typename type_list_merge<Accumulator, Tail...>::type;
+};
+
+template <class Accumulator, class Head, class... Rest, class... Tail>
+struct type_list_merge_one<
+    Accumulator, TypeList<Head, Rest...>, Tail...
+> {
+    using next = typename type_list_append_unique<Accumulator, Head>::type;
+    using type = typename type_list_merge_one<
+        next, TypeList<Rest...>, Tail...
+    >::type;
+};
+
+template <class Accumulator, class Head, class... Tail>
+struct type_list_merge<Accumulator, Head, Tail...> {
+    using type = typename type_list_merge_one<
+        Accumulator, Head, Tail...
+    >::type;
+};
+
+// Stateless source headers specialize this trait.  Keeping the default here
+// lets every physical operator ask for a recursively unique expression list
+// without knowing which scalar operators are present.
+template <class Source>
+struct expression_source_traits {
+    using type = TypeList<>;
+};
+
+template <class... Sources>
+struct expression_sources_for {
+    using type = typename type_list_merge<
+        TypeList<>, typename expression_source_traits<Sources>::type...
+    >::type;
+};
+
+template <class Source>
+struct ExpressionCacheSlot {
+    mutable source_value_t<Source> value{};
+    mutable bool ready = false;
+};
+
+template <class Context, class Expressions>
+class ExpressionCacheContext;
+
+template <class Context, class... Expressions>
+class ExpressionCacheContext<Context, TypeList<Expressions...>>
+    : private ExpressionCacheSlot<Expressions>... {
+public:
+    explicit STACKDSL_HOT ExpressionCacheContext(
+        const Context& context
+    ) noexcept : context_(context) {}
+
+    template <class Source>
+    STACKDSL_HOT source_value_t<Source> read_native(
+        std::size_t lane
+    ) const noexcept {
+        static_assert(source_width_v<Source> == 1);
+        if constexpr (
+            type_list_contains<Source, TypeList<Expressions...>>::value
+        ) {
+            auto& slot = const_cast<ExpressionCacheSlot<Source>&>(
+                static_cast<const ExpressionCacheSlot<Source>&>(*this)
+            );
+            if (!slot.ready) {
+                slot.value = Source::read(*this, lane);
+                slot.ready = true;
+            }
+            return slot.value;
+        } else {
+            return context_.template read_native<Source>(lane);
+        }
+    }
+
+    template <class Source>
+    STACKDSL_HOT double read(std::size_t lane) const noexcept {
+        return static_cast<double>(read_native<Source>(lane));
+    }
+
+private:
+    const Context& context_;
+};
+
 template <std::size_t N, std::size_t Inputs, std::size_t ScratchSlots, std::size_t MatrixScratchSlots = 0, std::size_t MatrixScratchWidth = 1>
 struct alignas(64) RowContext {
     std::array<const void*, Inputs> inputs{};
@@ -153,6 +270,8 @@ struct alignas(64) RowContext {
             return values[Src::row_width == 1 ? 0 : lane];
         } else if constexpr (requires { Src::slot_index; }) {
             return scratch_storage<source_value_t<Src>>()[Src::slot_index][Src::row_scalar ? 0 : lane];
+        } else if constexpr (requires { Src::read(*this, lane); }) {
+            return Src::read(*this, lane);
         } else {
             return Src::value;
         }

@@ -39,6 +39,24 @@ struct PctSeenSessionVolumePolicy {
     }
 };
 
+template<class Policy,class... Inputs>
+struct StatelessExpressionSrc {
+    static_assert(sizeof...(Inputs)==Policy::arity);
+    using value_type=double;
+    static constexpr std::size_t feature_width=1;
+    template<class Context>
+    STACKDSL_HOT static double read(const Context& ctx,std::size_t lane) noexcept {
+        return Policy::apply(ctx.template read<Inputs>(lane)...);
+    }
+};
+
+template<class Policy,class... Inputs>
+struct expression_source_traits<StatelessExpressionSrc<Policy,Inputs...>> {
+    using source=StatelessExpressionSrc<Policy,Inputs...>;
+    using nested=typename expression_sources_for<Inputs...>::type;
+    using type=typename type_list_append_unique<nested,source>::type;
+};
+
 template<std::size_t N,class Out,class Policy,class Execution,class... Inputs>
 struct StatelessNode {
     static_assert(sizeof...(Inputs)==Policy::arity);

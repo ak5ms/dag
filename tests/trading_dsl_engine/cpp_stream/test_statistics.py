@@ -485,13 +485,13 @@ def test_rolling_theilsen_matches_exact_pairwise_median(tmp_path: Path) -> None:
 def test_large_rolling_theilsen_uses_subquadratic_selection_accurately(
     tmp_path: Path,
 ) -> None:
-    periods = 257
+    periods = 513
     rng = np.random.default_rng(771)
     x = rng.normal(size=(periods, 1))
     y = 2.25 * x + rng.normal(scale=0.3, size=(periods, 1))
     y[::37] += rng.normal(scale=12.0, size=(len(y[::37]), 1))
     actual, _ = _run(
-        "rolling_theilsen(y, x, periods=257, min_periods=257)",
+        "rolling_theilsen(y, x, periods=513, min_periods=513)",
         {"x": x, "y": y},
         tmp_path,
         (periods, 1),

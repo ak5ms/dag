@@ -379,6 +379,98 @@ struct WhereOp {
     }
 };
 
+template <class Result, class Op, class... Inputs>
+struct NaryExpressionSrc {
+    static_assert(sizeof...(Inputs) == Op::arity);
+    using value_type = Result;
+    static constexpr std::size_t feature_width = 1;
+
+    template <class Context>
+    STACKDSL_HOT static Result read(
+        const Context& ctx, std::size_t lane
+    ) noexcept {
+        return Op::template apply<Result>(
+            ctx.template read_native<Inputs>(lane)...
+        );
+    }
+};
+
+template <class Result, class Op, class... Inputs>
+struct expression_source_traits<
+    NaryExpressionSrc<Result, Op, Inputs...>
+> {
+    using source = NaryExpressionSrc<Result, Op, Inputs...>;
+    using nested = typename expression_sources_for<Inputs...>::type;
+    using type = typename type_list_append_unique<nested, source>::type;
+};
+
+namespace nary_detail {
+
+template <class Exponent>
+consteval bool has_small_integer_exponent() {
+    if constexpr (!requires { Exponent::value; }) {
+        return false;
+    } else {
+        constexpr auto value = Exponent::value;
+        if constexpr (std::is_integral_v<decltype(value)>) {
+            return value >= -64 && value <= 64;
+        } else {
+            return value >= -64.0 && value <= 64.0
+                && value == static_cast<long long>(value);
+        }
+    }
+}
+
+template <unsigned long long Exponent, class Result>
+STACKDSL_HOT Result positive_integer_power(Result base) noexcept {
+    if constexpr (Exponent == 0) return Result{1};
+    else if constexpr (Exponent == 1) return base;
+    else {
+        const Result half = positive_integer_power<Exponent / 2>(base);
+        const Result square = half * half;
+        if constexpr ((Exponent & 1ULL) != 0) return square * base;
+        else return square;
+    }
+}
+
+template <long long Exponent, class Result>
+STACKDSL_HOT Result integer_power(Result base) noexcept {
+    if constexpr (Exponent < 0) {
+        return Result{1} /
+            positive_integer_power<static_cast<unsigned long long>(-Exponent)>(
+                base
+            );
+    } else {
+        return positive_integer_power<
+            static_cast<unsigned long long>(Exponent)
+        >(base);
+    }
+}
+
+}  // namespace nary_detail
+
+template <class Result, class Base, class Exponent>
+struct NaryExpressionSrc<Result, PowOp, Base, Exponent> {
+    using value_type = Result;
+    static constexpr std::size_t feature_width = 1;
+
+    template <class Context>
+    STACKDSL_HOT static Result read(
+        const Context& ctx, std::size_t lane
+    ) noexcept {
+        if constexpr (nary_detail::has_small_integer_exponent<Exponent>()) {
+            return nary_detail::integer_power<
+                static_cast<long long>(Exponent::value)
+            >(static_cast<Result>(ctx.template read_native<Base>(lane)));
+        } else {
+            return PowOp::template apply<Result>(
+                ctx.template read_native<Base>(lane),
+                ctx.template read_native<Exponent>(lane)
+            );
+        }
+    }
+};
+
 template <
     std::size_t N,
     class Lhs,

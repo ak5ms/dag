@@ -11,6 +11,7 @@
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/cat.hpp"
+#include "stackdsl/ops/order_tree.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -212,11 +213,22 @@ struct RollingOrderNode {
     static constexpr double quantile = std::bit_cast<double>(QuantileBits);
     static_assert(quantile >= 0.0 && quantile <= 1.0);
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    static constexpr bool UseTree = Periods >= 64;
+    using Ring = std::conditional_t<
+        UseTree,
+        std::array<double, 1>,
+        std::array<double, StateSize * Periods>
+    >;
+    using Tree = std::conditional_t<
+        UseTree, FixedOrderTree<Periods>, EmptyOrderTree
+    >;
+    alignas(64) Ring ring{};
+    alignas(64) std::array<Tree, StateSize> tree{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
     void setup() noexcept {
         ring.fill(kNaN);
+        for (auto& item : tree) item.setup();
         step.fill(0);
     }
 
@@ -228,8 +240,49 @@ struct RollingOrderNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const double current = ctx.template read<In>(lane);
-            ring[index * Periods + step[index] % Periods] = current;
+            const std::size_t ring_position = step[index] % Periods;
+            if constexpr (UseTree) {
+                tree[index].replace(
+                    static_cast<typename FixedOrderTree<Periods>::Index>(
+                        ring_position
+                    ),
+                    current
+                );
+            } else {
+                ring[index * Periods + ring_position] = current;
+            }
             ++step[index];
+            if constexpr (UseTree) {
+                const std::size_t count = tree[index].size();
+                if (count < MinPeriods || count == 0) {
+                    out[lane] = kNaN;
+                } else if constexpr (std::is_same_v<
+                    Projection, RollingPctRankProjection
+                >) {
+                    out[lane] = finite(current)
+                        ? static_cast<double>(
+                            tree[index].upper_count(current)
+                        ) / static_cast<double>(count + 1)
+                        : kNaN;
+                } else {
+                    const double position = quantile
+                        * static_cast<double>(count - 1);
+                    const std::size_t lower =
+                        static_cast<std::size_t>(position);
+                    const std::size_t upper =
+                        std::min(count - 1, lower + 1);
+                    const double lower_value = tree[index].kth(lower);
+                    if (upper == lower) {
+                        out[lane] = lower_value;
+                    } else {
+                        const double upper_value = tree[index].kth(upper);
+                        out[lane] = lower_value
+                            + (position - static_cast<double>(lower))
+                                * (upper_value - lower_value);
+                    }
+                }
+                continue;
+            }
             std::array<double, Periods> values{};
             std::size_t count = 0;
             for (std::size_t position = 0; position < Periods; ++position) {
@@ -412,15 +465,32 @@ STACKDSL_HOT double selected_slope(
     std::uint64_t rank,
     double bound
 ) noexcept {
-    double lower = -bound;
-    double upper = bound;
-    for (std::size_t iteration = 0; iteration < 72; ++iteration) {
-        const double middle = lower + 0.5 * (upper - lower);
-        if (!(middle > lower && middle < upper)) break;
-        if (count_slopes_le(points, count, middle) > rank) upper = middle;
-        else lower = middle;
+    constexpr std::uint64_t Sign = std::uint64_t{1} << 63U;
+    auto ordered_key = [](double value) noexcept {
+        const std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
+        return (bits & Sign) != 0U ? ~bits : bits ^ Sign;
+    };
+    auto ordered_value = [](std::uint64_t key) noexcept {
+        const std::uint64_t bits = (key & Sign) != 0U
+            ? key ^ Sign
+            : ~key;
+        return std::bit_cast<double>(bits);
+    };
+
+    // Search the ordered IEEE-754 domain, not an arbitrary number of numeric
+    // bisections.  This terminates at the first representable value whose
+    // inversion count crosses rank, including around zero and subnormals.
+    std::uint64_t lower = ordered_key(-bound);
+    std::uint64_t upper = ordered_key(bound);
+    while (lower < upper) {
+        const std::uint64_t middle = lower + (upper - lower) / 2U;
+        if (count_slopes_le(points, count, ordered_value(middle)) > rank) {
+            upper = middle;
+        } else {
+            lower = middle + 1U;
+        }
     }
-    return upper;
+    return ordered_value(lower);
 }
 
 template <std::size_t Periods>
@@ -505,7 +575,7 @@ struct RollingTheilSenNode {
                 if (finite(x) && finite(y)) points[count++] = {x, y};
             }
             if (count < MinPeriods) out[lane] = kNaN;
-            else if constexpr (Periods <= 256) {
+            else if constexpr (Periods <= 512) {
                 out[lane] = stats_detail::exact_theilsen(points, count);
             } else {
                 out[lane] = stats_detail::subquadratic_theilsen(points, count);
