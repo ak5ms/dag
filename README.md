@@ -137,3 +137,7 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/numba/test_performance.py -q
 - Add graph-level IR + CSE for shared subtrees across multi-feature workflows.
 - Expand shape system for richer multi-output model/optimizer nodes.
 - Continue reducing memory movement in batch paths for large memmap workloads.
+
+## Branch push validation
+
+This repository accepts branch updates through the standard pull request workflow. Use a small documentation-only change like this section when validating branch push and PR automation without altering runtime behavior.
