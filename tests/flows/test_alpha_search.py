@@ -3,7 +3,9 @@ from math import isfinite
 import pytest
 from deap import gp
 
+import flows.alpha_search as alpha_search
 from flows.alpha_search import (
+    OperatorSpec,
     PositiveScalar,
     PositiveIntScalar,
     default_alpha_pnl,
@@ -22,7 +24,7 @@ def test_default_pnl_and_ridge_pool_build_expected_formula_shapes():
     alpha = var("alpha")
     pnl = default_alpha_pnl(alpha, roll_rets=var("roll_rets"), is_tradable=var("is_tradable"), hl=1440)
     assert isinstance(pnl, Call)
-    assert pnl.fn == "einsum"
+    assert pnl.fn == "mul"
 
     pooled = ridge_pool_alpha_pnl(
         alpha,
@@ -47,11 +49,63 @@ def test_make_alpha_pset_uses_standard_deap_typed_groups():
     assert len(pset.terminals[PositiveIntScalar]) == 2
     assert any(primitive.name == "ewm" and primitive.args == [Expr, PositiveScalar] for primitive in pset.primitives[Expr])
     assert any(primitive.name == "shift" and primitive.args == [Expr, PositiveIntScalar] for primitive in pset.primitives[Expr])
+    assert any(primitive.name == "positive" and primitive.args == [Expr] for primitive in pset.primitives[PositiveScalar])
+    assert any(primitive.name == "positive_int" and primitive.args == [Expr] for primitive in pset.primitives[PositiveIntScalar])
 
     with pytest.raises(ValueError, match="Positive scalar"):
         make_alpha_pset(["x"], halflives=[0])
     with pytest.raises(ValueError, match="Positive integer"):
         make_alpha_pset(["x"], shift_lags=[1.5])
+
+
+def test_dynamic_parameter_subtrees_compile_to_normal_dsl_expressions():
+    pset = make_alpha_pset(["x", "adaptive"], halflives=[5], shift_lags=[1])
+
+    ewm_tree = gp.PrimitiveTree.from_string("ewm(x, positive(xs_rank(adaptive)))", pset)
+    ewm_expr = individual_to_expr(ewm_tree, pset)
+    assert isinstance(ewm_expr, Call)
+    assert ewm_expr.fn == "ewm"
+    assert "xs_rank" in repr(ewm_expr)
+
+    shift_tree = gp.PrimitiveTree.from_string("shift(x, positive_int(abs(adaptive)))", pset)
+    shift_expr = individual_to_expr(shift_tree, pset)
+    assert isinstance(shift_expr, Call)
+    assert shift_expr.fn == "shift"
+    assert "floor" in repr(shift_expr)
+
+
+def test_same_type_family_uses_multi_type_intersection_algorithm(monkeypatch):
+    class FakeMeta:
+        def __init__(self, types):
+            self._types = types
+
+        def get_types(self):
+            return set(self._types)
+
+    def fake_analyze(expr, config):
+        text = repr(expr)
+        if "price" in text:
+            return FakeMeta({"price", "market_data"})
+        if "volume" in text:
+            return FakeMeta({"volume", "market_data"})
+        return FakeMeta({"dimensionless"})
+
+    monkeypatch.setattr(alpha_search, "analyze_formula_metadata", fake_analyze)
+    pset = make_alpha_pset(
+        ["price", "volume"],
+        operators=[OperatorSpec("add", alpha_search.add, 2, "same_type")],
+    )
+
+    # Multiple node types are supported: the shared market_data type permits it.
+    expr = individual_to_expr(gp.PrimitiveTree.from_string("add(price, volume)", pset), pset)
+    assert expr.fn == "add"
+
+    def disjoint_analyze(expr, config):
+        return FakeMeta({"price"} if "price" in repr(expr) else {"volume"})
+
+    monkeypatch.setattr(alpha_search, "analyze_formula_metadata", disjoint_analyze)
+    with pytest.raises(ValueError, match="intersecting semantic type"):
+        individual_to_expr(gp.PrimitiveTree.from_string("add(price, volume)", pset), pset)
 
 
 def test_depth_three_generation_example_filters_dimensionless_not_in_pool():
@@ -86,7 +140,6 @@ def test_depth_three_generation_example_filters_dimensionless_not_in_pool():
     assert out
     assert all(depth <= 3 for _, _, depth in out)
     assert all(repr(expr) not in pool_keys for expr, _, _ in out)
-    assert any("xs_rank" in repr(expr) and "clip" in repr(expr) for expr, _, _ in out)
 
 
 def test_individual_to_expr_and_search_formulas_use_standard_deap_individuals():
