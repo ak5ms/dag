@@ -104,6 +104,11 @@ def test_weighted_ridge_inference_uses_penalized_covariance(tmp_path: Path) -> N
         f"get_{name}({model})" for name in metric_names
     ) + ")"
     runtime = compile_formula(metric_formula, data, n_instruments=lanes)
+    bundles = [
+        stage for stage in runtime.plan.stages if stage.kind == "ridge_bundle"
+    ]
+    assert len(bundles) == 1
+    assert len(bundles[0].members) == len(metric_names)
     output = tmp_path / "metrics.bin"
     runtime.run(out_path=output)
     actual_metrics = np.fromfile(output, dtype=np.float64).reshape(

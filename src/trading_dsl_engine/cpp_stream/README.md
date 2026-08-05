@@ -145,6 +145,14 @@ passed to every component `ewm` as one missing observation, and its effect follo
 the selected `ignore_na` mode. Variance and standardized higher moments are
 population statistics; kurtosis is not excess kurtosis.
 
+These remain ordinary DSL compositions. Physical lowering detects compatible
+sibling `ewm` nodes and emits one variadic `EwmBundleNode`; it is not a co-moment
+kernel. The bundle accepts any generated scalar expression graph, shares validity
+metadata while observation masks agree, and splits to per-component metadata when
+they diverge. If its only consumer is scalar algebra or a scalar-width `cat`, that
+consumer becomes a generated epilogue over the live EWM state, avoiding a second
+row traversal and raw-moment scratch writes.
+
 Statistics without a useful EWM definition use fixed-row windows:
 
 ```python
@@ -162,14 +170,42 @@ rolling_theilsen(y, x, periods=63)
 ```
 
 Rolling moments use removable stable state, min/max and their relative indices use
-monotonic deques, and order statistics use fixed scratch. Theil-Sen uses exact
-pairwise median selection for ordinary windows and a fixed-memory subquadratic
-inversion-count selector for windows above 256 rows. No implementation allocates in
-`on_data`.
+monotonic deques, and order statistics use an allocation-free order-statistics tree
+for windows of at least 64 rows. Backfill walks a fixed recency list only to the
+requested `k`; previous-different lookup adaptively changes from a bounded fast scan
+to O(1) run state; entropy reuses the order tree for extrema and scans active values
+once. Theil-Sen uses exact pairwise median selection through 512 rows and a
+fixed-memory subquadratic inversion-count selector above that boundary. No
+implementation allocates in `on_data`.
 
 Cheap formulas such as `ewm_std`, `ewm_skewness`, `ewm_kurtosis`, `xs_zscore`,
 `xs_scale`, `xs_vector_neut`, `rolling_range`, `rolling_zscore`, and `rolling_scale`
 live in `cpp_stream.python.utils` and expand to the native primitives above.
+
+## Compile-time CSE and physical fusion
+
+The neutral IR deduplicates stateless expressions, including safely commutative
+binary forms such as `x + y` and `y + x`. NaN literals share one semantic key, while
+signed zero and order-sensitive minimum/maximum retain their original ordering.
+
+Lowering then keeps stateless scalar and tensor expressions as typed sources instead
+of assigning one scratch slot per AST node. They materialize only at an actual
+pointer boundary such as grouped feeds or a dense model feature matrix. Generated
+C++ exposes the nested expression type to the optimizer and uses a typed per-lane
+cache when several fused consumers share a subexpression.
+
+Compatible stateful siblings use one generic physical operation:
+
+- EWM siblings share one traversal and pandas-style metadata;
+- tensor reductions with equal shape/axes/policy share one source pass;
+- projections of the same Ridge object share sufficient-statistic updates, one
+  solve, and one inference calculation.
+
+This is graph-driven rather than operator-name-driven: `ewm_co_kurtosis`, for
+example, remains a utility composition but lowers to one eight-member EWM bundle.
+Specialized cross-sectional algorithms (`xs_rank`, `xs_pct_rank`, and related
+nodes) remain physical stages so fusion does not replace their tuned sort/ranking
+implementation.
 
 ## Ridge projections and named regression results
 

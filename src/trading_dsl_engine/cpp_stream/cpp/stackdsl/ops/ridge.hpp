@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/cat.hpp"
@@ -31,6 +32,17 @@ struct RidgeR2Projection {};
 struct RidgeResidualVarianceProjection {};
 struct RidgeEffectiveDfProjection {};
 struct RidgeEffectiveNProjection {};
+
+template <class Out, class Projection>
+struct RidgeProjectionBinding {
+    using output_type = Out;
+    using projection_type = Projection;
+};
+
+template <class... Bindings>
+struct RidgeProjectionBundle {
+    static_assert(sizeof...(Bindings) > 1);
+};
 
 namespace ridge_detail {
 
@@ -393,6 +405,62 @@ template <class Projection> struct is_tstat_projection : std::false_type {};
 template <std::size_t Component>
 struct is_tstat_projection<RidgeTStatProjection<Component>> : std::true_type {};
 
+template <class Projection>
+struct projection_traits {
+    static constexpr bool predicts =
+        std::is_same_v<Projection, RidgePredsProjection>
+        || std::is_same_v<Projection, RidgeResidualsProjection>;
+    static constexpr bool full_coefficients =
+        std::is_same_v<Projection, RidgeBetaProjection>
+        || std::is_same_v<Projection, RidgeStandardErrorsProjection>
+        || std::is_same_v<Projection, RidgeTStatsProjection>;
+    static constexpr bool needs_inference =
+        std::is_same_v<Projection, RidgeStandardErrorsProjection>
+        || std::is_same_v<Projection, RidgeTStatsProjection>
+        || std::is_same_v<Projection, RidgeResidualVarianceProjection>
+        || std::is_same_v<Projection, RidgeEffectiveDfProjection>
+        || is_standard_error_projection<Projection>::value
+        || is_tstat_projection<Projection>::value;
+    static constexpr bool needs_metrics =
+        needs_inference
+        || std::is_same_v<Projection, RidgeSseProjection>
+        || std::is_same_v<Projection, RidgeSstProjection>
+        || std::is_same_v<Projection, RidgeR2Projection>
+        || std::is_same_v<Projection, RidgeEffectiveNProjection>;
+};
+
+template <class ProjectionSpec, class DefaultOut>
+struct projection_set {
+    static constexpr bool predicts = projection_traits<ProjectionSpec>::predicts;
+    static constexpr bool needs_inference =
+        projection_traits<ProjectionSpec>::needs_inference;
+    static constexpr bool needs_metrics =
+        projection_traits<ProjectionSpec>::needs_metrics;
+
+    template <class Function>
+    STACKDSL_HOT static void for_each(Function&& function) noexcept {
+        function.template operator()<DefaultOut, ProjectionSpec>();
+    }
+};
+
+template <class DefaultOut, class... Bindings>
+struct projection_set<RidgeProjectionBundle<Bindings...>, DefaultOut> {
+    static constexpr bool predicts =
+        (projection_traits<typename Bindings::projection_type>::predicts || ...);
+    static constexpr bool needs_inference =
+        (projection_traits<typename Bindings::projection_type>::needs_inference || ...);
+    static constexpr bool needs_metrics =
+        (projection_traits<typename Bindings::projection_type>::needs_metrics || ...);
+
+    template <class Function>
+    STACKDSL_HOT static void for_each(Function&& function) noexcept {
+        (function.template operator()<
+            typename Bindings::output_type,
+            typename Bindings::projection_type
+        >(), ...);
+    }
+};
+
 }  // namespace ridge_detail
 
 template <std::size_t N, class Features, class Y, class Weights, class Out, std::uint64_t AlphaBits, std::uint64_t LambdaBits, bool Nonnegative, bool Stateful, class Projection, class Execution = DirectExecution<N>> struct RidgeNode;
@@ -403,26 +471,10 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
     static constexpr std::size_t Groups = Execution::cross_state_size;
     static constexpr std::size_t MaxActiveGroups = Groups < N ? Groups : N;
     static_assert(K > 0 && Groups > 0);
-    static constexpr bool PredProjection =
-        std::is_same_v<Projection, RidgePredsProjection> ||
-        std::is_same_v<Projection, RidgeResidualsProjection>;
-    static constexpr bool FullCoefficientProjection =
-        std::is_same_v<Projection, RidgeBetaProjection> ||
-        std::is_same_v<Projection, RidgeStandardErrorsProjection> ||
-        std::is_same_v<Projection, RidgeTStatsProjection>;
-    static constexpr bool NeedsInference =
-        std::is_same_v<Projection, RidgeStandardErrorsProjection> ||
-        std::is_same_v<Projection, RidgeTStatsProjection> ||
-        std::is_same_v<Projection, RidgeResidualVarianceProjection> ||
-        std::is_same_v<Projection, RidgeEffectiveDfProjection> ||
-        ridge_detail::is_standard_error_projection<Projection>::value ||
-        ridge_detail::is_tstat_projection<Projection>::value;
-    static constexpr bool NeedsMetrics =
-        NeedsInference ||
-        std::is_same_v<Projection, RidgeSseProjection> ||
-        std::is_same_v<Projection, RidgeSstProjection> ||
-        std::is_same_v<Projection, RidgeR2Projection> ||
-        std::is_same_v<Projection, RidgeEffectiveNProjection>;
+    using Projections = ridge_detail::projection_set<Projection, Out>;
+    static constexpr bool PredProjection = Projections::predicts;
+    static constexpr bool NeedsInference = Projections::needs_inference;
+    static constexpr bool NeedsMetrics = Projections::needs_metrics;
     ridge_detail::RidgeState<Groups, K, Stateful> state{};
     ridge_detail::RidgeMetricState<Groups, K, Stateful && NeedsMetrics> metrics{};
     STACKDSL_HOT void setup() noexcept {}
@@ -549,20 +601,34 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
             }
         }
         if constexpr (Stateful && PredProjection) {
-            auto* out = ctx.template write_ptr<Out>();
-            for (std::size_t lane = 0; lane < N; ++lane) {
-                if (!prediction_valid[lane]) {
-                    out[lane] = kNaN;
-                    continue;
+            Projections::for_each(
+                [&]<class ProjectionOut, class ProjectionType>() noexcept {
+                    if constexpr (
+                        ridge_detail::projection_traits<
+                            ProjectionType
+                        >::predicts
+                    ) {
+                        auto* projection_out =
+                            ctx.template write_ptr<ProjectionOut>();
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            if (!prediction_valid[lane]) {
+                                projection_out[lane] = kNaN;
+                                continue;
+                            }
+                            const double prediction = ridge_detail::dot(
+                                features_by_lane[lane],
+                                state.beta.data()
+                                    + static_cast<std::size_t>(
+                                        lane_groups[lane]
+                                    ) * K
+                            );
+                            projection_out[lane] = std::is_same_v<
+                                ProjectionType, RidgeResidualsProjection
+                            > ? y_by_lane[lane] - prediction : prediction;
+                        }
+                    }
                 }
-                const double prediction = ridge_detail::dot(
-                    features_by_lane[lane],
-                    state.beta.data() + static_cast<std::size_t>(lane_groups[lane]) * K
-                );
-                out[lane] = std::is_same_v<Projection, RidgeResidualsProjection>
-                    ? y_by_lane[lane] - prediction
-                    : prediction;
-            }
+            );
         }
         std::array<std::array<double, K>, MaxActiveGroups> solved_betas{};
         std::array<std::array<double, K>, MaxActiveGroups> standard_errors{};
@@ -845,79 +911,139 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                 }
             }
         }
-        if constexpr (PredProjection) {
-            if constexpr (!Stateful) {
-                auto* out = ctx.template write_ptr<Out>();
-                for (std::size_t lane = 0; lane < N; ++lane) {
-                    if (!prediction_valid[lane]) {
-                        out[lane] = kNaN;
-                        continue;
+        Projections::for_each(
+            [&]<class ProjectionOut, class ProjectionType>() noexcept {
+                using Traits = ridge_detail::projection_traits<ProjectionType>;
+                if constexpr (Traits::predicts) {
+                    if constexpr (!Stateful) {
+                        auto* projection_out =
+                            ctx.template write_ptr<ProjectionOut>();
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            if (!prediction_valid[lane]) {
+                                projection_out[lane] = kNaN;
+                                continue;
+                            }
+                            const double prediction = ridge_detail::dot(
+                                features_by_lane[lane],
+                                solved_betas[
+                                    active_index_by_lane[lane]
+                                ].data()
+                            );
+                            projection_out[lane] = std::is_same_v<
+                                ProjectionType, RidgeResidualsProjection
+                            > ? y_by_lane[lane] - prediction : prediction;
+                        }
                     }
-                    const double prediction = ridge_detail::dot(
-                        features_by_lane[lane],
-                        solved_betas[active_index_by_lane[lane]].data()
-                    );
-                    out[lane] = std::is_same_v<Projection, RidgeResidualsProjection>
-                        ? y_by_lane[lane] - prediction
-                        : prediction;
-                }
-            }
-        } else if constexpr (FullCoefficientProjection) {
-            auto* out = ctx.template write_ptr<Out>();
-            if constexpr (Groups == 1) {
-                for (std::size_t j = 0; j < K; ++j) {
-                    if constexpr (std::is_same_v<Projection, RidgeBetaProjection>) {
-                        out[j] = solved_betas[0][j];
-                    } else if constexpr (std::is_same_v<Projection, RidgeStandardErrorsProjection>) {
-                        out[j] = standard_errors[0][j];
-                    } else out[j] = tstats[0][j];
-                }
-            } else {
-                for (std::size_t lane = 0; lane < N; ++lane) {
-                    const std::size_t active = active_index_by_lane[lane];
-                    for (std::size_t j = 0; j < K; ++j) {
-                        if constexpr (std::is_same_v<Projection, RidgeBetaProjection>) {
-                            out[lane * K + j] = solved_betas[active][j];
-                        } else if constexpr (std::is_same_v<Projection, RidgeStandardErrorsProjection>) {
-                            out[lane * K + j] = standard_errors[active][j];
-                        } else out[lane * K + j] = tstats[active][j];
+                } else if constexpr (Traits::full_coefficients) {
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    if constexpr (Groups == 1) {
+                        for (std::size_t j = 0; j < K; ++j) {
+                            if constexpr (std::is_same_v<
+                                ProjectionType, RidgeBetaProjection
+                            >) {
+                                projection_out[j] = solved_betas[0][j];
+                            } else if constexpr (std::is_same_v<
+                                ProjectionType, RidgeStandardErrorsProjection
+                            >) {
+                                projection_out[j] = standard_errors[0][j];
+                            } else {
+                                projection_out[j] = tstats[0][j];
+                            }
+                        }
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            const std::size_t active =
+                                active_index_by_lane[lane];
+                            for (std::size_t j = 0; j < K; ++j) {
+                                if constexpr (std::is_same_v<
+                                    ProjectionType, RidgeBetaProjection
+                                >) {
+                                    projection_out[lane * K + j] =
+                                        solved_betas[active][j];
+                                } else if constexpr (std::is_same_v<
+                                    ProjectionType,
+                                    RidgeStandardErrorsProjection
+                                >) {
+                                    projection_out[lane * K + j] =
+                                        standard_errors[active][j];
+                                } else {
+                                    projection_out[lane * K + j] =
+                                        tstats[active][j];
+                                }
+                            }
+                        }
+                    }
+                } else if constexpr (
+                    ridge_detail::projection_component<ProjectionType>::value
+                    != std::numeric_limits<std::size_t>::max()
+                ) {
+                    constexpr std::size_t component =
+                        ridge_detail::projection_component<
+                            ProjectionType
+                        >::value;
+                    static_assert(component < K);
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    auto projected = [&](std::size_t active) {
+                        if constexpr (
+                            ridge_detail::is_coefficient_projection<
+                                ProjectionType
+                            >::value
+                        ) {
+                            return solved_betas[active][component];
+                        } else if constexpr (
+                            ridge_detail::is_standard_error_projection<
+                                ProjectionType
+                            >::value
+                        ) {
+                            return standard_errors[active][component];
+                        } else {
+                            return tstats[active][component];
+                        }
+                    };
+                    if constexpr (Groups == 1) {
+                        projection_out[0] = projected(0);
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            projection_out[lane] = projected(
+                                active_index_by_lane[lane]
+                            );
+                        }
+                    }
+                } else {
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    const auto& values = [&]() -> const auto& {
+                        if constexpr (std::is_same_v<
+                            ProjectionType, RidgeSseProjection
+                        >) return sse_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeSstProjection
+                        >) return sst_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeR2Projection
+                        >) return r2_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeResidualVarianceProjection
+                        >) return residual_variances;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeEffectiveDfProjection
+                        >) return effective_df_values;
+                        else return effective_n_values;
+                    }();
+                    if constexpr (Groups == 1) {
+                        projection_out[0] = values[0];
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            projection_out[lane] = values[
+                                active_index_by_lane[lane]
+                            ];
+                        }
                     }
                 }
             }
-        } else if constexpr (
-            ridge_detail::projection_component<Projection>::value !=
-            std::numeric_limits<std::size_t>::max()
-        ) {
-            constexpr std::size_t component =
-                ridge_detail::projection_component<Projection>::value;
-            static_assert(component < K);
-            auto* out = ctx.template write_ptr<Out>();
-            auto projected = [&](std::size_t active) {
-                if constexpr (ridge_detail::is_coefficient_projection<Projection>::value) {
-                    return solved_betas[active][component];
-                } else if constexpr (ridge_detail::is_standard_error_projection<Projection>::value) {
-                    return standard_errors[active][component];
-                } else return tstats[active][component];
-            };
-            if constexpr (Groups == 1) out[0] = projected(0);
-            else for (std::size_t lane = 0; lane < N; ++lane) {
-                out[lane] = projected(active_index_by_lane[lane]);
-            }
-        } else {
-            auto* out = ctx.template write_ptr<Out>();
-            const auto& values = [&]() -> const auto& {
-                if constexpr (std::is_same_v<Projection, RidgeSseProjection>) return sse_values;
-                else if constexpr (std::is_same_v<Projection, RidgeSstProjection>) return sst_values;
-                else if constexpr (std::is_same_v<Projection, RidgeR2Projection>) return r2_values;
-                else if constexpr (std::is_same_v<Projection, RidgeResidualVarianceProjection>) return residual_variances;
-                else if constexpr (std::is_same_v<Projection, RidgeEffectiveDfProjection>) return effective_df_values;
-                else return effective_n_values;
-            }();
-            if constexpr (Groups == 1) out[0] = values[0];
-            else for (std::size_t lane = 0; lane < N; ++lane) {
-                out[lane] = values[active_index_by_lane[lane]];
-            }
-        }
+        );
         if constexpr (Stateful) ++state.t;
     }
 };

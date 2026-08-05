@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import math
+import struct
 
 from trading_dsl_engine.base.custom import StatelessCall
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -124,16 +125,39 @@ _NARY_ARITY = {
     "where": 3,
 }
 _LOGICAL_OPS = {"eq", "ne", "lt", "gt", "le", "ge", "and_", "or_", "xor"}
+_COMMUTATIVE_NARY = {
+    "add",
+    "mul",
+    "eq",
+    "ne",
+    "and_",
+    "or_",
+    "xor",
+}
 _DERIVED_TERMINALS: dict[str, Expr] = {
     "minute": Call("minute", (Identifier("_ev_ts"),), ())
 }
+
+
+def _number_key(value: float) -> tuple:
+    """Return a stable semantic key for a parsed numeric literal.
+
+    All NaNs are equivalent in the DSL.  Other values use their IEEE encoding so
+    signed zero remains distinct for order-sensitive operations such as minimum
+    and maximum.
+    """
+
+    numeric = float(value)
+    if math.isnan(numeric):
+        return ("nan",)
+    return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
 def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
-        return ("num", node.value)
+        return ("num", _number_key(node.value))
     if isinstance(node, String):
         return ("str", node.value)
     if isinstance(node, Universe):
@@ -158,10 +182,13 @@ def _expr_key(node: Expr) -> tuple:
             tuple(_expr_key(arg) for arg in node.args),
         )
     if isinstance(node, Call):
+        args = tuple(_expr_key(arg) for arg in node.args)
+        if node.fn in _COMMUTATIVE_NARY and len(args) == 2:
+            args = tuple(sorted(args, key=repr))
         return (
             "call",
             node.fn,
-            tuple(_expr_key(arg) for arg in node.args),
+            args,
             tuple((name, _expr_key(value)) for name, value in node.kwargs),
         )
     raise FormulaIRCompileError(f"unhandled expression {node!r}")

@@ -166,18 +166,36 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
     ).text
     assert "stackdsl::InputSrc<0, double, 9>" in source
     assert "stackdsl::InputSrc<1, std::int64_t, 1>" in source
-    assert "stackdsl::BinaryNode<9," in source
-    assert "stackdsl::OutputDst, double, stackdsl::AddOp" in source
+    assert "stackdsl::CopyNode<9," in source
+    assert (
+        "stackdsl::NaryExpressionSrc<double, stackdsl::AddOp, "
+        "stackdsl::InputSrc<0, double, 9>, "
+        "stackdsl::InputSrc<1, std::int64_t, 1>>"
+    ) in source
+    assert "stackdsl::OutputDst" in source
     assert "cpp_stream_run_arrays" in source
 
 
 def test_generated_runtime_has_one_row_pass_and_cse_for_repeated_cat_branches():
-    source = _render("cat(close + 1, close + 1, close + 2)")
+    plan = lower_program(
+        compile_ir("cat(close + 1, close + 1, close + 2)"),
+        n_instruments=5,
+    )
+    assert len(plan.stages) == 1
+    cat_stage = plan.stages[0]
+    assert cat_stage.kind == "cat"
+    assert cat_stage.inputs[0] == cat_stage.inputs[1]
+    assert cat_stage.inputs[0] != cat_stage.inputs[2]
+
+    source = render_translation_unit(
+        plan, n_instruments=5, prefetch_rows=16
+    ).text
     header = _generated_row_loop_header(source)
     assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
     assert source.count(header) == 1
     assert source.count("ctx.inputs[0] =") == 1
-    assert source.count("stackdsl::BinaryNode<5,") == 2
+    assert "stackdsl::BinaryNode<" not in source
+    assert "stackdsl::NaryExpressionSrc<double, stackdsl::AddOp" in source
     assert source.count("stackdsl::CatNode<") == 1
 
 
@@ -199,7 +217,9 @@ def test_statistics_codegen_selects_specialized_allocation_free_nodes():
         n=9,
     )
     assert "stackdsl::XsPctRankNode<" in source
-    assert source.count("stackdsl::EwmNode<") >= 3
+    assert source.count("stackdsl::EwmBundleNode<") == 1
+    assert source.count("stackdsl::EwmBinding<") >= 3
+    assert "stackdsl::EwmNode<" not in source
     assert "stackdsl::EwmStatsNode<" not in source
     assert "stackdsl::RollingExtremaNode<" in source
     assert "stackdsl::RollingTheilSenNode<" in source
@@ -228,7 +248,7 @@ def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
     source = _render("xs_rank((x + 5 + y) * 3)", n=9)
     header = _generated_row_loop_header(source)
     loop_start = source.index(header)
-    last_call_text = "s3.on_data(ctx);"
+    last_call_text = "s0.on_data(ctx);"
     last_call = source.index(last_call_text, loop_start)
     row_loop_prefix = source[loop_start : last_call + len(last_call_text)]
 
@@ -237,8 +257,9 @@ def test_complex_stateless_stages_are_adjacent_inside_one_row_loop():
         row_loop_prefix,
         re.MULTILINE,
     )
-    assert stage_calls == ["0", "1", "2", "3"]
-    assert source.count("stackdsl::BinaryNode<9,") == 3
+    assert stage_calls == ["0"]
+    assert "stackdsl::BinaryNode<" not in source
+    assert source.count("stackdsl::NaryExpressionSrc<double,") >= 3
     assert source.count("stackdsl::XsRankNode<9,") == 1
     assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
     assert row_loop_prefix.count("ctx.inputs[0] =") == 1
@@ -263,8 +284,7 @@ def test_temporal_reduction_suffix_runs_once_during_finalization():
     calls = (
         "s0.finalize(ctx);",
         "s1.on_data(ctx);",
-        "s2.on_data(ctx);",
-        "s2.finalize(ctx);",
+        "s1.finalize(ctx);",
     )
     positions = [final_phase.index(call) for call in calls]
     assert positions == sorted(positions)

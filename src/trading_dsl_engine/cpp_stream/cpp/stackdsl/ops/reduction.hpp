@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -394,6 +396,264 @@ struct ReductionNode {
     template <class Context>
     STACKDSL_HOT void finalize(Context& ctx) noexcept {
         if constexpr (Temporal) write_result(state, ctx);
+    }
+};
+
+template <class Tensor, class Out>
+struct ReductionBinding {
+    using tensor_type = Tensor;
+    using output_type = Out;
+};
+
+template <
+    class Axes,
+    class Policy,
+    std::size_t Ddof,
+    bool IgnoreNa,
+    bool Temporal,
+    class... Bindings
+>
+struct ReductionBundleNode {
+    static_assert(sizeof...(Bindings) > 1);
+    static constexpr std::size_t component_count = sizeof...(Bindings);
+    using BindingTuple = std::tuple<Bindings...>;
+    using FirstBinding = std::tuple_element_t<0, BindingTuple>;
+    using Shape = typename FirstBinding::tensor_type::shape;
+    static_assert((std::is_same_v<Shape, typename Bindings::tensor_type::shape> && ...));
+
+    static constexpr std::size_t input_size = Shape::size;
+    static constexpr std::size_t output_size = reduced_output_size<Shape, Axes>();
+    static constexpr bool retains_leading_axis =
+        Shape::rank > 0 && !Axes::contains(0);
+    static constexpr std::size_t leading_extent =
+        Shape::rank > 0 ? Shape::dims[0] : 1;
+    static constexpr std::size_t input_lane_width =
+        retains_leading_axis ? input_size / leading_extent : input_size;
+    static constexpr std::size_t output_lane_width =
+        retains_leading_axis ? output_size / leading_extent : output_size;
+    using State = ReductionState<Policy, output_size, Ddof, IgnoreNa>;
+
+    std::array<State, component_count> state{};
+
+    STACKDSL_HOT void setup() noexcept {
+        for (auto& item : state) item.reset();
+    }
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        if constexpr (!Temporal) {
+            for (auto& item : state) item.reset();
+        }
+        accumulate(ctx);
+        if constexpr (!Temporal) write_result(ctx);
+    }
+
+    template <class Context>
+    STACKDSL_HOT void finalize(Context& ctx) noexcept {
+        if constexpr (Temporal) write_result(ctx);
+    }
+
+private:
+    template <std::size_t Index, class Context>
+    STACKDSL_HOT static double read_binding(
+        const Context& ctx, std::size_t offset
+    ) noexcept {
+        using Tensor = typename std::tuple_element_t<
+            Index, BindingTuple
+        >::tensor_type;
+        return Tensor::read_flat(ctx, offset);
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void add_offset(
+        const Context& ctx,
+        std::size_t output,
+        std::size_t offset,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        // One physical traversal exposes all sibling tensor expressions in the
+        // same optimizer region and computes the output index only once.
+        (state[Indexes].add(
+            output,
+            read_binding<Indexes>(ctx, offset)
+        ), ...);
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT static std::array<double, component_count> read_values(
+        const Context& ctx,
+        std::size_t offset,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        return {read_binding<Indexes>(ctx, offset)...};
+    }
+
+    template <class Context>
+    STACKDSL_HOT void accumulate(const Context& ctx) noexcept {
+        using Indexes = std::make_index_sequence<component_count>;
+        if constexpr (reduces_contiguous_suffix<Shape, Axes>()) {
+            constexpr std::size_t reduction_width = input_size / output_size;
+            std::size_t output_begin = 0;
+            std::size_t output_end = output_size;
+            if constexpr (retains_leading_axis) {
+                const std::size_t lane_begin =
+                    std::min(ctx.lane_begin, leading_extent);
+                const std::size_t lane_end =
+                    std::min(ctx.lane_end, leading_extent);
+                output_begin = lane_begin * output_lane_width;
+                output_end = lane_end * output_lane_width;
+            }
+            for (std::size_t output = output_begin; output < output_end; ++output) {
+                const std::size_t base = output * reduction_width;
+                if constexpr (
+                    reduction_width > 1
+                    && !std::is_same_v<Policy, StdReductionPolicy>
+                ) {
+                    std::array<std::array<double, 4>, component_count> partial{};
+                    std::array<std::uint64_t, component_count> count{};
+                    std::array<bool, component_count> invalid{};
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 8
+#endif
+                    for (std::size_t reduction = 0; reduction < reduction_width; ++reduction) {
+                        const auto values = read_values(
+                            ctx, base + reduction, Indexes{}
+                        );
+                        for (std::size_t component = 0; component < component_count; ++component) {
+                            const double value = values[component];
+                            if (finite(value)) {
+                                if constexpr (std::is_same_v<Policy, MinReductionPolicy>) {
+                                    partial[component][0] = count[component] == 0
+                                        ? value
+                                        : std::min(partial[component][0], value);
+                                } else if constexpr (std::is_same_v<Policy, MaxReductionPolicy>) {
+                                    partial[component][0] = count[component] == 0
+                                        ? value
+                                        : std::max(partial[component][0], value);
+                                } else {
+                                    partial[component][reduction & 3U] += value;
+                                }
+                                ++count[component];
+                            } else if constexpr (!IgnoreNa) {
+                                invalid[component] = true;
+                            }
+                        }
+                    }
+                    for (std::size_t component = 0; component < component_count; ++component) {
+                        const double total =
+                            std::is_same_v<Policy, MinReductionPolicy>
+                            || std::is_same_v<Policy, MaxReductionPolicy>
+                            ? partial[component][0]
+                            : (partial[component][0] + partial[component][1])
+                                + (partial[component][2] + partial[component][3]);
+                        state[component].merge_block(
+                            output,
+                            total,
+                            0.0,
+                            0.0,
+                            count[component],
+                            invalid[component]
+                        );
+                    }
+                } else if constexpr (reduction_width > 1) {
+                    std::array<double, component_count> block_mean{};
+                    std::array<double, component_count> block_m2{};
+                    std::array<std::uint64_t, component_count> block_count{};
+                    std::array<bool, component_count> block_invalid{};
+                    for (std::size_t reduction = 0; reduction < reduction_width; ++reduction) {
+                        const auto values = read_values(
+                            ctx, base + reduction, Indexes{}
+                        );
+                        for (std::size_t component = 0; component < component_count; ++component) {
+                            const double value = values[component];
+                            if (!finite(value)) {
+                                if constexpr (!IgnoreNa) block_invalid[component] = true;
+                                continue;
+                            }
+                            const std::uint64_t next = block_count[component] + 1;
+                            const double delta = value - block_mean[component];
+                            block_mean[component] += delta / static_cast<double>(next);
+                            const double delta2 = value - block_mean[component];
+                            block_m2[component] = std::fma(
+                                delta, delta2, block_m2[component]
+                            );
+                            block_count[component] = next;
+                        }
+                    }
+                    for (std::size_t component = 0; component < component_count; ++component) {
+                        state[component].merge_block(
+                            output,
+                            0.0,
+                            block_mean[component],
+                            block_m2[component],
+                            block_count[component],
+                            block_invalid[component]
+                        );
+                    }
+                } else {
+                    add_offset(ctx, output, base, Indexes{});
+                }
+            }
+        } else if constexpr (retains_leading_axis) {
+            const std::size_t lane_begin =
+                std::min(ctx.lane_begin, leading_extent);
+            const std::size_t lane_end =
+                std::min(ctx.lane_end, leading_extent);
+            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
+                const std::size_t begin = lane * input_lane_width;
+                const std::size_t end = begin + input_lane_width;
+                for (std::size_t offset = begin; offset < end; ++offset) {
+                    add_offset(
+                        ctx,
+                        reduced_output_index<Shape, Axes>(offset),
+                        offset,
+                        Indexes{}
+                    );
+                }
+            }
+        } else {
+            for (std::size_t offset = 0; offset < input_size; ++offset) {
+                add_offset(
+                    ctx,
+                    reduced_output_index<Shape, Axes>(offset),
+                    offset,
+                    Indexes{}
+                );
+            }
+        }
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT static auto output_pointers(
+        Context& ctx, std::index_sequence<Indexes...>
+    ) noexcept {
+        return std::array<double*, component_count>{
+            ctx.template write_ptr<
+                typename std::tuple_element_t<Indexes, BindingTuple>::output_type
+            >()...
+        };
+    }
+
+    template <class Context>
+    STACKDSL_HOT void write_result(Context& ctx) noexcept {
+        auto outputs = output_pointers(
+            ctx, std::make_index_sequence<component_count>{}
+        );
+        std::size_t output_begin = 0;
+        std::size_t output_end = output_size;
+        if constexpr (retains_leading_axis) {
+            const std::size_t lane_begin =
+                std::min(ctx.lane_begin, leading_extent);
+            const std::size_t lane_end =
+                std::min(ctx.lane_end, leading_extent);
+            output_begin = lane_begin * output_lane_width;
+            output_end = lane_end * output_lane_width;
+        }
+        for (std::size_t output = output_begin; output < output_end; ++output) {
+            for (std::size_t component = 0; component < component_count; ++component) {
+                outputs[component][output] = state[component].result(output);
+            }
+        }
     }
 };
 

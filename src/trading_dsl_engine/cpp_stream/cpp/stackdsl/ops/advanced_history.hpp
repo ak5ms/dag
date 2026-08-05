@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "stackdsl/engine.hpp"
+#include "stackdsl/ops/order_tree.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -285,10 +287,13 @@ template <
 >
 struct RollingKthNode {
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    alignas(64) std::array<FixedRecencyList<Periods>, StateSize> recency{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept {
+        for (auto& item : recency) item.setup();
+        step.fill(0);
+    }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -298,21 +303,18 @@ struct RollingKthNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
-            ring[index * Periods + current % Periods] = ctx.template read<In>(lane);
-            ++step[index];
-            const std::size_t available = std::min<std::uint64_t>(current + 1, Periods);
-            std::size_t valid_count = 0;
-            double selected = kNaN;
-            for (std::size_t age = 0; age < available; ++age) {
-                const double value = ring[
-                    index * Periods + (current + Periods - age) % Periods
-                ];
-                if (!finite(value) || (IgnoreZero && value == 0.0)) continue;
-                ++valid_count;
-                if (valid_count == K) selected = value;
+            const auto position = static_cast<
+                typename FixedRecencyList<Periods>::Index
+            >(current % Periods);
+            auto& history = recency[index];
+            history.erase(position);
+            const double incoming = ctx.template read<In>(lane);
+            if (finite(incoming) && (!IgnoreZero || incoming != 0.0)) {
+                history.insert_newest(position, incoming);
             }
-            out[lane] = valid_count >= MinPeriods && valid_count >= K
-                ? selected
+            ++step[index];
+            out[lane] = history.count >= MinPeriods && history.count >= K
+                ? history.kth_newest(K - 1)
                 : kNaN;
         }
     }
@@ -327,10 +329,22 @@ template <
 >
 struct RollingPrevDiffNode {
     static constexpr std::size_t StateSize = Execution::state_size;
+    static constexpr std::size_t SwitchScan = 8;
     alignas(64) std::array<double, StateSize * Periods> ring{};
+    alignas(64) std::array<double, StateSize> run_value{};
+    alignas(64) std::array<double, StateSize> run_candidate{};
+    alignas(64) std::array<std::uint64_t, StateSize> run_candidate_step{};
+    alignas(64) std::array<std::uint8_t, StateSize> run_mode{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept {
+        ring.fill(kNaN);
+        run_value.fill(kNaN);
+        run_candidate.fill(kNaN);
+        run_candidate_step.fill(0);
+        run_mode.fill(0);
+        step.fill(0);
+    }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -341,20 +355,78 @@ struct RollingPrevDiffNode {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
             const double incoming = ctx.template read<In>(lane);
-            ring[index * Periods + current % Periods] = incoming;
+            const std::size_t position = current % Periods;
+            const std::size_t base = index * Periods;
+            ring[base + position] = incoming;
             ++step[index];
             out[lane] = kNaN;
-            if (!finite(incoming)) continue;
-            const std::size_t available = std::min<std::uint64_t>(current + 1, Periods);
-            for (std::size_t age = 1; age < available; ++age) {
+
+            if (!finite(incoming)) [[unlikely]] {
+                run_mode[index] = 0;
+                continue;
+            }
+
+            if (run_mode[index]) [[unlikely]] {
+                if (incoming != run_value[index]) {
+                    // The immediately preceding finite run is necessarily the
+                    // nearest different observation.
+                    out[lane] = run_value[index];
+                    run_mode[index] = 0;
+                } else if (
+                    finite(run_candidate[index])
+                    && current - run_candidate_step[index] < Periods
+                ) {
+                    out[lane] = run_candidate[index];
+                }
+                continue;
+            }
+
+            if constexpr (Periods > 1) {
+                if (current != 0) {
+                    const double previous = ring[
+                        base + (current + Periods - 1) % Periods
+                    ];
+                    if (finite(previous) && previous != incoming) {
+                        out[lane] = previous;
+                        continue;
+                    }
+                }
+            }
+
+            const std::size_t available = std::min<std::uint64_t>(
+                current + 1, Periods
+            );
+            const std::size_t scan = std::min(
+                available - 1, SwitchScan
+            );
+            for (std::size_t age = 2; age <= scan; ++age) {
                 const double value = ring[
-                    index * Periods + (current + Periods - age) % Periods
+                    base + (current + Periods - age) % Periods
                 ];
                 if (finite(value) && value != incoming) {
                     out[lane] = value;
                     break;
                 }
             }
+            if (finite(out[lane]) || available - 1 <= SwitchScan) continue;
+
+            // A repeated/NaN-heavy prefix made the bounded fast scan expensive.
+            // Find its one live predecessor once, then answer the rest of the run
+            // in O(1) until the value changes.
+            run_value[index] = incoming;
+            run_candidate[index] = kNaN;
+            for (std::size_t age = SwitchScan + 1; age < available; ++age) {
+                const double value = ring[
+                    base + (current + Periods - age) % Periods
+                ];
+                if (finite(value) && value != incoming) {
+                    run_candidate[index] = value;
+                    run_candidate_step[index] = current - age;
+                    out[lane] = value;
+                    break;
+                }
+            }
+            run_mode[index] = 1;
         }
     }
 };
@@ -430,10 +502,24 @@ template <
 >
 struct RollingEntropyNode {
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    static constexpr bool UseTree = Periods >= 64;
+    using Ring = std::conditional_t<
+        UseTree,
+        std::array<double, 1>,
+        std::array<double, StateSize * Periods>
+    >;
+    using Tree = std::conditional_t<
+        UseTree, FixedOrderTree<Periods>, EmptyOrderTree
+    >;
+    alignas(64) Ring ring{};
+    alignas(64) std::array<Tree, StateSize> tree{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept {
+        ring.fill(kNaN);
+        for (auto& item : tree) item.setup();
+        step.fill(0);
+    }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -443,17 +529,36 @@ struct RollingEntropyNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
-            ring[index * Periods + current % Periods] = ctx.template read<In>(lane);
+            const std::size_t ring_position = current % Periods;
+            const double incoming = ctx.template read<In>(lane);
+            if constexpr (UseTree) {
+                tree[index].replace(
+                    static_cast<typename FixedOrderTree<Periods>::Index>(
+                        ring_position
+                    ),
+                    incoming
+                );
+            } else {
+                ring[index * Periods + ring_position] = incoming;
+            }
             ++step[index];
             double minimum = std::numeric_limits<double>::infinity();
             double maximum = -std::numeric_limits<double>::infinity();
             std::size_t count = 0;
-            for (std::size_t position = 0; position < Periods; ++position) {
-                const double value = ring[index * Periods + position];
-                if (!finite(value)) continue;
-                minimum = std::min(minimum, value);
-                maximum = std::max(maximum, value);
-                ++count;
+            if constexpr (UseTree) {
+                count = tree[index].size();
+                if (count != 0) {
+                    minimum = tree[index].minimum();
+                    maximum = tree[index].maximum();
+                }
+            } else {
+                for (std::size_t position = 0; position < Periods; ++position) {
+                    const double value = ring[index * Periods + position];
+                    if (!finite(value)) continue;
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                    ++count;
+                }
             }
             if (count < MinPeriods || count == 0) {
                 out[lane] = kNaN;
@@ -465,14 +570,20 @@ struct RollingEntropyNode {
             }
             std::array<std::uint32_t, Buckets> counts{};
             const double scale = static_cast<double>(Buckets) / (maximum - minimum);
-            for (std::size_t position = 0; position < Periods; ++position) {
-                const double value = ring[index * Periods + position];
-                if (!finite(value)) continue;
+            auto add_bucket = [&](double value) {
                 const std::size_t bucket = std::min<std::size_t>(
                     Buckets - 1,
                     static_cast<std::size_t>((value - minimum) * scale)
                 );
                 ++counts[bucket];
+            };
+            if constexpr (UseTree) {
+                tree[index].for_each_active(add_bucket);
+            } else {
+                for (std::size_t position = 0; position < Periods; ++position) {
+                    const double value = ring[index * Periods + position];
+                    if (finite(value)) add_bucket(value);
+                }
             }
             double entropy = 0.0;
             for (std::uint32_t bucket_count : counts) {

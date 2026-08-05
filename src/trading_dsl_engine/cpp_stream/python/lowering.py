@@ -118,6 +118,8 @@ class Stage:
     group: "GroupStage | None" = None
     einsum_step: ContractionStep | None = None
     final_only: bool = False
+    members: tuple["Stage", ...] = ()
+    epilogues: tuple["Stage", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
