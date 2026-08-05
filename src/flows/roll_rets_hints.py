@@ -24,6 +24,8 @@ PovFieldsWithHints = SimpleNamespace(
     session_start=key(
         PovFields.session_start,
         row_scalar=True,
+        # Input timestamps in the current pipeline are float64 because NaN is a
+        # valid missing marker. Remove or update this assertion for another dtype.
         dtype="float64",
         monotonic=True,
     ),
