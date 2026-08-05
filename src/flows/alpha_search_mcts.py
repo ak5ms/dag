@@ -6,6 +6,7 @@ from dataclasses import replace
 import numpy as np
 
 from flows.alpha_mcts import AlphaMCTS, SearchConfig, SearchResult, SemanticInfo, market_terminal_semantics
+from flows.alpha_operator_schemas import all_operator_schemas
 from trading_dsl_engine.base.dsl import abs as dsl_abs, clip, ensure_expr, var
 from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.base.terminals import alpha_search_field_metadata
@@ -95,7 +96,12 @@ def search_market_alphas(
     if not config.target_types:
         config = replace(config, target_types=frozenset({"dimensionless"}))
     fitness = make_sharpe_fitness(evaluate_alpha, forward_returns, is_tradable=is_tradable)
-    return AlphaMCTS(terminals, fitness, config=config).search()
+    return AlphaMCTS(
+        terminals,
+        fitness,
+        operators=all_operator_schemas(),
+        config=config,
+    ).search()
 
 
 __all__ = [
