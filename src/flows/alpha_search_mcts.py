@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+import math
 
 import numpy as np
 
@@ -31,21 +32,23 @@ def make_sharpe_fitness(
     returns: np.ndarray,
     *,
     is_tradable: np.ndarray | None = None,
+    chunk_rows: int = 262_144,
 ) -> Callable[[Expr], float]:
-    """Build the sole search reward.
+    """Build the sole search reward using a bounded-memory exact reduction.
 
-    This implements the requested convention::
+    This implements::
 
         w = alpha
         pnl = w.shift().mul(r).sum(1)
         fitness = pnl.sum() / pnl.std()
 
-    The first shifted row is NaN and the row reduction uses skip-NaN
-    semantics, matching the DSL's default reduction behavior.
+    The first shifted row contributes zero because the row reduction uses the
+    DSL's skip-NaN semantics. Population standard deviation (``ddof=0``) is
+    reconstructed from float64 sums and squared sums across row chunks.
     """
-    returns_array = np.asarray(returns, dtype=float)
+    returns_array = np.asarray(returns)
     tradable = (
-        np.ones_like(returns_array, dtype=bool)
+        np.ones(returns_array.shape, dtype=bool)
         if is_tradable is None
         else np.asarray(is_tradable, dtype=bool)
     )
@@ -53,21 +56,40 @@ def make_sharpe_fitness(
         raise ValueError("returns must be a 2-D time-by-instrument array")
     if returns_array.shape != tradable.shape:
         raise ValueError("returns and is_tradable must have identical shapes")
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
 
     def fitness(expr: Expr) -> float:
-        w = np.asarray(evaluate_alpha(expr), dtype=float)
+        w = np.asarray(evaluate_alpha(expr))
         if w.shape != returns_array.shape:
             raise ValueError(f"candidate shape {w.shape} does not match returns shape {returns_array.shape}")
-        shifted = np.empty_like(w, dtype=float)
-        shifted[0] = np.nan
-        shifted[1:] = w[:-1]
-        contributions = np.where(
-            tradable & np.isfinite(shifted) & np.isfinite(returns_array),
-            shifted * returns_array,
-            np.nan,
-        )
-        pnl = np.nansum(contributions, axis=1)
-        return sharpe_ratio(pnl)
+        n_rows = returns_array.shape[0]
+        if n_rows < 2:
+            return float("-inf")
+
+        total = 0.0
+        total_sq = 0.0
+        count = 1  # pnl[0] == 0 after skip-NaN row reduction.
+        for start in range(1, n_rows, chunk_rows):
+            stop = min(n_rows, start + chunk_rows)
+            prev_w = np.asarray(w[start - 1:stop - 1], dtype=np.float64)
+            r_chunk = np.asarray(returns_array[start:stop], dtype=np.float64)
+            valid = (
+                tradable[start:stop]
+                & np.isfinite(prev_w)
+                & np.isfinite(r_chunk)
+            )
+            contributions = np.where(valid, prev_w * r_chunk, np.nan)
+            pnl_chunk = np.nansum(contributions, axis=1, dtype=np.float64)
+            total += float(pnl_chunk.sum(dtype=np.float64))
+            total_sq += float(np.dot(pnl_chunk, pnl_chunk))
+            count += int(pnl_chunk.size)
+
+        variance = total_sq / count - (total / count) ** 2
+        std = math.sqrt(max(0.0, variance))
+        if not math.isfinite(std) or std <= 0.0:
+            return float("-inf")
+        return total / std
 
     return fitness
 
@@ -102,6 +124,7 @@ def search_market_alphas(
     is_tradable: np.ndarray | None = None,
     field_metadata: Mapping[str, Mapping[str, object]] | None = None,
     config: SearchConfig = SearchConfig(),
+    fitness_chunk_rows: int = 262_144,
 ) -> SearchResult:
     fields = dict(alpha_search_field_metadata() if field_metadata is None else field_metadata)
     terminals = market_terminal_semantics(fields)
@@ -113,7 +136,12 @@ def search_market_alphas(
         ))
     if not config.target_types:
         config = replace(config, target_types=frozenset({"dimensionless"}))
-    fitness = make_sharpe_fitness(evaluate_alpha, returns, is_tradable=is_tradable)
+    fitness = make_sharpe_fitness(
+        evaluate_alpha,
+        returns,
+        is_tradable=is_tradable,
+        chunk_rows=fitness_chunk_rows,
+    )
     return AlphaMCTS(
         terminals,
         fitness,
