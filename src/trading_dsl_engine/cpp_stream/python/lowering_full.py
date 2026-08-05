@@ -933,11 +933,19 @@ def _build_plan(
             specs = base._resolved_key_specs(
                 program, node.child_ids, op, key_cardinalities
             )
-            dense = bool(specs) and all(
-                spec.num_keys is not None for spec in specs
+            monotonic_specs = tuple(spec for spec in specs if spec.monotonic)
+            if any(spec.row_scalar is not True for spec in monotonic_specs):
+                raise CppStreamLoweringError(
+                    "monotonic group keys require row_scalar=True"
+                )
+            retained_specs = tuple(spec for spec in specs if not spec.monotonic)
+            dense = bool(retained_specs) and all(
+                spec.num_keys is not None for spec in retained_specs
             )
             capacity = (
-                base._dense_capacity(specs)
+                1
+                if not retained_specs
+                else base._dense_capacity(retained_specs)
                 if dense
                 else (op.capacity or default_group_capacity)
             )
