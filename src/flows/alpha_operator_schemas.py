@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from trading_dsl_engine.base.dsl import (
-    and_, ceil, eq, floor, floordiv, isnan, mod, ne, norm_inv, or_, pow,
+    and_, ceil, eq, floor, floordiv, mod, ne, norm_inv, or_, pow,
     ratio, xor,
 )
 
+from flows import alpha_mcts
 from flows.alpha_mcts import OperatorSchema, default_operator_schemas
 
 
-# Operators that are meaningful in an unconstrained alpha expression tree and
-# can be described by the generic schema families.  The base list contains all
-# temporal, cross-sectional, comparison, conditional, and common math ops.
 def all_operator_schemas() -> tuple[OperatorSchema, ...]:
+    """Return every generic expression operator currently safe for MCTS.
+
+    Schema registration also updates the compiler dispatch used by completed
+    symbolic trees. Structural/object-valued operators are reported separately.
+    """
     extra = (
         OperatorSchema("ceil", ceil, "unary_same", 1, 0.4),
         OperatorSchema("floor", floor, "unary_same", 1, 0.4),
         OperatorSchema("norm_inv", norm_inv, "unary_dimensionless", 1, 0.5),
-        OperatorSchema("isnan", isnan, "comparison", 1, 0.4),
         OperatorSchema("pow", pow, "binary_numeric", 2, 0.5),
         OperatorSchema("mod", mod, "binary_numeric", 2, 0.3),
         OperatorSchema("floordiv", floordiv, "binary_numeric", 2, 0.2),
@@ -34,12 +36,10 @@ def all_operator_schemas() -> tuple[OperatorSchema, ...]:
         if schema.name not in seen:
             out.append(schema)
             seen.add(schema.name)
+    alpha_mcts._SCHEMA_BY_NAME.update({schema.name: schema for schema in out})
     return tuple(out)
 
 
-# These are not omitted accidentally.  They need additional structured holes
-# rather than ordinary expression children and therefore should be searched by
-# a dedicated schema plugin before being enabled.
 STRUCTURAL_OPERATOR_REQUIREMENTS = {
     "Ridge": "variadic feature list and object-valued result",
     "InstrumentBasisMean": "object-valued result",
