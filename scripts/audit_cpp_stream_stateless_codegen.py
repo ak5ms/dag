@@ -147,9 +147,43 @@ def main() -> None:
         input_types=input_types,
     ).text
     stages = _stage_types(generated)
-    if len(stages) != 4:
+    if len(stages) != 1:
         raise AssertionError(
-            f"expected three arithmetic stages plus rank, got {stages!r}"
+            f"expected one rank stage with a fused lazy expression, got {stages!r}"
+        )
+    stage_index, stage_type = stages[0]
+    required_type_fragments = (
+        "stackdsl::XsRankNode<",
+        "stackdsl::NaryExpressionSrc<double, stackdsl::AddOp",
+        "stackdsl::NaryExpressionSrc<double, stackdsl::MulOp",
+    )
+    missing_type_fragments = [
+        fragment
+        for fragment in required_type_fragments
+        if fragment not in stage_type
+    ]
+    if stage_index != 0 or missing_type_fragments:
+        raise AssertionError(
+            "stateless arithmetic did not fuse into the rank source; "
+            f"missing={missing_type_fragments!r}, stages={stages!r}"
+        )
+    if plan.scratch_slots != 0 or plan.matrix_scratch_slots != 0:
+        raise AssertionError(
+            "fused stateless expression unexpectedly materializes scratch: "
+            f"scalar={plan.scratch_slots}, matrix={plan.matrix_scratch_slots}"
+        )
+    materialized_node_types = (
+        "stackdsl::BinaryNode<",
+        "stackdsl::UnaryNode<",
+        "stackdsl::TernaryNode<",
+    )
+    unexpected_node_types = [
+        node_type for node_type in materialized_node_types if node_type in generated
+    ]
+    if unexpected_node_types:
+        raise AssertionError(
+            "stateless arithmetic was emitted as materialized stages: "
+            f"{unexpected_node_types!r}"
         )
 
     row_loop = _row_loop(generated, len(stages))
