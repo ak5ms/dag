@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: >-
           python -m pip install --upgrade
-          pip numpy pytest jinja2 includeigen scipy deap
+          pip numpy numba pytest jinja2 includeigen scipy deap
       - name: Run alpha-search and native dynamic-EWM tests
         env:
           PYTHONPATH: src
