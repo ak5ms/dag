@@ -66,11 +66,16 @@ def test_canonicalization_deduplicates_commutative_and_idempotent_forms():
 def test_fitness_uses_shift_row_sum_and_total_sum_over_std():
     returns = np.array([[0.01, -0.01], [0.02, -0.02], [0.03, -0.03]])
     signal = np.array([[1.0, -1.0], [1.0, -1.0], [1.0, -1.0]])
-    fitness = make_sharpe_fitness(lambda expr: signal, returns)
     expected_pnl = np.array([0.0, 0.04, 0.06])
     expected = expected_pnl.sum() / expected_pnl.std()
-    assert fitness(var("anything")) == expected
-    assert fitness(var("anything")) == sharpe_ratio(expected_pnl)
+    for chunk_rows in (1, 2, 262_144):
+        fitness = make_sharpe_fitness(
+            lambda expr: signal,
+            returns,
+            chunk_rows=chunk_rows,
+        )
+        assert fitness(var("anything")) == expected
+    assert sharpe_ratio(expected_pnl) == expected
 
 
 def test_mcts_exposes_dimensionless_terminal_and_progressive_actions():
