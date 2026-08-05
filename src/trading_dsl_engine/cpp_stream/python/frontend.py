@@ -150,12 +150,19 @@ from trading_dsl_engine.cpp_stream.python import lowering as _lowering  # noqa: 
 from trading_dsl_engine.cpp_stream.python.codegen_full import (  # noqa: E402
     install as _install_full_codegen,
 )
+from trading_dsl_engine.cpp_stream.python.dynamic_ewm import (  # noqa: E402
+    install_codegen as _install_dynamic_ewm_codegen,
+    install_frontend as _install_dynamic_ewm_frontend,
+    wrap_lower_program as _wrap_dynamic_ewm_lower_program,
+)
 from trading_dsl_engine.cpp_stream.python.lowering_full import (  # noqa: E402
     lower_program as _full_lower_program,
 )
 
+_install_dynamic_ewm_frontend(neutral_frontend)
 _install_full_codegen()
-_lowering.lower_program = _full_lower_program
+_install_dynamic_ewm_codegen()
+_lowering.lower_program = _wrap_dynamic_ewm_lower_program(_full_lower_program)
 
 
 __all__ = ["FormulaIRCompileError", "compile_ir"]
