@@ -1,0 +1,40 @@
+name: alpha search MCTS
+
+on:
+  push:
+    branches: [agent/alpha-search-mcts]
+    paths:
+      - "src/flows/alpha_*.py"
+      - "src/trading_dsl_engine/base/terminals.py"
+      - "src/trading_dsl_engine/cpp_stream/python/dynamic_ewm.py"
+      - "src/trading_dsl_engine/cpp_stream/python/frontend.py"
+      - "src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/dynamic_ewm.hpp"
+      - "src/trading_dsl_engine/cpp_stream/cpp/stackdsl/runtime.hpp"
+      - "tests/flows/test_alpha_mcts.py"
+      - "tests/trading_dsl_engine/cpp_stream/test_dynamic_ewm.py"
+      - ".github/workflows/alpha-search-mcts.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy pytest jinja2 includeigen scipy deap
+      - name: Run alpha-search and native dynamic-EWM tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/flows/test_alpha_mcts.py
+          tests/trading_dsl_engine/cpp_stream/test_dynamic_ewm.py
