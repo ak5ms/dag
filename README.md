@@ -241,3 +241,127 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 - Add graph-level IR + CSE for shared subtrees across multi-feature workflows.
 - Expand shape system for richer multi-output model/optimizer nodes.
 - Continue reducing memory movement in batch paths for large memmap workloads.
+
+### Experimental `cpp_new` formula-specialized tier
+
+`trading_dsl_engine.cpp_new` consumes the same typed, topologically ordered
+JAX-flat `StreamingProgram`; it does not add a parser.  Lowering produces an
+immutable and hashable IR, applies the documented semantics-safe pass order,
+plans 64-byte-aligned persistent and lifetime-colored scratch arenas, and emits
+a straight-line formula transition through a typed C++ syntax tree (includes,
+declarations, functions, blocks, and statements), rather than assembling the
+translation unit by appending source fragments. Batch execution is defined as repeated
+calls to that exact ordered row transition. Runtime-sized arrays live in owned
+arenas—not the C++ call stack—so independently initialized stream states share
+immutable formula data but never mutable state.
+
+The compile-time descriptor registry currently recognizes `ewm`, `xs_rank`,
+`cat`, `Ridge`, and the eliminable `get_beta` projection. A root `cat` of EWM
+siblings over the same input is lifted into a fused native parameter-lane
+kernel: it updates independent lane state in one native batch transition and
+writes the instrument-by-lane root directly. Unsupported formulas retain
+the generic flat-native tier as their cold-start/fallback implementation. Modes
+are `generic-only`, `eagerly-specialized`, and `cached-specialized`. The initial
+release publishes generated source into a locked, content-addressed, atomically
+renamed cache; native execution remains on the equivalence-proven generic core
+while the generated-module loader is completed.
+
+Use `runtime.inspect_ir()`, `inspect_layout()`, and
+`inspect_generated_source()` to inspect mappings, optimization counts, arena
+layout, scratch lifetimes, scheduling traits, and source without running the
+formula, tracing JAX, or loading a generated module. Formula specialization
+removes interpretation and enables future fusion/lane lifting, but adds cold
+compiler latency, cache space, and instruction-cache pressure; benchmarks must
+therefore report cold compilation and cached loading separately from execution.
+
+The opt-in `benchmark_cpp_new.py` benchmark validates outputs before timing and
+reports the selected execution tier: ordinary formulas remain
+`generic-flat-native-bridge`, while lifted EWM `cat` formulas report
+`fused-ewm-lane-native`. On the 2026-07-29 development container (4,096 rows, 150
+instruments, five samples), the EWM-chain baseline measured 548,713 rows/s
+versus 570,547 rows/s through the bridge; `xs_rank` measured 101,199 rows/s
+versus 107,650 rows/s. These differences include ordinary run/order variance,
+**not** a specialization speedup. Cold source materialization was 1.91 ms/1.53
+ms and cached materialization 0.91 ms/0.60 ms for EWM/rank respectively;
+generated sources were 1,217 and 974 bytes.
+
+For the lifted formula `cat(*[ewm(close, span_i) ...])` on 4,096 rows and 150
+instruments, five-sample serial medians were:
+
+| lanes | existing flat C++ | fused cpp_new | speedup |
+| ---: | ---: | ---: | ---: |
+| 4 | 256,406 rows/s | 544,964 rows/s | 2.13x |
+| 16 | 57,735 rows/s | 86,023 rows/s | 1.49x |
+| 32 | 26,800 rows/s | 39,924 rows/s | 1.49x |
+
+The gain comes from eliminating per-node opcode traversal and intermediate
+vector materialization for the sibling EWM family. Each lane retains separate
+value, weight, count, and initialized arrays; the native batch loop releases
+the GIL and allocates only at state/output boundaries, not per timestep.
+
+#### Lane ablation and generalization
+
+A CPU-pinned serial 16-lane ablation (4,096 × 150, seven samples) separated the
+sources of the gap. Existing flat C++ improved from 47,822 to 53,415 rows/s
+when given a reusable direct output; cpp_new improved from 79,024 to 107,370
+rows/s. Within cpp_new, lane-major state traversal achieved 79,844 rows/s,
+instrument-major traversal 111,259 rows/s, and a lane-major transition followed
+by a separate transpose/materialization 85,710 rows/s. A store-only kernel
+reached 474,574 rows/s (8.49 GiB/s). Both runtimes were single-threaded.
+
+These results attribute the gap to four effects, in descending importance for
+this workload: generic per-node evaluation/state-container overhead; output
+allocation and first-touch costs; instrument-contiguous loop/output layout; and
+the avoided intermediate `cat` materialization. Multithreading did not cause
+the measured difference. The store-only ceiling is over 4.5 times the optimized
+EWM rate, so raw output bandwidth is not yet the primary limit.
+
+Lane discovery is descriptor-driven rather than EWM-specific: an operator opts
+in with invariant topology and a declared set of lane-varying static parameters.
+The same planner can therefore form lane families for elementwise operators,
+independent `xs_rank` branches, and independent Ridge models. Their executors
+remain operator-family-specific because barriers and state differ: elementwise
+families can fuse instrument loops, rank families need one preallocated sort
+scratch per active lane, and Ridge families need independent pairwise clocks
+and deterministic reduction/solve state. Cross-sectional and solve barriers
+must not be fused as if they were ordinary elementwise loops.
+
+Lifting is automatic and does not require a lane construct in the DSL. Users
+continue to write ordinary branches under `cat`; lowering recognizes compatible
+siblings from the optimized graph. The first cross-sectional family,
+`cat(xs_rank(ewm(x, p1)), xs_rank(ewm(x, p2)), ...)`, now uses the same fused EWM
+transition followed by one preallocated sort barrier per lane. Time remains the
+outer sequential batch dimension: “instrument-major” describes only loop order
+*within one timestep*. Consequently all instruments for a row have been updated
+before `xs_rank` compacts, sorts, scans ties, and scatters that row's scores.
+
+The “store-only ceiling” is an ablation, not a usable formula result. It repeats
+each input value into every output lane while skipping EWM arithmetic and state;
+it estimates the best achievable output-store rate for the validated memory
+layout. Comparing it with real kernels distinguishes memory-bandwidth limits
+from computation/state-transition limits.
+
+Lane extraction walks each `cat` branch recursively, so optimization is not
+limited to one producer/barrier pair. A branch such as
+`xs_rank(ewm(xs_rank(ewm(x, p)), q))` becomes one native pipeline with two EWM
+state stages and two explicit rank barriers. Preallocated ping-pong row buffers
+carry lane values between barriers without returning to the generic node
+interpreter. Every barrier still observes the complete current timestep.
+
+Pattern discovery itself has no EWM or rank special case. It builds a canonical
+lane graph from operator descriptors, complete child topology, invariant static
+parameters, and source-input identities. Registered native-family factories
+probe that graph and either construct an executor or decline it. The built-in
+EWM/rank factory is therefore an executor plugin, not a conditional in the
+public runtime. New stateless, n-ary, model, or grouped families extend the same
+mechanism by registering descriptors and a capability probe; mismatched branch
+topology is rejected rather than partially fused.
+
+The remaining native operator set, including canonical composite-key groupby,
+continues to use the existing flat-native executor when no specialized family
+matches. Groupby cannot safely be treated as an elementwise lane: its optimized
+form needs formula-specific inner transitions plus preallocated open-addressing
+tables per universe, canonical NaN/zero hashing, and independently owned bucket
+state. This fallback is deliberate until that executor has equivalence and
+churn/locality profiles; cpp_new does not advertise placeholder kernels as
+specialized support.

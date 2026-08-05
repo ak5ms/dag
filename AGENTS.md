@@ -132,3 +132,36 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ## Future roadmap hints
 
 Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+
+## cpp_new experimental backend
+
+`src/trading_dsl_engine/cpp_new/` is the formula-specialized native tier. It must
+consume `StreamingProgram`, keep descriptors compile-time-only, emit one
+straight-line tick used by batch through the typed `cpp_ast` renderer (not
+incremental source-string concatenation), and use aligned persistent/scratch arenas. New
+operators require a descriptor, typed lowering, independently testable native
+kernel, JAX-flat equivalence coverage, and an explicit generic fallback. Never
+claim generated-native performance while execution is using the initial generic
+core bridge; report compilation, cache loading, and execution independently.
+Root `cat` formulas whose children are static-span EWM siblings over one input
+use the fused native lane-family runtime; preserve its independent per-lane
+state and direct instrument-by-lane output layout.
+Lane-family discovery belongs in compile-time operator descriptors: declare
+which static parameters vary and group only identical invariant topology.
+Family executors remain distinct for elementwise, cross-sectional-sort, and
+model/reduction barriers. Use instrument-major direct output by default; the
+recorded EWM ablation showed it outperforming lane-major and materialized forms.
+Instrument-major means the inner loop order within a single timestep; it never
+reorders time. Cross-sectional lane families must finish their upstream row
+transition, then execute one explicit preallocated barrier per lane. Compatible
+lane discovery is automatic for ordinary DSL branches under `cat`.
+Lane extraction may cross multiple alternating stateful stages and
+cross-sectional barriers using preallocated ping-pong row buffers; it must
+never reorder or merge barriers. Operators without a measured specialized
+family, especially groupby, remain on the generic flat-native executor rather
+than gaining placeholder cpp_new kernels.
+The public runtime must not contain operator-specific pattern matchers. Generic
+lane-graph discovery compares descriptor-declared semantics, complete child
+topology, invariant parameters, and input identities; executor plugins probe
+the result through the accelerator-factory registry. Adversarially mismatched
+branches must decline specialization and preserve the generic fallback.
