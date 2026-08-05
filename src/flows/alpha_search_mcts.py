@@ -15,6 +15,7 @@ AlphaEvaluator = Callable[[Expr], np.ndarray]
 
 
 def sharpe_ratio(pnl: np.ndarray) -> float:
+    """Return the requested search score: pnl.sum() / pnl.std()."""
     values = np.asarray(pnl, dtype=float).reshape(-1)
     values = values[np.isfinite(values)]
     if values.size < 2:
@@ -22,28 +23,50 @@ def sharpe_ratio(pnl: np.ndarray) -> float:
     std = float(values.std())
     if not np.isfinite(std) or std <= 0.0:
         return float("-inf")
-    return float(values.mean() / std)
+    return float(values.sum() / std)
 
 
 def make_sharpe_fitness(
     evaluate_alpha: AlphaEvaluator,
-    forward_returns: np.ndarray,
+    returns: np.ndarray,
     *,
     is_tradable: np.ndarray | None = None,
 ) -> Callable[[Expr], float]:
-    """Build the sole search reward: realized Sharpe of the candidate alpha."""
-    returns = np.asarray(forward_returns, dtype=float)
-    tradable = np.ones_like(returns, dtype=bool) if is_tradable is None else np.asarray(is_tradable, dtype=bool)
-    if returns.shape != tradable.shape:
-        raise ValueError("forward_returns and is_tradable must have identical shapes")
+    """Build the sole search reward.
+
+    This implements the requested convention::
+
+        w = alpha
+        pnl = w.shift().mul(r).sum(1)
+        fitness = pnl.sum() / pnl.std()
+
+    The first shifted row is NaN and the row reduction uses skip-NaN
+    semantics, matching the DSL's default reduction behavior.
+    """
+    returns_array = np.asarray(returns, dtype=float)
+    tradable = (
+        np.ones_like(returns_array, dtype=bool)
+        if is_tradable is None
+        else np.asarray(is_tradable, dtype=bool)
+    )
+    if returns_array.ndim != 2:
+        raise ValueError("returns must be a 2-D time-by-instrument array")
+    if returns_array.shape != tradable.shape:
+        raise ValueError("returns and is_tradable must have identical shapes")
 
     def fitness(expr: Expr) -> float:
-        alpha = np.asarray(evaluate_alpha(expr), dtype=float)
-        if alpha.shape != returns.shape:
-            raise ValueError(f"candidate shape {alpha.shape} does not match returns shape {returns.shape}")
-        pnl = np.where(tradable & np.isfinite(alpha) & np.isfinite(returns), alpha * returns, np.nan)
-        if pnl.ndim > 1:
-            pnl = np.nansum(pnl, axis=tuple(range(1, pnl.ndim)))
+        w = np.asarray(evaluate_alpha(expr), dtype=float)
+        if w.shape != returns_array.shape:
+            raise ValueError(f"candidate shape {w.shape} does not match returns shape {returns_array.shape}")
+        shifted = np.empty_like(w, dtype=float)
+        shifted[0] = np.nan
+        shifted[1:] = w[:-1]
+        contributions = np.where(
+            tradable & np.isfinite(shifted) & np.isfinite(returns_array),
+            shifted * returns_array,
+            np.nan,
+        )
+        pnl = np.nansum(contributions, axis=1)
         return sharpe_ratio(pnl)
 
     return fitness
@@ -55,12 +78,7 @@ def adaptive_parameter_terminals(
     min_span: float,
     max_span: float,
 ) -> dict[str, tuple[Expr, SemanticInfo]]:
-    """Create bounded expression-valued parameter sources from every field.
-
-    The generic abs+clip transform guarantees positivity without manually
-    enumerating field-specific parameter recipes. Stateful operators consume
-    the current row's value, so these are tagged scalar-like for grammar use.
-    """
+    """Create bounded expression-valued parameter sources from every field."""
     out: dict[str, tuple[Expr, SemanticInfo]] = {}
     lo = ensure_expr(float(min_span))
     hi = ensure_expr(float(max_span))
@@ -79,7 +97,7 @@ def adaptive_parameter_terminals(
 
 def search_market_alphas(
     evaluate_alpha: AlphaEvaluator,
-    forward_returns: np.ndarray,
+    returns: np.ndarray,
     *,
     is_tradable: np.ndarray | None = None,
     field_metadata: Mapping[str, Mapping[str, object]] | None = None,
@@ -95,7 +113,7 @@ def search_market_alphas(
         ))
     if not config.target_types:
         config = replace(config, target_types=frozenset({"dimensionless"}))
-    fitness = make_sharpe_fitness(evaluate_alpha, forward_returns, is_tradable=is_tradable)
+    fitness = make_sharpe_fitness(evaluate_alpha, returns, is_tradable=is_tradable)
     return AlphaMCTS(
         terminals,
         fitness,
