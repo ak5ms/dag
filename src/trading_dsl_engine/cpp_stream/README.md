@@ -145,6 +145,14 @@ passed to every component `ewm` as one missing observation, and its effect follo
 the selected `ignore_na` mode. Variance and standardized higher moments are
 population statistics; kurtosis is not excess kurtosis.
 
+The public formulas remain ordinary compositions. During native lowering,
+structurally identical NaN masks are CSE'd, arithmetic becomes lazy typed C++
+expressions, and compatible sibling `ewm` transitions are emitted as one physical
+bundle. The bundle delegates every update to the canonical EWM policy above; it is
+automatic loop/state fusion, not a second co-moment kernel or a second set of EWM
+semantics. The same bundle machinery shares vector reductions and projections of
+one `Ridge(...)` object.
+
 Statistics without a useful EWM definition use fixed-row windows:
 
 ```python
@@ -162,9 +170,11 @@ rolling_theilsen(y, x, periods=63)
 ```
 
 Rolling moments use removable stable state, min/max and their relative indices use
-monotonic deques, and order statistics use fixed scratch. Theil-Sen uses exact
-pairwise median selection for ordinary windows and a fixed-memory subquadratic
-inversion-count selector for windows above 256 rows. No implementation allocates in
+monotonic deques, and order statistics select between a vectorizable fixed-window
+scan and a fixed-capacity order-statistic tree at compile time. Backfill stores only
+valid observations and previous-different stores compressed finite runs. Theil-Sen
+uses exact pairwise median selection through 512 rows and a fixed-memory
+inversion-count selector above that crossover. No implementation allocates in
 `on_data`.
 
 Cheap formulas such as `ewm_std`, `ewm_skewness`, `ewm_kurtosis`, `xs_zscore`,
@@ -215,6 +225,13 @@ GroupedExecution<N, Capacity, PartitionCount>
 There are no `GroupedFooNode` or formula-specific fast-path classes. `groupby.hpp`
 contains only key resolution, grouped-context construction, and inner-plan
 invocation. No operator allocates from the heap during `on_data`.
+
+The generated row body also performs general physical fusion: elementwise trees are
+inlined as expression sources, compatible state/reduction/model siblings share one
+node, and an adjacent stateless epilogue can be wrapped with its producer by the
+operator-agnostic `FusedStageNode`. This gives the C++ optimizer one inlinable scope
+without recognizing names such as `ewm_co_skewness` or maintaining custom kernels
+for derived operators.
 
 `cat(...)`, RBF bases, coefficient matrices, and einsum use compile-time dimensions.
 Lazy basis sources and nested Cat expressions flatten into `FeatureList<Sources...>`

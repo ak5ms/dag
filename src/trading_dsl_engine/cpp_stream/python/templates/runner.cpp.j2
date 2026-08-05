@@ -84,6 +84,7 @@ struct CppStreamPlanRunner {
         double* STACKDSL_RESTRICT out,
         std::size_t lane_begin,
         std::size_t lane_end) noexcept {
+        (void)out;
         ctx.lane_begin = lane_begin;
         ctx.lane_end = lane_end;
         for (std::size_t t = row_begin; t < row_end; ++t) {
@@ -155,6 +156,7 @@ int run_bound_inputs(
     double* cpu_seconds_out,
     std::size_t* threads_out,
     std::size_t* available_cpus_out) {
+    (void)requested_threads;
     constexpr std::size_t N = {{ n }};
     constexpr std::size_t output_row_width = {{ output_row_width }};
     constexpr std::size_t output_row_bytes = output_row_width * sizeof(double);

@@ -118,6 +118,8 @@ class Stage:
     group: "GroupStage | None" = None
     einsum_step: ContractionStep | None = None
     final_only: bool = False
+    bundle_outs: tuple[Dest, ...] = ()
+    bundle_projections: tuple[tuple[str, int | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +179,9 @@ def _coerce_literal_for_dtype(value: int | float, dtype: str) -> int | float:
 
 
 def _normal_nary_dtype(op: NaryOp, children: tuple[str, ...]) -> str:
-    if op.name in _LOGICAL_NARY or op.name in {"where", "fillna", "pow"}:
+    if op.name in _LOGICAL_NARY or op.name in {
+        "where", "fillna", "pow", "pow2", "pow3", "pow4"
+    }:
         return "float64"
     if op.arity == 1:
         return children[0]

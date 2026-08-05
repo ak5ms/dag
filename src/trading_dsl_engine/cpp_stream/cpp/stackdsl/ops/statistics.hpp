@@ -11,6 +11,7 @@
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/cat.hpp"
+#include "stackdsl/ops/order_tree.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -197,6 +198,13 @@ private:
 struct RollingQuantileProjection {};
 struct RollingPctRankProjection {};
 
+template <std::size_t StateSize, std::size_t Periods>
+struct RollingOrderScanState {
+    alignas(64) std::array<double, StateSize * Periods> ring{};
+
+    void setup() noexcept { ring.fill(kNaN); }
+};
+
 template <
     std::size_t N,
     class In,
@@ -212,11 +220,20 @@ struct RollingOrderNode {
     static constexpr double quantile = std::bit_cast<double>(QuantileBits);
     static_assert(quantile >= 0.0 && quantile <= 1.0);
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    static constexpr bool PctRank =
+        std::is_same_v<Projection, RollingPctRankProjection>;
+    static constexpr bool UseTree =
+        (!PctRank && Periods >= 32) || (PctRank && Periods > 2048);
+    using OrderState = std::conditional_t<
+        UseTree,
+        FixedOrderStatisticTree<StateSize, Periods>,
+        RollingOrderScanState<StateSize, Periods>
+    >;
+    OrderState order{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
     void setup() noexcept {
-        ring.fill(kNaN);
+        order.setup();
         step.fill(0);
     }
 
@@ -228,39 +245,91 @@ struct RollingOrderNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const double current = ctx.template read<In>(lane);
-            ring[index * Periods + step[index] % Periods] = current;
-            ++step[index];
-            std::array<double, Periods> values{};
-            std::size_t count = 0;
-            for (std::size_t position = 0; position < Periods; ++position) {
-                const double value = ring[index * Periods + position];
-                if (finite(value)) values[count++] = value;
-            }
-            if (count < MinPeriods || count == 0) {
-                out[lane] = kNaN;
-            } else if constexpr (std::is_same_v<Projection, RollingPctRankProjection>) {
-                if (!finite(current)) out[lane] = kNaN;
-                else {
-                    std::size_t upper = 0;
-                    for (std::size_t position = 0; position < count; ++position) {
-                        upper += static_cast<std::size_t>(values[position] <= current);
-                    }
-                    out[lane] = static_cast<double>(upper) /
-                        static_cast<double>(count + 1);
-                }
+            const std::uint64_t sequence = step[index];
+            if constexpr (UseTree) {
+                order.replace(
+                    index,
+                    static_cast<std::size_t>(sequence % Periods),
+                    current,
+                    sequence
+                );
             } else {
-                const double position = quantile * static_cast<double>(count - 1);
-                const std::size_t lower = static_cast<std::size_t>(position);
-                const std::size_t upper = std::min(count - 1, lower + 1);
-                std::nth_element(values.begin(), values.begin() + lower, values.begin() + count);
-                const double lower_value = values[lower];
-                if (upper == lower) out[lane] = lower_value;
-                else {
-                    const double upper_value = *std::min_element(
-                        values.begin() + lower + 1, values.begin() + count
+                order.ring[
+                    index * Periods + static_cast<std::size_t>(sequence % Periods)
+                ] = current;
+            }
+            ++step[index];
+            if constexpr (!UseTree) {
+                std::array<double, Periods> values;
+                std::size_t count = 0;
+                for (std::size_t position = 0; position < Periods; ++position) {
+                    const double value = order.ring[index * Periods + position];
+                    if (finite(value)) values[count++] = value;
+                }
+                if (count < MinPeriods || count == 0) {
+                    out[lane] = kNaN;
+                } else if constexpr (PctRank) {
+                    if (!finite(current)) {
+                        out[lane] = kNaN;
+                    } else {
+                        std::size_t upper = 0;
+                        for (std::size_t position = 0; position < count; ++position) {
+                            upper += static_cast<std::size_t>(
+                                values[position] <= current
+                            );
+                        }
+                        out[lane] = static_cast<double>(upper)
+                            / static_cast<double>(count + 1);
+                    }
+                } else {
+                    const double position =
+                        quantile * static_cast<double>(count - 1);
+                    const std::size_t lower = static_cast<std::size_t>(position);
+                    const std::size_t upper = std::min(count - 1, lower + 1);
+                    std::nth_element(
+                        values.begin(), values.begin() + lower,
+                        values.begin() + count
                     );
-                    out[lane] = lower_value + (position - static_cast<double>(lower))
-                        * (upper_value - lower_value);
+                    const double lower_value = values[lower];
+                    if (upper == lower) {
+                        out[lane] = lower_value;
+                    } else {
+                        const double upper_value = *std::min_element(
+                            values.begin() + lower + 1,
+                            values.begin() + count
+                        );
+                        out[lane] = lower_value
+                            + (position - static_cast<double>(lower))
+                                * (upper_value - lower_value);
+                    }
+                }
+                continue;
+            }
+            if constexpr (UseTree) {
+                const std::size_t count = order.size(index);
+                if (count < MinPeriods || count == 0) {
+                    out[lane] = kNaN;
+                } else if constexpr (PctRank) {
+                    if (!finite(current)) out[lane] = kNaN;
+                    else {
+                        const std::size_t upper =
+                            order.count_less_equal(index, current);
+                        out[lane] = static_cast<double>(upper) /
+                            static_cast<double>(count + 1);
+                    }
+                } else {
+                    const double position =
+                        quantile * static_cast<double>(count - 1);
+                    const std::size_t lower = static_cast<std::size_t>(position);
+                    const std::size_t upper = std::min(count - 1, lower + 1);
+                    const double lower_value = order.kth(index, lower);
+                    if (upper == lower) out[lane] = lower_value;
+                    else {
+                        const double upper_value = order.kth(index, upper);
+                        out[lane] = lower_value
+                            + (position - static_cast<double>(lower))
+                                * (upper_value - lower_value);
+                    }
                 }
             }
         }
@@ -336,7 +405,7 @@ STACKDSL_HOT double exact_theilsen(
     std::size_t count
 ) noexcept {
     constexpr std::size_t MaxPairs = Periods * (Periods - 1) / 2;
-    std::array<double, MaxPairs> slopes{};
+    std::array<double, MaxPairs> slopes;
     std::size_t slope_count = 0;
     for (std::size_t left = 0; left < count; ++left) {
         for (std::size_t right = left + 1; right < count; ++right) {
@@ -361,13 +430,39 @@ STACKDSL_HOT std::uint64_t count_slopes_le(
     std::size_t count,
     double candidate
 ) noexcept {
-    std::array<double, Periods> z{};
-    std::array<double, Periods> ordered{};
+    struct RankedValue {
+        double value;
+        std::uint32_t index;
+    };
+    std::array<RankedValue, Periods> ordered;
+    std::array<std::uint32_t, Periods> ranks;
     for (std::size_t index = 0; index < count; ++index) {
-        z[index] = std::fma(-candidate, points[index].x, points[index].y);
-        ordered[index] = z[index];
+        ordered[index] = {
+            std::fma(-candidate, points[index].x, points[index].y),
+            static_cast<std::uint32_t>(index),
+        };
     }
-    std::sort(ordered.begin(), ordered.begin() + count);
+    std::sort(
+        ordered.begin(), ordered.begin() + count,
+        [](const RankedValue& left, const RankedValue& right) {
+            return left.value < right.value
+                || (left.value == right.value && left.index < right.index);
+        }
+    );
+    std::size_t rank_begin = 0;
+    while (rank_begin < count) {
+        std::size_t rank_end = rank_begin + 1;
+        while (
+            rank_end < count
+            && ordered[rank_end].value == ordered[rank_begin].value
+        ) {
+            ++rank_end;
+        }
+        for (std::size_t item = rank_begin; item < rank_end; ++item) {
+            ranks[ordered[item].index] = static_cast<std::uint32_t>(rank_begin);
+        }
+        rank_begin = rank_end;
+    }
     std::array<std::uint32_t, Periods + 1> fenwick{};
     auto add = [&](std::size_t position) {
         for (++position; position <= count; position += position & (~position + 1)) {
@@ -386,18 +481,11 @@ STACKDSL_HOT std::uint64_t count_slopes_le(
         std::size_t end = group + 1;
         while (end < count && points[end].x == points[group].x) ++end;
         for (std::size_t index = group; index < end; ++index) {
-            const std::size_t rank = static_cast<std::size_t>(
-                std::lower_bound(ordered.begin(), ordered.begin() + count, z[index])
-                    - ordered.begin()
-            );
+            const std::size_t rank = ranks[index];
             result += processed - prefix(rank);
         }
         for (std::size_t index = group; index < end; ++index) {
-            const std::size_t rank = static_cast<std::size_t>(
-                std::lower_bound(ordered.begin(), ordered.begin() + count, z[index])
-                    - ordered.begin()
-            );
-            add(rank);
+            add(ranks[index]);
         }
         processed += end - group;
         group = end;
@@ -505,7 +593,7 @@ struct RollingTheilSenNode {
                 if (finite(x) && finite(y)) points[count++] = {x, y};
             }
             if (count < MinPeriods) out[lane] = kNaN;
-            else if constexpr (Periods <= 256) {
+            else if constexpr (Periods <= 512) {
                 out[lane] = stats_detail::exact_theilsen(points, count);
             } else {
                 out[lane] = stats_detail::subquadratic_theilsen(points, count);

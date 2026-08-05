@@ -71,6 +71,30 @@ struct PowOp {
         );
     }
 };
+struct Pow2Op {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const R value = static_cast<R>(a);
+        return value * value;
+    }
+};
+struct Pow3Op {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const R value = static_cast<R>(a);
+        return (value * value) * value;
+    }
+};
+struct Pow4Op {
+    static constexpr int arity = 1;
+    template <class R, class A>
+    STACKDSL_HOT static R apply(A a) noexcept {
+        const R square = static_cast<R>(a) * static_cast<R>(a);
+        return square * square;
+    }
+};
 
 struct DivOp {
     static constexpr int arity = 2;
@@ -376,6 +400,55 @@ struct WhereOp {
     template <class R, class C, class A, class B>
     STACKDSL_HOT static R apply(C c, A a, B b) noexcept {
         return static_cast<R>((c != C{0}) ? a : b);
+    }
+};
+
+// Lazy scalar expression sources are the native fusion boundary.  They can be
+// nested arbitrarily and consumed by any existing node through Context::read,
+// so adding a new stateful operator does not require a matching fusion kernel.
+template <class In, class Result, class Op>
+struct UnaryExprSrc {
+    static_assert(Op::arity == 1);
+    using value_type = Result;
+    static constexpr std::size_t feature_width = 1;
+    template <class Context>
+    STACKDSL_HOT static Result read(
+        const Context& ctx, std::size_t lane
+    ) noexcept {
+        return Op::template apply<Result>(ctx.template read_native<In>(lane));
+    }
+};
+
+template <class Left, class Right, class Result, class Op>
+struct BinaryExprSrc {
+    static_assert(Op::arity == 2);
+    using value_type = Result;
+    static constexpr std::size_t feature_width = 1;
+    template <class Context>
+    STACKDSL_HOT static Result read(
+        const Context& ctx, std::size_t lane
+    ) noexcept {
+        return Op::template apply<Result>(
+            ctx.template read_native<Left>(lane),
+            ctx.template read_native<Right>(lane)
+        );
+    }
+};
+
+template <class A, class B, class C, class Result, class Op>
+struct TernaryExprSrc {
+    static_assert(Op::arity == 3);
+    using value_type = Result;
+    static constexpr std::size_t feature_width = 1;
+    template <class Context>
+    STACKDSL_HOT static Result read(
+        const Context& ctx, std::size_t lane
+    ) noexcept {
+        return Op::template apply<Result>(
+            ctx.template read_native<A>(lane),
+            ctx.template read_native<B>(lane),
+            ctx.template read_native<C>(lane)
+        );
     }
 };
 

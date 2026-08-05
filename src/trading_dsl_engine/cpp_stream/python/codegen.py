@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from trading_dsl_engine.ir.ops import (
     GroupKeySpec,
     InstrumentBasisMeanOp,
     LinearFilterOp,
+    NaryOp,
     PeriodsSinceChangeOp,
     RbfBasisOp,
     ReductionOp,
@@ -175,6 +176,38 @@ def _source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
+    if source.kind == "expr":
+        assert isinstance(source.op, NaryOp)
+        inputs = tuple(
+            _source_type(part, n=n, input_types=input_types)
+            for part in source.parts
+        )
+        result = _cpp_type(source.dtype)
+        if source.op.arity == 1:
+            return tmpl(
+                "stackdsl::UnaryExprSrc",
+                inputs[0],
+                result,
+                Name(_UNARY_POLICIES[source.op.name]),
+            )
+        if source.op.arity == 2:
+            return tmpl(
+                "stackdsl::BinaryExprSrc",
+                inputs[0],
+                inputs[1],
+                result,
+                Name(_BINARY_POLICIES[source.op.name]),
+            )
+        if source.op.arity == 3:
+            return tmpl(
+                "stackdsl::TernaryExprSrc",
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                result,
+                Name(_TERNARY_POLICIES[source.op.name]),
+            )
+        raise ValueError(f"unsupported expression arity {source.op.arity}")
     if source.kind == "input":
         index = int(source.value)
         if input_types is None:
@@ -291,6 +324,42 @@ def _tensor_source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
+    if source.kind == "tensor_expr":
+        assert isinstance(source.op, NaryOp)
+        inputs = tuple(
+            _tensor_source_type(part, n=n, input_types=input_types)
+            for part in source.parts
+        )
+        shape = _tensor_shape(source.shape)
+        result = _cpp_type(source.dtype)
+        if source.op.arity == 1:
+            return tmpl(
+                "stackdsl::TensorUnaryExpr",
+                inputs[0],
+                shape,
+                result,
+                Name(_UNARY_POLICIES[source.op.name]),
+            )
+        if source.op.arity == 2:
+            return tmpl(
+                "stackdsl::TensorBinaryExpr",
+                inputs[0],
+                inputs[1],
+                shape,
+                result,
+                Name(_BINARY_POLICIES[source.op.name]),
+            )
+        if source.op.arity == 3:
+            return tmpl(
+                "stackdsl::TensorTernaryExpr",
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                shape,
+                result,
+                Name(_TERNARY_POLICIES[source.op.name]),
+            )
+        raise ValueError(f"unsupported tensor expression arity {source.op.arity}")
     if source.kind == "input" and len(source.shape) >= 2:
         return tmpl(
             "stackdsl::DenseTensorSource",
@@ -392,6 +461,9 @@ _UNARY_POLICIES = {
     "isfinite": "stackdsl::IsFiniteOp",
     "logical_not": "stackdsl::LogicalNotOp",
     "norm_inv": "stackdsl::NormInvOp",
+    "pow2": "stackdsl::Pow2Op",
+    "pow3": "stackdsl::Pow3Op",
+    "pow4": "stackdsl::Pow4Op",
 }
 _TERNARY_POLICIES = {"where": "stackdsl::WhereOp"}
 _CUSTOM_POLICIES = {
@@ -408,6 +480,35 @@ def _stateful_alpha(half_life: float) -> float:
     return 1.0 - math.exp(math.log(0.5) / half_life)
 
 
+def _ridge_projection_type(
+    field: str, component: int | None
+) -> CppType:
+    if field in {"coefficient", "standard_error", "tstat"}:
+        if component is None:
+            raise ValueError(f"Ridge {field} projection requires a component")
+        return tmpl(
+            {
+                "coefficient": "stackdsl::RidgeCoefficientProjection",
+                "standard_error": "stackdsl::RidgeStandardErrorProjection",
+                "tstat": "stackdsl::RidgeTStatProjection",
+            }[field],
+            IntArg(component),
+        )
+    return Name({
+        "beta": "stackdsl::RidgeBetaProjection",
+        "preds": "stackdsl::RidgePredsProjection",
+        "residuals": "stackdsl::RidgeResidualsProjection",
+        "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
+        "tstats": "stackdsl::RidgeTStatsProjection",
+        "sse": "stackdsl::RidgeSseProjection",
+        "sst": "stackdsl::RidgeSstProjection",
+        "r2": "stackdsl::RidgeR2Projection",
+        "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
+        "effective_df": "stackdsl::RidgeEffectiveDfProjection",
+        "effective_n": "stackdsl::RidgeEffectiveNProjection",
+    }[field])
+
+
 def _stage_type(
     stage: Stage,
     n: CppType,
@@ -417,6 +518,35 @@ def _stage_type(
 ) -> CppType:
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
+    if stage.kind == "reduce_bundle":
+        assert isinstance(stage.op, ReductionOp) and not stage.op.temporal
+        if len(stage.bundle_outs) != len(stage.inputs) or len(stage.inputs) < 2:
+            raise ValueError("reduction bundle inputs/outputs must have equal size > 1")
+        tensors = tuple(
+            _tensor_source_type(source, n=n, input_types=input_types)
+            for source in stage.inputs
+        )
+        outputs = tuple(
+            _dest_type(replace(stage, out=dest))
+            for dest in stage.bundle_outs
+        )
+        row_axes = tuple(axis - 1 for axis in stage.op.axes if axis != 0)
+        policy = {
+            "sum": "stackdsl::SumReductionPolicy",
+            "mean": "stackdsl::MeanReductionPolicy",
+            "std": "stackdsl::StdReductionPolicy",
+            "min": "stackdsl::MinReductionPolicy",
+            "max": "stackdsl::MaxReductionPolicy",
+        }[stage.op.kind]
+        return tmpl(
+            "stackdsl::ReductionBundleNode",
+            tmpl("stackdsl::TypeList", *tensors),
+            tmpl("stackdsl::TypeList", *outputs),
+            tmpl("stackdsl::AxisList", *(IntArg(axis) for axis in row_axes)),
+            Name(policy),
+            IntArg(stage.op.ddof),
+            BoolArg(stage.op.ignore_na),
+        )
     if stage.kind == "reduce":
         assert isinstance(stage.op, ReductionOp)
         tensor_source = _tensor_source_type(
@@ -577,6 +707,25 @@ def _stage_type(
             stage_n,
             inputs[0],
             out,
+            UInt64Arg(double_bits(stage.op.span)),
+            IntArg(stage.op.min_periods),
+            BoolArg(stage.op.ignore_na),
+            BoolArg(stage.op.adjust),
+            execution,
+        )
+    if stage.kind == "ewm_bundle":
+        assert isinstance(stage.op, EwmOp)
+        if len(stage.bundle_outs) != len(inputs) or len(inputs) < 2:
+            raise ValueError("EWM bundle inputs/outputs must have equal size > 1")
+        outputs = tuple(
+            _dest_type(replace(stage, out=dest))
+            for dest in stage.bundle_outs
+        )
+        return tmpl(
+            "stackdsl::EwmBundleNode",
+            stage_n,
+            tmpl("stackdsl::TypeList", *inputs),
+            tmpl("stackdsl::TypeList", *outputs),
             UInt64Arg(double_bits(stage.op.span)),
             IntArg(stage.op.min_periods),
             BoolArg(stage.op.ignore_na),
@@ -839,9 +988,8 @@ def _stage_type(
             Name(projection),
             execution,
         )
-    if stage.kind == "ridge":
+    if stage.kind in {"ridge", "ridge_bundle"}:
         assert isinstance(stage.op, RidgeOp)
-        assert stage.projection is not None
         assert stage.half_life is not None and stage.ridge_lambda is not None
         features = stage.inputs[:-2]
         y_source, weight_source = stage.inputs[-2:]
@@ -850,39 +998,54 @@ def _stage_type(
             and math.isfinite(stage.half_life)
             and stage.half_life > 0.0
         )
-        component = stage.projection_component
-        if stage.projection in {"coefficient", "standard_error", "tstat"}:
-            assert component is not None
-            projection = tmpl({
-                "coefficient": "stackdsl::RidgeCoefficientProjection",
-                "standard_error": "stackdsl::RidgeStandardErrorProjection",
-                "tstat": "stackdsl::RidgeTStatProjection",
-            }[stage.projection], IntArg(component))
-        else:
-            projection = Name({
-                "beta": "stackdsl::RidgeBetaProjection",
-                "preds": "stackdsl::RidgePredsProjection",
-                "residuals": "stackdsl::RidgeResidualsProjection",
-                "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
-                "tstats": "stackdsl::RidgeTStatsProjection",
-                "sse": "stackdsl::RidgeSseProjection",
-                "sst": "stackdsl::RidgeSstProjection",
-                "r2": "stackdsl::RidgeR2Projection",
-                "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
-                "effective_df": "stackdsl::RidgeEffectiveDfProjection",
-                "effective_n": "stackdsl::RidgeEffectiveNProjection",
-            }[stage.projection])
-        return tmpl(
-            "stackdsl::RidgeNode",
+        common = (
             n,
             _feature_list(features, n=n, input_types=input_types),
             _source_type(y_source, n=n, input_types=input_types),
             _source_type(weight_source, n=n, input_types=input_types),
-            out,
+        )
+        trailing = (
             UInt64Arg(double_bits(_stateful_alpha(stage.half_life))),
             UInt64Arg(double_bits(stage.ridge_lambda)),
             BoolArg(stage.op.nonneg),
             BoolArg(stateful),
+        )
+        if stage.kind == "ridge_bundle":
+            if (
+                len(stage.bundle_outs) != len(stage.bundle_projections)
+                or len(stage.bundle_outs) < 2
+            ):
+                raise ValueError(
+                    "Ridge bundle outputs/projections must have equal size > 1"
+                )
+            bindings = tuple(
+                tmpl(
+                    "stackdsl::RidgeProjectionBinding",
+                    _dest_type(replace(stage, out=dest)),
+                    _ridge_projection_type(field, component),
+                )
+                for dest, (field, component) in zip(
+                    stage.bundle_outs,
+                    stage.bundle_projections,
+                    strict=True,
+                )
+            )
+            return tmpl(
+                "stackdsl::RidgeBundleNode",
+                *common,
+                *trailing,
+                tmpl("stackdsl::RidgeProjectionBundle", *bindings),
+                execution,
+            )
+        assert stage.projection is not None
+        projection = _ridge_projection_type(
+            stage.projection, stage.projection_component
+        )
+        return tmpl(
+            "stackdsl::RidgeNode",
+            *common,
+            out,
+            *trailing,
             projection,
             execution,
         )
@@ -962,6 +1125,17 @@ class InputView:
     row_width: int
 
 
+def _can_fuse_physical_pair(first: Stage, second: Stage) -> bool:
+    return (
+        first.kind in {"ewm_bundle", "reduce_bundle", "ridge_bundle"}
+        and second.kind in {"copy", "cat", "tensor_copy"}
+        and not first.final_only
+        and not second.final_only
+        and first.group is None
+        and second.group is None
+    )
+
+
 def _inner_view(name: str, group: GroupStage) -> InnerView:
     n = Name("N")
     execution = tmpl(
@@ -971,15 +1145,40 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
         Name("PartitionCount"),
     )
     stages: list[StageView] = []
-    for index, stage in enumerate(group.inner.stages):
+    stage_index = 0
+    emitted_index = 0
+    while stage_index < len(group.inner.stages):
+        stage = group.inner.stages[stage_index]
         if stage.kind == "groupby":
             raise ValueError("nested groupby is not supported")
+        if (
+            stage_index + 1 < len(group.inner.stages)
+            and _can_fuse_physical_pair(
+                stage, group.inner.stages[stage_index + 1]
+            )
+        ):
+            second = group.inner.stages[stage_index + 1]
+            stages.append(
+                StageView(
+                    emitted_index,
+                    tmpl(
+                        "stackdsl::FusedStageNode",
+                        _stage_type(stage, n, execution, input_types=None),
+                        _stage_type(second, n, execution, input_types=None),
+                    ).render(),
+                )
+            )
+            stage_index += 2
+            emitted_index += 1
+            continue
         stages.append(
             StageView(
-                index,
+                emitted_index,
                 _stage_type(stage, n, execution, input_types=None).render(),
             )
         )
+        stage_index += 1
+        emitted_index += 1
     return InnerView(
         name,
         group.inner.input_count,
@@ -1071,14 +1270,41 @@ def render_translation_unit(
     n = IntArg(n_instruments)
     direct = tmpl("stackdsl::DirectExecution", n)
     stages: list[StageView] = []
-    for index, stage in enumerate(plan.stages):
+    original_index = 0
+    emitted_index = 0
+    while original_index < len(plan.stages):
+        stage = plan.stages[original_index]
+        if (
+            original_index + 1 < len(plan.stages)
+            and _can_fuse_physical_pair(
+                stage, plan.stages[original_index + 1]
+            )
+        ):
+            second = plan.stages[original_index + 1]
+            stages.append(
+                StageView(
+                    emitted_index,
+                    tmpl(
+                        "stackdsl::FusedStageNode",
+                        _stage_type(
+                            stage, n, direct, input_types=input_types
+                        ),
+                        _stage_type(
+                            second, n, direct, input_types=input_types
+                        ),
+                    ).render(),
+                )
+            )
+            original_index += 2
+            emitted_index += 1
+            continue
         if stage.kind == "groupby":
             assert stage.group is not None
             stages.append(
                 StageView(
-                    index,
+                    emitted_index,
                     _group_type(
-                        group_names[index],
+                        group_names[original_index],
                         stage.group,
                         stage,
                         n_instruments,
@@ -1091,7 +1317,7 @@ def render_translation_unit(
         else:
             stages.append(
                 StageView(
-                    index,
+                    emitted_index,
                     _stage_type(
                         stage, n, direct, input_types=input_types
                     ).render(),
@@ -1100,6 +1326,8 @@ def render_translation_unit(
                     and plan.output_mode == "final",
                 )
             )
+        original_index += 1
+        emitted_index += 1
     if plan.input_count == 0:
         raise ValueError("cpp_stream requires at least one file-backed input")
 

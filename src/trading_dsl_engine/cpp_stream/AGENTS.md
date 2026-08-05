@@ -94,13 +94,19 @@ This backend must remain independent of `jax_flat`.
 - EWM covariance, correlation, higher cross moments, triple correlation, and partial
   correlation must compose from the canonical `EwmNode` with its `span`,
   `min_periods`, `ignore_na`, and `adjust` behavior. Complete-case masks are part of
-  the composed graph; do not add a second EWM state machine for statistics.
+  the composed graph; do not add a second EWM state machine for statistics. Lowering
+  may coalesce compatible sibling EWM transitions into `EwmBundleNode`, but every
+  bundled lane must use the same canonical `EwmState` update policy.
 - Rolling sum/mean/std use removable stable moments. Rolling extrema and relative
-  arg extrema use monotonic deques. Quantiles and percentile ranks may use fixed
-  compile-time scratch but must not allocate in `on_data`.
-- `rolling_theilsen` is exact through 256 periods. Larger windows use the fixed-memory
-  inversion-count slope selector; do not replace it with quadratic pair storage for
-  all window sizes.
+  arg extrema use monotonic deques. Rolling order statistics choose at compile time
+  between vectorizable fixed-window scans and the fixed-capacity order-statistic tree;
+  keep the measured crossover rather than forcing either algorithm at every window.
+  Backfill keeps a valid-observation deque, and previous-different keeps compressed
+  finite runs. No path may allocate in `on_data`.
+- `rolling_theilsen` is exact through 512 periods. Larger windows use the fixed-memory
+  inversion-count slope selector with one sorted rank assignment per candidate; do
+  not restore repeated per-point binary searches or use quadratic pair storage for
+  every window size.
 - Cheap derived formulas belong in `python/utils.py` and must expand through the DSL
   registry to native primitives. Stateful work must never move into a Python row
   loop.
@@ -109,6 +115,13 @@ This backend must remain independent of `jax_flat`.
 
 - Preserve the all-finite small-width rank-count path.
 - Preserve the common recursive-EWM policy and avoid weight/count traffic when semantics permit it.
+- Stateless arithmetic stays as lazy typed expression sources. Canonicalize NaN
+  literals for structural CSE, lower literal powers 2--4 to multiplication, and
+  bundle compatible sibling EWM/reduction/Ridge projections before materialization.
+- Adjacent bundle/epilogue stages may use the generic `FusedStageNode`; do not add
+  formula-name or operator-family pattern matching to code generation.
+- Projections of the same Ridge object share one `RidgeBundleNode` state update and
+  solve whenever dependency analysis proves the sibling projections compatible.
 - Row-scalar facts must propagate through pure stateless graphs.
 - Reusable output files must not be retruncated when their size already matches.
 - No operator may allocate from the heap in `on_data`; no Python per-row loop is allowed. Fixed-size Eigen objects are permitted, but dynamic Eigen matrices/vectors and hidden temporaries requiring heap storage are not.

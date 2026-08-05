@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import replace
 from typing import Mapping
 
@@ -71,8 +72,111 @@ def _build_plan(
     node_dtypes: tuple[str, ...],
 ) -> Plan:
     root = program.output_id
+    parents: list[list[int]] = [[] for _ in program.nodes]
+    final_only_nodes: list[bool] = []
+    for parent_id, candidate in enumerate(program.nodes):
+        for child_id in candidate.child_ids:
+            parents[child_id].append(parent_id)
+        final_only_nodes.append(
+            any(final_only_nodes[child] for child in candidate.child_ids)
+            or (
+                isinstance(candidate.op, ReductionOp)
+                and candidate.op.temporal
+            )
+        )
+
+    ewm_candidates: dict[tuple, list[int]] = defaultdict(list)
+    for candidate_id, candidate in enumerate(program.nodes):
+        if not isinstance(candidate.op, EwmOp) or candidate_id == root:
+            continue
+        shape = resolve_shape(candidate.value_type, n_instruments)
+        if shape not in {(), (n_instruments,)}:
+            continue
+        ewm_candidates[
+            (
+                candidate.op,
+                shape,
+                candidate_id in row_scalar_nodes,
+                final_only_nodes[candidate_id],
+            )
+        ].append(candidate_id)
+
+    ewm_bundles: dict[int, tuple[int, ...]] = {}
+    lazy_ops = (NaryOp, CatOp)
+    def register_safe_bundles(
+        candidates: dict[tuple, list[int]],
+        destination: dict[int, tuple[int, ...]],
+    ) -> None:
+        for candidate_ids in candidates.values():
+            if len(candidate_ids) < 2:
+                continue
+            member_set = set(candidate_ids)
+            last_member = candidate_ids[-1]
+            safe = True
+            frontier = list(candidate_ids)
+            seen = set(candidate_ids)
+            while frontier and safe:
+                child = frontier.pop()
+                for parent in parents[child]:
+                    if parent in member_set:
+                        safe = False
+                        break
+                    if parent >= last_member:
+                        continue
+                    if parent in seen:
+                        continue
+                    seen.add(parent)
+                    if isinstance(program.nodes[parent].op, lazy_ops):
+                        frontier.append(parent)
+                    else:
+                        safe = False
+                        break
+            if safe:
+                bundle = tuple(candidate_ids)
+                for candidate_id in bundle:
+                    destination[candidate_id] = bundle
+
+    register_safe_bundles(ewm_candidates, ewm_bundles)
+
+    reduction_candidates: dict[tuple, list[int]] = defaultdict(list)
+    for candidate_id, candidate in enumerate(program.nodes):
+        if (
+            not isinstance(candidate.op, ReductionOp)
+            or candidate.op.temporal
+            or candidate_id == root
+        ):
+            continue
+        child_type = program.nodes[candidate.child_ids[0]].value_type
+        reduction_candidates[
+            (
+                candidate.op,
+                resolve_shape(child_type, n_instruments),
+                resolve_shape(candidate.value_type, n_instruments),
+                candidate_id in row_scalar_nodes,
+                final_only_nodes[candidate_id],
+            )
+        ].append(candidate_id)
+    reduction_bundles: dict[int, tuple[int, ...]] = {}
+    register_safe_bundles(reduction_candidates, reduction_bundles)
+
+    ridge_candidates: dict[tuple[int, bool], list[int]] = defaultdict(list)
+    for candidate_id, candidate in enumerate(program.nodes):
+        if isinstance(candidate.op, RidgeProjectionOp) and candidate_id != root:
+            ridge_candidates[(
+                candidate.child_ids[0],
+                final_only_nodes[candidate_id],
+            )].append(candidate_id)
+    ridge_bundles: dict[int, tuple[int, ...]] = {}
+    register_safe_bundles(ridge_candidates, ridge_bundles)
+
     sources: dict[int, Source] = {}
     stages: list[Stage] = []
+    pending_ewm_inputs: dict[int, Source] = {}
+    pending_ewm_outs: dict[int, Dest] = {}
+    pending_reduction_inputs: dict[int, Source] = {}
+    pending_reduction_outs: dict[int, Dest] = {}
+    pending_ridge_outs: dict[int, Dest] = {}
+    pending_ridge_projections: dict[int, tuple[str, int | None]] = {}
     next_slot = 0
     next_matrix_slot = 0
     max_matrix_width = 1
@@ -178,6 +282,41 @@ def _build_plan(
     def scalar_width_shape(shape: tuple[int, ...]) -> bool:
         return shape == () or shape == (n_instruments,)
 
+    def materialize(node_id: int) -> Source:
+        """Force a lazy expression into addressable scratch.
+
+        Most consumers use ``Context::read`` and can retain a fused expression.
+        Group feeds are the exception because the generic grouped ABI passes
+        contiguous pointers into its inner plan.
+        """
+
+        source = sources[node_id]
+        if source.kind not in {"expr", "tensor_expr"}:
+            return source
+        shape = source.shape
+        out = value_dest(False, shape)
+        tensor_copy = source.kind == "tensor_expr"
+        stages.append(
+            Stage(
+                "tensor_copy" if tensor_copy else "copy",
+                (source,),
+                out,
+                1 if shape == () else n_instruments,
+                dtype=source.dtype,
+                output_kind=program.nodes[node_id].value_type.kind,
+                output_width=int(program.nodes[node_id].value_type.width),
+                final_only=source.final_only,
+            )
+        )
+        materialized = source_from_dest(
+            out,
+            shape,
+            dtype=source.dtype,
+            final_only=source.final_only,
+        )
+        sources[node_id] = materialized
+        return materialized
+
     for node_id, node in enumerate(program.nodes):
         op = node.op
         dtype = node_dtypes[node_id]
@@ -206,6 +345,9 @@ def _build_plan(
             )
             continue
 
+        if isinstance(op, GroupByOp):
+            for child in node.child_ids:
+                materialize(child)
         children = tuple(sources[child] for child in node.child_ids)
         final_only = any(child.final_only for child in children)
         is_root = node_id == root
@@ -287,6 +429,38 @@ def _build_plan(
             continue
 
         if isinstance(op, ReductionOp):
+            bundle = reduction_bundles.get(node_id)
+            if bundle is not None:
+                out = value_dest(False, node_shape)
+                pending_reduction_inputs[node_id] = children[0]
+                pending_reduction_outs[node_id] = out
+                sources[node_id] = source_from_dest(
+                    out,
+                    node_shape,
+                    dtype=dtype,
+                    final_only=final_only,
+                )
+                if node_id == bundle[-1]:
+                    stages.append(
+                        Stage(
+                            "reduce_bundle",
+                            tuple(
+                                pending_reduction_inputs[item]
+                                for item in bundle
+                            ),
+                            pending_reduction_outs[bundle[0]],
+                            n_instruments,
+                            output_kind=node.value_type.kind,
+                            output_width=int(node.value_type.width),
+                            op=op,
+                            final_only=final_only,
+                            bundle_outs=tuple(
+                                pending_reduction_outs[item]
+                                for item in bundle
+                            ),
+                        )
+                    )
+                continue
             out = value_dest(is_root, node_shape)
             stages.append(
                 Stage(
@@ -428,6 +602,40 @@ def _build_plan(
             ridge_lambda = base._literal_scalar(
                 object_children[cursor + 1], "Ridge lambda"
             )
+            bundle = ridge_bundles.get(node_id)
+            if bundle is not None:
+                out = value_dest(False, node_shape)
+                pending_ridge_outs[node_id] = out
+                pending_ridge_projections[node_id] = (op.field, op.component)
+                sources[node_id] = source_from_dest(
+                    out,
+                    node_shape,
+                    dtype=dtype,
+                    final_only=final_only,
+                )
+                if node_id == bundle[-1]:
+                    stages.append(
+                        Stage(
+                            "ridge_bundle",
+                            tuple(feature_sources) + (y_source, weight_source),
+                            pending_ridge_outs[bundle[0]],
+                            n_instruments,
+                            output_kind=node.value_type.kind,
+                            output_width=int(node.value_type.width),
+                            op=ridge_op,
+                            half_life=half_life,
+                            ridge_lambda=ridge_lambda,
+                            final_only=final_only,
+                            bundle_outs=tuple(
+                                pending_ridge_outs[item] for item in bundle
+                            ),
+                            bundle_projections=tuple(
+                                pending_ridge_projections[item]
+                                for item in bundle
+                            ),
+                        )
+                    )
+                continue
             out = value_dest(is_root, node_shape)
             stages.append(
                 Stage(
@@ -498,37 +706,21 @@ def _build_plan(
             continue
 
         if isinstance(op, NaryOp):
-            out = value_dest(is_root, node_shape)
             scalar_width = (
                 scalar_width_shape(node_shape)
                 and all(child.width == 1 for child in children)
             )
-            if scalar_width:
-                kind = (
-                    "unary"
-                    if op.arity == 1
-                    else "binary"
-                    if op.arity == 2
-                    else "ternary"
-                )
-            else:
-                kind = (
-                    "tensor_unary"
-                    if op.arity == 1
-                    else "tensor_binary"
-                    if op.arity == 2
-                    else "tensor_ternary"
-                )
-            stage = Stage(
-                kind,
-                children,
-                out,
-                lane_count,
+            sources[node_id] = Source(
+                "expr" if scalar_width else "tensor_expr",
+                row_scalar=row_scalar,
                 dtype=dtype,
-                op_name=op.name,
-                output_kind=node.value_type.kind,
-                output_width=int(node.value_type.width),
+                width=(1 if scalar_width else max(1, int(node.value_type.width))),
+                shape=node_shape,
+                parts=children,
+                op=op,
+                final_only=final_only,
             )
+            continue
         elif isinstance(op, CustomCallOp):
             if any(child.width != 1 for child in children):
                 raise CppStreamLoweringError(
@@ -573,6 +765,32 @@ def _build_plan(
                 op=op,
             )
         elif isinstance(op, EwmOp):
+            bundle = ewm_bundles.get(node_id)
+            if bundle is not None:
+                out = value_dest(False, node_shape)
+                pending_ewm_inputs[node_id] = children[0]
+                pending_ewm_outs[node_id] = out
+                sources[node_id] = source_from_dest(
+                    out,
+                    node_shape,
+                    dtype=dtype,
+                    final_only=final_only,
+                )
+                if node_id == bundle[-1]:
+                    stages.append(
+                        Stage(
+                            "ewm_bundle",
+                            tuple(pending_ewm_inputs[item] for item in bundle),
+                            pending_ewm_outs[bundle[0]],
+                            lane_count,
+                            op=op,
+                            final_only=final_only,
+                            bundle_outs=tuple(
+                                pending_ewm_outs[item] for item in bundle
+                            ),
+                        )
+                    )
+                continue
             out = value_dest(is_root, node_shape)
             stage = Stage(
                 "ewm" if scalar_width_shape(node_shape) else "tensor_ewm",
@@ -760,9 +978,11 @@ def _build_plan(
 
     root_type = program.nodes[root].value_type
     root_shape = resolve_shape(root_type, n_instruments)
-    if isinstance(program.nodes[root].op, (InputOp, LiteralOp)):
+    if isinstance(program.nodes[root].op, (InputOp, LiteralOp)) or sources[root].kind in {
+        "expr", "tensor_expr"
+    }:
         source = sources[root]
-        tensor_copy = not scalar_width_shape(root_shape)
+        tensor_copy = source.kind == "tensor_expr" or not scalar_width_shape(root_shape)
         out = value_dest(True, root_shape)
         stages.append(
             Stage(

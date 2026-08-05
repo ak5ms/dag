@@ -21,6 +21,12 @@ namespace stackdsl {
 
 inline constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
+// Generic compile-time packs used by automatic multi-output lowering.  Keeping
+// the container operator-agnostic lets EWM, reductions, and model projections
+// share the same code-generation machinery.
+template <class... Types>
+struct TypeList {};
+
 template <class T>
 inline constexpr bool always_false_v = false;
 
@@ -148,7 +154,9 @@ struct alignas(64) RowContext {
     template <class Src>
     STACKDSL_HOT source_value_t<Src> read_native(std::size_t lane) const noexcept {
         static_assert(source_width_v<Src> == 1, "scalar read of matrix/tensor source");
-        if constexpr (requires { Src::input_index; }) {
+        if constexpr (requires { Src::read(*this, lane); }) {
+            return Src::read(*this, lane);
+        } else if constexpr (requires { Src::input_index; }) {
             const auto* values = static_cast<const source_value_t<Src>*>(inputs[Src::input_index]);
             return values[Src::row_width == 1 ? 0 : lane];
         } else if constexpr (requires { Src::slot_index; }) {

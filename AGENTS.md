@@ -35,6 +35,11 @@ Priorities, in order:
 - In `cpp_stream`, derived exponentially weighted statistics must compose through
   the canonical `ewm` operator and preserve its `span`, `min_periods`, `ignore_na`,
   and `adjust` semantics rather than introducing a parallel EWM state workflow.
+- `cpp_stream` performance work should strengthen typed graph lowering first:
+  canonicalize structural literals, retain stateless expression trees for C++
+  inlining, and bundle compatible sibling state/reduction/model projections. Keep
+  derived public operators compositional instead of matching their names to custom
+  generated kernels.
 - Formula metadata must stay static and off the compiled hot path: unit/type/range propagation should run at compile time, expose runtime inspection methods such as `get_units()`/`get_range()`, and avoid changing streaming tick or batch semantics.
 - Formula alpha generation/search belongs at Python compile/search time; keep DEAP evolution, objective orchestration, and candidate filtering outside JAX-flat live/batch hot paths.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).

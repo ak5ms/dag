@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -394,6 +396,132 @@ struct ReductionNode {
     template <class Context>
     STACKDSL_HOT void finalize(Context& ctx) noexcept {
         if constexpr (Temporal) write_result(state, ctx);
+    }
+};
+
+// Automatically bundled row reductions share traversal of a common logical
+// shape.  Each expression keeps its own canonical ReductionState, so this is a
+// physical scheduling optimization rather than a second statistics workflow.
+template <
+    class Tensors,
+    class Outputs,
+    class Axes,
+    class Policy,
+    std::size_t Ddof,
+    bool IgnoreNa
+>
+struct ReductionBundleNode;
+
+template <
+    class Axes,
+    class Policy,
+    std::size_t Ddof,
+    bool IgnoreNa,
+    class... Tensors,
+    class... Outputs
+>
+struct ReductionBundleNode<
+    TypeList<Tensors...>,
+    TypeList<Outputs...>,
+    Axes,
+    Policy,
+    Ddof,
+    IgnoreNa
+> {
+    static_assert(sizeof...(Tensors) == sizeof...(Outputs));
+    static_assert(sizeof...(Tensors) > 1);
+    using TensorTuple = std::tuple<Tensors...>;
+    using OutputTuple = std::tuple<Outputs...>;
+    using FirstTensor = std::tuple_element_t<0, TensorTuple>;
+    using Shape = typename FirstTensor::shape;
+    static_assert((std::is_same_v<Shape, typename Tensors::shape> && ...));
+    static constexpr std::size_t input_size = Shape::size;
+    static constexpr std::size_t output_size =
+        reduced_output_size<Shape, Axes>();
+    static constexpr bool retains_leading_axis =
+        Shape::rank > 0 && !Axes::contains(0);
+    static constexpr std::size_t leading_extent =
+        Shape::rank > 0 ? Shape::dims[0] : 1;
+    static constexpr std::size_t input_lane_width =
+        retains_leading_axis ? input_size / leading_extent : input_size;
+    static constexpr std::size_t output_lane_width =
+        retains_leading_axis ? output_size / leading_extent : output_size;
+    using State = ReductionState<Policy, output_size, Ddof, IgnoreNa>;
+    std::array<State, sizeof...(Tensors)> states{};
+
+    STACKDSL_HOT void setup() noexcept { reset(); }
+
+    STACKDSL_HOT void reset() noexcept {
+        for (auto& state : states) state.reset();
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void add_all(
+        const Context& ctx,
+        std::size_t output,
+        std::size_t input,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        (states[Indexes].add(
+            output,
+            std::tuple_element_t<Indexes, TensorTuple>::read_flat(ctx, input)
+        ), ...);
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void write_all(
+        Context& ctx,
+        std::size_t output,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        ((ctx.template write_ptr<
+              std::tuple_element_t<Indexes, OutputTuple>
+          >()[output] = states[Indexes].result(output)), ...);
+    }
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        reset();
+        const auto indexes = std::index_sequence_for<Tensors...>{};
+        if constexpr (retains_leading_axis) {
+            const std::size_t lane_begin =
+                std::min(ctx.lane_begin, leading_extent);
+            const std::size_t lane_end =
+                std::min(ctx.lane_end, leading_extent);
+            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
+                const std::size_t begin = lane * input_lane_width;
+                const std::size_t end = begin + input_lane_width;
+                for (std::size_t input = begin; input < end; ++input) {
+                    add_all(
+                        ctx,
+                        reduced_output_index<Shape, Axes>(input),
+                        input,
+                        indexes
+                    );
+                }
+                const std::size_t output_begin = lane * output_lane_width;
+                const std::size_t output_end = output_begin + output_lane_width;
+                for (
+                    std::size_t output = output_begin;
+                    output < output_end;
+                    ++output
+                ) {
+                    write_all(ctx, output, indexes);
+                }
+            }
+        } else {
+            for (std::size_t input = 0; input < input_size; ++input) {
+                add_all(
+                    ctx,
+                    reduced_output_index<Shape, Axes>(input),
+                    input,
+                    indexes
+                );
+            }
+            for (std::size_t output = 0; output < output_size; ++output) {
+                write_all(ctx, output, indexes);
+            }
+        }
     }
 };
 

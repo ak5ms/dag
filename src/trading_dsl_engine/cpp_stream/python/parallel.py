@@ -32,6 +32,7 @@ _TEMPORAL_KINDS = {
     "ffill",
     "shift",
     "ewm",
+    "ewm_bundle",
     "rolling",
     "theilsen",
     "periods_since_change",
@@ -61,6 +62,7 @@ _LANE_LOCAL_KINDS = {
     "ffill",
     "shift",
     "ewm",
+    "ewm_bundle",
     "rolling",
     "theilsen",
     "periods_since_change",
@@ -98,6 +100,7 @@ _EXPERIMENTAL_STAGE_WORK = {
     "ffill": 2,
     "shift": 2,
     "ewm": 3,
+    "ewm_bundle": 8,
     "rolling": 6,
     "theilsen": 16,
     "periods_since_change": 2,
@@ -121,10 +124,12 @@ _EXPERIMENTAL_STAGE_WORK = {
     "tensor_column": 1,
     "cat": 2,
     "reduce": 2,
+    "reduce_bundle": 5,
     "emit_last": 1,
     "einsum": 5,
     "instrument_basis": 10,
     "ridge": 12,
+    "ridge_bundle": 18,
     "xs_rank": 8,
     "xs_pct_rank": 8,
     "xs_aggregate": 8,
@@ -136,7 +141,7 @@ _EXPERIMENTAL_STAGE_WORK = {
 
 
 def _ridge_is_stateful(stage: Stage) -> bool:
-    if stage.kind != "ridge":
+    if stage.kind not in {"ridge", "ridge_bundle"}:
         return False
     op = stage.op
     return bool(
@@ -155,7 +160,7 @@ def _reduction_is_temporal(stage: Stage) -> bool:
 
 def _reduction_is_lane_local(stage: Stage, n_instruments: int) -> bool:
     """A row reduction is lane-local only when it retains the instrument axis."""
-    if stage.kind != "reduce" or _reduction_is_temporal(stage):
+    if stage.kind not in {"reduce", "reduce_bundle"} or _reduction_is_temporal(stage):
         return False
     axes = tuple(getattr(stage.op, "axes", ()))
     if 1 in axes:
@@ -198,7 +203,9 @@ def _source_is_available(
         return int(source.value) in scalar_slots
     if source.kind in {"matrix_slot", "tensor_slot"}:
         return int(source.value) in tensor_slots
-    if source.kind in {"cat", "rbf", "future_rbf"}:
+    if source.kind in {
+        "cat", "rbf", "future_rbf", "expr", "tensor_expr"
+    }:
         return all(
             _source_is_available(part, scalar_slots, tensor_slots)
             for part in source.parts
@@ -299,7 +306,7 @@ def _plan_is_lane_independent(
             local = _tensor_stage_lane_local(stage, n_instruments)
         elif stage.kind in _LANE_LOCAL_KINDS:
             local = True
-        elif stage.kind == "reduce":
+        elif stage.kind in {"reduce", "reduce_bundle"}:
             local = _reduction_is_lane_local(stage, n_instruments)
         elif stage.kind == "einsum":
             local = _einsum_lane_local(
@@ -317,6 +324,13 @@ def _plan_is_lane_independent(
                 tensor_slots.add(stage.out.slot)
             else:
                 scalar_slots.add(stage.out.slot)
+        for dest in stage.bundle_outs:
+            if dest.slot is None:
+                continue
+            if dest.matrix or dest.tensor:
+                tensor_slots.add(dest.slot)
+            else:
+                scalar_slots.add(dest.slot)
     return True
 
 

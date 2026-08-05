@@ -60,6 +60,89 @@ STACKDSL_HOT double tensor_broadcast_read(
     );
 }
 
+template <class Input, class OutputShape, class Result, class Op>
+struct TensorUnaryExpr {
+    static_assert(Op::arity == 1);
+    using shape = OutputShape;
+    template <class Context>
+    STACKDSL_HOT static double read_flat(
+        const Context& ctx, std::size_t index
+    ) noexcept {
+        return static_cast<double>(Op::template apply<Result>(
+            tensor_broadcast_read<Input, OutputShape>(ctx, index)
+        ));
+    }
+
+    template <class Context>
+    STACKDSL_HOT static void load_contiguous(
+        const Context& ctx,
+        std::size_t begin,
+        std::size_t count,
+        double* STACKDSL_RESTRICT out
+    ) noexcept {
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            out[offset] = read_flat(ctx, begin + offset);
+        }
+    }
+};
+
+template <class Left, class Right, class OutputShape, class Result, class Op>
+struct TensorBinaryExpr {
+    static_assert(Op::arity == 2);
+    using shape = OutputShape;
+    template <class Context>
+    STACKDSL_HOT static double read_flat(
+        const Context& ctx, std::size_t index
+    ) noexcept {
+        return static_cast<double>(Op::template apply<Result>(
+            tensor_broadcast_read<Left, OutputShape>(ctx, index),
+            tensor_broadcast_read<Right, OutputShape>(ctx, index)
+        ));
+    }
+
+    template <class Context>
+    STACKDSL_HOT static void load_contiguous(
+        const Context& ctx,
+        std::size_t begin,
+        std::size_t count,
+        double* STACKDSL_RESTRICT out
+    ) noexcept {
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            out[offset] = read_flat(ctx, begin + offset);
+        }
+    }
+};
+
+template <
+    class A, class B, class C, class OutputShape, class Result, class Op
+>
+struct TensorTernaryExpr {
+    static_assert(Op::arity == 3);
+    using shape = OutputShape;
+    template <class Context>
+    STACKDSL_HOT static double read_flat(
+        const Context& ctx, std::size_t index
+    ) noexcept {
+        return static_cast<double>(Op::template apply<Result>(
+            tensor_broadcast_read<A, OutputShape>(ctx, index),
+            tensor_broadcast_read<B, OutputShape>(ctx, index),
+            tensor_broadcast_read<C, OutputShape>(ctx, index)
+        ));
+    }
+
+    template <class Context>
+    STACKDSL_HOT static void load_contiguous(
+        const Context& ctx,
+        std::size_t begin,
+        std::size_t count,
+        double* STACKDSL_RESTRICT out
+    ) noexcept {
+        for (std::size_t offset = 0; offset < count; ++offset) {
+            out[offset] = read_flat(ctx, begin + offset);
+        }
+    }
+};
+
 template <
     class Input,
     class Out,

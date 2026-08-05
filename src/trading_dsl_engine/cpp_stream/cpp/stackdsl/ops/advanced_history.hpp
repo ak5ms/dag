@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "stackdsl/engine.hpp"
+#include "stackdsl/ops/order_tree.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -285,10 +287,19 @@ template <
 >
 struct RollingKthNode {
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    alignas(64) std::array<double, StateSize * Periods> values{};
+    alignas(64) std::array<std::uint64_t, StateSize * Periods> value_steps{};
+    alignas(64) std::array<std::uint32_t, StateSize> head{};
+    alignas(64) std::array<std::uint32_t, StateSize> size{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept {
+        values.fill(kNaN);
+        value_steps.fill(0);
+        head.fill(0);
+        size.fill(0);
+        step.fill(0);
+    }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -298,23 +309,31 @@ struct RollingKthNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
-            ring[index * Periods + current % Periods] = ctx.template read<In>(lane);
-            ++step[index];
-            const std::size_t available = std::min<std::uint64_t>(current + 1, Periods);
-            std::size_t valid_count = 0;
-            double selected = kNaN;
-            for (std::size_t age = 0; age < available; ++age) {
-                const double value = ring[
-                    index * Periods + (current + Periods - age) % Periods
-                ];
-                if (!finite(value) || (IgnoreZero && value == 0.0)) continue;
-                ++valid_count;
-                if (valid_count == K) selected = value;
+            while (size[index] > 0) {
+                const std::size_t front = physical(index, 0);
+                if (value_steps[front] + Periods > current) break;
+                head[index] = (head[index] + 1U) % Periods;
+                --size[index];
             }
-            out[lane] = valid_count >= MinPeriods && valid_count >= K
-                ? selected
+            const double incoming = ctx.template read<In>(lane);
+            if (finite(incoming) && (!IgnoreZero || incoming != 0.0)) {
+                const std::size_t tail = physical(index, size[index]);
+                values[tail] = incoming;
+                value_steps[tail] = current;
+                ++size[index];
+            }
+            ++step[index];
+            out[lane] = size[index] >= MinPeriods && size[index] >= K
+                ? values[physical(index, size[index] - K)]
                 : kNaN;
         }
+    }
+
+private:
+    STACKDSL_HOT std::size_t physical(
+        std::size_t index, std::size_t logical
+    ) const noexcept {
+        return index * Periods + (head[index] + logical) % Periods;
     }
 };
 
@@ -327,10 +346,19 @@ template <
 >
 struct RollingPrevDiffNode {
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    alignas(64) std::array<double, StateSize * Periods> run_values{};
+    alignas(64) std::array<std::uint64_t, StateSize * Periods> run_steps{};
+    alignas(64) std::array<std::uint32_t, StateSize> head{};
+    alignas(64) std::array<std::uint32_t, StateSize> size{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept {
+        run_values.fill(kNaN);
+        run_steps.fill(0);
+        head.fill(0);
+        size.fill(0);
+        step.fill(0);
+    }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -341,21 +369,49 @@ struct RollingPrevDiffNode {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
             const double incoming = ctx.template read<In>(lane);
-            ring[index * Periods + current % Periods] = incoming;
-            ++step[index];
             out[lane] = kNaN;
-            if (!finite(incoming)) continue;
-            const std::size_t available = std::min<std::uint64_t>(current + 1, Periods);
-            for (std::size_t age = 1; age < available; ++age) {
-                const double value = ring[
-                    index * Periods + (current + Periods - age) % Periods
-                ];
-                if (finite(value) && value != incoming) {
-                    out[lane] = value;
-                    break;
+            while (size[index] > 0) {
+                const std::size_t front = physical(index, 0);
+                if (run_steps[front] + Periods > current) break;
+                head[index] = (head[index] + 1U) % Periods;
+                --size[index];
+            }
+            if (finite(incoming)) {
+                if (size[index] == 0) {
+                    append(index, incoming, current);
+                } else {
+                    const std::size_t back = physical(index, size[index] - 1);
+                    if (run_values[back] == incoming) {
+                        if (size[index] >= 2) {
+                            out[lane] = run_values[
+                                physical(index, size[index] - 2)
+                            ];
+                        }
+                        run_steps[back] = current;
+                    } else {
+                        out[lane] = run_values[back];
+                        append(index, incoming, current);
+                    }
                 }
             }
+            ++step[index];
         }
+    }
+
+private:
+    STACKDSL_HOT std::size_t physical(
+        std::size_t index, std::size_t logical
+    ) const noexcept {
+        return index * Periods + (head[index] + logical) % Periods;
+    }
+
+    STACKDSL_HOT void append(
+        std::size_t index, double value, std::uint64_t current
+    ) noexcept {
+        const std::size_t tail = physical(index, size[index]);
+        run_values[tail] = value;
+        run_steps[tail] = current;
+        ++size[index];
     }
 };
 
@@ -430,10 +486,20 @@ template <
 >
 struct RollingEntropyNode {
     static constexpr std::size_t StateSize = Execution::state_size;
-    alignas(64) std::array<double, StateSize * Periods> ring{};
+    static constexpr bool UseTree = Periods > 1024;
+    struct ScanState {
+        alignas(64) std::array<double, StateSize * Periods> ring{};
+        void setup() noexcept { ring.fill(kNaN); }
+    };
+    using EntropyState = std::conditional_t<
+        UseTree,
+        FixedOrderStatisticTree<StateSize, Periods>,
+        ScanState
+    >;
+    EntropyState order{};
     alignas(64) std::array<std::uint64_t, StateSize> step{};
 
-    void setup() noexcept { ring.fill(kNaN); step.fill(0); }
+    void setup() noexcept { order.setup(); step.fill(0); }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -443,45 +509,96 @@ struct RollingEntropyNode {
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
             const std::uint64_t current = step[index];
-            ring[index * Periods + current % Periods] = ctx.template read<In>(lane);
-            ++step[index];
-            double minimum = std::numeric_limits<double>::infinity();
-            double maximum = -std::numeric_limits<double>::infinity();
-            std::size_t count = 0;
-            for (std::size_t position = 0; position < Periods; ++position) {
-                const double value = ring[index * Periods + position];
-                if (!finite(value)) continue;
-                minimum = std::min(minimum, value);
-                maximum = std::max(maximum, value);
-                ++count;
-            }
-            if (count < MinPeriods || count == 0) {
-                out[lane] = kNaN;
-                continue;
-            }
-            if (minimum == maximum) {
-                out[lane] = 0.0;
-                continue;
-            }
-            std::array<std::uint32_t, Buckets> counts{};
-            const double scale = static_cast<double>(Buckets) / (maximum - minimum);
-            for (std::size_t position = 0; position < Periods; ++position) {
-                const double value = ring[index * Periods + position];
-                if (!finite(value)) continue;
-                const std::size_t bucket = std::min<std::size_t>(
-                    Buckets - 1,
-                    static_cast<std::size_t>((value - minimum) * scale)
+            if constexpr (UseTree) {
+                order.replace(
+                    index,
+                    current % Periods,
+                    ctx.template read<In>(lane),
+                    current
                 );
-                ++counts[bucket];
+            } else {
+                order.ring[index * Periods + current % Periods] =
+                    ctx.template read<In>(lane);
             }
-            double entropy = 0.0;
-            for (std::uint32_t bucket_count : counts) {
-                if (bucket_count == 0) continue;
-                const double probability = static_cast<double>(bucket_count)
-                    / static_cast<double>(count);
-                entropy -= probability * std::log(probability);
+            ++step[index];
+            if constexpr (!UseTree) {
+                double minimum = std::numeric_limits<double>::infinity();
+                double maximum = -std::numeric_limits<double>::infinity();
+                std::size_t count = 0;
+                for (std::size_t position = 0; position < Periods; ++position) {
+                    const double value = order.ring[index * Periods + position];
+                    if (!finite(value)) continue;
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                    ++count;
+                }
+                if (count < MinPeriods || count == 0) {
+                    out[lane] = kNaN;
+                    continue;
+                }
+                if (minimum == maximum) {
+                    out[lane] = 0.0;
+                    continue;
+                }
+                std::array<std::uint32_t, Buckets> counts{};
+                const double scale =
+                    static_cast<double>(Buckets) / (maximum - minimum);
+                for (std::size_t position = 0; position < Periods; ++position) {
+                    const double value = order.ring[index * Periods + position];
+                    if (!finite(value)) continue;
+                    const std::size_t bucket = std::min<std::size_t>(
+                        Buckets - 1,
+                        static_cast<std::size_t>((value - minimum) * scale)
+                    );
+                    ++counts[bucket];
+                }
+                double entropy = 0.0;
+                for (std::uint32_t bucket_count : counts) {
+                    if (bucket_count == 0) continue;
+                    const double probability = static_cast<double>(bucket_count)
+                        / static_cast<double>(count);
+                    entropy -= probability * std::log(probability);
+                }
+                out[lane] = entropy;
+                continue;
             }
-            out[lane] = entropy;
+            if constexpr (UseTree) {
+                const std::size_t count = order.size(index);
+                if (count < MinPeriods || count == 0) {
+                    out[lane] = kNaN;
+                    continue;
+                }
+                const double minimum = order.kth(index, 0);
+                const double maximum = order.kth(index, count - 1);
+                if (minimum == maximum) {
+                    out[lane] = 0.0;
+                    continue;
+                }
+                std::array<std::uint32_t, Buckets> counts{};
+                std::size_t previous = 0;
+                for (std::size_t bucket = 1; bucket < Buckets; ++bucket) {
+                    const double boundary = minimum
+                        + (maximum - minimum)
+                        * (
+                            static_cast<double>(bucket)
+                            / static_cast<double>(Buckets)
+                        );
+                    const std::size_t below = order.count_less(index, boundary);
+                    counts[bucket - 1] =
+                        static_cast<std::uint32_t>(below - previous);
+                    previous = below;
+                }
+                counts[Buckets - 1] =
+                    static_cast<std::uint32_t>(count - previous);
+                double entropy = 0.0;
+                for (std::uint32_t bucket_count : counts) {
+                    if (bucket_count == 0) continue;
+                    const double probability = static_cast<double>(bucket_count)
+                        / static_cast<double>(count);
+                    entropy -= probability * std::log(probability);
+                }
+                out[lane] = entropy;
+            }
         }
     }
 };

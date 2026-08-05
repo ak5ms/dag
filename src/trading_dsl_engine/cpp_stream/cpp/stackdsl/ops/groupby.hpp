@@ -275,7 +275,8 @@ struct alignas(64) GroupRowContext {
     template <class Src>
     STACKDSL_HOT double read_native(std::size_t lane) const noexcept {
         static_assert(source_width_v<Src> == 1);
-        if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
+        if constexpr (requires { Src::read(*this, lane); }) return Src::read(*this, lane);
+        else if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
         else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
         else return Src::value;
     }

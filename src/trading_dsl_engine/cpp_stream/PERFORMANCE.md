@@ -9,6 +9,7 @@ same process or workflow job.
 
 ```bash
 python scripts/benchmark_cpp_stream.py
+python scripts/benchmark_cpp_stream_codegen_fusion.py
 CPP_STREAM_RIDGE_CASE=all python scripts/benchmark_cpp_stream_ridge.py
 python scripts/benchmark_cpp_stream_einsum.py
 python scripts/benchmark_cpp_stream_roll_rets.py
@@ -16,6 +17,106 @@ python scripts/benchmark_cpp_stream_roll_rets.py
 
 The full einsum and roll-rets benchmarks default to 5,000,000 rows, 9 instruments,
 one warmup, and ten measured executions.
+
+## Automatic fusion and operator audit: August 5, 2026
+
+The automatic-codegen work was compared with the exact
+`26ff5ed1a66a7e0957c4c27fa377018f28f7691d` baseline on one pinned Intel Xeon
+Platinum 8370C core using GCC 13.3, `-O3 -march=native -mtune=native -flto`, one
+warmup, and ten measured executions. Each pair used the same generated input and
+produced the same checksum. Absolute rates on this host are lower than the earlier
+8573C audit, so only same-host ratios are compared.
+
+The optimizer is structural rather than formula-specific. It now:
+
+- canonicalizes NaN literals and small literal powers in the neutral IR;
+- keeps scalar and fixed-width tensor arithmetic lazy across stage boundaries;
+- bundles compatible sibling EWM states, reductions, and Ridge projections;
+- fuses a compatible physical producer and output epilogue into one runner stage;
+- reuses the canonical `EwmState` update policy for every bundle, preserving
+  `span`, `min_periods`, `ignore_na`, and `adjust` semantics.
+
+There is no co-skewness, co-kurtosis, vector-skewness, or multi-projection Ridge
+pattern in the optimizer. These cases exercise the same dependency, type, shape,
+and state-compatibility rules available to arbitrary formulas.
+
+### EWM higher moments: 5M x 9
+
+| Formula and argument regime | Baseline | Automatic codegen | Speedup |
+| --- | ---: | ---: | ---: |
+| Co-skewness, finite/default | 0.836 M rows/s | 1.717 M rows/s | 2.05x |
+| Co-kurtosis, finite/default | 0.547 M rows/s | 1.520 M rows/s | 2.78x |
+| Co-skewness, missing, `span=32`, `min_periods=20`, `ignore_na=False`, `adjust=True` | 0.737 M rows/s | 1.419 M rows/s | 1.93x |
+| Co-kurtosis, same pandas-style arguments | 0.486 M rows/s | 1.284 M rows/s | 2.64x |
+
+The finite/default generated source shrank from 77 stages/13 EWM states to one
+six-state bundle plus its output epilogue for co-skewness, and from 93 stages/15
+EWM states to one eight-state bundle plus its epilogue for co-kurtosis. Generated
+source is 16,021 and 19,671 bytes, respectively, and contains packed multiply/FMA
+instructions with no external `pow` call.
+
+Earlier on the faster 8573C host, handwritten fused controls established an
+approximately 7.92x co-skewness and 10.09x co-kurtosis ceiling over the old plans.
+That remains a theoretical, formula-aware ceiling rather than a directly comparable
+absolute result. The general optimizer recovers a material fraction without adding
+operator-specific state machines; the remaining gap is principally generic state
+layout and output/intermediate traffic, not a failure by GCC to vectorize ordinary
+arithmetic.
+
+Finite/default automatic-codegen measured seconds:
+
+```text
+co-skewness
+2.894538, 2.876010, 3.039368, 2.926378, 2.839209,
+3.017042, 2.933845, 2.834629, 2.898917, 3.163144
+
+co-kurtosis
+3.047023, 3.066419, 3.104320, 3.267215, 3.350727,
+3.398217, 3.311926, 3.443382, 4.680847, 3.257409
+```
+
+### Other generic bundles
+
+Vector moments used 200,000 x 9 rows with tensor width 16. The Ridge case emitted
+only the last row to isolate shared state/solve work from its unusually wide output.
+
+| Case | Baseline | Automatic codegen | Speedup |
+| --- | ---: | ---: | ---: |
+| Vector skewness | 0.139 M rows/s | 0.481 M rows/s | 3.46x |
+| Vector kurtosis | 0.084 M rows/s | 0.457 M rows/s | 5.44x |
+| Six projections of one Ridge state | 0.623 M rows/s | 1.873 M rows/s | 3.01x |
+
+### Rolling structures: 200k x 9, 256 periods
+
+| Case | Baseline | Updated | Speedup |
+| --- | ---: | ---: | ---: |
+| Median | 0.038 M rows/s | 0.102 M rows/s | 2.68x |
+| Percentile rank | 0.359 M rows/s | 0.408 M rows/s | 1.14x |
+| Entropy | 0.109 M rows/s | 0.107 M rows/s | 0.98x |
+| Backfill / first valid | 0.304 M rows/s | 2.289 M rows/s | 7.53x |
+| Previous different value, constant-data worst case | 0.308 M rows/s | 2.421 M rows/s | 7.86x |
+
+Median switches from a scan to a fixed-capacity order-statistic tree at 32 periods.
+Rank and entropy retain vectorized scans through 2,048 and 1,024 periods because
+matched benchmarks showed the tree's maintenance cost is higher below those
+crossovers. Backfill now uses a valid-observation deque, and previous-different uses
+a run-compressed deque; both are allocation-free and amortized O(1).
+
+### Theil-Sen threshold and selector
+
+These small-row diagnostics use one lane and report median wall seconds because
+the expensive full-window count changes with the lookback.
+
+| Periods | Baseline | Updated | Speedup |
+| ---: | ---: | ---: | ---: |
+| 257 | 1.387 s | 0.183 s | 7.57x |
+| 512 | 1.108 s | 0.162 s | 6.84x |
+| 513 | 1.179 s | 0.274 s | 4.30x |
+
+The exact selector now remains active through 512 periods. Above that threshold,
+the bounded-memory selector assigns candidate ranks once per pass instead of doing
+a binary search per point. The updated 257-period measured seconds were `0.183360,
+0.167231, 0.191502`; the baseline was `1.573886, 1.387453, 1.385834`.
 
 ## Generic einsum: 5M x 9
 

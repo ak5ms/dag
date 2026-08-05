@@ -5,11 +5,97 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
+#include <utility>
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
+
+template <
+    std::size_t StateSize,
+    std::uint64_t SpanBits,
+    int MinPeriods,
+    bool IgnoreNa,
+    bool Adjust
+>
+struct EwmState {
+    static constexpr double span = std::bit_cast<double>(SpanBits);
+    static_assert(span > 0.0);
+    static constexpr double alpha = 2.0 / (span + 1.0);
+    static constexpr double old_weight_factor = 1.0 - alpha;
+
+    alignas(64) std::array<double, StateSize> value{};
+    alignas(64) std::array<double, StateSize> weight{};
+    alignas(64) std::array<std::int64_t, StateSize> count{};
+    alignas(64) std::array<std::uint8_t, StateSize> initialized{};
+    bool all_initialized = false;
+
+    void setup() noexcept {
+        value.fill(0.0);
+        weight.fill(0.0);
+        count.fill(0);
+        initialized.fill(0);
+        all_initialized = false;
+    }
+
+    STACKDSL_HOT double recursive_update(
+        std::size_t index, double x
+    ) noexcept {
+        if (finite(x)) {
+            if (initialized[index]) {
+                value[index] = std::fma(alpha, x - value[index], value[index]);
+            } else {
+                value[index] = x;
+                initialized[index] = 1;
+            }
+        }
+        return initialized[index] ? value[index] : kNaN;
+    }
+
+    STACKDSL_HOT double general_update(
+        std::size_t index, double x
+    ) noexcept {
+        const bool observation = finite(x);
+        double old_weight = weight[index];
+        if (initialized[index] && (observation || !IgnoreNa)) {
+            old_weight *= old_weight_factor;
+        }
+        if (observation) {
+            if (initialized[index]) {
+                double new_weight = Adjust ? 1.0 : alpha;
+                if constexpr (!Adjust) {
+                    if (std::abs(alpha - 0.5) <= 1e-12) {
+                        new_weight = 1.0 - old_weight;
+                    }
+                }
+                if (value[index] != x) {
+                    value[index] = (
+                        old_weight * value[index] + new_weight * x
+                    ) / (old_weight + new_weight);
+                }
+                old_weight = Adjust ? old_weight + new_weight : 1.0;
+            } else {
+                value[index] = x;
+                initialized[index] = 1;
+                old_weight = 1.0;
+            }
+            ++count[index];
+        }
+        weight[index] = old_weight;
+        const bool enough = MinPeriods <= 0 || count[index] >= MinPeriods;
+        return initialized[index] && enough ? value[index] : kNaN;
+    }
+
+    STACKDSL_HOT double update(std::size_t index, double x) noexcept {
+        if constexpr (MinPeriods <= 0 && IgnoreNa && !Adjust) {
+            return recursive_update(index, x);
+        } else {
+            return general_update(index, x);
+        }
+    }
+};
 
 template <
     std::size_t N,
@@ -22,25 +108,13 @@ template <
     class Execution = DirectExecution<N>
 >
 struct EwmNode {
-    static constexpr double span = std::bit_cast<double>(SpanBits);
-    static_assert(span > 0.0);
-    static constexpr double alpha = 2.0 / (span + 1.0);
-    static constexpr double old_weight_factor = 1.0 - alpha;
-    static constexpr std::size_t state_size = Execution::state_size;
+    using State = EwmState<
+        Execution::state_size, SpanBits, MinPeriods, IgnoreNa, Adjust
+    >;
+    static constexpr double alpha = State::alpha;
+    State state{};
 
-    alignas(64) std::array<double, state_size> value{};
-    alignas(64) std::array<double, state_size> weight{};
-    alignas(64) std::array<std::int64_t, state_size> count{};
-    alignas(64) std::array<std::uint8_t, state_size> initialized{};
-    bool all_initialized = false;
-
-    void setup() noexcept {
-        value.fill(0.0);
-        weight.fill(0.0);
-        count.fill(0);
-        initialized.fill(0);
-        all_initialized = false;
-    }
+    void setup() noexcept { state.setup(); }
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) noexcept {
@@ -72,13 +146,17 @@ private:
             input[lane] = ctx.template read<In>(lane);
             all_finite = all_finite && finite(input[lane]);
         }
-        if (all_initialized && all_finite) {
+        if (state.all_initialized && all_finite) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 16
 #endif
             for (std::size_t lane = begin; lane < end; ++lane) {
-                const double next = std::fma(alpha, input[lane] - value[lane], value[lane]);
-                value[lane] = next;
+                const double next = std::fma(
+                    alpha,
+                    input[lane] - state.value[lane],
+                    state.value[lane]
+                );
+                state.value[lane] = next;
                 out[lane] = next;
             }
             return;
@@ -89,17 +167,10 @@ private:
 #pragma GCC unroll 16
 #endif
         for (std::size_t lane = begin; lane < end; ++lane) {
-            if (finite(input[lane])) {
-                if (initialized[lane]) value[lane] = std::fma(alpha, input[lane] - value[lane], value[lane]);
-                else {
-                    value[lane] = input[lane];
-                    initialized[lane] = 1;
-                }
-            }
-            out[lane] = initialized[lane] ? value[lane] : kNaN;
-            now_all_initialized = now_all_initialized && initialized[lane];
+            out[lane] = state.recursive_update(lane, input[lane]);
+            now_all_initialized = now_all_initialized && state.initialized[lane];
         }
-        all_initialized = now_all_initialized;
+        state.all_initialized = now_all_initialized;
     }
 
     template <class Context>
@@ -111,15 +182,9 @@ private:
 #endif
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
-            const double x = ctx.template read<In>(lane);
-            if (finite(x)) {
-                if (initialized[index]) value[index] = std::fma(alpha, x - value[index], value[index]);
-                else {
-                    value[index] = x;
-                    initialized[index] = 1;
-                }
-            }
-            out[lane] = initialized[index] ? value[index] : kNaN;
+            out[lane] = state.recursive_update(
+                index, ctx.template read<In>(lane)
+            );
         }
     }
 
@@ -129,28 +194,210 @@ private:
         const std::size_t end = execution_lane_end<N, Execution>(ctx);
         for (std::size_t lane = begin; lane < end; ++lane) {
             const std::size_t index = Execution::state_index(ctx, lane);
-            const double x = ctx.template read<In>(lane);
-            const bool observation = finite(x);
-            double old_weight = weight[index];
-            if (initialized[index] && (observation || !IgnoreNa)) old_weight *= old_weight_factor;
-            if (observation) {
-                if (initialized[index]) {
-                    double new_weight = Adjust ? 1.0 : alpha;
-                    if constexpr (!Adjust) {
-                        if (std::abs(alpha - 0.5) <= 1e-12) new_weight = 1.0 - old_weight;
-                    }
-                    if (value[index] != x) value[index] = (old_weight * value[index] + new_weight * x) / (old_weight + new_weight);
-                    old_weight = Adjust ? old_weight + new_weight : 1.0;
-                } else {
-                    value[index] = x;
-                    initialized[index] = 1;
-                    old_weight = 1.0;
+            out[lane] = state.general_update(
+                index, ctx.template read<In>(lane)
+            );
+        }
+    }
+};
+
+template <
+    std::size_t N,
+    class Inputs,
+    class Outputs,
+    std::uint64_t SpanBits,
+    int MinPeriods,
+    bool IgnoreNa,
+    bool Adjust,
+    class Execution = DirectExecution<N>
+>
+struct EwmBundleNode;
+
+template <
+    std::size_t N,
+    std::uint64_t SpanBits,
+    int MinPeriods,
+    bool IgnoreNa,
+    bool Adjust,
+    class Execution,
+    class... Inputs,
+    class... Outputs
+>
+struct EwmBundleNode<
+    N,
+    TypeList<Inputs...>,
+    TypeList<Outputs...>,
+    SpanBits,
+    MinPeriods,
+    IgnoreNa,
+    Adjust,
+    Execution
+> {
+    static_assert(sizeof...(Inputs) == sizeof...(Outputs));
+    static_assert(sizeof...(Inputs) > 1);
+    using Kernel = EwmState<
+        Execution::state_size, SpanBits, MinPeriods, IgnoreNa, Adjust
+    >;
+    static constexpr std::size_t BundleSize = sizeof...(Inputs);
+    std::array<Kernel, sizeof...(Inputs)> states{};
+
+    void setup() noexcept {
+        for (auto& state : states) state.setup();
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void load_lane(
+        Context& ctx,
+        std::size_t lane,
+        std::array<std::array<double, N>, BundleSize>& values,
+        bool& all_finite,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        ((values[Indexes][lane] = ctx.template read<
+              std::tuple_element_t<Indexes, std::tuple<Inputs...>>
+          >(lane),
+          all_finite = all_finite && finite(values[Indexes][lane])), ...);
+    }
+
+    template <std::size_t Index, class Context>
+    STACKDSL_HOT void run_recursive_fast(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
+        auto& state = states[Index];
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<
+            std::tuple_element_t<Index, std::tuple<Outputs...>>
+        >();
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 16
+#endif
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            const double next = std::fma(
+                Kernel::alpha,
+                values[Index][lane] - state.value[lane],
+                state.value[lane]
+            );
+            state.value[lane] = next;
+            out[lane] = next;
+        }
+    }
+
+    template <std::size_t Index, class Context>
+    STACKDSL_HOT void run_recursive_checked(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
+        auto& state = states[Index];
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<
+            std::tuple_element_t<Index, std::tuple<Outputs...>>
+        >();
+        bool now_all_initialized = true;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 16
+#endif
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            const std::size_t state_index =
+                Execution::state_index(ctx, lane);
+            out[lane] = state.recursive_update(
+                state_index, values[Index][lane]
+            );
+            now_all_initialized = now_all_initialized
+                && state.initialized[state_index];
+        }
+        state.all_initialized = now_all_initialized;
+    }
+
+    template <std::size_t Index, class Context>
+    STACKDSL_HOT void run_general(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
+        auto& state = states[Index];
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<
+            std::tuple_element_t<Index, std::tuple<Outputs...>>
+        >();
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            out[lane] = state.general_update(
+                Execution::state_index(ctx, lane), values[Index][lane]
+            );
+        }
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void run_recursive_fast_all(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        (run_recursive_fast<Indexes>(ctx, values, begin, end), ...);
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void run_recursive_checked_all(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        (run_recursive_checked<Indexes>(ctx, values, begin, end), ...);
+    }
+
+    template <class Context, std::size_t... Indexes>
+    STACKDSL_HOT void run_general_all(
+        Context& ctx,
+        const std::array<std::array<double, N>, BundleSize>& values,
+        std::size_t begin,
+        std::size_t end,
+        std::index_sequence<Indexes...>
+    ) noexcept {
+        (run_general<Indexes>(ctx, values, begin, end), ...);
+    }
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        std::array<std::array<double, N>, BundleSize> values{};
+        bool all_finite = true;
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            load_lane(
+                ctx, lane, values, all_finite,
+                std::index_sequence_for<Inputs...>{}
+            );
+        }
+        if constexpr (MinPeriods <= 0 && IgnoreNa && !Adjust) {
+            const bool all_initialized = [&]<std::size_t... Indexes>(
+                std::index_sequence<Indexes...>
+            ) {
+                return (states[Indexes].all_initialized && ...);
+            }(std::index_sequence_for<Inputs...>{});
+            if constexpr (Execution::contiguous_lanes) {
+                if (all_initialized && all_finite) {
+                    run_recursive_fast_all(
+                        ctx, values, begin, end,
+                        std::index_sequence_for<Inputs...>{}
+                    );
+                    return;
                 }
-                ++count[index];
             }
-            weight[index] = old_weight;
-            const bool enough = MinPeriods <= 0 || count[index] >= MinPeriods;
-            out[lane] = initialized[index] && enough ? value[index] : kNaN;
+            run_recursive_checked_all(
+                ctx, values, begin, end,
+                std::index_sequence_for<Inputs...>{}
+            );
+        } else {
+            run_general_all(
+                ctx, values, begin, end,
+                std::index_sequence_for<Inputs...>{}
+            );
         }
     }
 };

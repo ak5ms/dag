@@ -133,7 +133,14 @@ def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
-        return ("num", node.value)
+        value = node.value
+        # Floating NaNs are semantically one literal in the formula graph even
+        # though IEEE equality deliberately reports ``nan != nan``.  Keeping the
+        # raw value in the memo key defeated CSE for every composed complete-case
+        # mask (``where(mask, value, nan)``).
+        if isinstance(value, float) and math.isnan(value):
+            return ("num", "nan")
+        return ("num", value)
     if isinstance(node, String):
         return ("str", node.value)
     if isinstance(node, Universe):
@@ -679,6 +686,17 @@ class _BaseBuilder:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
                 raise FormulaIRCompileError(f"{node.fn} expects {arity} args")
+            if node.fn == "pow" and isinstance(node.args[1], Number):
+                exponent = node.args[1].value
+                if exponent == 1.0:
+                    return self.build(node.args[0])
+                if exponent in (2, 3, 4):
+                    child = self.build(node.args[0])
+                    return self._append(
+                        NaryOp(f"pow{int(exponent)}", 1),
+                        (child,),
+                        self.nodes[child].value_type,
+                    )
             children = tuple(self.build(arg) for arg in node.args)
             return self._append(
                 NaryOp(node.fn, arity),

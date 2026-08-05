@@ -360,6 +360,140 @@ def test_rolling_family_uses_period_counts_and_nan_skipping(tmp_path: Path) -> N
     )
 
 
+def test_tree_backed_rolling_order_matches_random_ties_and_nans(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(20260805)
+    rows, lanes = 180, 4
+    x = np.round(rng.normal(size=(rows, lanes)), 1)
+    x[(np.arange(rows)[:, None] + 3 * np.arange(lanes)[None, :]) % 19 == 0] = np.nan
+    periods = 64
+    min_periods = 11
+    actual, _ = _run(
+        "cat(rolling_median(x,64,min_periods=11),"
+        "rolling_quantile(x,64,q=.2,min_periods=11),"
+        "rolling_pct_rank(x,64,min_periods=11))",
+        {"x": x},
+        tmp_path,
+        (rows, lanes, 3),
+    )
+    expected = np.full((rows, lanes, 3), np.nan)
+    for row in range(rows):
+        start = max(0, row + 1 - periods)
+        for lane in range(lanes):
+            window = x[start : row + 1, lane]
+            finite = window[np.isfinite(window)]
+            if finite.size < min_periods:
+                continue
+            expected[row, lane, 0] = np.quantile(finite, 0.5)
+            expected[row, lane, 1] = np.quantile(finite, 0.2)
+            if np.isfinite(x[row, lane]):
+                expected[row, lane, 2] = (
+                    np.count_nonzero(finite <= x[row, lane])
+                    / (finite.size + 1.0)
+                )
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True
+    )
+
+
+def test_fixed_deques_match_random_backfill_and_previous_different(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(8891)
+    rows, lanes = 150, 3
+    x = np.round(rng.normal(size=(rows, lanes)), 1)
+    x[(np.arange(rows)[:, None] + 5 * np.arange(lanes)[None, :]) % 13 == 0] = np.nan
+    x[40:70, 0] = 2.0
+    actual, _ = _run(
+        "cat(rolling_kth(x,17,k=4,ignore=\"NAN\",min_periods=4),"
+        "rolling_prev_diff(x,17))",
+        {"x": x},
+        tmp_path,
+        (rows, lanes, 2),
+    )
+    expected = np.full((rows, lanes, 2), np.nan)
+    for row in range(rows):
+        start = max(0, row - 16)
+        for lane in range(lanes):
+            window = x[start : row + 1, lane]
+            finite = window[np.isfinite(window)]
+            if finite.size >= 4:
+                expected[row, lane, 0] = finite[-4]
+            current = x[row, lane]
+            if np.isfinite(current):
+                prior = finite[:-1] if np.isfinite(window[-1]) else finite
+                different = prior[prior != current]
+                if different.size:
+                    expected[row, lane, 1] = different[-1]
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True
+    )
+
+
+def test_large_entropy_tree_matches_histogram_reference(tmp_path: Path) -> None:
+    rng = np.random.default_rng(1927)
+    periods = 1025
+    rows = periods + 5
+    x = rng.normal(size=(rows, 1))
+    x[::71] = np.nan
+    min_periods = 900
+    actual, _ = _run(
+        "rolling_entropy(x,1025,buckets=7,min_periods=900)",
+        {"x": x},
+        tmp_path,
+        (rows, 1),
+    )
+    expected = np.full_like(x, np.nan)
+    for row in range(rows):
+        start = max(0, row + 1 - periods)
+        finite = x[start : row + 1, 0]
+        finite = finite[np.isfinite(finite)]
+        if finite.size < min_periods:
+            continue
+        if np.ptp(finite) == 0.0:
+            expected[row, 0] = 0.0
+            continue
+        bins = np.minimum(
+            6,
+            ((finite - np.min(finite)) * 7 / np.ptp(finite)).astype(int),
+        )
+        counts = np.bincount(bins, minlength=7)
+        probabilities = counts[counts > 0] / finite.size
+        expected[row, 0] = -np.sum(probabilities * np.log(probabilities))
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True
+    )
+
+
+def test_large_rank_tree_matches_upper_tie_reference(tmp_path: Path) -> None:
+    rng = np.random.default_rng(8287)
+    periods = 2049
+    rows = periods + 4
+    x = np.round(rng.normal(size=(rows, 1)), 1)
+    x[::89] = np.nan
+    min_periods = 1900
+    actual, _ = _run(
+        "rolling_pct_rank(x,2049,min_periods=1900)",
+        {"x": x},
+        tmp_path,
+        (rows, 1),
+    )
+    expected = np.full_like(x, np.nan)
+    for row in range(rows):
+        start = max(0, row + 1 - periods)
+        window = x[start : row + 1, 0]
+        finite = window[np.isfinite(window)]
+        if finite.size >= min_periods and np.isfinite(x[row, 0]):
+            expected[row, 0] = (
+                np.count_nonzero(finite <= x[row, 0])
+                / (finite.size + 1.0)
+            )
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True
+    )
+
+
 def test_cheap_xs_and_rolling_compositions_expand_to_native_primitives(
     tmp_path: Path,
 ) -> None:
@@ -485,13 +619,13 @@ def test_rolling_theilsen_matches_exact_pairwise_median(tmp_path: Path) -> None:
 def test_large_rolling_theilsen_uses_subquadratic_selection_accurately(
     tmp_path: Path,
 ) -> None:
-    periods = 257
+    periods = 513
     rng = np.random.default_rng(771)
     x = rng.normal(size=(periods, 1))
     y = 2.25 * x + rng.normal(scale=0.3, size=(periods, 1))
     y[::37] += rng.normal(scale=12.0, size=(len(y[::37]), 1))
     actual, _ = _run(
-        "rolling_theilsen(y, x, periods=257, min_periods=257)",
+        "rolling_theilsen(y, x, periods=513, min_periods=513)",
         {"x": x, "y": y},
         tmp_path,
         (periods, 1),
