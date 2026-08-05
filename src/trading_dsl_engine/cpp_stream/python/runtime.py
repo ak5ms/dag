@@ -136,9 +136,6 @@ class CppStreamRuntime:
         missing = [name for name in self.input_names if name not in data]
         if missing:
             raise KeyError(f"missing cpp_stream source(s): {missing}")
-        extra = sorted(set(data) - set(self.input_names))
-        if extra:
-            raise KeyError(f"unexpected cpp_stream source(s): {extra}")
 
     @staticmethod
     def _validate_writeback(async_writeback_mb: int) -> int:

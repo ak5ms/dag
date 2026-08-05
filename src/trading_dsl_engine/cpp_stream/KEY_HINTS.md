@@ -31,6 +31,10 @@ result = groupby((minute,), var("x"), cumsum(self_))
   declaration changes results, so use it only for genuinely lane-invariant data.
 - `dtype`: Verifies the native key dtype and prevents an accidental conversion
   from being hidden. It does not cast the source.
+- `monotonic`: Declares a row-scalar key whose equal-value runs are contiguous and
+  never return after the value changes. cpp_stream resets the grouped RHS state at
+  each change and reuses one slot for that key. A false declaration changes
+  results. The hint requires `row_scalar=True`.
 
 ## Common patterns
 
@@ -57,20 +61,26 @@ sector = key(
 )
 ```
 
-### Unbounded but row-scalar session timestamp
+### Monotonic session epoch
 
 ```python
 session = key(
     var("session_start0"),
     row_scalar=True,
     dtype="float64",
+    monotonic=True,
 )
 ```
 
 Absolute session timestamps are not a bounded key domain, so `num_keys` is
-intentionally omitted. This is the optimization used by
-`flows.roll_rets_keys.roll_rets_keys`: the POV group resolver processes one
-session key per row rather than one identical key per instrument.
+intentionally omitted. Because the session timestamp only advances and never
+returns, cpp_stream does not retain a hash-table entry for every historical
+session. It resets the grouped RHS at a transition and recycles capacity one.
+This is the optimization used by `flows.roll_rets_hints.roll_rets_hints`.
+
+A tuple can combine monotonic epoch keys with ordinary keys. The ordinary keys
+retain dense or hashed slots only within the current epoch; all of those slots
+are reset together when an epoch key changes.
 
 ## Automatic inference
 

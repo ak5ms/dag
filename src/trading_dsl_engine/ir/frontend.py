@@ -170,6 +170,7 @@ def _expr_key(node: Expr) -> tuple:
             node.offset,
             node.row_scalar,
             node.dtype,
+            node.monotonic,
         )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
@@ -1251,6 +1252,7 @@ class _OuterBuilder(_BaseBuilder):
                         item.offset,
                         item.row_scalar,
                         item.dtype,
+                        item.monotonic,
                     )
                 )
             else:

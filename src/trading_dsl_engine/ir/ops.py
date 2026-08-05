@@ -386,6 +386,7 @@ class GroupKeySpec:
     offset: int = 0
     row_scalar: bool | None = None
     dtype: str | None = None
+    monotonic: bool = False
 
 
 @dataclass(frozen=True, slots=True)

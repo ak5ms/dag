@@ -53,6 +53,12 @@ class Key(Expr):
         inputs the compiler verifies this against the file dtype. For derived
         expressions it verifies the inferred native result type. The hint never
         authorizes an implicit conversion of the input or expression.
+    ``monotonic``
+        Assert that this row-scalar key forms contiguous, non-returning runs: the
+        value may repeat, but once it changes an earlier value never appears
+        again. A streaming backend may then discard all state from the completed
+        run and reuse one group slot. This is an assertion, not a runtime sort or
+        validation; a false declaration changes results.
 
     A tuple may contain independently described ``Key`` objects. If every dynamic
     key has ``num_keys``, a backend may use mixed-radix dense routing with capacity
@@ -65,6 +71,7 @@ class Key(Expr):
     offset: int = 0
     row_scalar: bool | None = None
     dtype: str | None = None
+    monotonic: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "expr", ensure_expr(self.expr))
@@ -76,6 +83,7 @@ class Key(Expr):
         object.__setattr__(self, "offset", int(self.offset))
         if self.row_scalar is not None:
             object.__setattr__(self, "row_scalar", bool(self.row_scalar))
+        object.__setattr__(self, "monotonic", bool(self.monotonic))
         if self.dtype is not None:
             dtype = str(self.dtype).lower()
             if dtype not in _SUPPORTED_DTYPES:
@@ -93,6 +101,7 @@ def key(
     offset: int = 0,
     row_scalar: bool | None = None,
     dtype: str | None = None,
+    monotonic: bool = False,
 ) -> Key:
     """Construct :class:`Key`; see ``Key`` for exact hint semantics."""
     return Key(
@@ -101,6 +110,7 @@ def key(
         offset=offset,
         row_scalar=row_scalar,
         dtype=dtype,
+        monotonic=monotonic,
     )
 
 

@@ -255,6 +255,75 @@ struct NoKeyResolver {
     }
 };
 
+template <std::size_t N, class Resolver, class EpochKeyList, class RetainedKeyList>
+struct MonotonicGroupResolver;
+
+template <std::size_t N, class Resolver, class... EpochKeys, class... RetainedKeys>
+struct MonotonicGroupResolver<
+    N,
+    Resolver,
+    KeyList<EpochKeys...>,
+    KeyList<RetainedKeys...>
+> {
+    static constexpr std::size_t capacity = Resolver::capacity;
+    static constexpr std::size_t epoch_parts = sizeof...(EpochKeys);
+    static_assert(epoch_parts > 0);
+    static_assert(
+        (EpochKeys::row_scalar && ...),
+        "monotonic group keys must be row-scalar"
+    );
+
+    Resolver resolver{};
+    KeyBits<epoch_parts> current_epoch{};
+    bool epoch_initialized = false;
+    bool reset_pending = false;
+
+    void setup() noexcept {
+        resolver.setup();
+        epoch_initialized = false;
+        reset_pending = false;
+    }
+
+    template <class Context>
+    STACKDSL_HOT static KeyBits<epoch_parts> make_epoch(
+        const Context& ctx
+    ) noexcept {
+        return KeyBits<epoch_parts>{{EpochKeys::canonical_bits(ctx, 0)...}};
+    }
+
+    template <class Context, class... RuntimeKeys>
+    STACKDSL_HOT bool resolve_range(
+        Context& ctx,
+        KeyList<RuntimeKeys...>,
+        std::array<std::uint16_t, N>& slots,
+        std::size_t begin,
+        std::size_t end
+    ) noexcept {
+        const auto epoch = make_epoch(ctx);
+        if (!epoch_initialized) {
+            current_epoch = epoch;
+            epoch_initialized = true;
+        } else if (!(current_epoch == epoch)) {
+            current_epoch = epoch;
+            resolver.setup();
+            reset_pending = true;
+        }
+        return resolver.resolve_range(
+            ctx,
+            KeyList<RetainedKeys...>{},
+            slots,
+            begin,
+            end
+        );
+    }
+
+    STACKDSL_HOT bool consume_reset() noexcept {
+        const bool result = reset_pending;
+        reset_pending = false;
+        return result;
+    }
+};
+
 template <
     std::size_t N,
     std::size_t Inputs,
@@ -314,6 +383,9 @@ struct GroupByNode<N, Resolver, Partitions, InnerPlan, Out, KeyList<Keys...>, So
         const std::size_t begin = ctx.lane_begin;
         const std::size_t end = ctx.lane_end;
         if (!resolver.resolve_range(ctx, KeyList<Keys...>{}, group_slots, begin, end)) return false;
+        if constexpr (requires { resolver.consume_reset(); }) {
+            if (resolver.consume_reset()) inner.setup();
+        }
         std::array<const double*, sizeof...(FeedSources)> feeds{ctx.template read_ptr<FeedSources>()...};
         inner.on_data(
             feeds,
