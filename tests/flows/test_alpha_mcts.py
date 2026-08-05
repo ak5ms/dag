@@ -12,7 +12,7 @@ from flows.alpha_mcts import (
     market_terminal_semantics,
 )
 from flows.alpha_search_mcts import adaptive_parameter_terminals, make_sharpe_fitness, sharpe_ratio
-from trading_dsl_engine.base.dsl import add, var, xs_rank
+from trading_dsl_engine.base.dsl import var
 from trading_dsl_engine.base.terminals import alpha_search_field_metadata
 
 
@@ -58,8 +58,9 @@ def test_canonicalization_deduplicates_commutative_and_idempotent_forms():
     rhs = SExpr(op="add", children=(y, x))
     assert canonical_key(lhs) == canonical_key(rhs)
 
-    ranked = SExpr(op="xs_rank", children=(SExpr(op="xs_rank", children=(x,)),))
-    assert canonical_key(ranked) == repr(var("x"))
+    inner = SExpr(op="xs_rank", children=(x,))
+    ranked = SExpr(op="xs_rank", children=(inner,))
+    assert canonical_key(ranked) == canonical_key(inner)
 
 
 def test_sharpe_is_the_only_fitness_value():
