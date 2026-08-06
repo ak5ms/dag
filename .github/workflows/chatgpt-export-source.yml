@@ -1,0 +1,32 @@
+name: ChatGPT export source
+
+on:
+  push:
+    branches:
+      - chatgpt/groupby-integration-bench-20260722
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Create source archive
+        run: |
+          git rev-parse HEAD > CHATGPT_SOURCE_COMMIT
+          zip -qr dag-source.zip . -x '.git/*' 'dag-source.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-source
+          path: dag-source.zip
+          if-no-files-found: error
+          retention-days: 1
+
+# Temporary workflow; this branch and PR will be closed after integration testing.

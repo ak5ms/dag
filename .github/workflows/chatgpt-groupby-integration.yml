@@ -1,0 +1,103 @@
+name: ChatGPT groupby integration test
+
+on:
+  push:
+    branches:
+      - chatgpt/groupby-integration-bench-20260722
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Create baseline worktree
+        run: git worktree add --detach /tmp/dag-baseline origin/main
+      - name: Create optimized worktree
+        run: git worktree add --detach /tmp/dag-optimized origin/main
+      - name: Validate and apply optimization patch
+        working-directory: /tmp/dag-optimized
+        run: |
+          wc -l "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
+          git apply --check --verbose "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
+          git apply "$GITHUB_WORKSPACE/.github/chatgpt/groupby_generic_fastpath.patch"
+      - name: Install dependencies and build baseline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e /tmp/dag-baseline
+      - name: Benchmark baseline
+        env:
+          PYTHONPATH: /tmp/dag-baseline/src
+        run: |
+          python "$GITHUB_WORKSPACE/.github/chatgpt/benchmark_groupby.py" \
+            --variant baseline --output "$GITHUB_WORKSPACE/baseline.json"
+      - name: Build optimized native extension
+        working-directory: /tmp/dag-optimized
+        run: python setup.py build_ext --inplace --force -v
+      - name: Run optimized targeted tests
+        env:
+          PYTHONPATH: /tmp/dag-optimized/src
+        working-directory: /tmp/dag-optimized
+        run: |
+          python -m pytest -n 0 -q \
+            tests/trading_dsl_engine/jax_flat/test_groupby_semantics_spec.py \
+            tests/trading_dsl_engine/jax_flat/test_groupby_dataclass_outputs.py \
+            tests/trading_dsl_engine/jax_flat/test_stateless_callable.py \
+            tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py
+      - name: Benchmark optimized
+        env:
+          PYTHONPATH: /tmp/dag-optimized/src
+        run: |
+          python "$GITHUB_WORKSPACE/.github/chatgpt/benchmark_groupby.py" \
+            --variant optimized --output "$GITHUB_WORKSPACE/optimized.json"
+      - name: Compare outputs and write summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+
+          baseline = json.loads(Path("baseline.json").read_text())
+          optimized = json.loads(Path("optimized.json").read_text())
+          b = {x["name"]: x for x in baseline["benchmarks"]}
+          o = {x["name"]: x for x in optimized["benchmarks"]}
+          lines = [
+              "| Benchmark | Baseline s | Optimized s | Speedup | Optimized state |",
+              "|---|---:|---:|---:|---|",
+          ]
+          for name in ("pure_jax_nested_10k", "custom_groupby_10k", "default_multifeed_10k"):
+              assert np.isclose(b[name]["checksum"], o[name]["checksum"], rtol=1e-9, atol=1e-9, equal_nan=True)
+              speedup = b[name]["median_s"] / o[name]["median_s"]
+              lines.append(
+                  f'| {name} | {b[name]["median_s"]:.6f} | {o[name]["median_s"]:.6f} | '
+                  f'{speedup:.2f}x | {o[name]["state_type"]} |'
+              )
+          for name in ("pure_jax_nested_100k", "custom_groupby_100k", "native_multifeed_1m"):
+              x = o[name]
+              lines.append(
+                  f'| {name} | — | {x["median_s"]:.6f} | — | {x["state_type"]} |'
+              )
+          Path("benchmark-summary.md").write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: groupby-integration-results
+          path: |
+            baseline.json
+            optimized.json
+            benchmark-summary.md
+          if-no-files-found: error
+          retention-days: 7

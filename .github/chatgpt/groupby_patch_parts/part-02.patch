@@ -1,0 +1,120 @@
++    ("floor", 1): lambda: NaryOp(jnp.floor, cpp_name="floor", group_memberwise=True),
++    ("round", 1): lambda: NaryOp(jnp.round, cpp_name="round", group_memberwise=True),
++    ("exp", 1): lambda: NaryOp(jnp.exp, cpp_name="exp", group_memberwise=True),
++    ("sign", 1): lambda: NaryOp(jnp.sign, cpp_name="sign", group_memberwise=True),
++    ("arctan", 1): lambda: NaryOp(jnp.arctan, cpp_name="arctan", group_memberwise=True),
++    ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan", group_memberwise=True),
++    ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify", group_memberwise=True),
++    ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction", group_memberwise=True),
++    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv", group_memberwise=True),
+     ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
+     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
+     ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
+@@ -1199,27 +1206,27 @@
+     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
+     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
+     ("cumsum", 1): lambda: CumsumOp(),
+-    ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),
+-    ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub"),
+-    ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul"),
+-    ("mod", 2): lambda: NaryOp(lambda l, r: jnp.mod(l, r), cpp_name="mod"),
+-    ("pow", 2): lambda: NaryOp(lambda l, r: l**r, cpp_name="pow"),
+-    ("div", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div"),
+-    ("floordiv", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv"),
+-    ("eq", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq"),
+-    ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne"),
+-    ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt"),
+-    ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt"),
+-    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le"),
+-    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge"),
+-    ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+-    ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+-    ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+-    ("or_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+-    ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
+-    ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
+-    ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
+-    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
++    ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add", group_memberwise=True),
++    ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub", group_memberwise=True),
++    ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul", group_memberwise=True),
++    ("mod", 2): lambda: NaryOp(lambda l, r: jnp.mod(l, r), cpp_name="mod", group_memberwise=True),
++    ("pow", 2): lambda: NaryOp(lambda l, r: l**r, cpp_name="pow", group_memberwise=True),
++    ("div", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div", group_memberwise=True),
++    ("floordiv", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv", group_memberwise=True),
++    ("eq", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq", group_memberwise=True),
++    ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne", group_memberwise=True),
++    ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt", group_memberwise=True),
++    ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt", group_memberwise=True),
++    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le", group_memberwise=True),
++    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge", group_memberwise=True),
++    ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and", group_memberwise=True),
++    ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and", group_memberwise=True),
++    ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or", group_memberwise=True),
++    ("or_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or", group_memberwise=True),
++    ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor", group_memberwise=True),
++    ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna", group_memberwise=True),
++    ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where", group_memberwise=True),
++    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip", group_memberwise=True),
+     ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
+ }
+ 
+--- a/src/trading_dsl_engine/jax_flat/custom.py
++++ b/src/trading_dsl_engine/jax_flat/custom.py
+@@ -21,6 +21,7 @@
+     output_kind: OutputKind | None = None
+     output_width: int | None = None
+     name: str | None = None
++    group_memberwise: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+@@ -31,6 +32,7 @@
+     output_kind: OutputKind | None = None
+     output_width: int | None = None
+     name: str | None = None
++    group_memberwise: bool = False
+ 
+     def __call__(self, *args) -> StatelessJaxCall:
+         if not args:
+@@ -41,6 +43,7 @@
+             output_kind=self.output_kind,
+             output_width=self.output_width,
+             name=self.name or getattr(self.fn, "__name__", None),
++            group_memberwise=self.group_memberwise,
+         )
+ 
+ 
+@@ -85,13 +88,16 @@
+     output_kind: OutputKind | None = None,
+     output_width: int | None = None,
+     name: str | None = None,
++    group_memberwise: bool = False,
+ ):
+     """Build a jax_flat Expr wrapper around a stateless JAX callable.
+ 
+     The callable is executed inside the jax_flat tick and batch JIT paths and may
+     accept any number of compiled child values. If output metadata is omitted,
+     jax_flat infers the output kind and width from the first child, which is
+-    suitable for shape-preserving transforms such as ``jnp.flip``.
++    suitable for shape-preserving transforms such as ``jnp.flip``. Set
++    ``group_memberwise=True`` only when the callable acts independently on each
++    instrument; this enables vectorized keyed-state execution inside groupby.
+     """
+ 
+     def wrap(target: Callable[..., jax.Array]) -> StatelessJaxFunction:
+@@ -100,6 +106,7 @@
+             output_kind=output_kind,
+             output_width=output_width,
+             name=name or getattr(target, "__name__", None),
++            group_memberwise=group_memberwise,
+         )
+ 
+     if fn is None:
+--- a/src/trading_dsl_engine/jax_flat/engine.py
++++ b/src/trading_dsl_engine/jax_flat/engine.py
+@@ -866,6 +866,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,

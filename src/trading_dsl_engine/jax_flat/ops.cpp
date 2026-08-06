@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -86,62 +85,8 @@ enum class OpCode : int {
     Ridge,
     GetBeta,
     GetPreds,
-    VolumeForFitSession,
-    VolumeForSeenSession,
-    Nonnegative,
-    PctSeenSessionVolume,
     Group,
-    Count,
 };
-
-enum class PrepareKind : uint8_t { None, Einsum, FutureBasis };
-enum class OutputRows : uint8_t { Instruments, Fixed, ModelProjection, EinsumDerived };
-enum class StateKind : uint8_t { Value, RollingMean, Shift, Ridge, InstrumentBasisMean, Group, Count };
-
-struct OpMetadata {
-    // These are construction-time traits, not the implementation of the op.
-    // Think of this as a Python dataclass keyed by OpCode: Runtime reads it once
-    // while building buffers/plans, and eval_row still executes the actual kernel.
-    PrepareKind prepare = PrepareKind::None;
-    OutputRows output_rows = OutputRows::Instruments;
-    StateKind state = StateKind::Value;
-    bool direct_root_write = false;
-    bool needs_rank_scratch = false;
-};
-
-constexpr auto make_op_metadata() {
-    // Every entry starts with the common vector/value-state defaults. An op is
-    // listed below only when it differs from those defaults. OpCode::Count makes
-    // the compiler keep this array aligned when new enum values are appended.
-    std::array<OpMetadata, static_cast<size_t>(OpCode::Count)> metadata{};
-    const auto set_direct = [&](OpCode opcode) { metadata[static_cast<size_t>(opcode)].direct_root_write = true; };
-    for (OpCode opcode : std::array{
-             OpCode::Input, OpCode::Literal, OpCode::Add, OpCode::Sub, OpCode::Mul, OpCode::Div,
-             OpCode::Abs, OpCode::Ln, OpCode::Ceil, OpCode::Floor, OpCode::Round, OpCode::Exp,
-             OpCode::Sign, OpCode::Arctan, OpCode::IsNan, OpCode::Purify, OpCode::Fraction,
-             OpCode::NormInv}) {
-        set_direct(opcode);
-    }
-    metadata[static_cast<size_t>(OpCode::Literal)].output_rows = OutputRows::Fixed;
-    metadata[static_cast<size_t>(OpCode::Mean)].output_rows = OutputRows::Fixed;
-    metadata[static_cast<size_t>(OpCode::GetBeta)].output_rows = OutputRows::ModelProjection;
-    metadata[static_cast<size_t>(OpCode::Einsum)].output_rows = OutputRows::EinsumDerived;
-    metadata[static_cast<size_t>(OpCode::Einsum)].prepare = PrepareKind::Einsum;
-    metadata[static_cast<size_t>(OpCode::FutureRbfBasisSum)].prepare = PrepareKind::FutureBasis;
-    metadata[static_cast<size_t>(OpCode::XsRank)].needs_rank_scratch = true;
-    metadata[static_cast<size_t>(OpCode::RollMean)].state = StateKind::RollingMean;
-    metadata[static_cast<size_t>(OpCode::Shift)].state = StateKind::Shift;
-    metadata[static_cast<size_t>(OpCode::Ridge)].state = StateKind::Ridge;
-    metadata[static_cast<size_t>(OpCode::InstrumentBasisMean)].state = StateKind::InstrumentBasisMean;
-    metadata[static_cast<size_t>(OpCode::Group)].state = StateKind::Group;
-    return metadata;
-}
-
-constexpr auto OP_METADATA = make_op_metadata();
-
-constexpr const OpMetadata& op_metadata(OpCode opcode) {
-    return OP_METADATA[static_cast<size_t>(opcode)];
-}
 
 OpCode parse_opcode(const std::string& name) {
     if (name == "input") return OpCode::Input;
@@ -199,10 +144,6 @@ OpCode parse_opcode(const std::string& name) {
     if (name == "ridge") return OpCode::Ridge;
     if (name == "get_beta") return OpCode::GetBeta;
     if (name == "get_preds") return OpCode::GetPreds;
-    if (name == "volume_for_fit_session") return OpCode::VolumeForFitSession;
-    if (name == "volume_for_seen_session") return OpCode::VolumeForSeenSession;
-    if (name == "nonnegative") return OpCode::Nonnegative;
-    if (name == "pct_seen_session_volume") return OpCode::PctSeenSessionVolume;
     if (name == "group") return OpCode::Group;
     throw std::invalid_argument("unsupported C++ jax_flat opcode: " + name);
 }
@@ -377,11 +318,6 @@ struct NodeValue {
     int size(int n) const { return rows(n) * width; }
 };
 
-struct RankItem {
-    double value;
-    int instrument;
-};
-
 struct ValueState {
     Vec value;
     Vec weight;
@@ -472,7 +408,6 @@ struct GroupState {
     std::vector<int> group_indices;
     RowMatrix keys;
     ByteVec occupied;
-    std::vector<uint64_t> key_hashes;
     Vec cached_group_key;
     int cached_group_slot = -1;
     int cached_group_universe = -1;
@@ -482,16 +417,13 @@ struct GroupState {
     std::vector<ByteVec> inner_initialized;
     std::vector<I64Vec> inner_streak;
     std::vector<ByteVec> inner_seen;
-    std::vector<double> inner_values_tmp;
 
-    GroupState(int key_count = 0, int slot_count = 0, int inner_state_count = 0, int instruments = 0, int inner_node_count = 0)
+    GroupState(int key_count = 0, int slot_count = 0, int inner_state_count = 0, int instruments = 0)
         : n_keys(key_count),
           capacity(slot_count),
           keys(RowMatrix::Constant(slot_count, std::max(key_count, 1), NaN)),
           occupied(ByteVec::Zero(slot_count)),
-          key_hashes(static_cast<size_t>(slot_count), 0),
-          cached_group_key(Vec::Constant(std::max(key_count, 1), NaN)),
-          inner_values_tmp(static_cast<size_t>(inner_node_count), NaN) {
+          cached_group_key(Vec::Constant(std::max(key_count, 1), NaN)) {
         inner_values.reserve(static_cast<size_t>(inner_state_count));
         inner_weights.reserve(static_cast<size_t>(inner_state_count));
         inner_initialized.reserve(static_cast<size_t>(inner_state_count));
@@ -544,24 +476,11 @@ private:
     std::vector<RidgeState> ridge_states_;
     std::vector<InstrumentBasisMeanState> instrument_basis_mean_states_;
     std::vector<GroupState> group_states_;
-    std::vector<RankItem> rank_items_;
-    std::vector<double> full_rank_scores_;
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
-    std::vector<const double*> batch_base_ptrs_;
-    std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> tick_input_owners_;
 };
 
 class Runtime {
-    struct PreparedNode {
-        // PreparedNode is deliberately generic and parallel to nodes_. Only the
-        // field selected by OpMetadata::prepare is populated. This moves parsing
-        // and lookup-table allocation out of eval_row without adding one vector
-        // (and one opcode allowlist) for every future prepared-data type.
-        EinsumExecPlan einsum;
-        std::vector<double> table;
-    };
-
 public:
     Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states)
         : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states) {
@@ -569,11 +488,9 @@ public:
             throw std::invalid_argument("invalid C++ jax_flat output id");
         }
         assign_native_state_indices();
-        prepared_nodes_.reserve(nodes_.size());
+        einsum_plans_.reserve(nodes_.size());
         for (const auto& spec : nodes_) {
-            const OpMetadata& metadata = op_metadata(spec.opcode);
-            has_rank_scratch_ = has_rank_scratch_ || metadata.needs_rank_scratch;
-            prepared_nodes_.push_back(prepare_node(spec, metadata.prepare));
+            einsum_plans_.push_back(spec.opcode == OpCode::Einsum ? make_einsum_exec_plan(spec) : EinsumExecPlan{});
         }
     }
 
@@ -590,18 +507,8 @@ public:
         if (out_buf.shape(0) != static_cast<py::ssize_t>(output_size(state))) {
             throw std::invalid_argument("tick_into output width does not match C++ jax_flat root output size");
         }
-        // Keep force-cast owners alive until native evaluation completes.  The
-        // previous helper retained only their raw pointers, which could dangle
-        // as soon as validation returned for non-float64/non-contiguous input.
         bind_tick_rows(state, rows);
-        if (state.n_instruments_ >= 1024) {
-            py::gil_scoped_release release;
-            eval_row(state, state.row_ptrs_, &out_buf(0));
-        } else {
-            // Releasing/reacquiring the GIL costs more than a short vector
-            // transition. Batch always releases once around its complete loop.
-            eval_row(state, state.row_ptrs_, &out_buf(0));
-        }
+        eval_row(state, state.row_ptrs_, &out_buf(0));
     }
 
     py::array_t<double> run_batch(State& state, py::args arrays) const {
@@ -615,29 +522,18 @@ public:
     void run_batch_into(State& state, py::array_t<double> out, py::args arrays) const {
         int64_t rows = -1;
         auto input_arrays = validate_batch(state, arrays, rows);
-        auto out_info = out.request();
-        const int row_width = output_size(state);
-        if (!(out.flags() & py::array::c_style) || out_info.size != rows * row_width) {
+        auto out_buf = out.mutable_unchecked<2>();
+        if (out_buf.shape(0) != rows || out_buf.shape(1) != static_cast<py::ssize_t>(output_size(state))) {
             throw std::invalid_argument("C++ jax_flat batch output shape mismatch");
         }
-        auto* __restrict output_ptr = static_cast<double*>(out_info.ptr);
         const int n = state.n_instruments_;
         state.row_ptrs_.assign(input_arrays.size(), nullptr);
-        state.batch_base_ptrs_.resize(input_arrays.size());
-        for (size_t i = 0; i < input_arrays.size(); ++i) {
-            state.batch_base_ptrs_[i] = static_cast<const double*>(input_arrays[i].request().ptr);
-        }
-        {
-            py::gil_scoped_release release;
-            for (int64_t t = 0; t < rows; ++t) {
-                for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
-                    state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
-#if defined(__GNUC__) || defined(__clang__)
-                    if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
-#endif
-                }
-                eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
-            }
+        std::vector<const double*> base_ptrs;
+        base_ptrs.reserve(input_arrays.size());
+        for (const auto& arr : input_arrays) base_ptrs.push_back(static_cast<const double*>(arr.request().ptr));
+        for (int64_t t = 0; t < rows; ++t) {
+            for (size_t i = 0; i < base_ptrs.size(); ++i) state.row_ptrs_[i] = base_ptrs[i] + t * n;
+            eval_row(state, state.row_ptrs_, &out_buf(t, 0));
         }
     }
 
@@ -646,72 +542,12 @@ private:
     std::vector<NodeSpec> nodes_;
     int output_id_;
     int n_states_;
-    std::vector<PreparedNode> prepared_nodes_;
-    bool has_rank_scratch_ = false;
+    std::vector<EinsumExecPlan> einsum_plans_;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
-    static PreparedNode prepare_node(const NodeSpec& spec, PrepareKind kind) {
-        PreparedNode prepared;
-        switch (kind) {
-            case PrepareKind::None: break;
-            case PrepareKind::Einsum: prepared.einsum = make_einsum_exec_plan(spec); break;
-            case PrepareKind::FutureBasis: prepared.table = make_future_basis_table(spec); break;
-        }
-        return prepared;
-    }
-
-    static void configure_value_layout(
-        const NodeSpec& spec, const std::vector<NodeSpec>& nodes,
-        const std::vector<NodeValue>& prior_values, int n_instruments, NodeValue& value) {
-        value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
-        value.fixed_rows = 1;
-        // rows_kind answers "what does axis 0 mean?": instruments (n rows) or a
-        // fixed mathematical result (usually one row). Width is axis 1. Most ops
-        // use the first branch; only shape-changing families need another policy.
-        switch (op_metadata(spec.opcode).output_rows) {
-            case OutputRows::Instruments:
-                value.rows_kind = 0;
-                return;
-            case OutputRows::Fixed:
-                value.rows_kind = 1;
-                return;
-            case OutputRows::ModelProjection: {
-                const bool instrument_projection = !spec.children.empty()
-                    && nodes[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
-                value.rows_kind = instrument_projection ? 0 : 1;
-                return;
-            }
-            case OutputRows::EinsumDerived:
-                break;
-        }
-
-        const bool fixed_matrix = spec.str_param.ends_with("->jk") && !spec.feature_widths.empty();
-        value.fixed_rows = fixed_matrix ? spec.feature_widths[0] : 1;
-        bool fixed_rows = spec.str_param.ends_with("->") || fixed_matrix;
-        const size_t arrow = spec.str_param.find("->");
-        const std::string out_text = arrow == std::string::npos ? std::string() : spec.str_param.substr(arrow + 2);
-        const auto out_labels = parse_einsum_term(out_text);
-        if (out_labels.size() == 1) {
-            bool instrument_rows = false;
-            const auto in_terms = split_einsum_csv(spec.str_param.substr(0, arrow));
-            for (size_t child_i = 0; child_i < in_terms.size() && child_i < spec.children.size(); ++child_i) {
-                const auto labels = parse_einsum_term(in_terms[child_i]);
-                if (!labels.empty() && labels[0] == out_labels[0]) {
-                    const NodeValue& child_value = prior_values[static_cast<size_t>(spec.children[child_i])];
-                    if (!(child_value.rows_kind == 1 && child_value.width > 1 && labels.size() == 1)) instrument_rows = true;
-                }
-            }
-            fixed_rows = !instrument_rows;
-        }
-        value.rows_kind = fixed_rows ? 1 : 0;
-    }
-
-    void bind_tick_rows(
-        State& state, py::args rows) const {
+    void bind_tick_rows(State& state, py::args rows) const {
         if (rows.size() != state.row_ptrs_.size()) throw std::invalid_argument("wrong number of C++ jax_flat tick inputs");
-        state.tick_input_owners_.clear();
-        state.tick_input_owners_.reserve(rows.size());
         for (size_t i = 0; i < rows.size(); ++i) {
             py::array_t<double, py::array::c_style | py::array::forcecast> arr = py::cast<py::array>(rows[i]);
             auto info = arr.request();
@@ -719,7 +555,6 @@ private:
                 throw std::invalid_argument("C++ jax_flat tick inputs must be 1D float64 arrays matching n_instruments");
             }
             state.row_ptrs_[i] = static_cast<const double*>(info.ptr);
-            state.tick_input_owners_.push_back(std::move(arr));
         }
     }
 
@@ -748,10 +583,21 @@ private:
     static GroupState& group_state(State& state, const NodeSpec& spec) { return state.group_states_.at(static_cast<size_t>(spec.state_index)); }
 
     void assign_native_state_indices() {
-        std::array<int, static_cast<size_t>(StateKind::Count)> next{};
+        std::array<int, 6> next{0, 0, 0, 0, 0, 0};
         for (NodeSpec& spec : nodes_) {
             if (spec.state_index < 0) continue;
-            spec.state_index = next[static_cast<size_t>(op_metadata(spec.opcode).state)]++;
+            spec.state_index = next[static_cast<size_t>(state_bucket(spec.opcode))]++;
+        }
+    }
+
+    static int state_bucket(OpCode opcode) {
+        switch (opcode) {
+            case OpCode::RollMean: return 1;
+            case OpCode::Shift: return 2;
+            case OpCode::Ridge: return 3;
+            case OpCode::InstrumentBasisMean: return 4;
+            case OpCode::Group: return 5;
+            default: return 0;
         }
     }
     static const NodeValue& child(const State& state, const NodeSpec& spec, size_t i) { return state.values_.at(static_cast<size_t>(spec.children.at(i))); }
@@ -793,6 +639,7 @@ private:
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
+        std::vector<double> row(static_cast<size_t>(k));
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -803,29 +650,26 @@ private:
                 for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = NaN;
                 continue;
             }
-            normalized_rbf_row((ts - s) / len, k, dst_v.data.data() + static_cast<size_t>(i * k));
+            normalized_rbf_row((ts - s) / len, k, row.data());
+            for (int b = 0; b < k; ++b) dst_v.data[static_cast<size_t>(i * k + b)] = row[static_cast<size_t>(b)];
         }
     }
 
-    static std::vector<double> make_future_basis_table(const NodeSpec& spec) {
-        const int k = spec.width;
-        const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
-        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
-        std::vector<double> vals(static_cast<size_t>(k));
-        for (int g = steps - 1; g >= 0; --g) {
-            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
-            for (int b = 0; b < k; ++b) suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
-        }
-        return suffix;
-    }
-
-    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v, const std::vector<double>& suffix) {
+    static void fill_future_rbf_basis_sum(State& state, const NodeSpec& spec, NodeValue& dst_v) {
         const int n = state.n_instruments_;
         const int k = spec.width;
         const int steps = std::max(1, static_cast<int>(std::llround(spec.param)));
         const auto& ev = child(state, spec, 0);
         const auto& start = child(state, spec, 1);
         const auto& end = child(state, spec, 2);
+        std::vector<double> suffix(static_cast<size_t>((steps + 1) * k), 0.0);
+        std::vector<double> vals(static_cast<size_t>(k));
+        for (int g = steps - 1; g >= 0; --g) {
+            normalized_rbf_row(static_cast<double>(g) / static_cast<double>(steps), k, vals.data());
+            for (int b = 0; b < k; ++b) {
+                suffix[static_cast<size_t>(g * k + b)] = suffix[static_cast<size_t>((g + 1) * k + b)] + vals[static_cast<size_t>(b)];
+            }
+        }
         for (int i = 0; i < n; ++i) {
             const double ts = at(ev, n, i);
             const double s = at(start, n, i);
@@ -969,67 +813,12 @@ private:
         }
     }
 
-    template <OpCode Code>
-    static void eval_basic_binary(State& state, const NodeSpec& spec, NodeValue& dst_v, double* __restrict dst) {
-        const int n = state.n_instruments_;
-        const auto& lhs = child(state, spec, 0);
-        const auto& rhs = child(state, spec, 1);
-        const int width = dst_v.width;
-        if (width == 1) {
-            const bool lhs_scalar = lhs.rows(n) == 1;
-            const bool rhs_scalar = rhs.rows(n) == 1;
-            const double lhs0 = lhs.data[0];
-            const double rhs0 = rhs.data[0];
-            Eigen::Map<Vec> out(dst, n);
-            Eigen::Map<const Vec> lhs_vec(lhs.data.data(), lhs_scalar ? 1 : n);
-            Eigen::Map<const Vec> rhs_vec(rhs.data.data(), rhs_scalar ? 1 : n);
-            if constexpr (Code == OpCode::Add) {
-                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 + rhs0);
-                else if (lhs_scalar) out.array() = lhs0 + rhs_vec.array();
-                else if (rhs_scalar) out.array() = lhs_vec.array() + rhs0;
-                else out.array() = lhs_vec.array() + rhs_vec.array();
-            } else if constexpr (Code == OpCode::Sub) {
-                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 - rhs0);
-                else if (lhs_scalar) out.array() = lhs0 - rhs_vec.array();
-                else if (rhs_scalar) out.array() = lhs_vec.array() - rhs0;
-                else out.array() = lhs_vec.array() - rhs_vec.array();
-            } else if constexpr (Code == OpCode::Mul) {
-                if (lhs_scalar && rhs_scalar) out.setConstant(lhs0 * rhs0);
-                else if (lhs_scalar) out.array() = lhs0 * rhs_vec.array();
-                else if (rhs_scalar) out.array() = lhs_vec.array() * rhs0;
-                else out.array() = lhs_vec.array() * rhs_vec.array();
-            } else if constexpr (Code == OpCode::Div) {
-                if (rhs_scalar) {
-                    if (rhs0 == 0.0) out.setConstant(NaN);
-                    else if (lhs_scalar) out.setConstant(lhs0 / rhs0);
-                    else out.array() = lhs_vec.array() / rhs0;
-                } else if (lhs_scalar) {
-                    out.array() = (rhs_vec.array() == 0.0).select(NaN, lhs0 / rhs_vec.array());
-                } else {
-                    out.array() = (rhs_vec.array() == 0.0).select(NaN, lhs_vec.array() / rhs_vec.array());
-                }
-            }
-            return;
-        }
-        for (int i = 0; i < n; ++i) {
-            for (int c = 0; c < width; ++c) {
-                const double a = at(lhs, n, i, c);
-                const double b = at(rhs, n, i, c);
-                if constexpr (Code == OpCode::Add) dst[static_cast<size_t>(i * width + c)] = a + b;
-                else if constexpr (Code == OpCode::Sub) dst[static_cast<size_t>(i * width + c)] = a - b;
-                else if constexpr (Code == OpCode::Mul) dst[static_cast<size_t>(i * width + c)] = a * b;
-                else if constexpr (Code == OpCode::Div) dst[static_cast<size_t>(i * width + c)] = b == 0.0 ? NaN : a / b;
-            }
-        }
-    }
-
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
         const int n = state.n_instruments_;
-        const bool direct_root = op_metadata(nodes_[static_cast<size_t>(output_id_)].opcode).direct_root_write;
         for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
             const NodeSpec& spec = nodes_[node_i];
             NodeValue& dst_v = state.values_[node_i];
-            double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
+            double* __restrict dst = dst_v.data.data();
             switch (spec.opcode) {
                 case OpCode::Input: {
                     const double* __restrict src = input_ptrs.at(static_cast<size_t>(spec.input_index));
@@ -1039,10 +828,10 @@ private:
                 case OpCode::Literal:
                     std::fill(dst, dst + dst_v.size(n), spec.literal);
                     break;
-                case OpCode::Add: eval_basic_binary<OpCode::Add>(state, spec, dst_v, dst); break;
-                case OpCode::Sub: eval_basic_binary<OpCode::Sub>(state, spec, dst_v, dst); break;
-                case OpCode::Mul: eval_basic_binary<OpCode::Mul>(state, spec, dst_v, dst); break;
-                case OpCode::Div: eval_basic_binary<OpCode::Div>(state, spec, dst_v, dst); break;
+                case OpCode::Add:
+                case OpCode::Sub:
+                case OpCode::Mul:
+                case OpCode::Div:
                 case OpCode::Mod:
                 case OpCode::Pow:
                 case OpCode::FloorDiv:
@@ -1066,7 +855,11 @@ private:
                             const double a = at(l, n, i, c);
                             const double b = r_ptr == nullptr ? NaN : at(*r_ptr, n, i, c);
                             double out = NaN;
-                            if (spec.opcode == OpCode::Mod) out = b == 0.0 ? NaN : a - std::floor(a / b) * b;
+                            if (spec.opcode == OpCode::Add) out = a + b;
+                            else if (spec.opcode == OpCode::Sub) out = a - b;
+                            else if (spec.opcode == OpCode::Mul) out = a * b;
+                            else if (spec.opcode == OpCode::Div) out = b == 0.0 ? NaN : a / b;
+                            else if (spec.opcode == OpCode::Mod) out = b == 0.0 ? NaN : a - std::floor(a / b) * b;
                             else if (spec.opcode == OpCode::Pow) out = std::pow(a, b);
                             else if (spec.opcode == OpCode::FloorDiv) out = b == 0.0 ? NaN : std::floor(a / b);
                             else if (spec.opcode == OpCode::FillNa) out = std::isnan(a) ? b : a;
@@ -1092,18 +885,6 @@ private:
                     const auto& tv = child(state, spec, 1);
                     const auto& fv = child(state, spec, 2);
                     const int width = dst_v.width;
-                    if (width == 1) {
-                        const bool cond_scalar = cond.rows(n) == 1;
-                        const bool true_scalar = tv.rows(n) == 1;
-                        const bool false_scalar = fv.rows(n) == 1;
-                        for (int i = 0; i < n; ++i) {
-                            const double c = cond_scalar ? cond.data[0] : cond.data[static_cast<size_t>(i)];
-                            const double t = true_scalar ? tv.data[0] : tv.data[static_cast<size_t>(i)];
-                            const double f = false_scalar ? fv.data[0] : fv.data[static_cast<size_t>(i)];
-                            dst[i] = c != 0.0 ? t : f;
-                        }
-                        break;
-                    }
                     for (int i = 0; i < n; ++i) {
                         for (int c = 0; c < width; ++c) {
                             dst[static_cast<size_t>(i * width + c)] = at(cond, n, i, c) != 0.0 ? at(tv, n, i, c) : at(fv, n, i, c);
@@ -1158,7 +939,7 @@ private:
                     break;
                 }
                 case OpCode::Einsum: {
-                    eval_einsum(state, spec, prepared_nodes_[node_i].einsum, dst_v);
+                    eval_einsum(state, spec, einsum_plans_[node_i], dst_v);
                     break;
                 }
                 case OpCode::XsNorm: {
@@ -1195,33 +976,14 @@ private:
                 }
                 case OpCode::XsRank: {
                     const auto& x = child(state, spec, 0);
-                    auto& items = state.rank_items_;
-                    int count = 0;
+                    std::vector<double> compact;
+                    compact.reserve(static_cast<size_t>(n));
+                    for (int i = 0; i < n; ++i) if (finite(x.data[static_cast<size_t>(i)])) compact.push_back(x.data[static_cast<size_t>(i)]);
+                    std::sort(compact.begin(), compact.end());
+                    const double denom = static_cast<double>(compact.size() + 1);
                     for (int i = 0; i < n; ++i) {
-                        const double value = x.data[static_cast<size_t>(i)];
-                        if (finite(value)) {
-                            items[static_cast<size_t>(count++)] = RankItem{value, i};
-                        } else {
-                            dst[i] = NaN;
-                        }
-                    }
-                    std::sort(
-                        items.begin(), items.begin() + count,
-                        [](const RankItem& lhs, const RankItem& rhs) { return lhs.value < rhs.value; });
-                    const double denom = static_cast<double>(count + 1);
-                    int tie_start = 0;
-                    while (tie_start < count) {
-                        int upper = tie_start + 1;
-                        while (upper < count && items[static_cast<size_t>(upper)].value == items[static_cast<size_t>(tie_start)].value) {
-                            ++upper;
-                        }
-                        const double score = count == n
-                            ? state.full_rank_scores_[static_cast<size_t>(upper - 1)]
-                            : norm_inv(static_cast<double>(upper) / denom);
-                        for (int pos = tie_start; pos < upper; ++pos) {
-                            dst[items[static_cast<size_t>(pos)].instrument] = score;
-                        }
-                        tie_start = upper;
+                        const double v = x.data[static_cast<size_t>(i)];
+                        dst[i] = finite(v) ? norm_inv(static_cast<double>(std::upper_bound(compact.begin(), compact.end(), v) - compact.begin()) / denom) : NaN;
                     }
                     break;
                 }
@@ -1264,7 +1026,7 @@ private:
                     fill_rbf_basis(state, spec, dst_v);
                     break;
                 case OpCode::FutureRbfBasisSum:
-                    fill_future_rbf_basis_sum(state, spec, dst_v, prepared_nodes_[node_i].table);
+                    fill_future_rbf_basis_sum(state, spec, dst_v);
                     break;
                 case OpCode::Col: {
                     const auto& x = child(state, spec, 0);
@@ -1391,49 +1153,13 @@ private:
                     std::copy(r.data.begin(), r.data.end(), dst);
                     break;
                 }
-                case OpCode::VolumeForFitSession:
-                case OpCode::VolumeForSeenSession:
-                case OpCode::Nonnegative:
-                case OpCode::PctSeenSessionVolume: {
-                    const auto& first = child(state, spec, 0);
-                    for (int i = 0; i < n; ++i) {
-                        if (spec.opcode == OpCode::Nonnegative) {
-                            const double x = at(first, n, i);
-                            dst[i] = finite(x) ? std::max(x, 0.0) : 0.0;
-                            continue;
-                        }
-                        if (spec.opcode == OpCode::PctSeenSessionVolume) {
-                            const double seen = at(first, n, i);
-                            const double forecast = at(child(state, spec, 1), n, i);
-                            const double ts = at(child(state, spec, 2), n, i);
-                            const double start = at(child(state, spec, 3), n, i);
-                            dst[i] = finite(ts) && finite(start) && ts >= start && seen + forecast > 0.0
-                                ? seen / (seen + forecast) : NaN;
-                            continue;
-                        }
-                        const double volume = at(first, n, i);
-                        const double ts = at(child(state, spec, 1), n, i);
-                        const double start = at(child(state, spec, 2), n, i);
-                        const double end = at(child(state, spec, 3), n, i);
-                        bool active = finite(ts) && finite(start) && finite(end) && end > start && ts >= start && ts < end;
-                        if (spec.opcode == OpCode::VolumeForSeenSession) {
-                            const double tradable = at(child(state, spec, 4), n, i);
-                            active = active && finite(tradable) && tradable == 1.0;
-                        }
-                        const double clean = finite(volume) ? std::max(volume, 0.0) : 0.0;
-                        dst[i] = active ? clean : (spec.opcode == OpCode::VolumeForFitSession ? NaN : 0.0);
-                    }
-                    break;
-                }
                 case OpCode::Group:
                     eval_group(state, spec, dst_v);
                     break;
             }
         }
-        if (!direct_root) {
-            const auto& root = state.values_[static_cast<size_t>(output_id_)];
-            std::copy(root.data.begin(), root.data.begin() + root.size(n), out_ptr);
-        }
+        const auto& root = state.values_[static_cast<size_t>(output_id_)];
+        std::copy(root.data.begin(), root.data.begin() + root.size(n), out_ptr);
     }
 
 
@@ -1574,7 +1300,7 @@ private:
         const int lhs_child = s.n_keys;
         const auto& lhs = state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(lhs_child)])];
         std::fill(dst_v.data.begin(), dst_v.data.end(), NaN);
-        auto& inner_values_tmp = s.inner_values_tmp;
+        std::vector<double> inner_values_tmp(spec.inner_nodes.size(), NaN);
         for (int group_i = 0; group_i < s.n_groups; ++group_i) {
             for (int pos = s.group_offsets[static_cast<size_t>(group_i)]; pos < s.group_offsets[static_cast<size_t>(group_i + 1)]; ++pos) {
                 eval_group_row(state, spec, s, lhs, group_i, s.group_indices[static_cast<size_t>(pos)], inner_values_tmp, dst_v);
@@ -1621,54 +1347,25 @@ private:
             return s.cached_group_slot;
         }
         const int begin = group_i * s.capacity;
-        const uint64_t hash = hash_group_key(state, spec, row);
-        const int start = static_cast<int>(hash % static_cast<uint64_t>(s.capacity));
-        int relative_slot = start;
-        for (int probe = 0; probe < s.capacity; ++probe) {
-            const int slot_i = begin + relative_slot;
-            if (!s.occupied[slot_i]) {
-                s.occupied[slot_i] = 1;
-                s.key_hashes[static_cast<size_t>(slot_i)] = hash;
-                const int n = state.n_instruments_;
-                for (int k = 0; k < s.n_keys; ++k) {
-                    s.keys(slot_i, k) = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
-                }
+        const int end = begin + s.capacity;
+        for (int slot_i = begin; slot_i < end; ++slot_i) {
+            if (!s.occupied[slot_i]) continue;
+            if (row_matches_slot(state, spec, row, s, slot_i)) {
                 cache_group_slot(state, spec, row, group_i, s, slot_i);
                 return slot_i;
             }
-            if (s.key_hashes[static_cast<size_t>(slot_i)] == hash && row_matches_slot(state, spec, row, s, slot_i)) {
-                cache_group_slot(state, spec, row, group_i, s, slot_i);
-                return slot_i;
+        }
+        for (int slot_i = begin; slot_i < end; ++slot_i) {
+            if (s.occupied[slot_i]) continue;
+            s.occupied[slot_i] = 1;
+            const int n = state.n_instruments_;
+            for (int k = 0; k < s.n_keys; ++k) {
+                s.keys(slot_i, k) = at(state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
             }
-            if (++relative_slot == s.capacity) relative_slot = 0;
+            cache_group_slot(state, spec, row, group_i, s, slot_i);
+            return slot_i;
         }
         throw std::runtime_error("C++ jax_flat groupby capacity exceeded");
-    }
-
-    static uint64_t canonical_key_bits(double value) {
-        if (std::isnan(value)) return UINT64_C(0x7ff8000000000000);
-        if (value == 0.0) return 0;  // Equality treats -0.0 and +0.0 as one key.
-        return std::bit_cast<uint64_t>(value);
-    }
-
-    static uint64_t mix_key_hash(uint64_t hash, uint64_t value) {
-        value ^= value >> 30;
-        value *= UINT64_C(0xbf58476d1ce4e5b9);
-        value ^= value >> 27;
-        value *= UINT64_C(0x94d049bb133111eb);
-        value ^= value >> 31;
-        return hash ^ (value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2));
-    }
-
-    static uint64_t hash_group_key(State& state, const NodeSpec& spec, int row) {
-        const int n = state.n_instruments_;
-        uint64_t hash = UINT64_C(0xcbf29ce484222325);
-        for (int k = 0; k < spec.int_param; ++k) {
-            const double value = at(
-                state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(k)])], n, row, 0);
-            hash = mix_key_hash(hash, canonical_key_bits(value));
-        }
-        return hash;
     }
 
     void eval_ridge(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
@@ -1849,64 +1546,73 @@ void configure_group_universe(GroupState& group, const NodeSpec& spec, int n_ins
     }
 }
 
-State::State(const Runtime* runtime, int n_instruments)
-    : n_instruments_(n_instruments),
-      rank_items_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0),
-      full_rank_scores_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0) {
+State::State(const Runtime* runtime, int n_instruments) : n_instruments_(n_instruments) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
-    if (runtime->has_rank_scratch_) {
-        for (int rank = 1; rank <= n_instruments; ++rank) {
-            full_rank_scores_[static_cast<size_t>(rank - 1)] =
-                norm_inv(static_cast<double>(rank) / static_cast<double>(n_instruments + 1));
-        }
-    }
     values_.resize(runtime->nodes_.size());
     for (size_t i = 0; i < runtime->nodes_.size(); ++i) {
         const NodeSpec& spec = runtime->nodes_[i];
         NodeValue& value = values_[i];
-        Runtime::configure_value_layout(spec, runtime->nodes_, values_, n_instruments, value);
+        value.width = spec.width == 0 ? n_instruments : std::max(spec.width, 1);
+        value.fixed_rows = (spec.opcode == OpCode::Einsum && spec.str_param.ends_with("->jk") && !spec.feature_widths.empty()) ? spec.feature_widths[0] : 1;
+        const bool instrument_beta = spec.opcode == OpCode::GetBeta
+            && !spec.children.empty()
+            && runtime->nodes_[static_cast<size_t>(spec.children[0])].opcode == OpCode::InstrumentBasisMean;
+        bool fixed_einsum_rows = spec.opcode == OpCode::Einsum && (spec.str_param.ends_with("->") || spec.str_param.ends_with("->jk"));
+        if (spec.opcode == OpCode::Einsum) {
+            const size_t arrow = spec.str_param.find("->");
+            const std::string out_text = arrow == std::string::npos ? std::string() : spec.str_param.substr(arrow + 2);
+            const auto out_labels = parse_einsum_term(out_text);
+            if (out_labels.size() == 1) {
+                bool instrument_rows = false;
+                const auto in_terms = split_einsum_csv(spec.str_param.substr(0, arrow));
+                for (size_t child_i = 0; child_i < in_terms.size() && child_i < spec.children.size(); ++child_i) {
+                    const auto labels = parse_einsum_term(in_terms[child_i]);
+                    if (!labels.empty() && labels[0] == out_labels[0]) {
+                        const NodeValue& child_value = values_[static_cast<size_t>(spec.children[child_i])];
+                        if (!(child_value.rows_kind == 1 && child_value.width > 1 && labels.size() == 1)) instrument_rows = true;
+                    }
+                }
+                fixed_einsum_rows = !instrument_rows;
+            }
+        }
+        value.rows_kind = ((spec.opcode == OpCode::GetBeta && !instrument_beta) || spec.opcode == OpCode::Mean || fixed_einsum_rows) ? 1 : 0;
         value.data.assign(static_cast<size_t>(value.size(n_instruments)), NaN);
     }
     output_.assign(static_cast<size_t>(values_[static_cast<size_t>(runtime->output_id_)].size(n_instruments)), NaN);
     row_ptrs_.assign(count_inputs(runtime->nodes_), nullptr);
-    tick_input_owners_.reserve(row_ptrs_.size());
     for (const NodeSpec& spec : runtime->nodes_) {
         if (spec.state_index < 0) continue;
         const int node_size = values_[static_cast<size_t>(&spec - runtime->nodes_.data())].size(n_instruments);
 
-        switch (op_metadata(spec.opcode).state) {
-            case StateKind::RollingMean:
+        switch (spec.opcode) {
+            case OpCode::RollMean:
                 rolling_mean_states_.emplace_back(spec.int_param, node_size);
                 break;
-            case StateKind::Shift:
+            case OpCode::Shift:
                 shift_states_.emplace_back(spec.int_param + 1, node_size);
                 break;
-            case StateKind::Ridge: {
+            case OpCode::Ridge: {
                 const int feature_count = std::accumulate(spec.feature_widths.begin(), spec.feature_widths.end(), 0);
                 ridge_states_.emplace_back(feature_count, n_instruments);
                 break;
             }
-            case StateKind::InstrumentBasisMean: {
+            case OpCode::InstrumentBasisMean: {
                 const int feature_width = spec.feature_widths.empty() ? spec.width : spec.feature_widths.at(0);
                 instrument_basis_mean_states_.emplace_back(feature_width, n_instruments);
                 break;
             }
-            case StateKind::Group: {
+            case OpCode::Group: {
                 const int groups = spec.feature_widths.empty() ? 1 : spec.feature_widths.at(0);
                 const int capacity = static_cast<int>(spec.param);
                 const int total_slots = capacity * groups;
                 const int inner_states = count_inner_states(spec.inner_nodes);
-                group_states_.emplace_back(
-                    spec.int_param, total_slots, inner_states, n_instruments,
-                    static_cast<int>(spec.inner_nodes.size()));
+                group_states_.emplace_back(spec.int_param, total_slots, inner_states, n_instruments);
                 configure_group_universe(group_states_.back(), spec, n_instruments, groups, capacity);
                 break;
             }
-            case StateKind::Value:
+            default:
                 value_states_.emplace_back(node_size);
                 break;
-            case StateKind::Count:
-                throw std::logic_error("invalid native state metadata");
         }
     }
 }

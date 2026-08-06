@@ -75,7 +75,8 @@ from trading_dsl_engine.base.dsl import (
     arctan,
     pow,
 )
-from trading_dsl_engine.base.keys import Key, key
+
+
 from trading_dsl_engine.base.terminals import (
     feature_names_with_tags,
     futures_field_metadata,
@@ -97,8 +98,6 @@ __all__ = [
     "call",
     "op",
     "var",
-    "Key",
-    "key",
     "add",
     "sub",
     "mul",

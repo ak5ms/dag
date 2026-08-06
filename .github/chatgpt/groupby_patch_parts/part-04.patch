@@ -1,0 +1,109 @@
++
++    fast_fn = stateless(
++        lambda x, y: x + 2.0 * y,
++        name="fast_fn",
++        group_memberwise=True,
++    )
++    generic_fn = stateless(lambda x, y: x + 2.0 * y, name="generic_fn")
++    key = var("key")
++    x = var("x")
++    y = var("y")
++    fast_formula = groupby((key,), x, cumsum(ewm(fast_fn(self_, y), 3.0)))
++    builtin_formula = groupby((key,), x, cumsum(ewm(self_ + 2.0 * y, 3.0)))
++    generic_formula = groupby((key,), x, cumsum(ewm(generic_fn(self_, y), 3.0)))
++
++    fast = compile_formula(fast_formula, cpp=False)
++    builtin = compile_formula(builtin_formula, cpp=False)
++    generic = compile_formula(generic_formula, cpp=False)
++    fast_op = fast.program.nodes[fast.program.outputs[0]].op
++    generic_op = generic.program.nodes[generic.program.outputs[0]].op
++    assert fast_op._inner_graph_is_memberwise()
++    assert not generic_op._inner_graph_is_memberwise()
++
++    rows = 32
++    cols = 5
++    row = np.arange(rows, dtype=np.float64)[:, None]
++    col = np.arange(cols, dtype=np.float64)[None, :]
++    data = {
++        "key": np.mod(row // 3.0 + col, 4.0),
++        "x": 0.1 * row + col,
++        "y": np.sin(0.2 * row + col),
++    }
++    data["x"][7, 2] = np.nan
++    data["y"][11, 4] = np.nan
++
++    _, fast_out = fast.run_batch(data)
++    _, builtin_out = builtin.run_batch(data)
++    np.testing.assert_allclose(
++        np.asarray(fast_out),
++        np.asarray(builtin_out),
++        rtol=1e-10,
++        atol=1e-10,
++        equal_nan=True,
++    )
+--- a/tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py
++++ b/tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py
+@@ -166,6 +166,24 @@
+     )
+ 
+ 
++def test_cpp_flat_groupby_nested_rhs_supports_multiple_feeds():
++    rows = 40
++    cols = 6
++    row = np.arange(rows, dtype=np.float64)[:, None]
++    col = np.arange(cols, dtype=np.float64)[None, :]
++    close = 0.2 * row + col
++    open_ = np.cos(0.1 * row + col)
++    key = np.mod(row // 2.0 + col, 5.0)
++    close[6, 2] = np.nan
++    open_[13, 4] = np.nan
++    data = {"close": close, "open": open_, "key": key}
++
++    _assert_cpp_matches_pure_jax(
++        "groupby((key,), close, cumsum(ewm(add(self_, open), 3.0)))",
++        data,
++    )
++
++
+ def test_cpp_flat_tick_into_reuses_output_buffer():
+     runtime = compile_formula_native("add(close, open)")
+     state = runtime.init_state(3)
+--- a/README.md
++++ b/README.md
+@@ -131,7 +131,7 @@
+ 
+ The active `trading_dsl_engine.jax_flat` backend additionally supports `buffer(shift(x, lag, max_size), min_lag, max_lag)` (or keyword form `buffer(shift(x, lag=..., max_lag=...), min=..., max=...)`). This JAX-flat-only operator emits a lag cube whose last axis is lags `1..max_lag`, preserving shift ring ordering and masking lags below dynamic `min_lag`, above dynamic `lag`, or beyond available history. Vector inputs produce `(time, n_instruments, max_lag)` outputs; matrix/ndarray inputs such as `bspline(...)` preserve their feature axes and append the lag axis, e.g. `(time, n_instruments, n_basis, max_lag)`.
+ 
+-`jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis:
++`jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis. Callables that operate independently on each instrument may set `group_memberwise=True`; grouped state is then gathered for every `(key slot, instrument)` pair, the complete nested RHS graph is evaluated with one `vmap`, and all state leaves are scattered back in one operation instead of invoking the RHS once per member:
+ 
+ For JIT diagnostics, a compiled JAX-flat runtime exposes `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)`, with `get_jaxpr`/`get_compiled_hlo` aliases. The arguments follow `tick`'s state-and-row ABI; the latter helper returns the compiled executable's optimized HLO text. `jit_compile_count` tracks observed tick-transition JAX traces (a per-runtime proxy for JIT compilation cache misses) across live ticks, compiled-HLO inspection, and batch scans, and `reset_jit_compile_count()` clears it. JAXPR inspection itself does not change the counter because it does not compile.
+ 
+@@ -141,6 +141,7 @@
+ from trading_dsl_engine.jax_flat import compile_formula, stateless
+ 
+ rev = stateless(lambda x: jnp.flip(x, axis=-1), name="rev")
++scale = stateless(lambda x, y: x + 2.0 * y, name="scale", group_memberwise=True)
+ close = var("close")
+ upper_lag = var("upper_lag")
+ min_lag = var("min_lag")
+@@ -180,7 +181,7 @@
+ 
+ The native batch helper intentionally stays a repeated tick loop over the same `eval_row` transition rather than a separate vectorized semantic path. It binds contiguous row pointers once, calls the same non-batch evaluator for each row, and uses `__restrict`/flat contiguous buffers so C++ compilers can optimize the row loop without changing streaming state behavior. The benchmark script compiles and warms both C++ and JAX-flat runtimes before timing, so printed results exclude extension import, formula compilation, and JAX first-use compilation. When the optional extension is installed, `JaxFlatRuntime.run_batch(...)` may use the same native flat evaluator for fully supported dynamic-key groupby programs (including `univ(...)` column partitions and NumPy memmap-backed batch inputs) with no caller-supplied state. If the whole formula is not native-lowerable but contains coarse supported stateful/grouped subgraphs, batch execution can materialize multiple native islands, compute one or more JAX-only frontier values, and then run a final supported native root when the downstream graph becomes C++-lowerable again; this handles shapes such as `cpp(jax_only(cpp(...)), cpp(...))` while keeping user `jax_flat.stateless(...)` callables on the compiled JAX path. Set `TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=1` to force the pure JAX path for behavior checks. Native groupby lowering uses a nested RHS node table rather than a per-operator grouped-cumsum branch, so additional scalar/vector-width-1 RHS operators can compose without adding a new grouped hot-path case. If a grouped formula is not yet native-supported, `run_batch` emits a one-time `RuntimeWarning` identifying the unsupported node and automatically falls back to the JAX-flat implementation.
+ 
+-Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `outer`, an Eigen-backed `einsum` subset, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights solved via Eigen, `get_beta`, `get_preds`, and dynamic-key `groupby(...)` with optional `univ(...)` column partitions for nested scalar/vector-width-1 RHS graphs over `self_` (for example `cumsum(self_)`, `cumsum(cumsum(self_))`, or `add(cumsum(self_), 1)`). Explicit `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` still raises `NotImplementedError` for unsupported nodes, while automatic `compile_formula(..., cpp=True)` acceleration either runs a full native batch, runs supported native subgraphs before a JAX residual, or warns once and falls back to the default JAX-flat runtime. Arbitrary Python/JAX lambdas cannot be invoked from the C++ hot path without embedding a Python interpreter or a separate lowering/code-generation layer; today they remain JAX residual nodes unless rewritten as registered builtins with a `cpp_name` and native implementation.
++Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `outer`, an Eigen-backed `einsum` subset, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights solved via Eigen, `get_beta`, `get_preds`, and dynamic-key `groupby(...)` with optional `univ(...)` column partitions for nested scalar/vector-width-1 RHS graphs over any number of grouped feeds (for example `cumsum(self_)`, `cumsum(cumsum(self_))`, or `cumsum(ewm(add(self_, open), 3))`). Explicit `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` still raises `NotImplementedError` for unsupported nodes, while automatic `compile_formula(..., cpp=True)` acceleration either runs a full native batch, runs supported native subgraphs before a JAX residual, or warns once and falls back to the default JAX-flat runtime. Arbitrary Python/JAX lambdas cannot be invoked from the C++ hot path without embedding a Python interpreter or a separate lowering/code-generation layer; today they remain JAX residual nodes unless rewritten as registered builtins with a `cpp_name` and native implementation.
+ 
+ The extension build defaults to aggressive native optimization for local performance-sensitive installs: `-O3`, `-DNDEBUG`, `-DEIGEN_NO_DEBUG`, link-time optimization, `-march=native`, `-mtune=native`, `-fvisibility=hidden`, `-fno-math-errno`, and loop unrolling on Unix-like compilers. It intentionally does not enable `-ffast-math`, because the DSL has explicit NaN, infinity, and divide-by-zero semantics that must match JAX-flat behavior. Set `TRADING_DSL_ENGINE_CPP_NATIVE=0` before installation to omit CPU-specific `-march/-mtune` flags for redistributable wheels, set `TRADING_DSL_ENGINE_CPP_LTO=0` if the compiler/linker toolchain cannot use LTO, or append custom flags with `TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS` and `TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS`. To force a clean rebuild of previously built native binaries, remove `build/`, any in-place extension such as `src/trading_dsl_engine/jax_flat/_cpp_flat*.so`, and stale package metadata such as `src/trading_dsl_engine.egg-info/`, then reinstall with `python -m pip install -e . --no-build-isolation --force-reinstall --no-cache-dir` or run `python setup.py build_ext --inplace --force -v` for a direct verbose extension rebuild.
+ 
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -20,7 +20,7 @@
+ - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
+ - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
+ - Keep compiler composition nested (no interpreter fallback in execution hot path).
+-- For grouped runtime implementations (especially JAX/JAX-flat), do not add per-operator custom hot-path branches (for example, special-casing `cumsum` inside `GroupbyOp`). Keep grouped execution generic/compositional and optimize shared mechanisms instead.
++- For grouped runtime implementations (especially JAX/JAX-flat), do not add per-operator custom hot-path branches (for example, special-casing `cumsum` inside `GroupbyOp`). Keep grouped execution generic/compositional and optimize shared mechanisms instead. Componentwise operators may declare `group_memberwise=True`; the shared grouped runtime must vectorize the complete eligible inner graph rather than branch on operator names.
+ - For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution. JAX-flat-only lag-history operators such as `buffer(shift(...), min_lag, max_size)` should expose ordered ring state through compositional JAX ops, not Numba kernels. User-supplied `jax_flat.stateless(...)` callables must stay stateless and execute through the same generic compiled `NaryOp` tick/`vmap` batch path. When adding a JAX-flat operator, implement `scan_batch` alongside `init_state` and `tick` rather than relying on the default per-tick scan.
+ - JAX-flat runtime diagnostics must remain off the hot path: `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)` use the tick ABI for debugging; JAXPR inspection does not affect `jit_compile_count`, while compiled-HLO inspection records its compile trace. The counter records observed traced tick transitions as a per-runtime JIT-compilation proxy.
+ - Support arity > 1 cleanly.

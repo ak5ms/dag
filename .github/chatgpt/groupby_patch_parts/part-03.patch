@@ -1,0 +1,120 @@
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
+@@ -894,6 +895,7 @@
+             node.output_kind,
+             node.output_width,
+             node.name,
++            node.group_memberwise,
+             tuple(_expr_key(a) for a in node.args),
+         )
+     if isinstance(node, StatelessJaxCall):
+@@ -973,6 +975,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
+@@ -1043,7 +1046,12 @@
+         raise ValueError("stateless JAX call expects at least one child")
+     output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+     output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+-    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
++    return NaryOp(
++        expr.fn,
++        output_kind=output_kind,
++        output_width=output_width,
++        group_memberwise=expr.group_memberwise,
++    )
+ 
+ 
+ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
+@@ -1098,7 +1106,10 @@
+             return NaryOp(jnp.round, cpp_name="round"), None
+         if len(expr.args) == 2 and isinstance(expr.args[1], Number):
+             decimals = int(round(float(expr.args[1].value)))
+-            return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
++            return NaryOp(
++                lambda x, decimals=decimals: jnp.round(x, decimals=decimals),
++                group_memberwise=True,
++            ), 1
+     if expr.fn == "ewm" and len(expr.args) in (2, 3, 4, 5):
+         span = float(expr.args[1].value) if isinstance(expr.args[1], Number) else None
+         min_periods = None
+@@ -1528,6 +1539,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+--- a/src/trading_dsl_engine/jax_flat/engine_cpp.py
++++ b/src/trading_dsl_engine/jax_flat/engine_cpp.py
+@@ -273,8 +273,6 @@
+     inner = op.inner_op
+     if not isinstance(inner, InnerGraphOp):
+         raise NotImplementedError("C++ jax_flat groupby expects lowered inner graph")
+-    if inner.n_inputs != 1:
+-        raise NotImplementedError("C++ jax_flat groupby currently supports RHS graphs over self_ only")
+     inner_specs, supported = _cpp_inner_node_specs(inner, spec_tuple)
+     return (
+         spec_tuple(
+--- a/src/trading_dsl_engine/jax_flat/ops.cpp
++++ b/src/trading_dsl_engine/jax_flat/ops.cpp
+@@ -1279,7 +1279,6 @@
+         State& state,
+         const NodeSpec& spec,
+         GroupState& s,
+-        const NodeValue& lhs,
+         int group_i,
+         int row,
+         std::vector<double>& inner_values_tmp,
+@@ -1288,22 +1287,30 @@
+         const int n = state.n_instruments_;
+         const int slot_i = find_or_insert_group_slot(state, spec, row, group_i);
+         inner_values_tmp.assign(spec.inner_nodes.size(), NaN);
+-        if (!inner_values_tmp.empty()) inner_values_tmp[0] = at(lhs, n, row, 0);
+         for (size_t node_i = 0; node_i < spec.inner_nodes.size(); ++node_i) {
+-            inner_values_tmp[node_i] = eval_group_inner_node(s, spec.inner_nodes[node_i], n, row, slot_i, inner_values_tmp);
++            const NodeSpec& inner = spec.inner_nodes[node_i];
++            if (inner.opcode == OpCode::Input) {
++                const size_t child_i = static_cast<size_t>(s.n_keys + inner.input_index);
++                inner_values_tmp[node_i] = at(
++                    state.values_.at(static_cast<size_t>(spec.children.at(child_i))),
++                    n,
++                    row,
++                    0
++                );
++            } else {
++                inner_values_tmp[node_i] = eval_group_inner_node(s, inner, n, row, slot_i, inner_values_tmp);
++            }
+         }
+         dst_v.data[static_cast<size_t>(row)] = inner_values_tmp.at(static_cast<size_t>(spec.inner_output_id));
+     }
+ 
+     void eval_group(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
+         GroupState& s = group_state(state, spec);
+-        const int lhs_child = s.n_keys;
+-        const auto& lhs = state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(lhs_child)])];
+         std::fill(dst_v.data.begin(), dst_v.data.end(), NaN);
+         std::vector<double> inner_values_tmp(spec.inner_nodes.size(), NaN);
+         for (int group_i = 0; group_i < s.n_groups; ++group_i) {
+             for (int pos = s.group_offsets[static_cast<size_t>(group_i)]; pos < s.group_offsets[static_cast<size_t>(group_i + 1)]; ++pos) {
+-                eval_group_row(state, spec, s, lhs, group_i, s.group_indices[static_cast<size_t>(pos)], inner_values_tmp, dst_v);
++                eval_group_row(state, spec, s, group_i, s.group_indices[static_cast<size_t>(pos)], inner_values_tmp, dst_v);
+             }
+         }
+     }
+--- a/tests/trading_dsl_engine/jax_flat/test_stateless_callable.py
++++ b/tests/trading_dsl_engine/jax_flat/test_stateless_callable.py
+@@ -82,3 +82,50 @@
+ 
+     expected = np.nanmean(np.stack((np.asarray(open_data), np.asarray(close_data)), axis=0), axis=0)
+     np.testing.assert_allclose(np.asarray(out), expected, equal_nan=True)
++
++
++def test_stateless_callable_can_opt_into_memberwise_groupby_execution():
++    from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_

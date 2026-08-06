@@ -3,15 +3,8 @@ import time
 import jax
 import pytest
 import numpy as np
-import trading_dsl_engine._native_build as native_build
 from trading_dsl_engine.jax_flat import compile_formula
-from trading_dsl_engine.jax_flat.engine_cpp import (
-    BroadcastMode,
-    compile_formula as compile_formula_native,
-    inspect_hybrid_partition,
-    lower_native_plan,
-)
-from trading_dsl_engine._native_build import native_source_fingerprint
+from trading_dsl_engine.jax_flat.engine_cpp import compile_formula as compile_formula_native
 
 
 def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -20,59 +13,6 @@ def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
     _, cpp_out = cpp_runtime.run_batch(data)
     _, jax_out = jax_runtime.run_batch(data)
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
-
-
-def test_cpp_flat_source_fingerprint_tracks_transitive_local_dependencies(tmp_path):
-    source_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
-    source_dir.mkdir(parents=True)
-    (tmp_path / "setup.py").write_text("# build configuration\n")
-    (tmp_path / "pyproject.toml").write_text("[build-system]\n")
-    (source_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
-    (source_dir / "ops.cpp").write_text('#include "detail.h"\n')
-    detail = source_dir / "detail.h"
-    detail.write_text("constexpr int version = 1;\n")
-
-    initial = native_source_fingerprint(tmp_path)
-    detail.write_text("constexpr int version = 2;\n")
-    assert native_source_fingerprint(tmp_path) != initial
-
-    restored = native_source_fingerprint(tmp_path)
-    (tmp_path / "unrelated.txt").write_text("not a compiler input")
-    assert native_source_fingerprint(tmp_path) == restored
-
-    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
-    nnqp_dir.mkdir(parents=True)
-    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
-    nnqp_header = nnqp_dir / "nnqp_eigen_impl.h"
-    nnqp_header.write_text("constexpr int solver_version = 1;\n")
-    nnqp_initial = native_source_fingerprint(tmp_path, "eigen_nnqp")
-    nnqp_header.write_text("constexpr int solver_version = 2;\n")
-    assert native_source_fingerprint(tmp_path, "eigen_nnqp") != nnqp_initial
-
-
-def test_native_extension_rebuilds_once_for_changed_dependency(tmp_path, monkeypatch):
-    flat_dir = tmp_path / "src/trading_dsl_engine/jax_flat"
-    nnqp_dir = tmp_path / "src/trading_dsl_engine/jax_ffi/nnqp"
-    flat_dir.mkdir(parents=True)
-    nnqp_dir.mkdir(parents=True)
-    (tmp_path / "setup.py").write_text("# build configuration\n")
-    (flat_dir / "engine.cpp").write_text('#include "ops.cpp"\n')
-    dependency = flat_dir / "ops.cpp"
-    dependency.write_text("constexpr int version = 1;\n")
-    (nnqp_dir / "eigen_nnqp.cc").write_text('#include "nnqp_eigen_impl.h"\n')
-    (nnqp_dir / "nnqp_eigen_impl.h").write_text("constexpr int solver_version = 1;\n")
-    extension = flat_dir / "_cpp_flat.so"
-    extension.touch()
-    builds = []
-    monkeypatch.setattr(native_build.subprocess, "run", lambda *args, **kwargs: builds.append((args, kwargs)))
-
-    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
-    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
-    assert len(builds) == 1
-
-    dependency.write_text("constexpr int version = 2;\n")
-    native_build.ensure_native_extension_current(tmp_path, "cpp_flat", extension)
-    assert len(builds) == 2
 
 
 def _assert_cpp_matches_pure_jax(formula, data, *, rtol=1e-10, atol=1e-10):
@@ -117,18 +57,6 @@ def test_cpp_flat_more_stateless_and_matrix_ops_match_jax_flat():
         "add(add(and(gt(open, close), lt(close, open)), or(eq(open, close), ne(open, close))), xor(gt(open, close), lt(open, close)))",
     ):
         _assert_cpp_matches_jax(formula, data)
-
-
-def test_cpp_flat_xs_rank_preserves_upper_ties_and_nonfinite_masking():
-    values = np.array(
-        [
-            [3.0, 1.0, 1.0, 2.0, np.nan, np.inf],
-            [-0.0, 0.0, 4.0, 4.0, -np.inf, np.nan],
-            [7.0, 7.0, 7.0, 7.0, 7.0, 7.0],
-        ],
-        dtype=np.float64,
-    )
-    _assert_cpp_matches_pure_jax("xs_rank(close)", {"close": values})
 
 
 def test_cpp_flat_stateful_cumsum_ewm_shift_ffill_matches_jax_flat():
@@ -220,38 +148,6 @@ def test_cpp_flat_rbf_and_instrument_basis_mean_match_jax_flat():
     ):
         _assert_cpp_matches_jax(formula, data, rtol=1e-9, atol=1e-9)
 
-
-def test_cpp_flat_roll_returns_pov_helpers_are_fully_native():
-    from flows.pov import RollRets
-
-    rows, cols = 36, 4
-    row = np.arange(rows, dtype=np.float64)[:, None]
-    col = np.arange(cols, dtype=np.float64)[None, :]
-    data = {
-        "wdte_out0": np.where(row < 18, 2.0, 1.0) + np.zeros((rows, cols)),
-        "mp_out0.close": 100.0 + row + col,
-        "mp_out1.close": 102.0 + 0.8 * row + col,
-        "is_tradable_out0": np.ones((rows, cols)),
-        "is_tradable_out1": np.ones((rows, cols)),
-        "_ev_ts": row + np.zeros((rows, cols)),
-        "session_start0": np.zeros((rows, cols)),
-        "session_end0": np.full((rows, cols), 30.0),
-        "volume_out0": 10.0 + row + col,
-    }
-    expr = RollRets().roll_rets(n_basis=3, h=32)
-    native = compile_formula_native(expr)
-    pure_jax = compile_formula(expr, cpp=False)
-    _, native_out = native.run_batch(data)
-    _, jax_out = pure_jax.run_batch(data)
-    np.testing.assert_allclose(native_out, np.asarray(jax_out), rtol=1e-9, atol=1e-9, equal_nan=True)
-    assert {node.opcode for node in native.native_plan.nodes} >= {
-        "volume_for_fit_session",
-        "volume_for_seen_session",
-        "nonnegative",
-        "pct_seen_session_volume",
-        "get_beta",
-    }
-
 def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     rows = 18
     cols = 5
@@ -270,23 +166,6 @@ def test_cpp_flat_groupby_nested_rhs_matches_jax_flat():
     )
 
 
-def test_cpp_flat_groupby_hash_index_preserves_nan_signed_zero_and_key_churn():
-    rows, cols = 48, 6
-    row = np.arange(rows, dtype=np.float64)[:, None]
-    col = np.arange(cols, dtype=np.float64)[None, :]
-    close = row * 0.1 + col
-    key0 = np.mod(row + 7.0 * col, 31.0)
-    key1 = np.mod(3.0 * row + col, 11.0)
-    key0[2, 0] = np.nan
-    key0[3, 0] = np.nan
-    key1[5, 1] = -0.0
-    key1[6, 1] = 0.0
-    _assert_cpp_matches_pure_jax(
-        "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
-        {"close": close, "key0": key0, "key1": key1},
-    )
-
-
 def test_cpp_flat_tick_into_reuses_output_buffer():
     runtime = compile_formula_native("add(close, open)")
     state = runtime.init_state(3)
@@ -299,106 +178,6 @@ def test_cpp_flat_tick_into_reuses_output_buffer():
     runtime.tick_into(state, out, close + 1.0, open_)
     assert id(out) == out_id
     np.testing.assert_allclose(out, [12.0, 23.0, 34.0])
-
-
-def test_cpp_flat_tick_into_keeps_force_cast_input_alive_during_native_compute():
-    runtime = compile_formula_native("add(close, open)")
-    state = runtime.init_state(3)
-    out = np.empty(3, dtype=np.float64)
-    runtime.tick_into(
-        state,
-        out,
-        np.array([1.0, 2.0, 3.0], dtype=np.float32),
-        np.array([10, 20, 30], dtype=np.int32),
-    )
-    np.testing.assert_allclose(out, [11.0, 22.0, 33.0])
-
-
-def test_cpp_flat_typed_plan_exposes_resolved_liveness_and_state():
-    runtime = compile_formula_native("add(cumsum(close), mul(open, 2.0))")
-    plan = runtime.native_plan
-    diagnostic = runtime.inspect_native_plan()
-
-    assert plan.output_id == len(plan.nodes) - 1
-    assert diagnostic["version"] == 1
-    assert diagnostic["dtype"] == "float64"
-    assert diagnostic["nodes"][plan.output_id]["liveness"][1] == len(plan.nodes)
-    cumsum_node = next(node for node in plan.nodes if node.opcode == "cumsum")
-    assert cumsum_node.stateful and not cumsum_node.pure
-    assert cumsum_node.state_index >= 0
-    assert cumsum_node.value_type.broadcast is BroadcastMode.ELEMENTWISE
-    assert all(node.live_until >= node.live_from for node in plan.nodes)
-
-
-def test_cpp_flat_typed_plan_rejects_unknown_dtype_without_touching_runtime():
-    runtime = compile_formula("add(close, 1.0)", cpp=False)
-    with pytest.raises(ValueError, match="unsupported native dtype"):
-        lower_native_plan(runtime.program, dtype="complex128")
-
-
-def test_cpp_flat_plan_optimization_folds_literals_cses_and_preserves_ticks():
-    formula = "add(add(close, mul(2.0, 3.0)), add(close, mul(2.0, 3.0)))"
-    jax_runtime = compile_formula(formula, cpp=False)
-    optimized, _ = lower_native_plan(jax_runtime.program)
-    reference, _ = lower_native_plan(jax_runtime.program, optimize=False)
-
-    assert len(optimized.nodes) < len(reference.nodes)
-    assert dict(optimized.optimizations)["constant_folds"] >= 1
-    assert dict(optimized.optimizations)["dead_nodes"] >= 1
-
-    native = compile_formula_native(formula)
-    state = native.init_state(4)
-    jax_state = jax_runtime.init_state(4)
-    rows = (
-        np.array([1.0, np.nan, np.inf, -np.inf]),
-        np.array([-2.0, 0.0, 5.0, np.nan]),
-    )
-    for row in rows:
-        native_out = native.tick(state, row)
-        jax_state, jax_out = jax_runtime.tick(jax_state, row)
-        np.testing.assert_allclose(native_out, np.asarray(jax_out), equal_nan=True)
-
-
-def test_cpp_flat_hybrid_partition_diagnostic_reports_cost_inputs():
-    from trading_dsl_engine.base.dsl import cumsum, var
-    from trading_dsl_engine.jax_flat import stateless
-
-    unsupported = stateless(lambda x: x + 1, name="diagnostic_only")
-    runtime = compile_formula(unsupported(cumsum(var("close"))) + 2.0, cpp=False)
-    diagnostic = inspect_hybrid_partition(runtime.program, 1024, 150)
-    assert diagnostic["version"] == 1
-    candidate = diagnostic["candidates"][0]
-    assert candidate["estimated_work"] > 0
-    assert candidate["frontier_bytes"] == 1024 * 150 * 8
-    assert candidate["conversion_copy"] is True
-    assert isinstance(candidate["accelerate"], bool)
-
-
-def test_cpp_flat_stateful_cse_shares_identical_alpha_denominator_transitions():
-    from flows.alpha_search import default_alpha_pnl
-    from flows.utils import pct_change
-    from trading_dsl_engine.base.dsl import cat, ewm, var, xs_rank
-
-    returns = pct_change(var("close"))
-    features = [xs_rank(ewm(returns, span)) for span in range(1, 5)]
-    formula = cat(
-        *(
-            default_alpha_pnl(
-                feature, roll_rets=returns, is_tradable=var("tradable"), hl=32
-            )
-            for feature in features
-        )
-    )
-    jax_runtime = compile_formula(formula, cpp=False)
-    plan, _ = lower_native_plan(jax_runtime.program)
-    assert dict(plan.optimizations)["stateful_common_subexpressions"] > 0
-
-    rng = np.random.default_rng(43)
-    data = {
-        "close": 100.0 + np.cumsum(rng.normal(size=(16, 6)), axis=0),
-        "tradable": (rng.random((16, 6)) > 0.1).astype(np.float64),
-    }
-    _assert_cpp_matches_pure_jax(formula, data)
 
 
 def test_cpp_flat_micro_runtime_comparison_smoke(capsys):
@@ -450,44 +229,6 @@ def test_compile_formula_cpp_flag_and_unsupported_groupby_fallback_warning():
         _, fallback_out = runtime_cpp.run_batch(data)
     _, jax_out = runtime_jax.run_batch(data)
     np.testing.assert_allclose(np.asarray(fallback_out), np.asarray(jax_out), rtol=1e-10, atol=1e-10, equal_nan=True)
-
-
-def test_cpp_lowering_plan_warning_and_visualizations():
-    from trading_dsl_engine.base.dsl import cumsum, var
-    from trading_dsl_engine.jax_flat import stateless
-
-    jax_only = stateless(lambda x: x + 1.0, name="jax_only_feature")
-    with pytest.warns(RuntimeWarning, match="jax_only_feature"):
-        runtime = compile_formula(jax_only(cumsum(var("close"))), cpp=True)
-
-    plan = runtime.get_lowering_plan()
-    assert plan.missing_cpp_functions == ("jax_only_feature",)
-    assert [node.backend for node in plan.nodes] == ["cpp", "cpp", "jax"]
-    assert "JAX-flat lowering plan" in runtime.explain()
-    assert '"backend": "jax"' in runtime.explain("json")
-    dot = runtime.explain("dot")
-    assert dot.startswith("digraph jax_flat_plan")
-    assert "n1 -> n2" in dot
-
-
-def test_cpp_warning_uses_real_spec_lowerer_as_capability_source(monkeypatch):
-    import trading_dsl_engine.jax_flat.engine_cpp as engine_cpp
-
-    lower_specs = engine_cpp._cpp_node_specs
-
-    def reject_add(program):
-        root = program.nodes[program.outputs[0]].op
-        if getattr(root, "cpp_name", None) == "add":
-            raise NotImplementedError("test lowerer rejected add")
-        return lower_specs(program)
-
-    monkeypatch.setattr(engine_cpp, "_cpp_node_specs", reject_add)
-    with pytest.warns(RuntimeWarning, match=r"function\(s\): add"):
-        runtime = compile_formula("add(close, 1.0)", cpp=True)
-
-    add_node = runtime.get_lowering_plan().nodes[-1]
-    assert add_node.backend == "jax"
-    assert add_node.reason == "test lowerer rejected add"
 
 
 def test_cpp_flat_outer_and_einsum_subset_match_jax_flat():

@@ -29,7 +29,6 @@ volume_for_fit = stateless(
     output_kind="vector",
     output_width=1,
     name="volume_for_fit_session",
-    cpp_name="volume_for_fit_session",
 )
 volume_for_seen = stateless(
     lambda volume, ts, session_start, session_end, is_tradable: jnp.where(
@@ -40,14 +39,12 @@ volume_for_seen = stateless(
     output_kind="vector",
     output_width=1,
     name="volume_for_seen_session",
-    cpp_name="volume_for_seen_session",
 )
 nonnegative = stateless(
     lambda x: jnp.maximum(jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), 0.0),
     output_kind="vector",
     output_width=1,
     name="nonnegative",
-    cpp_name="nonnegative",
 )
 pct_seen = stateless(
     lambda seen, forecast, ts, session_start: jnp.where(
@@ -58,7 +55,6 @@ pct_seen = stateless(
     output_kind="vector",
     output_width=1,
     name="pct_seen_session_volume",
-    cpp_name="pct_seen_session_volume",
 )
 
 PovFields = SimpleNamespace(
