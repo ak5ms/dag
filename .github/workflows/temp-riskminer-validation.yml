@@ -1,6 +1,8 @@
 name: temporary RiskMiner validation
 
 on:
+  issue_comment:
+    types: [created]
   workflow_run:
     workflows: ["alpha search MCTS"]
     types: [completed]
@@ -10,7 +12,12 @@ permissions:
 
 jobs:
   validate:
-    if: github.event.workflow_run.id == 31017758603
+    if: >-
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.number == 148 &&
+       github.event.comment.body == '/run-riskminer-validation') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.id == 31017758603)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
