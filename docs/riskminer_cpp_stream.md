@@ -6,13 +6,15 @@ environment and PUCT Monte Carlo tree search.
 
 ## Execution split
 
-- Python owns the symbolic RPN state, semantic action mask, MCTS tree, and
-  risk-seeking token policy.
+- Python owns the symbolic RPN state, semantic action mask, MCTS tree, replay
+  episodes, and orchestration.
+- JAX owns only the token-selection policy: a four-layer GRU with 64 hidden units
+  followed by a 32/32 MLP, matching the RiskMiner architecture.
 - `trading_dsl_engine.cpp_stream` owns every candidate-alpha calculation,
   candidate PnL calculation, temporal mean/std reduction, and Ridge-pool
   calculation.
 - NumPy is used only to create hypothetical inputs, read final native output, and
-  construct small test references.
+  construct small correctness references.
 
 There is no NumPy/JAX/Numba candidate-evaluation fallback. A candidate that cannot
 compile or execute in `cpp_stream` receives `-inf`, and its rejection is recorded.
@@ -44,7 +46,8 @@ Examples:
 - cross-sectional ranks become dimensionless;
 - EWM, rolling, and shift preserve their value type.
 
-The root defaults to `dimensionless`.
+The root defaults to `dimensionless`. Evaluation-only fields such as `roll_rets`,
+`hs`, `vol`, and `is_tradable` are not formula terminals.
 
 ## MCTS
 
@@ -53,9 +56,17 @@ several policy-guided RPN rollouts, batched native evaluation, and mean finite
 reward backup. Selection batches use virtual visits so several leaves can be
 collected before compiling a candidate batch.
 
-The first checkpoint uses a small state-conditional token policy. Following the
-RiskMiner lower-tail rule, token logits observed in episodes below the tracked
-reward quantile are reduced. A GRU can replace it through the same interface.
+The default benchmark uses `GRURiskSeekingTokenPolicy`:
+
+- token embedding width 32;
+- four GRU layers of width 64;
+- two MLP hidden layers of width 32;
+- masked legal-action softmax;
+- tracked reward quantile;
+- lower-tail log-probability suppression.
+
+`RiskSeekingTokenPolicy`, a small deterministic state-conditional table policy,
+remains available for focused tests and MCTS ablations.
 
 ## Ridge pool
 
@@ -63,6 +74,11 @@ Top unique alphas are scaled by `vol`, shifted into a weighted streaming Ridge,
 projected with `get_beta`, session-masked, risk-scaled, shifted, multiplied by clean
 returns, row-summed, and scored with mean/std. The requested half-life is converted
 to the equivalent EWM span because the current canonical EWM API is span-based.
+
+The initial checkpoint evaluates the exact Ridge pool after individual-alpha search.
+It does not yet compile a 101-feature trial pool for every rollout. That separation
+keeps the first end-to-end run tractable while preserving exact native pool scoring
+for the selected family.
 
 ## Running the demonstration
 
@@ -75,20 +91,26 @@ RISKMINER_MAX_DEPTH=8 \
 python scripts/benchmark_riskminer_cpp_stream.py
 ```
 
-The script prints proposal counts, native compile/run timings, backend evidence,
-top formulas and token sequences, and the Ridge pool score. It also writes a JSON
-result file. CI deliberately uses a smaller dataset and search budget. The output is
-intended to make the token sequence, compiled formula, score, and pool effect easy
-to inspect together.
-
-The validation PR is intentionally kept open while the reduced native run is
-reviewed; its purpose is test execution, not automatic merging.
+The script prints proposal counts, GRU training state, native compile/run timings,
+backend evidence, top formulas and token sequences, and the Ridge pool score. It
+also writes a JSON result file. The environment-variable controls make it possible
+to reduce rows and simulation count for a quick smoke run without changing the
+search semantics.
 
 ## Deliberate checkpoint boundaries
 
 The directly searchable vocabulary covers arithmetic, unary transforms,
 cross-sectional rank/normalization, EWM, shift, common rolling statistics,
 comparisons, and conditionals. `cat`, `einsum`, and `Ridge` are structured
-evaluation operators. Grouping, arbitrary einsum strings, object-valued model
-nodes, the paper's GRU, and native runtime-expression lookbacks remain subsequent
-checkpoints rather than being silently treated as complete.
+evaluation operators.
+
+The following remain explicit subsequent checkpoints rather than being silently
+claimed as complete:
+
+- native runtime-expression EWM decay, lag, and rolling windows;
+- structured groupby/universe actions inside ordinary alpha formulas;
+- arbitrary generated einsum signatures;
+- object-valued model nodes as ordinary formula tokens;
+- exact Ridge-pool terminal reward on every rollout;
+- promotion of every `cpp_stream` entrypoint from classified inventory to a direct
+  RPN action where its argument structure is economically meaningful.
