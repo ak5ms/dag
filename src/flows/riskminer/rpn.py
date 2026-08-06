@@ -59,6 +59,12 @@ class RPNState:
         return self.terminated and self.invalid_reason is None and len(self.stack) == 1
 
 
+def _literal_state_key(value: float | None) -> tuple[str, float | None]:
+    if value is not None and math.isnan(value):
+        return ("nan", None)
+    return ("value", value)
+
+
 class RPNEnvironment:
     def __init__(
         self,
@@ -116,7 +122,16 @@ class RPNEnvironment:
         return value
 
     def state_key(self, state: RPNState) -> tuple:
-        stack = tuple((value.canonical_key, value.depth, tuple(sorted(self.relations.closure(value.semantics.types))), value.semantics.shape, value.semantics.literal_value) for value in state.stack)
+        stack = tuple(
+            (
+                value.canonical_key,
+                value.depth,
+                tuple(sorted(self.relations.closure(value.semantics.types))),
+                value.semantics.shape,
+                _literal_state_key(value.semantics.literal_value),
+            )
+            for value in state.stack
+        )
         return (stack, len(state.token_ids), state.terminated, state.invalid_reason)
 
     def legal_tokens(self, state: RPNState) -> tuple[Token, ...]:
@@ -143,7 +158,11 @@ class RPNEnvironment:
             operands = state.stack[-operator.arity :]
             if 1 + max(value.depth for value in operands) > self.max_depth:
                 continue
-            result = operator.apply(tuple(value.expr for value in operands), tuple(value.semantics for value in operands), self.relations)
+            result = operator.apply(
+                tuple(value.expr for value in operands),
+                tuple(value.semantics for value in operands),
+                self.relations,
+            )
             if result is None:
                 continue
             new_stack_size = len(state.stack) - operator.arity + 1
@@ -155,28 +174,60 @@ class RPNEnvironment:
         token = self.token_by_id[token_id]
         legal_ids = {candidate.token_id for candidate in self.legal_tokens(state)}
         if token_id not in legal_ids:
-            return RPNState(state.token_ids + (token_id,), state.stack, terminated=True, invalid_reason=f"illegal token {token.name!r}")
+            return RPNState(
+                state.token_ids + (token_id,),
+                state.stack,
+                terminated=True,
+                invalid_reason=f"illegal token {token.name!r}",
+            )
         next_tokens = state.token_ids + (token_id,)
         if token.kind is TokenKind.END:
             return RPNState(next_tokens, state.stack, terminated=True)
         if token.kind is TokenKind.TERMINAL:
             assert token.terminal_name is not None
             expression = var(token.terminal_name)
-            value = StackValue(expression, self.terminals[token.terminal_name], 0, 1, canonical_string(expression))
+            value = StackValue(
+                expression,
+                self.terminals[token.terminal_name],
+                0,
+                1,
+                canonical_string(expression),
+            )
             return RPNState(next_tokens, state.stack + (value,))
         if token.kind is TokenKind.LITERAL:
             assert token.literal_value is not None
             expression = ensure_expr(token.literal_value)
-            value = StackValue(expression, literal_semantics(token.literal_value), 0, 1, canonical_string(expression))
+            value = StackValue(
+                expression,
+                literal_semantics(token.literal_value),
+                0,
+                1,
+                canonical_string(expression),
+            )
             return RPNState(next_tokens, state.stack + (value,))
         operator = token.operator
         assert operator is not None
         operands = state.stack[-operator.arity :]
-        result = operator.apply(tuple(value.expr for value in operands), tuple(value.semantics for value in operands), self.relations)
+        result = operator.apply(
+            tuple(value.expr for value in operands),
+            tuple(value.semantics for value in operands),
+            self.relations,
+        )
         if result is None:
-            return RPNState(next_tokens, state.stack, terminated=True, invalid_reason=f"semantic rejection in {operator.name}")
+            return RPNState(
+                next_tokens,
+                state.stack,
+                terminated=True,
+                invalid_reason=f"semantic rejection in {operator.name}",
+            )
         expression, semantics = result
-        value = StackValue(expression, semantics, 1 + max(item.depth for item in operands), 1 + sum(item.node_count for item in operands), canonical_string(expression))
+        value = StackValue(
+            expression,
+            semantics,
+            1 + max(item.depth for item in operands),
+            1 + sum(item.node_count for item in operands),
+            canonical_string(expression),
+        )
         return RPNState(next_tokens, state.stack[: -operator.arity] + (value,))
 
     def parse(self, token_names: Sequence[str]) -> RPNState:
