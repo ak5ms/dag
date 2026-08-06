@@ -79,6 +79,9 @@ The script prints proposal counts, native compile/run timings, backend evidence,
 top formulas and token sequences, and the Ridge pool score. It also writes a JSON
 result file. CI deliberately uses a smaller dataset and search budget.
 
+The draft validation PR is intentionally kept open while the reduced native run is
+reviewed; its purpose is test execution, not automatic merging.
+
 ## Deliberate checkpoint boundaries
 
 The directly searchable vocabulary covers arithmetic, unary transforms,
