@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.jax_flat import engine as jax_flat_engine
-from trading_dsl_engine.jax_flat import runtime as jax_flat_runtime
 
 
 def _rss_bytes() -> int:
@@ -76,8 +75,8 @@ def test_run_batch_streams_memmap_mapping_inputs_in_chunks(tmp_path, monkeypatch
     close_r = np.memmap(close_path, mode="r", shape=(n_steps, n_instruments), dtype=np.float64)
     open_r = np.memmap(open_path, mode="r", shape=(n_steps, n_instruments), dtype=np.float64)
 
-    runtime = jax_flat_engine.compile_formula("close + open", cpp=False)
-    monkeypatch.setattr(jax_flat_runtime, "_BATCH_CHUNK_SIZE", chunk_size)
+    runtime = jax_flat_engine.compile_formula("close + open")
+    monkeypatch.setattr(jax_flat_engine, "_BATCH_CHUNK_SIZE", chunk_size)
 
     original_asarray = jax_flat_engine.jnp.asarray
     memmap_shapes_seen: list[tuple[int, ...]] = []
@@ -120,8 +119,8 @@ def test_run_batch_out_path_writes_memmap_incrementally(tmp_path, monkeypatch):
     out_path = tmp_path / "out.memmap"
     close = jnp.arange(n_steps * n_instruments, dtype=jnp.float64).reshape(n_steps, n_instruments)
     open_ = jnp.ones((n_steps, n_instruments), dtype=jnp.float64)
-    runtime = jax_flat_engine.compile_formula("close + open", cpp=False)
-    monkeypatch.setattr(jax_flat_runtime, "_BATCH_CHUNK_SIZE", chunk_size)
+    runtime = jax_flat_engine.compile_formula("close + open")
+    monkeypatch.setattr(jax_flat_engine, "_BATCH_CHUNK_SIZE", chunk_size)
 
     writes: list[tuple[int, int]] = []
     original_memmap = jax_flat_engine.np.memmap
@@ -158,22 +157,3 @@ def test_run_batch_out_path_true_allocates_tmp_memmap():
         del out
         if os.path.exists(filename):
             os.remove(filename)
-
-
-def test_cpp_run_batch_out_path_writes_matrix_root_directly(tmp_path):
-    runtime = jax_flat_engine.compile_formula("cat(close + open, cumsum(close))", cpp=True)
-    close = np.arange(24, dtype=np.float64).reshape(6, 4)
-    open_ = np.ones_like(close)
-    out_path = tmp_path / "cpp_matrix.memmap"
-
-    state, out = runtime.run_batch(
-        {"open": open_, "close": close}, out_path=str(out_path)
-    )
-    _, expected = jax_flat_engine.compile_formula(
-        "cat(close + open, cumsum(close))", cpp=False
-    ).run_batch({"open": open_, "close": close})
-
-    assert type(state).__name__ == "CppFlatState"
-    assert isinstance(out, np.memmap)
-    assert out.shape == (6, 4, 2)
-    np.testing.assert_allclose(out, np.asarray(expected))

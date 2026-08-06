@@ -1,49 +1,32 @@
 from pathlib import Path
 import importlib
 import importlib.util
+import subprocess
+import sys
 
-from trading_dsl_engine.jax_flat.custom import (
-    RollingJaxCall,
-    StatelessJaxCall,
-    StatelessJaxFunction,
-    rolling,
-    stateless,
-)
-from trading_dsl_engine._native_build import ensure_native_extension_current
+from trading_dsl_engine.base.metadata import MetadataConfig, NodeMetadata, TypeRelationGraph, UnitInfo, ValueRange, field, metadata
+from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall, StatelessJaxFunction, rolling, stateless
+from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
 
 
 def _load_cpp_flat():
     module_name = __name__ + "._cpp_flat"
-    spec = importlib.util.find_spec(module_name)
-    extension = Path(spec.origin) if spec is not None and spec.origin is not None else None
-    ensure_native_extension_current(Path(__file__).resolve().parents[3], "cpp_flat", extension)
-    importlib.invalidate_caches()
+    if importlib.util.find_spec(module_name) is None:
+        if importlib.util.find_spec("setuptools") is None:
+            subprocess.run([sys.executable, "-m", "pip", "install", "setuptools", "wheel"], check=True)
+        root = Path(__file__).resolve().parents[3]
+        subprocess.run([sys.executable, "setup.py", "build_ext", "--inplace"], cwd=root, check=True)
+        importlib.invalidate_caches()
     return importlib.import_module(module_name)
 
 
 def __getattr__(name: str):
     if name == "_cpp_flat":
         return _load_cpp_flat()
-    if name in {"JaxFlatRuntime", "compile_formula"}:
-        from trading_dsl_engine.jax_flat.engine import JaxFlatRuntime, compile_formula
-
-        return JaxFlatRuntime if name == "JaxFlatRuntime" else compile_formula
     if name == "CppFlatRuntime":
         from trading_dsl_engine.jax_flat.engine_cpp import CppFlatRuntime
 
         return CppFlatRuntime
-    if name in {
-        "MetadataConfig",
-        "NodeMetadata",
-        "TypeRelationGraph",
-        "UnitInfo",
-        "ValueRange",
-        "field",
-        "metadata",
-    }:
-        from trading_dsl_engine.base import metadata as metadata_module
-
-        return getattr(metadata_module, name)
     raise AttributeError(name)
 
 

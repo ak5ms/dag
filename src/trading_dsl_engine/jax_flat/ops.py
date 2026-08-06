@@ -174,7 +174,6 @@ class NaryOp(Op):
     cpp_param: float = 0.0
     cpp_int_param: int = 0
     cpp_str_param: str = ""
-    diagnostic_name: str | None = None
 
     def tick(self, state: Any, *child_values: jax.Array):
         del state

@@ -1,16 +1,25 @@
 from pathlib import Path
 import importlib
 import importlib.util
-
-from trading_dsl_engine._native_build import ensure_native_extension_current
+import subprocess
+import sys
 
 
 def _ensure_eigen_nnqp() -> None:
     module_name = __name__ + "._eigen_nnqp"
-    spec = importlib.util.find_spec(module_name)
-    extension = Path(spec.origin) if spec is not None and spec.origin is not None else None
+    try:
+        importlib.import_module(module_name)
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"_eigen_nnqp", module_name}:
+            raise
+    if importlib.util.find_spec("setuptools") is None:
+        subprocess.run([sys.executable, "-m", "pip", "install", "setuptools", "wheel"], check=True)
     root = Path(__file__).resolve().parents[4]
-    ensure_native_extension_current(root, "eigen_nnqp", extension)
+    src = str(root / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    subprocess.run([sys.executable, "setup.py", "build_ext", "--inplace"], cwd=root, check=True)
     importlib.invalidate_caches()
     importlib.import_module(module_name)
 

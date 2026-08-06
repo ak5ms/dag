@@ -1,0 +1,583 @@
+--- a/src/trading_dsl_engine/jax_flat/ops_groupby.py
++++ b/src/trading_dsl_engine/jax_flat/ops_groupby.py
+@@ -156,6 +156,32 @@
+     return jax.tree_util.tree_map(set_leaf, tree, value)
+ 
+ 
++def _tree_take_slot_members(tree: Any, slots: jax.Array):
++    """Gather one independent member state from each keyed slot.
++
++    Memberwise formula graphs currently store every state leaf as
++    ``(capacity, group_width, ...)``.  Advanced indexing therefore lifts the
++    complete inner graph state for all members in one operation, so the RHS can
++    be evaluated with a single ``vmap`` instead of a sequential member loop.
++    """
++    tree = _ensure_dataclass_pytree(tree)
++    members = jnp.arange(slots.shape[0], dtype=jnp.int32)
++
++    def take_leaf(leaf):
++        leaf = jnp.asarray(leaf)
++        return leaf[slots, members]
++
++    return jax.tree_util.tree_map(take_leaf, tree)
++
++
++def _tree_set_slot_members(tree: Any, slots: jax.Array, value: Any):
++    """Scatter a batched memberwise inner state back to keyed slots."""
++    tree = _ensure_dataclass_pytree(tree)
++    value = _ensure_dataclass_pytree(value)
++    members = jnp.arange(slots.shape[0], dtype=jnp.int32)
++    return jax.tree_util.tree_map(lambda dst, src: dst.at[slots, members].set(src), tree, value)
++
++
+ def _hash_mix(value: jax.Array) -> jax.Array:
+     value = value ^ (value >> jnp.uint64(33))
+     value = value * jnp.uint64(0xff51afd7ed558ccd)
+@@ -256,6 +282,23 @@
+     return slot, GroupTableState(keys_next, occupied_next, table_next, count_next)
+ 
+ 
++def _lookup_or_insert_slots(
++    table: GroupTableState,
++    key_matrix: jax.Array,
++) -> tuple[jax.Array, GroupTableState]:
++    """Resolve one keyed slot per member while keeping RHS work vectorized."""
++    width = key_matrix.shape[0]
++    slots0 = jnp.empty((width,), dtype=jnp.int32)
++
++    def body(member_pos, carry):
++        table_c, slots_c = carry
++        slot, table_n = _lookup_or_insert_slot(table_c, key_matrix[member_pos])
++        return table_n, slots_c.at[member_pos].set(slot)
++
++    table_next, slots = jax.lax.fori_loop(0, width, body, (table, slots0))
++    return slots, table_next
++
++
+ def _empty_output_like(template: Any, width: int):
+     template = _ensure_dataclass_pytree(template)
+ 
+@@ -651,29 +694,7 @@
+ 
+     def _inner_graph_is_memberwise(self) -> bool:
+         nodes = getattr(self.inner_op, "nodes", None)
+-        if nodes is None:
+-            return False
+-        allowed_cpp_names = {
+-            "add", "sub", "mul", "div", "mod", "pow", "floordiv",
+-            "eq", "ne", "lt", "gt", "le", "ge", "and", "or", "xor", "fillna", "where",
+-            "abs", "ln", "ceil", "floor", "round", "exp", "sign", "arctan",
+-            "isnan", "purify", "fraction",
+-        }
+-        allowed_stateful = {"CumsumOp", "EwmOp", "FFillOp"}
+-        for node in nodes:
+-            op = node.op
+-            name = type(op).__name__
+-            if name in {"InputOp", "LiteralOp"}:
+-                continue
+-            if name in allowed_stateful:
+-                if op.output_width not in (None, 1):
+-                    return False
+-                continue
+-            cpp_name = getattr(op, "cpp_name", None)
+-            if cpp_name in allowed_cpp_names and op.output_width in (None, 1):
+-                continue
+-            return False
+-        return True
++        return bool(nodes) and all(getattr(node.op, "group_memberwise", False) for node in nodes)
+ 
+     def _tick_group_memberwise(
+         self,
+@@ -682,41 +703,42 @@
+         key_matrix: jax.Array,
+         args: tuple[jax.Array, ...],
+     ):
+-        group_width = idx.shape[0]
+-        sample_state = (
+-            _tree_take_slot_member(runtime.inner_state, jnp.asarray(0, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32))
+-            if runtime.inner_state is not None
+-            else None
++        inner_state = _flush_cached_inner_state(
++            runtime.inner_state,
++            runtime.cache.inner_state,
++            runtime.cache.slot,
++            runtime.cache.valid,
+         )
+-        sample_args = tuple(_slice_member_arg(arg, idx, jnp.asarray(0, dtype=jnp.int32), self._row_arg_source_width(arg, idx)) for arg in args)
+-        _, template = self.inner_op.tick(sample_state, *sample_args)
+-        group_out0 = _group_output_like(template, group_width)
+-
+-        def body(member_pos, carry):
+-            table_c, inner_state_c, group_out_c = carry
+-            key = key_matrix[member_pos]
+-            slot, table_next = _lookup_or_insert_slot(table_c, key)
+-            member_args = tuple(_slice_member_arg(arg, idx, member_pos, self._row_arg_source_width(arg, idx)) for arg in args)
+-            selected_state = (
+-                _tree_take_slot_member(inner_state_c, slot, member_pos)
+-                if inner_state_c is not None
+-                else None
+-            )
+-            updated_state, local_out = self.inner_op.tick(selected_state, *member_args)
+-            inner_state_next = (
+-                _tree_set_slot_member(inner_state_c, slot, member_pos, updated_state)
+-                if inner_state_c is not None and updated_state is not None
+-                else inner_state_c
+-            )
+-            group_out_next = _set_member_output(group_out_c, member_pos, local_out)
+-            return table_next, inner_state_next, group_out_next
+-
+-        table_next, inner_state_next, group_out = jax.lax.fori_loop(
+-            0,
+-            group_width,
+-            body,
+-            (runtime.table, runtime.inner_state, group_out0),
++        slots, table_next = _lookup_or_insert_slots(runtime.table, key_matrix)
++        selected_state = _tree_take_slot_members(inner_state, slots)
++
++        source_widths = tuple(self._row_arg_source_width(arg, idx) for arg in args)
++        group_args = tuple(
++            _slice_group_arg(arg, idx, source_width)
++            for arg, source_width in zip(args, source_widths)
+         )
+-        return GroupRuntimeState(table_next, runtime.cache, inner_state_next), group_out
++        arg_axes = tuple(
++            0
++            if jnp.asarray(group_arg).ndim > 0 and _is_group_aligned_arg(arg, source_width)
++            else None
++            for group_arg, arg, source_width in zip(group_args, args, source_widths)
++        )
++        updated_state, group_out = jax.vmap(
++            self.inner_op.tick,
++            in_axes=(0,) + arg_axes,
++            out_axes=(0, 0),
++        )(selected_state, *group_args)
++        inner_state_next = _tree_set_slot_members(inner_state, slots, updated_state)
++        cache_next = GroupCacheState(
++            runtime.cache.key,
++            runtime.cache.slot,
++            jnp.asarray(False),
++            runtime.cache.inner_state,
++        )
++        return GroupRuntimeState(table_next, cache_next, inner_state_next), group_out
+ 
+     def _tick_group_cached_single_key(
+         self,
+--- a/src/trading_dsl_engine/jax_flat/ops.py
++++ b/src/trading_dsl_engine/jax_flat/ops.py
+@@ -18,6 +18,7 @@
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     is_stateful: bool = False
++    group_memberwise: bool = False
+ 
+     def init_state(self, sample: jax.Array):
+         return None
+@@ -124,6 +125,7 @@
+ 
+ @dataclass(frozen=True)
+ class InputOp(Op):
++    group_memberwise = True
+     input_index: int
+     output_kind: str = "vector"
+     output_width: int | None = 1
+@@ -131,6 +133,7 @@
+ 
+ @dataclass(frozen=True)
+ class LiteralOp(Op):
++    group_memberwise = True
+     value: float
+     output_kind: str = "scalar"
+     output_width: int | None = 1
+@@ -171,6 +174,7 @@
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     cpp_name: str | None = None
++    group_memberwise: bool = False
+     cpp_param: float = 0.0
+     cpp_int_param: int = 0
+     cpp_str_param: str = ""
+@@ -186,6 +190,7 @@
+ 
+ @dataclass(frozen=True)
+ class EwmOp(Op):
++    group_memberwise = True
+     span: float | None = None
+     min_periods: float | None = None
+     ignore_na: bool = False
+@@ -506,6 +511,7 @@
+ 
+ @dataclass(frozen=True)
+ class CumsumOp(Op):
++    group_memberwise = True
+     output_kind: str = "vector"
+     output_width: int | None = 1
+     is_stateful: bool = True
+@@ -534,6 +540,7 @@
+ 
+ @dataclass(frozen=True)
+ class FFillOp(Op):
++    group_memberwise = True
+     limit: int | None = None
+     dynamic_limit: bool = False
+     output_kind: str = "vector"
+@@ -1178,18 +1185,18 @@
+ 
+ 
+ OP_FACTORIES: dict[tuple[str, int], Callable[..., Op]] = {
+-    ("abs", 1): lambda: NaryOp(jnp.abs, cpp_name="abs"),
+-    ("ln", 1): lambda: NaryOp(jnp.log, cpp_name="ln"),
+-    ("ceil", 1): lambda: NaryOp(jnp.ceil, cpp_name="ceil"),
+-    ("floor", 1): lambda: NaryOp(jnp.floor, cpp_name="floor"),
+-    ("round", 1): lambda: NaryOp(jnp.round, cpp_name="round"),
+-    ("exp", 1): lambda: NaryOp(jnp.exp, cpp_name="exp"),
+-    ("sign", 1): lambda: NaryOp(jnp.sign, cpp_name="sign"),
+-    ("arctan", 1): lambda: NaryOp(jnp.arctan, cpp_name="arctan"),
+-    ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan"),
+-    ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify"),
+-    ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction"),
+-    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv"),
++    ("abs", 1): lambda: NaryOp(jnp.abs, cpp_name="abs", group_memberwise=True),
++    ("ln", 1): lambda: NaryOp(jnp.log, cpp_name="ln", group_memberwise=True),
++    ("ceil", 1): lambda: NaryOp(jnp.ceil, cpp_name="ceil", group_memberwise=True),
++    ("floor", 1): lambda: NaryOp(jnp.floor, cpp_name="floor", group_memberwise=True),
++    ("round", 1): lambda: NaryOp(jnp.round, cpp_name="round", group_memberwise=True),
++    ("exp", 1): lambda: NaryOp(jnp.exp, cpp_name="exp", group_memberwise=True),
++    ("sign", 1): lambda: NaryOp(jnp.sign, cpp_name="sign", group_memberwise=True),
++    ("arctan", 1): lambda: NaryOp(jnp.arctan, cpp_name="arctan", group_memberwise=True),
++    ("isnan", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isnan(x), 1.0, 0.0), cpp_name="isnan", group_memberwise=True),
++    ("purify", 1): lambda: NaryOp(lambda x: jnp.where(jnp.isfinite(x), x, jnp.nan), cpp_name="purify", group_memberwise=True),
++    ("fraction", 1): lambda: NaryOp(lambda x: x - jnp.floor(x), cpp_name="fraction", group_memberwise=True),
++    ("norm_inv", 1): lambda: NaryOp(_norm_inv, cpp_name="norm_inv", group_memberwise=True),
+     ("xs_norm", 1): lambda: NaryOp(_xs_norm, cpp_name="xs_norm"),
+     ("xs_rank", 1): lambda: NaryOp(_xs_rank, cpp_name="xs_rank"),
+     ("get_beta", 1): lambda: NaryOp(lambda x: x.beta, cpp_name="get_beta"),
+@@ -1199,27 +1206,27 @@
+     ("mean", 1): lambda: NaryOp(lambda x: jnp.nanmean(x), output_kind="scalar", cpp_name="mean"),
+     ("outer", 1): lambda: NaryOp(lambda x: x[:, None] * x[None, :], output_kind="matrix", output_width=None, cpp_name="outer"),
+     ("cumsum", 1): lambda: CumsumOp(),
+-    ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add"),
+-    ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub"),
+-    ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul"),
+-    ("mod", 2): lambda: NaryOp(lambda l, r: jnp.mod(l, r), cpp_name="mod"),
+-    ("pow", 2): lambda: NaryOp(lambda l, r: l**r, cpp_name="pow"),
+-    ("div", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div"),
+-    ("floordiv", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv"),
+-    ("eq", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq"),
+-    ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne"),
+-    ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt"),
+-    ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt"),
+-    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le"),
+-    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge"),
+-    ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+-    ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and"),
+-    ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+-    ("or_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or"),
+-    ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor"),
+-    ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna"),
+-    ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where"),
+-    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip"),
++    ("add", 2): lambda: NaryOp(lambda l, r: l + r, cpp_name="add", group_memberwise=True),
++    ("sub", 2): lambda: NaryOp(lambda l, r: l - r, cpp_name="sub", group_memberwise=True),
++    ("mul", 2): lambda: NaryOp(lambda l, r: l * r, cpp_name="mul", group_memberwise=True),
++    ("mod", 2): lambda: NaryOp(lambda l, r: jnp.mod(l, r), cpp_name="mod", group_memberwise=True),
++    ("pow", 2): lambda: NaryOp(lambda l, r: l**r, cpp_name="pow", group_memberwise=True),
++    ("div", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l / r), cpp_name="div", group_memberwise=True),
++    ("floordiv", 2): lambda: NaryOp(lambda l, r: jnp.where(r == 0.0, jnp.nan, l // r), cpp_name="floordiv", group_memberwise=True),
++    ("eq", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l == r), cpp_name="eq", group_memberwise=True),
++    ("ne", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l != r), cpp_name="ne", group_memberwise=True),
++    ("lt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l < r), cpp_name="lt", group_memberwise=True),
++    ("gt", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l > r), cpp_name="gt", group_memberwise=True),
++    ("le", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l <= r), cpp_name="le", group_memberwise=True),
++    ("ge", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, l >= r), cpp_name="ge", group_memberwise=True),
++    ("and", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and", group_memberwise=True),
++    ("and_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) & (r != 0.0)), cpp_name="and", group_memberwise=True),
++    ("or", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or", group_memberwise=True),
++    ("or_", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) | (r != 0.0)), cpp_name="or", group_memberwise=True),
++    ("xor", 2): lambda: NaryOp(lambda l, r: _nan_cmp(l, r, (l != 0.0) ^ (r != 0.0)), cpp_name="xor", group_memberwise=True),
++    ("fillna", 2): lambda: NaryOp(lambda l, r: jnp.where(jnp.isnan(l), r, l), cpp_name="fillna", group_memberwise=True),
++    ("where", 3): lambda: NaryOp(lambda c, t, f: jnp.where(c != 0.0, t, f), cpp_name="where", group_memberwise=True),
++    ("clip", 3): lambda: NaryOp(lambda x, lo, hi: jnp.clip(x, lo, hi), cpp_name="clip", group_memberwise=True),
+     ("einsum", ANY_ARITY): lambda subscripts: NaryOp(lambda *child_values: _einsum(subscripts, *child_values), cpp_name="einsum", cpp_str_param=str(subscripts)),
+ }
+ 
+--- a/src/trading_dsl_engine/jax_flat/custom.py
++++ b/src/trading_dsl_engine/jax_flat/custom.py
+@@ -22,6 +22,7 @@
+     output_kind: OutputKind | None = None
+     output_width: int | None = None
+     name: str | None = None
++    group_memberwise: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+@@ -32,6 +33,7 @@
+     output_kind: OutputKind | None = None
+     output_width: int | None = None
+     name: str | None = None
++    group_memberwise: bool = False
+ 
+     def __call__(self, *args) -> StatelessJaxCall:
+         if not args:
+@@ -43,6 +45,7 @@
+             output_kind=self.output_kind,
+             output_width=self.output_width,
+             name=self.name or getattr(self.fn, "__name__", None),
++            group_memberwise=self.group_memberwise,
+         )
+ 
+ 
+@@ -82,6 +85,7 @@
+     output_kind: OutputKind | None = None,
+     output_width: int | None = None,
+     name: str | None = None,
++    group_memberwise: bool = False,
+ ):
+     """Build a jax_flat Expr wrapper around a stateless JAX callable.
+ 
+@@ -89,6 +93,9 @@
+     accept any number of compiled child values. If output metadata is omitted,
+     jax_flat infers the output kind and width from the first child, which is
+     suitable for shape-preserving transforms such as ``jnp.flip``.
++    ``group_memberwise=True`` only when the callable acts independently on each
++    instrument; this enables vectorized keyed-state execution inside groupby.
+     """
+ 
+     def wrap(target: Callable[..., jax.Array]) -> StatelessJaxFunction:
+@@ -98,6 +105,7 @@
+             output_kind=output_kind,
+             output_width=output_width,
+             name=name or getattr(target, "__name__", None),
++            group_memberwise=group_memberwise,
+         )
+ 
+     if fn is None:
+--- a/src/trading_dsl_engine/jax_flat/engine.py
++++ b/src/trading_dsl_engine/jax_flat/engine.py
+@@ -864,6 +864,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
+@@ -892,6 +893,7 @@
+             node.output_kind,
+             node.output_width,
+             node.name,
++            node.group_memberwise,
+             tuple(_expr_key(a) for a in node.args),
+         )
+     if isinstance(node, KeyTuple):
+@@ -972,6 +974,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
+@@ -1044,7 +1047,12 @@
+         raise ValueError("stateless JAX call expects at least one child")
+     output_kind = expr.output_kind if expr.output_kind is not None else child_ops[0].output_kind
+     output_width = expr.output_width if expr.output_width is not None else child_ops[0].output_width
+-    return NaryOp(expr.fn, output_kind=output_kind, output_width=output_width)
++    return NaryOp(
++        expr.fn,
++        output_kind=output_kind,
++        output_width=output_width,
++        group_memberwise=expr.group_memberwise,
++    )
+ 
+ 
+ def _build_op(expr: Call, child_ops: tuple[Op, ...] = ()) -> tuple[Op, int | tuple[int, ...] | None]:
+@@ -1095,7 +1103,10 @@
+         if len(expr.args) == 2:
+             decimals = int(round(float(expr.args[1].value)))
+-            return NaryOp(lambda x, decimals=decimals: jnp.round(x, decimals=decimals)), 1
++            return NaryOp(
++                lambda x, decimals=decimals: jnp.round(x, decimals=decimals),
++                group_memberwise=True,
++            ), 1
+@@ -1528,6 +1539,7 @@
+             output_kind=node.output_kind,
+             output_width=node.output_width,
+             name=node.name,
++            group_memberwise=node.group_memberwise,
+         )
+     if isinstance(node, KeyTuple):
+         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+--- a/src/trading_dsl_engine/jax_flat/engine_cpp.py
++++ b/src/trading_dsl_engine/jax_flat/engine_cpp.py
+@@ -275,8 +275,6 @@
+     inner = op.inner_op
+     if not isinstance(inner, InnerGraphOp):
+         raise NotImplementedError("C++ jax_flat groupby expects lowered inner graph")
+-    if inner.n_inputs != 1:
+-        raise NotImplementedError("C++ jax_flat groupby currently supports RHS graphs over self_ only")
+     inner_specs, supported = _cpp_inner_node_specs(inner, spec_tuple)
+     return (
+         spec_tuple(
+--- a/src/trading_dsl_engine/jax_flat/ops.cpp
++++ b/src/trading_dsl_engine/jax_flat/ops.cpp
+@@ -1280,7 +1280,6 @@
+         State& state,
+         const NodeSpec& spec,
+         GroupState& s,
+-        const NodeValue& lhs,
+         int group_i,
+         int row,
+         std::vector<double>& inner_values_tmp,
+@@ -1289,9 +1288,22 @@
+         const int n = state.n_instruments_;
+         const int slot_i = find_or_insert_group_slot(state, spec, row, group_i);
+         inner_values_tmp.assign(spec.inner_nodes.size(), NaN);
+-        if (!inner_values_tmp.empty()) inner_values_tmp[0] = at(lhs, n, row, 0);
+         for (size_t node_i = 0; node_i < spec.inner_nodes.size(); ++node_i) {
+-            inner_values_tmp[node_i] = eval_group_inner_node(s, spec.inner_nodes[node_i], n, row, slot_i, inner_values_tmp);
++            const NodeSpec& inner = spec.inner_nodes[node_i];
++            if (inner.opcode == OpCode::Input) {
++                const size_t child_i = static_cast<size_t>(s.n_keys + inner.input_index);
++                inner_values_tmp[node_i] = at(
++                    state.values_.at(static_cast<size_t>(spec.children.at(child_i))),
++                    n,
++                    row,
++                    0
++                );
++            } else {
++                inner_values_tmp[node_i] = eval_group_inner_node(s, inner, n, row, slot_i, inner_values_tmp);
++            }
+         }
+         dst_v.data[static_cast<size_t>(row)] = inner_values_tmp.at(static_cast<size_t>(spec.inner_output_id));
+     }
+@@ -1299,13 +1311,11 @@
+     void eval_group(State& state, const NodeSpec& spec, NodeValue& dst_v) const {
+         GroupState& s = group_state(state, spec);
+-        const int lhs_child = s.n_keys;
+-        const auto& lhs = state.values_[static_cast<size_t>(spec.children[static_cast<size_t>(lhs_child)])];
+         std::fill(dst_v.data.begin(), dst_v.data.end(), NaN);
+         std::vector<double> inner_values_tmp(spec.inner_nodes.size(), NaN);
+         for (int group_i = 0; group_i < s.n_groups; ++group_i) {
+             for (int pos = s.group_offsets[static_cast<size_t>(group_i)]; pos < s.group_offsets[static_cast<size_t>(group_i + 1)]; ++pos) {
+-                eval_group_row(state, spec, s, lhs, group_i, s.group_indices[static_cast<size_t>(pos)], inner_values_tmp, dst_v);
++                eval_group_row(state, spec, s, group_i, s.group_indices[static_cast<size_t>(pos)], inner_values_tmp, dst_v);
+             }
+         }
+     }
+--- a/tests/trading_dsl_engine/jax_flat/test_stateless_callable.py
++++ b/tests/trading_dsl_engine/jax_flat/test_stateless_callable.py
+@@ -91,3 +91,48 @@
+ 
+     expected = np.nanmean(np.stack((np.asarray(open_data), np.asarray(close_data)), axis=0), axis=0)
+     np.testing.assert_allclose(np.asarray(out), expected, equal_nan=True)
++
++
++def test_stateless_callable_can_opt_into_memberwise_groupby_execution():
++    from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_
++
++    fast_fn = stateless(
++        lambda x, y: x + 2.0 * y,
++        name="fast_fn",
++        group_memberwise=True,
++    )
++    generic_fn = stateless(lambda x, y: x + 2.0 * y, name="generic_fn")
++    key = var("key")
++    x = var("x")
++    y = var("y")
++    fast_formula = groupby((key,), x, cumsum(ewm(fast_fn(self_, y), 3.0)))
++    builtin_formula = groupby((key,), x, cumsum(ewm(self_ + 2.0 * y, 3.0)))
++    generic_formula = groupby((key,), x, cumsum(ewm(generic_fn(self_, y), 3.0)))
++
++    fast = compile_formula(fast_formula, cpp=False)
++    builtin = compile_formula(builtin_formula, cpp=False)
++    generic = compile_formula(generic_formula, cpp=False)
++    fast_op = fast.program.nodes[fast.program.outputs[0]].op
++    generic_op = generic.program.nodes[generic.program.outputs[0]].op
++    assert fast_op._inner_graph_is_memberwise()
++    assert not generic_op._inner_graph_is_memberwise()
++
++    rows = 32
++    cols = 5
++    row = np.arange(rows, dtype=np.float64)[:, None]
++    col = np.arange(cols, dtype=np.float64)[None, :]
++    data = {
++        "key": np.mod(row // 3.0 + col, 4.0),
++        "x": 0.1 * row + col,
++        "y": np.sin(0.2 * row + col),
++    }
++    data["x"][7, 2] = np.nan
++    data["y"][11, 4] = np.nan
++
++    _, fast_out = fast.run_batch(data)
++    _, builtin_out = builtin.run_batch(data)
++    np.testing.assert_allclose(
++        np.asarray(fast_out),
++        np.asarray(builtin_out),
++        rtol=1e-10,
++        atol=1e-10,
++        equal_nan=True,
++    )
+--- a/tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py
++++ b/tests/trading_dsl_engine/jax_flat/test_cpp_flat_runtime.py
+@@ -166,6 +166,24 @@
+     )
+ 
+ 
++def test_cpp_flat_groupby_nested_rhs_supports_multiple_feeds():
++    rows = 40
++    cols = 6
++    row = np.arange(rows, dtype=np.float64)[:, None]
++    col = np.arange(cols, dtype=np.float64)[None, :]
++    close = 0.2 * row + col
++    open_ = np.cos(0.1 * row + col)
++    key = np.mod(row // 2.0 + col, 5.0)
++    close[6, 2] = np.nan
++    open_[13, 4] = np.nan
++    data = {"close": close, "open": open_, "key": key}
++
++    _assert_cpp_matches_pure_jax(
++        "groupby((key,), close, cumsum(ewm(add(self_, open), 3.0)))",
++        data,
++    )
++
++
+ def test_cpp_flat_tick_into_reuses_output_buffer():
+     runtime = compile_formula_native("add(close, open)")
+     state = runtime.init_state(3)
+--- a/README.md
++++ b/README.md
+@@ -131,7 +131,7 @@
+ For JAX-flat, `buffer(shift(x, lag, max_size), min_lag, max_lag)` exposes the bounded lag ring already maintained by `shift` instead of allocating a second history. It emits shape `(time, n_instruments, max_lag)` with lag 1 in column 0, masks values below `min_lag`, masks values above the per-row `lag`, and rejects a `max_lag` larger than the underlying shift capacity. Matrix inputs such as `bspline(...)` preserve their feature axes and append the lag axis, e.g. `(time, n_instruments, n_basis, max_lag)`.
+ 
+-`jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis:
++`jax_flat.stateless(fn, ...)` wraps user-supplied stateless JAX callables as compositional variadic operators that still run inside the compiled tick and batch paths. If `output_kind`/`output_width` are omitted, the operator inherits shape metadata from its first child, which is suitable for shape-preserving transforms such as reversing the lag axis. Callables that operate independently on each instrument may set `group_memberwise=True`; grouped state is then gathered for every `(key slot, instrument)` pair, the complete nested RHS graph is evaluated with one `vmap`, and all state leaves are scattered back in one operation instead of invoking the RHS once per member:
+ 
+ For JIT diagnostics, a compiled JAX-flat runtime exposes `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)`, with `get_jaxpr`/`get_compiled_hlo` aliases. The arguments follow `tick`'s state-and-row ABI; the latter helper returns the compiled executable's optimized HLO text. `jit_compile_count` tracks observed tick-transition JAX traces (a per-runtime proxy for JIT compilation cache misses) across live ticks, compiled-HLO inspection, and batch scans, and `reset_jit_compile_count()` clears it. JAXPR inspection itself does not change the counter because it does not compile.
+ 
+@@ -141,6 +141,7 @@
+ from trading_dsl_engine.jax_flat import compile_formula, stateless
+ 
+ rev = stateless(lambda x: jnp.flip(x, axis=-1), name="rev")
++scale = stateless(lambda x, y: x + 2.0 * y, name="scale", group_memberwise=True)
+ close = var("close")
+ upper_lag = var("upper_lag")
+ min_lag = var("min_lag")
+@@ -180,7 +181,7 @@
+ 
+ The native batch helper intentionally stays a repeated tick loop over the same `eval_row` transition rather than a separate vectorized semantic path. It binds contiguous row pointers once, calls the same non-batch evaluator for each row, and uses `__restrict`/flat contiguous buffers so C++ compilers can optimize the row loop without changing streaming state behavior. The benchmark script compiles and warms both C++ and JAX-flat runtimes before timing, so printed results exclude extension import, formula compilation, and JAX first-use compilation. When the optional extension is installed, `JaxFlatRuntime.run_batch(...)` may use the same native flat evaluator for fully supported dynamic-key groupby programs (including `univ(...)` column partitions and NumPy memmap-backed batch inputs) with no caller-supplied state. If the whole formula is not native-lowerable but contains coarse supported stateful/grouped subgraphs, batch execution can materialize multiple native islands, compute one or more JAX-only frontier values, and then run a final supported native root when the downstream graph becomes C++-lowerable again; this handles shapes such as `cpp(jax_only(cpp(...)), cpp(...))` while keeping user `jax_flat.stateless(...)` callables on the compiled JAX path. Set `TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL=1` to force the pure JAX path for behavior checks. Native groupby lowering uses a nested RHS node table rather than a per-operator grouped-cumsum branch, so additional scalar/vector-width-1 RHS operators can compose without adding a new grouped hot-path case. If a grouped formula is not yet native-supported, `run_batch` emits a one-time `RuntimeWarning` identifying the unsupported node and automatically falls back to the JAX-flat implementation.
+ 
+-Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `outer`, an Eigen-backed `einsum` subset, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights solved via Eigen, `get_beta`, `get_preds`, and dynamic-key `groupby(...)` with optional `univ(...)` column partitions for nested scalar/vector-width-1 RHS graphs over `self_` (for example `cumsum(self_)`, `cumsum(cumsum(self_))`, or `add(cumsum(self_), 1)`). Explicit `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` still raises `NotImplementedError` for unsupported nodes, while automatic `compile_formula(..., cpp=True)` acceleration either runs a full native batch, runs supported native subgraphs before a JAX residual, or warns once and falls back to the default JAX-flat runtime. Arbitrary Python/JAX lambdas cannot be invoked from the C++ hot path without embedding a Python interpreter or a separate lowering/code-generation layer; today they remain JAX residual nodes unless rewritten as registered builtins with a `cpp_name` and native implementation.
++Supported native operators now include inputs, literals, arithmetic/comparison/logical operators, `where`, `fillna`, `abs`, `ln`, `ceil`, `floor`, `round`, `exp`, `sign`, `arctan`, `isnan`, `purify`, `fraction`, `xstd`, `xs_rank`, `xs_sort`, `mean`, `outer`, an Eigen-backed `einsum` subset, `cat`, `bspline`, `col`, `cumsum`, literal-span `ewm`, static-limit `ffill`, `shift`, vector/`cat`-feature `Ridge` with scalar/vector weights solved via Eigen, `get_beta`, `get_preds`, and dynamic-key `groupby(...)` with optional `univ(...)` column partitions for nested scalar/vector-width-1 RHS graphs over any number of grouped feeds (for example `cumsum(self_)`, `cumsum(cumsum(self_))`, or `cumsum(ewm(add(self_, open), 3))`). Explicit `trading_dsl_engine.jax_flat.engine_cpp.compile_formula(...)` still raises `NotImplementedError` for unsupported nodes, while automatic `compile_formula(..., cpp=True)` acceleration either runs a full native batch, runs supported native subgraphs before a JAX residual, or warns once and falls back to the default JAX-flat runtime. Arbitrary Python/JAX lambdas cannot be invoked from the C++ hot path without embedding a Python interpreter or a separate lowering/code-generation layer; today they remain JAX residual nodes unless rewritten as registered builtins with a `cpp_name` and native implementation.
+ 
+ The extension build defaults to aggressive native optimization for local performance-sensitive installs: `-O3`, `-DNDEBUG`, `-DEIGEN_NO_DEBUG`, link-time optimization, `-march=native`, `-mtune=native`, `-fvisibility=hidden`, `-fno-math-errno`, and loop unrolling on Unix-like compilers. It intentionally does not enable `-ffast-math`, because the DSL has explicit NaN, infinity, and divide-by-zero semantics that must match JAX-flat behavior. Set `TRADING_DSL_ENGINE_CPP_NATIVE=0` before installation to omit CPU-specific `-march/-mtune` flags for redistributable wheels, set `TRADING_DSL_ENGINE_CPP_LTO=0` if the compiler/linker toolchain cannot use LTO, or append custom flags with `TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS` and `TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS`. To force a clean rebuild of previously built native binaries, remove `build/`, any in-place extension such as `src/trading_dsl_engine/jax_flat/_cpp_flat*.so`, and stale package metadata such as `src/trading_dsl_engine.egg-info/`, then reinstall with `python -m pip install -e . --no-build-isolation --force-reinstall --no-cache-dir` or run `python setup.py build_ext --inplace --force -v` for a direct verbose extension rebuild.
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -20,7 +20,7 @@
+ - Lagged operators such as `shift(x, nlag, max_size)` should keep bounded static history capacity from `max_size` while reading `x`/`nlag` through normal compiled sources.
+ - Avoid requiring `n_instruments` in constructors when shape can be inferred at first update.
+ - Keep compiler composition nested (no interpreter fallback in execution hot path).
+-- For grouped runtime implementations (especially JAX/JAX-flat), do not add per-operator custom hot-path branches (for example, special-casing `cumsum` inside `GroupbyOp`). Keep grouped execution generic/compositional and optimize shared mechanisms instead.
++- For grouped runtime implementations (especially JAX/JAX-flat), do not add per-operator custom hot-path branches (for example, special-casing `cumsum` inside `GroupbyOp`). Keep grouped execution generic/compositional and optimize shared mechanisms instead. Componentwise operators may declare `group_memberwise=True`; the shared grouped runtime must vectorize the complete eligible inner graph rather than branch on operator names.
+ - For the JAX backend, keep live tick and batch timestep hot paths under JAX JIT (`eqx.filter_jit`/`jax.jit` plus `lax.scan` for batch), and prefer functional PyTree state over Python mutation inside compiled execution. JAX-flat-only lag-history operators such as `buffer(shift(...), min_lag, max_size)` should expose ordered ring state through compositional JAX ops, not Numba kernels. User-supplied `jax_flat.stateless(...)` callables must stay stateless and execute through the same generic compiled `NaryOp` tick/`vmap` batch path. When adding a JAX-flat operator, implement `scan_batch` alongside `init_state` and `tick` rather than relying on the default per-tick scan.
+ - JAX-flat runtime diagnostics must remain off the hot path: `inspect_jaxpr(state, *rows)` and `inspect_compiled_hlo(state, *rows)` use the tick ABI for debugging; JAXPR inspection does not affect `jit_compile_count`, while compiled-HLO inspection records its compile trace. The counter records observed traced tick transitions as a per-runtime JIT-compilation proxy.
+ - Support arity > 1 cleanly.
