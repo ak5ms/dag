@@ -1,0 +1,57 @@
+name: temporary RiskMiner validation
+
+on:
+  workflow_run:
+    workflows: ["alpha search MCTS"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.event.workflow_run.id == 31017758603
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/alpha-search-mcts-cpp-stream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: |
+          set -o pipefail
+          mkdir -p .riskminer-validation
+          python -m pytest -q -o addopts="" tests/flows/test_riskminer.py 2>&1 | tee .riskminer-validation/pytest.log
+      - name: Run reduced native benchmark
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+          RISKMINER_ROWS: "1024"
+          RISKMINER_INSTRUMENTS: "9"
+          RISKMINER_SIMULATIONS: "16"
+          RISKMINER_ROLLOUTS: "2"
+          RISKMINER_SELECTION_BATCH: "4"
+          RISKMINER_MAX_DEPTH: "8"
+          RISKMINER_MAX_TOKENS: "16"
+          RISKMINER_POOL_SIZE: "4"
+          RISKMINER_WORK_DIR: ".riskminer-validation/work"
+          RISKMINER_RESULT_JSON: ".riskminer-validation/result.json"
+        run: |
+          set -o pipefail
+          python scripts/benchmark_riskminer_cpp_stream.py 2>&1 | tee .riskminer-validation/benchmark.log
+          cat .riskminer-validation/result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: temporary-riskminer-validation
+          path: .riskminer-validation/
+          if-no-files-found: warn
