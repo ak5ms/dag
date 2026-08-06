@@ -57,3 +57,5 @@ jobs:
           name: riskminer-cpp-stream-results
           path: .riskminer-ci/
           if-no-files-found: ignore
+
+# Contents API checkpoint: triggers the branch validation workflow.
