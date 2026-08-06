@@ -117,7 +117,8 @@ def _init_gru_policy(
     hidden_size: int,
     layers: int,
 ) -> dict[str, object]:
-    keys = iter(jax.random.split(key, 3 + layers * 3))
+    # embedding + three matrices per layer + three MLP/output matrices
+    keys = iter(jax.random.split(key, 4 + layers * 3))
     parameters: dict[str, object] = {
         "embedding": _xavier(next(keys), (vocabulary_size + 1, embedding_size)),
     }
