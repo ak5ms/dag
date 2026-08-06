@@ -11,10 +11,10 @@ import numpy as np
 from flows.riskminer import (
     CppStreamCandidateEvaluator,
     CppStreamRidgePoolEvaluator,
+    GRURiskSeekingTokenPolicy,
     MCTSConfig,
     RPNEnvironment,
     RiskMinerMCTS,
-    RiskSeekingTokenPolicy,
     default_market_semantics,
 )
 
@@ -85,9 +85,28 @@ def main() -> None:
     generation_started = time.perf_counter()
     sources = _synthetic_market_data(ROWS, INSTRUMENTS, SEED)
     generation_seconds = time.perf_counter() - generation_started
-    environment = RPNEnvironment(terminals=default_market_semantics(), target_types=("dimensionless",), max_depth=MAX_DEPTH, max_tokens=MAX_TOKENS)
-    evaluator = CppStreamCandidateEvaluator(sources, n_instruments=INSTRUMENTS, work_dir=WORK_DIR / "candidate-evaluation", max_batch_size=64)
-    policy = RiskSeekingTokenPolicy(risk_quantile=0.80, learning_rate=0.01, seed=SEED)
+    environment = RPNEnvironment(
+        terminals=default_market_semantics(),
+        # NaN remains available to structured evaluation graphs but is excluded
+        # from ordinary alpha rollouts because arithmetic with NaN is never useful.
+        literals=(-1.0, 0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, 120.0, 240.0, 1440.0),
+        target_types=("dimensionless",),
+        max_depth=MAX_DEPTH,
+        max_tokens=MAX_TOKENS,
+    )
+    evaluator = CppStreamCandidateEvaluator(
+        sources,
+        n_instruments=INSTRUMENTS,
+        work_dir=WORK_DIR / "candidate-evaluation",
+        max_batch_size=64,
+    )
+    policy = GRURiskSeekingTokenPolicy(
+        len(environment.tokens),
+        risk_quantile=0.80,
+        learning_rate=0.001,
+        quantile_learning_rate=0.01,
+        seed=SEED,
+    )
     search = RiskMinerMCTS(
         environment,
         evaluator,
@@ -108,7 +127,11 @@ def main() -> None:
         raise RuntimeError(f"RiskMiner produced no finite cpp_stream candidates; sample rejections={examples}")
     pool_count = min(POOL_SIZE, len(report.candidates))
     pool_alphas = [record.expr for record in report.candidates[:pool_count]]
-    pool_evaluator = CppStreamRidgePoolEvaluator(sources, n_instruments=INSTRUMENTS, work_dir=WORK_DIR / "pool-evaluation")
+    pool_evaluator = CppStreamRidgePoolEvaluator(
+        sources,
+        n_instruments=INSTRUMENTS,
+        work_dir=WORK_DIR / "pool-evaluation",
+    )
     pool_started = time.perf_counter()
     pool = pool_evaluator.evaluate(pool_alphas)
     pool_total_seconds = time.perf_counter() - pool_started
@@ -125,6 +148,8 @@ def main() -> None:
     ]
     payload = {
         "backend": "trading_dsl_engine.cpp_stream",
+        "policy": "four-layer GRU (64 hidden) + 32/32 MLP",
+        "policy_training_steps": policy.training_steps,
         "python": platform.python_version(),
         "platform": platform.platform(),
         "rows": ROWS,
@@ -168,6 +193,7 @@ def main() -> None:
     RESULT_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print("=== RiskMiner / cpp_stream smoke benchmark ===")
     print(f"rows={ROWS:,} instruments={INSTRUMENTS} max_depth={MAX_DEPTH} simulations={report.simulations} rollouts={ROLLOUTS}")
+    print(f"policy=GRU(4x64)->MLP(32,32) training_steps={policy.training_steps} quantile={report.policy_quantile:.6g}")
     print(f"proposals={report.rollout_proposals} finite={report.finite_proposals} archive={len(report.candidates)} tree_nodes={report.tree_nodes}")
     print(f"search={search_seconds:.3f}s cpp_compile={evaluator.stats.compile_seconds:.3f}s cpp_run={evaluator.stats.run_seconds:.3f}s compiled_batches={evaluator.stats.compiled_batches}")
     print(f"backend={evaluator.stats.last_runtime_type} output_mode={evaluator.stats.last_output_mode} output_shape={evaluator.stats.last_output_shape}")
