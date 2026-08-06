@@ -74,10 +74,16 @@ class OperatorSchema:
         semantic_tuple = tuple(semantics)
         if len(expr_tuple) != self.arity or len(semantic_tuple) != self.arity:
             raise ValueError(f"{self.name} expects {self.arity} operands")
-        output = self.infer(semantic_tuple, relations)
-        if output is None:
+        try:
+            output = self.infer(semantic_tuple, relations)
+            if output is None:
+                return None
+            return self.builder(expr_tuple, semantic_tuple), output
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            # A schema can be semantically plausible but unavailable for a
+            # particular DSL overload/backend parameter form. Treat that as one
+            # rejected action, never as a search-wide failure.
             return None
-        return self.builder(expr_tuple, semantic_tuple), output
 
 
 def _same_type(values: tuple[SemanticInfo, ...], relations: TypeRelations) -> SemanticInfo | None:
