@@ -1,6 +1,10 @@
 name: alpha search MCTS
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/alpha-search-mcts.yml"
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -13,6 +17,7 @@ permissions:
 jobs:
   riskminer-validation:
     if: >-
+      github.event_name == 'push' ||
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
