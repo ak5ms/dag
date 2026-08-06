@@ -2,7 +2,7 @@ from flows.riskminer.canonical import canonical_string, expression_key
 from flows.riskminer.cpp_stream_eval import CppStreamCandidateEvaluator, EvaluationStats
 from flows.riskminer.mcts import CandidateRecord, MCTSConfig, RiskMinerMCTS, SearchReport
 from flows.riskminer.operators import OperatorSchema, default_operator_schemas, operator_inventory
-from flows.riskminer.policy import PolicyEpisode, RiskSeekingTokenPolicy
+from flows.riskminer.policy import GRURiskSeekingTokenPolicy, PolicyEpisode, RiskSeekingTokenPolicy
 from flows.riskminer.pool import (
     CppStreamRidgePoolEvaluator,
     PoolEvaluation,
@@ -24,6 +24,7 @@ __all__ = [
     "CppStreamRidgePoolEvaluator",
     "DEFAULT_TYPE_RELATIONS",
     "EvaluationStats",
+    "GRURiskSeekingTokenPolicy",
     "MCTSConfig",
     "OperatorSchema",
     "PolicyEpisode",
