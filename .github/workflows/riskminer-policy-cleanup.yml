@@ -1,0 +1,32 @@
+name: Remove superseded RiskMiner policy prototype
+
+on:
+  push:
+    branches:
+      - agent/riskminer-cpp-stream-v1
+    paths:
+      - ".github/workflows/riskminer-policy-cleanup.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Remove superseded prototype and commit
+        shell: bash
+        run: |
+          if [ ! -f src/flows/riskminer/policy.py ]; then
+            echo "prototype already removed"
+            exit 0
+          fi
+          git rm src/flows/riskminer/policy.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Remove superseded RiskMiner policy prototype"
+          git push origin HEAD:agent/riskminer-cpp-stream-v1
