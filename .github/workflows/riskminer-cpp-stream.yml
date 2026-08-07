@@ -8,6 +8,7 @@ on:
       - "src/flows/riskminer/**"
       - "scripts/benchmark_riskminer_cpp_stream.py"
       - "scripts/benchmark_riskminer_deep_cpp_stream.py"
+      - "scripts/benchmark_riskminer_deep_quality_cpp_stream.py"
       - "tests/flows/riskminer/**"
       - ".github/workflows/riskminer-cpp-stream.yml"
   workflow_dispatch:
@@ -35,13 +36,13 @@ jobs:
           python -m pytest -q -o addopts=""
           tests/flows/riskminer/test_core.py
           tests/flows/riskminer/test_native.py
-      - name: Run higher-depth native RiskMiner benchmark
+      - name: Run quality-filtered higher-depth native RiskMiner benchmark
         env:
           PYTHONPATH: src
           JAX_ENABLE_X64: "1"
           RISKMINER_ROWS: "5000"
           RISKMINER_INSTRUMENTS: "9"
-          RISKMINER_SIMULATIONS: "32"
+          RISKMINER_SIMULATIONS: "48"
           RISKMINER_ROLLOUTS: "4"
           RISKMINER_EVALUATION_BATCH: "8"
           RISKMINER_ARCHIVE_SIZE: "100"
@@ -52,12 +53,12 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p /tmp/riskminer-deep-output
-          python scripts/benchmark_riskminer_deep_cpp_stream.py \
+          python scripts/benchmark_riskminer_deep_quality_cpp_stream.py \
             2>&1 | tee /tmp/riskminer-deep-output/benchmark.log
       - name: Upload higher-depth output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: riskminer-cpp-stream-deep-search
+          name: riskminer-cpp-stream-deep-quality-search
           path: /tmp/riskminer-deep-output/
           if-no-files-found: warn
