@@ -556,6 +556,7 @@ def _stage_type(
             IntArg(stage.op.ddof),
             BoolArg(stage.op.ignore_na),
             BoolArg(stage.op.temporal),
+            execution,
         )
     if stage.kind == "reduction_bundle":
         assert isinstance(stage.op, ReductionOp) and stage.members
@@ -584,6 +585,7 @@ def _stage_type(
             IntArg(stage.op.ddof),
             BoolArg(stage.op.ignore_na),
             BoolArg(stage.op.temporal),
+            execution,
             *bindings,
         )
     if stage.kind == "emit_last":
