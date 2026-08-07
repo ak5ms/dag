@@ -15,6 +15,7 @@ from trading_dsl_engine.base.dsl import (
     div,
     emit,
     einsum,
+    fillna,
     reduction,
     shift,
     var,
@@ -68,6 +69,10 @@ def build_candidate_score_formula(
         pnl = shift(w, 1, 1).mul(roll_rets).sum(axis=1)
         score = pnl.mean(axis=0) / pnl.std(axis=0, ddof=0)
 
+    Pandas-style row ``sum`` returns zero when the complete shifted row is NaN.
+    Explicitly filling shifted values with zero preserves that behavior while the
+    temporal mean/std remain final-only native reductions.
+
     ``cat`` creates row shape ``(instrument, candidate)``. Reduction axes address
     ``(time, *row_shape)``, so axis 1 is instruments and axis 0 is time.
     """
@@ -75,9 +80,10 @@ def build_candidate_score_formula(
     if not candidates:
         raise ValueError("at least one candidate is required")
     alpha_matrix = cat(*candidates)
+    shifted = fillna(shift(alpha_matrix, 1, 1), 0.0)
     contributions = einsum(
         "nf,n->nf",
-        shift(alpha_matrix, 1, 1),
+        shifted,
         var(roll_rets_name),
     )
     pnl = reduction("sum", contributions, axis=1)
