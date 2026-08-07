@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "stackdsl/engine.hpp"
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
 
@@ -198,7 +199,8 @@ template <
     class Policy,
     std::size_t Ddof,
     bool IgnoreNa,
-    bool Temporal
+    bool Temporal,
+    class Execution
 >
 struct ReductionNode {
     using Shape = typename Tensor::shape;
@@ -223,18 +225,19 @@ struct ReductionNode {
     STACKDSL_HOT void setup() noexcept { state.reset(); }
 
     template <class Context>
+    STACKDSL_HOT static std::pair<std::size_t, std::size_t> active_output_range(
+        const Context& ctx
+    ) noexcept {
+        if constexpr (retains_leading_axis) {
+            return execution_output_range<output_size, Execution>(ctx);
+        }
+        return {0, output_size};
+    }
+
+    template <class Context>
     STACKDSL_HOT static void accumulate(State& target, const Context& ctx) noexcept {
         if constexpr (contiguous_suffix) {
-            std::size_t output_begin = 0;
-            std::size_t output_end = output_size;
-            if constexpr (retains_leading_axis) {
-                const std::size_t lane_begin =
-                    std::min(ctx.lane_begin, leading_extent);
-                const std::size_t lane_end =
-                    std::min(ctx.lane_end, leading_extent);
-                output_begin = lane_begin * output_lane_width;
-                output_end = lane_end * output_lane_width;
-            }
+            const auto [output_begin, output_end] = active_output_range(ctx);
             for (
                 std::size_t output = output_begin;
                 output < output_end;
@@ -329,20 +332,15 @@ struct ReductionNode {
                 }
             }
         } else if constexpr (retains_leading_axis) {
-            const std::size_t lane_begin = std::min(ctx.lane_begin, leading_extent);
-            const std::size_t lane_end = std::min(ctx.lane_end, leading_extent);
-            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
-                const std::size_t begin = lane * input_lane_width;
-                const std::size_t end = begin + input_lane_width;
+            const auto [output_begin, output_end] = active_output_range(ctx);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC unroll 8
 #endif
-                for (std::size_t offset = begin; offset < end; ++offset) {
-                    target.add(
-                        reduced_output_index<Shape, Axes>(offset),
-                        Tensor::read_flat(ctx, offset)
-                    );
-                }
+            for (std::size_t offset = 0; offset < input_size; ++offset) {
+                const std::size_t output =
+                    reduced_output_index<Shape, Axes>(offset);
+                if (output < output_begin || output >= output_end) continue;
+                target.add(output, Tensor::read_flat(ctx, offset));
             }
         } else {
 #if defined(__GNUC__) || defined(__clang__)
@@ -362,20 +360,9 @@ struct ReductionNode {
         const State& source, Context& ctx
     ) noexcept {
         double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
-        if constexpr (retains_leading_axis) {
-            const std::size_t lane_begin = std::min(ctx.lane_begin, leading_extent);
-            const std::size_t lane_end = std::min(ctx.lane_end, leading_extent);
-            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
-                const std::size_t begin = lane * output_lane_width;
-                const std::size_t end = begin + output_lane_width;
-                for (std::size_t index = begin; index < end; ++index) {
-                    out[index] = source.result(index);
-                }
-            }
-        } else {
-            for (std::size_t index = 0; index < output_size; ++index) {
-                out[index] = source.result(index);
-            }
+        const auto [begin, end] = active_output_range(ctx);
+        for (std::size_t index = begin; index < end; ++index) {
+            out[index] = source.result(index);
         }
     }
 
@@ -411,6 +398,7 @@ template <
     std::size_t Ddof,
     bool IgnoreNa,
     bool Temporal,
+    class Execution,
     class... Bindings
 >
 struct ReductionBundleNode {
@@ -454,6 +442,16 @@ struct ReductionBundleNode {
     }
 
 private:
+    template <class Context>
+    STACKDSL_HOT static std::pair<std::size_t, std::size_t> active_output_range(
+        const Context& ctx
+    ) noexcept {
+        if constexpr (retains_leading_axis) {
+            return execution_output_range<output_size, Execution>(ctx);
+        }
+        return {0, output_size};
+    }
+
     template <std::size_t Index, class Context>
     STACKDSL_HOT static double read_binding(
         const Context& ctx, std::size_t offset
@@ -493,16 +491,7 @@ private:
         using Indexes = std::make_index_sequence<component_count>;
         if constexpr (reduces_contiguous_suffix<Shape, Axes>()) {
             constexpr std::size_t reduction_width = input_size / output_size;
-            std::size_t output_begin = 0;
-            std::size_t output_end = output_size;
-            if constexpr (retains_leading_axis) {
-                const std::size_t lane_begin =
-                    std::min(ctx.lane_begin, leading_extent);
-                const std::size_t lane_end =
-                    std::min(ctx.lane_end, leading_extent);
-                output_begin = lane_begin * output_lane_width;
-                output_end = lane_end * output_lane_width;
-            }
+            const auto [output_begin, output_end] = active_output_range(ctx);
             for (std::size_t output = output_begin; output < output_end; ++output) {
                 const std::size_t base = output * reduction_width;
                 if constexpr (
@@ -595,21 +584,12 @@ private:
                 }
             }
         } else if constexpr (retains_leading_axis) {
-            const std::size_t lane_begin =
-                std::min(ctx.lane_begin, leading_extent);
-            const std::size_t lane_end =
-                std::min(ctx.lane_end, leading_extent);
-            for (std::size_t lane = lane_begin; lane < lane_end; ++lane) {
-                const std::size_t begin = lane * input_lane_width;
-                const std::size_t end = begin + input_lane_width;
-                for (std::size_t offset = begin; offset < end; ++offset) {
-                    add_offset(
-                        ctx,
-                        reduced_output_index<Shape, Axes>(offset),
-                        offset,
-                        Indexes{}
-                    );
-                }
+            const auto [output_begin, output_end] = active_output_range(ctx);
+            for (std::size_t offset = 0; offset < input_size; ++offset) {
+                const std::size_t output =
+                    reduced_output_index<Shape, Axes>(offset);
+                if (output < output_begin || output >= output_end) continue;
+                add_offset(ctx, output, offset, Indexes{});
             }
         } else {
             for (std::size_t offset = 0; offset < input_size; ++offset) {
@@ -639,16 +619,7 @@ private:
         auto outputs = output_pointers(
             ctx, std::make_index_sequence<component_count>{}
         );
-        std::size_t output_begin = 0;
-        std::size_t output_end = output_size;
-        if constexpr (retains_leading_axis) {
-            const std::size_t lane_begin =
-                std::min(ctx.lane_begin, leading_extent);
-            const std::size_t lane_end =
-                std::min(ctx.lane_end, leading_extent);
-            output_begin = lane_begin * output_lane_width;
-            output_end = lane_end * output_lane_width;
-        }
+        const auto [output_begin, output_end] = active_output_range(ctx);
         for (std::size_t output = output_begin; output < output_end; ++output) {
             for (std::size_t component = 0; component < component_count; ++component) {
                 outputs[component][output] = state[component].result(output);
