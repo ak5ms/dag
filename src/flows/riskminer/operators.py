@@ -22,7 +22,6 @@ from trading_dsl_engine.base.dsl import (
     sign,
     sub,
     where,
-    xs_norm,
     xs_pct_rank,
     xs_rank,
 )
@@ -66,11 +65,27 @@ def _all_numeric(args: Sequence[SemanticInfo]) -> bool:
     return all(_numeric(arg) for arg in args)
 
 
-def _unary_row(args: Sequence[SemanticInfo]) -> bool:
+def _unary_numeric(args: Sequence[SemanticInfo]) -> bool:
     return len(args) == 1 and _numeric(args[0]) and args[0].shape in {
         SearchShape.ROW,
         SearchShape.SCALAR,
     }
+
+
+def _cross_sectional_row(args: Sequence[SemanticInfo]) -> bool:
+    """Cross-sectional transforms require an actual instrument row.
+
+    In particular, ranking a compile-time scalar is not a meaningful alpha and
+    produced degenerate formulas such as ``xs_pct_rank(60)`` in the first deep
+    run. The shape rule removes those actions before rollout rather than adding
+    a feature/operator blacklist.
+    """
+
+    return (
+        len(args) == 1
+        and _numeric(args[0])
+        and args[0].shape is SearchShape.ROW
+    )
 
 
 def _same_type(args: Sequence[SemanticInfo]) -> bool:
@@ -178,19 +193,20 @@ def _literal_at(values: Sequence[float | None], index: int, name: str) -> float:
 
 
 def default_operator_catalog() -> tuple[OperatorSchema, ...]:
-    """Conservative native catalog for the first RiskMiner checkpoint."""
+    """Conservative catalog whose entries are known to lower to cpp_stream."""
 
     unary_preserving = (
         ("abs", dsl_abs, 0.8),
         ("purify", purify, 0.7),
     )
-    unary_dimensionless = (
+    ordinary_dimensionless = (
         ("sign", sign, 0.8),
-        ("fraction", fraction, 0.55),
+        ("fraction", fraction, 0.35),
         ("arctan", arctan, 0.55),
+    )
+    cross_sectional_dimensionless = (
         ("xs_rank", xs_rank, 1.8),
         ("xs_pct_rank", xs_pct_rank, 1.6),
-        ("xs_norm", xs_norm, 1.4),
     )
     out: list[OperatorSchema] = []
 
@@ -199,7 +215,7 @@ def default_operator_catalog() -> tuple[OperatorSchema, ...]:
             OperatorSchema(
                 name,
                 1,
-                _unary_row,
+                _unary_numeric,
                 _preserve_first,
                 lambda exprs, literals, fn=fn: fn(exprs[0]),
                 prior=prior,
@@ -207,16 +223,29 @@ def default_operator_catalog() -> tuple[OperatorSchema, ...]:
             )
         )
 
-    for name, fn, prior in unary_dimensionless:
+    for name, fn, prior in ordinary_dimensionless:
         out.append(
             OperatorSchema(
                 name,
                 1,
-                _unary_row,
+                _unary_numeric,
                 _dimensionless,
                 lambda exprs, literals, fn=fn: fn(exprs[0]),
                 prior=prior,
                 family="normalization",
+            )
+        )
+
+    for name, fn, prior in cross_sectional_dimensionless:
+        out.append(
+            OperatorSchema(
+                name,
+                1,
+                _cross_sectional_row,
+                _dimensionless,
+                lambda exprs, literals, fn=fn: fn(exprs[0]),
+                prior=prior,
+                family="cross_sectional",
             )
         )
 
