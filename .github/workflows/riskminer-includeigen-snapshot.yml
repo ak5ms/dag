@@ -1,0 +1,41 @@
+name: RiskMiner includeigen snapshot
+
+on:
+  push:
+    branches:
+      - agent/riskminer-cpp-stream-v1
+    paths:
+      - ".github/workflows/riskminer-includeigen-snapshot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install includeigen
+      - name: Package includeigen module and Eigen headers
+        run: |
+          python - <<'PY'
+          import includeigen
+          from pathlib import Path
+          import shutil
+          root = Path('/tmp/includeigen-snapshot')
+          root.mkdir(parents=True, exist_ok=True)
+          package = Path(includeigen.__file__).resolve().parent
+          shutil.copytree(package, root / 'includeigen', dirs_exist_ok=True)
+          (root / 'metadata.txt').write_text(
+              f'package={package}\ninclude={includeigen.get_include()}\n'
+          )
+          PY
+          tar -czf /tmp/includeigen-snapshot.tar.gz -C /tmp/includeigen-snapshot .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: includeigen-snapshot
+          path: /tmp/includeigen-snapshot.tar.gz
+          if-no-files-found: error
