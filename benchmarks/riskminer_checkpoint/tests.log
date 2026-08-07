@@ -1,0 +1,171 @@
+............F......FF                                                    [100%]
+=================================== FAILURES ===================================
+__________ test_risk_quantile_tracker_moves_in_the_correct_direction ___________
+
+    def test_risk_quantile_tracker_moves_in_the_correct_direction():
+        tracker = RiskQuantileTracker(
+            cdf_quantile=0.8,
+            learning_rate=0.1,
+            value=0.0,
+        )
+        higher = tracker.update(1.0)
+        assert higher.value > tracker.value
+        lower = higher.update(-1.0)
+        assert lower.value < higher.value
+        sample = np.linspace(-1.0, 1.0, 101)
+        fitted = RiskQuantileTracker(
+            cdf_quantile=0.8,
+            learning_rate=0.01,
+            value=0.0,
+        )
+        for _ in range(50):
+            fitted = fitted.update_many(sample)
+>       assert abs(fitted.value - np.quantile(sample, 0.8)) < 0.08
+E       assert np.float64(0.16000000000000048) < 0.08
+E        +  where np.float64(0.16000000000000048) = abs((0.7600000000000006 - np.float64(0.6000000000000001)))
+E        +    where 0.7600000000000006 = RiskQuantileTracker(cdf_quantile=0.8, learning_rate=0.01, value=0.7600000000000006).value
+E        +    and   np.float64(0.6000000000000001) = <function quantile at 0x7fe29c7a49f0>(array([-1.  , -0.98, -0.96, -0.94, -0.92, -0.9 , -0.88, -0.86, -0.84,\n       -0.82, -0.8 , -0.78, -0.76, -0.74, -0.72,... 0.72,  0.74,  0.76,  0.78,\n        0.8 ,  0.82,  0.84,  0.86,  0.88,  0.9 ,  0.92,  0.94,  0.96,\n        0.98,  1.  ]), 0.8)
+E        +      where <function quantile at 0x7fe29c7a49f0> = np.quantile
+
+tests/flows/riskminer/test_policy.py:74: AssertionError
+____ test_depth_three_generation_example_filters_dimensionless_not_in_pool _____
+
+    def test_depth_three_generation_example_filters_dimensionless_not_in_pool():
+        fields = futures_field_metadata(levels=range(1))
+        features = feature_names_with_tags(fields, include=("dimensionless", "front_month_contract"))
+        pset = make_alpha_pset(features, halflives=[2, 5], shift_lags=[1])
+        pool = [var("vw_halfspread_out0")]
+        pool_keys = {repr(expr) for expr in pool}
+    
+        def valid(expr):
+            meta = analyze_formula_metadata(expr, fields)
+            value_range = meta.get_range()
+            return repr(expr) not in pool_keys and "dimensionless" in meta.get_types() and isfinite(value_range.lower) and isfinite(value_range.upper)
+    
+>       out = search_formulas(pset, lambda candidate, pool_: 1.0, max_depth=3, initial_pool=pool, filters=[valid], additive=lambda candidate, pool_, fitness: fitness > 0.0 and len(pool_) < 3, population_size=32, generations_per_depth=2, seed=11)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/flows/test_alpha_search.py:102: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/flows/alpha_search.py:140: in search_formulas
+    algorithms.eaSimple(pop, toolbox, cxpb=cx_prob, mutpb=mut_prob, ngen=generations_per_depth, verbose=False)
+/opt/hostedtoolcache/Python/3.11.15/x64/lib/python3.11/site-packages/deap/algorithms.py:150: in eaSimple
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/flows/alpha_search.py:135: in <lambda>
+    toolbox.register("map", lambda f, x: f(x))
+                                         ^^^^
+src/flows/alpha_search.py:159: in _evaluate_individual
+    expr = individual_to_expr(individual, pset)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/flows/alpha_search.py:113: in individual_to_expr
+    return ensure_expr(gp.compile(individual, pset))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+expr = [[<deap.gp.Primitive object at 0x7fe26c1a9170>, <deap.gp.Terminal object at 0x7fe275408140>, <deap.gp.Terminal object ...t at 0x7fe26cb4aca0>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], ...]
+pset = <deap.gp.PrimitiveSetTyped object at 0x7fe27577e4d0>
+
+    def compile(expr, pset):
+        """Compile the expression *expr*.
+    
+        :param expr: Expression to compile. It can either be a PrimitiveTree,
+                     a string of Python code or any object that when
+                     converted into string produced a valid Python code
+                     expression.
+        :param pset: Primitive set against which the expression is compile.
+        :returns: a function if the primitive set has 1 or more arguments,
+                  or return the results produced by evaluating the tree.
+        """
+        code = str(expr)
+        if len(pset.arguments) > 0:
+            # This section is a stripped version of the lambdify
+            # function of SymPy 0.6.6.
+            args = ",".join(arg for arg in pset.arguments)
+            code = "lambda {args}: {code}".format(args=args, code=code)
+        try:
+>           return eval(code, pset.context, {})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E             File "<string>", line 1
+E               [[<deap.gp.Primitive object at 0x7fe26c1a9170>, <deap.gp.Terminal object at 0x7fe275408140>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe275513060>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26cb4aca0>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a9210>, <deap.gp.Terminal object at 0x7fe2754081c0>, <deap.gp.Terminal object at 0x7fe26c1369c0>], [<deap.gp.Primitive object at 0x7fe275513650>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe26c1a9030>, <deap.gp.Terminal object at 0x7fe275408140>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a8810>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a8ef0>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe275511f80>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26cb4aca0>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe275513060>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe275513650>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a9210>, <deap.gp.Terminal object at 0x7fe2754081c0>, <deap.gp.Terminal object at 0x7fe26c1369c0>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe26c1a8ef0>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe275408140>]]
+E                 ^
+E           SyntaxError: invalid syntax
+
+/opt/hostedtoolcache/Python/3.11.15/x64/lib/python3.11/site-packages/deap/gp.py:498: SyntaxError
+__ test_individual_to_expr_and_search_formulas_use_standard_deap_individuals ___
+
+    def test_individual_to_expr_and_search_formulas_use_standard_deap_individuals():
+        pset = make_alpha_pset(["x", "y"], halflives=[2, 5])
+        expr = individual_to_expr(gp.PrimitiveTree.from_string("ewm(x, hl_0)", pset), pset)
+        assert isinstance(expr, Call) and expr.fn == "ewm"
+        accepted_pool_sizes = []
+    
+        def objective(candidate, pool):
+            accepted_pool_sizes.append(len(pool))
+            return 1.0
+    
+>       out = search_formulas(pset, objective, max_depth=2, filters=[lambda candidate: True], additive=lambda candidate, pool, fitness: fitness > 0.0 and len(pool) < 2, population_size=12, generations_per_depth=1, seed=7)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/flows/test_alpha_search.py:118: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/flows/alpha_search.py:140: in search_formulas
+    algorithms.eaSimple(pop, toolbox, cxpb=cx_prob, mutpb=mut_prob, ngen=generations_per_depth, verbose=False)
+/opt/hostedtoolcache/Python/3.11.15/x64/lib/python3.11/site-packages/deap/algorithms.py:150: in eaSimple
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/flows/alpha_search.py:135: in <lambda>
+    toolbox.register("map", lambda f, x: f(x))
+                                         ^^^^
+src/flows/alpha_search.py:159: in _evaluate_individual
+    expr = individual_to_expr(individual, pset)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/flows/alpha_search.py:113: in individual_to_expr
+    return ensure_expr(gp.compile(individual, pset))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+expr = [[<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal obje...at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], ...]
+pset = <deap.gp.PrimitiveSetTyped object at 0x7fe220b07190>
+
+    def compile(expr, pset):
+        """Compile the expression *expr*.
+    
+        :param expr: Expression to compile. It can either be a PrimitiveTree,
+                     a string of Python code or any object that when
+                     converted into string produced a valid Python code
+                     expression.
+        :param pset: Primitive set against which the expression is compile.
+        :returns: a function if the primitive set has 1 or more arguments,
+                  or return the results produced by evaluating the tree.
+        """
+        code = str(expr)
+        if len(pset.arguments) > 0:
+            # This section is a stripped version of the lambdify
+            # function of SymPy 0.6.6.
+            args = ",".join(arg for arg in pset.arguments)
+            code = "lambda {args}: {code}".format(args=args, code=code)
+        try:
+>           return eval(code, pset.context, {})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E             File "<string>", line 1
+E               [[<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Primitive object at 0x7fe1fcbb3b50>, <deap.gp.Terminal object at 0x7fe2200da440>, <deap.gp.Terminal object at 0x7fe22010a9c0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>]]
+E                 ^
+E           SyntaxError: invalid syntax
+
+/opt/hostedtoolcache/Python/3.11.15/x64/lib/python3.11/site-packages/deap/gp.py:498: SyntaxError
+=========================== short test summary info ============================
+FAILED tests/flows/riskminer/test_policy.py::test_risk_quantile_tracker_moves_in_the_correct_direction - assert np.float64(0.16000000000000048) < 0.08
+ +  where np.float64(0.16000000000000048) = abs((0.7600000000000006 - np.float64(0.6000000000000001)))
+ +    where 0.7600000000000006 = RiskQuantileTracker(cdf_quantile=0.8, learning_rate=0.01, value=0.7600000000000006).value
+ +    and   np.float64(0.6000000000000001) = <function quantile at 0x7fe29c7a49f0>(array([-1.  , -0.98, -0.96, -0.94, -0.92, -0.9 , -0.88, -0.86, -0.84,\n       -0.82, -0.8 , -0.78, -0.76, -0.74, -0.72,... 0.72,  0.74,  0.76,  0.78,\n        0.8 ,  0.82,  0.84,  0.86,  0.88,  0.9 ,  0.92,  0.94,  0.96,\n        0.98,  1.  ]), 0.8)
+ +      where <function quantile at 0x7fe29c7a49f0> = np.quantile
+FAILED tests/flows/test_alpha_search.py::test_depth_three_generation_example_filters_dimensionless_not_in_pool -   File "<string>", line 1
+    [[<deap.gp.Primitive object at 0x7fe26c1a9170>, <deap.gp.Terminal object at 0x7fe275408140>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe275513060>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26cb4aca0>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a9210>, <deap.gp.Terminal object at 0x7fe2754081c0>, <deap.gp.Terminal object at 0x7fe26c1369c0>], [<deap.gp.Primitive object at 0x7fe275513650>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe26c1a9030>, <deap.gp.Terminal object at 0x7fe275408140>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a8810>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a8ef0>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe275511f80>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26cb4aca0>, <deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe275513060>, <deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe275513650>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Primitive object at 0x7fe26c1a9210>, <deap.gp.Terminal object at 0x7fe2754081c0>, <deap.gp.Terminal object at 0x7fe26c1369c0>], [<deap.gp.Terminal object at 0x7fe27540ac00>], [<deap.gp.Terminal object at 0x7fe275408140>], [<deap.gp.Primitive object at 0x7fe26c1a8ef0>, <deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe2754081c0>], [<deap.gp.Terminal object at 0x7fe275408140>]]
+      ^
+SyntaxError: invalid syntax
+FAILED tests/flows/test_alpha_search.py::test_individual_to_expr_and_search_formulas_use_standard_deap_individuals -   File "<string>", line 1
+    [[<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Primitive object at 0x7fe1fcbb3b50>, <deap.gp.Terminal object at 0x7fe2200da440>, <deap.gp.Terminal object at 0x7fe22010a9c0>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200da440>], [<deap.gp.Terminal object at 0x7fe2200dadc0>]]
+      ^
+SyntaxError: invalid syntax
+3 failed, 18 passed in 31.48s

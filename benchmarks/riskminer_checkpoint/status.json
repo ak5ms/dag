@@ -1,0 +1,7 @@
+{
+  "source_sha": "f6f73712a3e0b48203ddc553061c3fd134829dfa",
+  "tests_exit_code": 1,
+  "benchmark_exit_code": 99,
+  "runner_os": "Linux",
+  "python": "3.11"
+}
