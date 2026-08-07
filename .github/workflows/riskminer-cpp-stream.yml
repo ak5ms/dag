@@ -7,6 +7,7 @@ on:
     paths:
       - "src/flows/riskminer/**"
       - "scripts/benchmark_riskminer_cpp_stream.py"
+      - "scripts/benchmark_riskminer_deep_cpp_stream.py"
       - "tests/flows/riskminer/**"
       - ".github/workflows/riskminer-cpp-stream.yml"
   workflow_dispatch:
@@ -15,9 +16,9 @@ permissions:
   contents: read
 
 jobs:
-  focused-tests-and-smoke:
+  focused-tests-and-deep-search:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,24 +34,29 @@ jobs:
         run: >-
           python -m pytest -q -o addopts=""
           tests/flows/riskminer
-          tests/flows/test_alpha_search.py
-      - name: Run reduced native RiskMiner benchmark
+      - name: Run higher-depth native RiskMiner benchmark
         env:
           PYTHONPATH: src
           JAX_ENABLE_X64: "1"
-          RISKMINER_ROWS: "4000"
+          RISKMINER_ROWS: "5000"
           RISKMINER_INSTRUMENTS: "9"
-          RISKMINER_SIMULATIONS: "8"
-          RISKMINER_ROLLOUTS: "2"
-          RISKMINER_EVALUATION_BATCH: "4"
-          RISKMINER_ARCHIVE_SIZE: "20"
-          RISKMINER_POOL_SIZE: "3"
-          RISKMINER_OUTPUT_DIR: "/tmp/riskminer-output"
-        run: python scripts/benchmark_riskminer_cpp_stream.py
-      - name: Upload benchmark JSON
+          RISKMINER_SIMULATIONS: "32"
+          RISKMINER_ROLLOUTS: "4"
+          RISKMINER_EVALUATION_BATCH: "8"
+          RISKMINER_ARCHIVE_SIZE: "100"
+          RISKMINER_MAX_DEPTH: "8"
+          RISKMINER_MIN_FORMULA_DEPTH: "5"
+          RISKMINER_MAX_TOKENS: "28"
+          RISKMINER_OUTPUT_DIR: "/tmp/riskminer-deep-output"
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/riskminer-deep-output
+          python scripts/benchmark_riskminer_deep_cpp_stream.py \
+            2>&1 | tee /tmp/riskminer-deep-output/benchmark.log
+      - name: Upload higher-depth output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: riskminer-cpp-stream-smoke
-          path: /tmp/riskminer-output/riskminer_benchmark.json
+          name: riskminer-cpp-stream-deep-search
+          path: /tmp/riskminer-deep-output/
           if-no-files-found: warn
