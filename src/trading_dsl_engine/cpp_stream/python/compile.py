@@ -24,7 +24,7 @@ from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
 from trading_dsl_engine.cpp_stream.python.sources import (
     SourceInfo,
     SourceValue,
-    inspect_source_mapping,
+    inspect_source,
 )
 from trading_dsl_engine.ir.ops import (
     CumsumOp,
@@ -176,6 +176,52 @@ def _input_value_type(spec: InputTypeSpec, n_instruments: int) -> ValueType:
         (None,) + shape[1:] if shape[0] == n_instruments else shape
     )
     return tensor(logical_shape, dtype=spec.dtype)
+
+
+class _ReferencedSourceTypes(Mapping[str, ValueType]):
+    """Inspect source metadata only when the neutral IR references a name."""
+
+    def __init__(
+        self,
+        data: Mapping[str, SourceValue],
+        expected_types: Mapping[str, InputTypeSpec] | None,
+        n_instruments: int | None,
+    ) -> None:
+        self._data = data
+        self._expected_types = expected_types or {}
+        self._n_instruments = n_instruments
+        self._infos: dict[str, SourceInfo] = {}
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def _info(self, name: str) -> SourceInfo:
+        if name not in self._data:
+            raise KeyError(name)
+        info = self._infos.get(name)
+        if info is None:
+            info = inspect_source(
+                self._data[name], expected=self._expected_types.get(name)
+            )
+            self._infos[name] = info
+        return info
+
+    def __getitem__(self, name: str) -> ValueType:
+        spec = self._info(name).input_type
+        if self._n_instruments is not None:
+            return _input_value_type(spec, int(self._n_instruments))
+        shape = tuple(spec.row_shape or ())
+        if not shape:
+            return SCALAR
+        # cpp_stream source row shapes are (instrument, *feature_axes). Keep the
+        # instrument extent symbolic until only referenced sources infer N.
+        return tensor((None,) + shape[1:], dtype=spec.dtype)
+
+    def infos_for(self, names: tuple[str, ...]) -> dict[str, SourceInfo]:
+        return {name: self._info(name) for name in names}
 
 
 def _broadcast_shapes(shapes: tuple[tuple[int | None, ...], ...]) -> tuple[int | None, ...]:
@@ -387,9 +433,8 @@ def _validate_names(
     what: str,
 ) -> None:
     missing = [name for name in program.input_names if name not in data]
-    extra = sorted(set(data) - set(program.input_names))
-    if missing or extra:
-        raise KeyError(f"{what} mismatch: missing={missing}, extra={extra}")
+    if missing:
+        raise KeyError(f"{what} mismatch: missing={missing}")
 
 
 def compile_formula(
@@ -409,11 +454,27 @@ def compile_formula(
         raise ValueError("prefetch_rows must be >= 0")
 
     if data is not None:
-        infos = inspect_source_mapping(data, expected_types=input_types)
-        if len({info.rows for info in infos.values()}) != 1:
+        referenced_types = _ReferencedSourceTypes(
+            data,
+            input_types,
+            n_instruments,
+        )
+        # The first pass discovers names while inspecting only source metadata
+        # requested by the IR. Surplus mapping entries are never touched.
+        program = compile_ir(
+            formula,
+            dsl_registry=dsl_registry,
+            column_names=column_names,
+            input_value_types=referenced_types,
+        )
+        _validate_names(program, data, what="source")
+        infos = referenced_types.infos_for(program.input_names)
+        if infos and len({info.rows for info in infos.values()}) != 1:
             details = {name: info.rows for name, info in infos.items()}
             raise ValueError(f"cpp_stream sources have different row counts: {details}")
         n = _infer_n(infos, n_instruments)
+        # Recompile with the exact inferred instrument count so tensor shapes and
+        # row-scalar analysis retain their existing behavior.
         program = compile_ir(
             formula,
             dsl_registry=dsl_registry,
@@ -425,7 +486,9 @@ def compile_formula(
         )
         _validate_names(program, data, what="source")
         ordered = tuple(infos[name].input_type for name in program.input_names)
-        bound_sources: Mapping[str, SourceValue] | None = dict(data)
+        bound_sources: Mapping[str, SourceValue] | None = {
+            name: data[name] for name in program.input_names
+        }
     else:
         if n_instruments is None:
             raise ValueError(

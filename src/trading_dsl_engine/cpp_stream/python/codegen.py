@@ -1184,17 +1184,30 @@ def _group_type(
     input_types: tuple[InputTypeSpec, ...],
 ) -> CppType:
     keys = _key_list(group, n=n, input_types=input_types)
-    if not keys:
+    described = tuple(zip(keys, group.key_specs))
+    epoch_keys = tuple(key for key, spec in described if spec.monotonic)
+    retained_keys = tuple(key for key, spec in described if not spec.monotonic)
+    if not retained_keys:
         resolver = tmpl("stackdsl::NoKeyResolver", IntArg(n))
     elif group.dense:
-        resolver = tmpl("stackdsl::DenseTupleGroupResolver", IntArg(n), *keys)
+        resolver = tmpl(
+            "stackdsl::DenseTupleGroupResolver", IntArg(n), *retained_keys
+        )
     else:
         resolver = tmpl(
             "stackdsl::HashGroupResolver",
             IntArg(n),
             IntArg(group.capacity),
             IntArg(group.hash_capacity),
-            *keys,
+            *retained_keys,
+        )
+    if epoch_keys:
+        resolver = tmpl(
+            "stackdsl::MonotonicGroupResolver",
+            IntArg(n),
+            resolver,
+            tmpl("stackdsl::KeyList", *epoch_keys),
+            tmpl("stackdsl::KeyList", *retained_keys),
         )
     partitions = tmpl(
         "stackdsl::StaticPartitions",
