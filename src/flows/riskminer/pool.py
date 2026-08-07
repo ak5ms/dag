@@ -17,6 +17,7 @@ from trading_dsl_engine.base.dsl import (
     einsum,
     ewm_std,
     ffill,
+    fillna,
     get_beta,
     mul,
     ne,
@@ -50,7 +51,7 @@ def build_ridge_pool_score_formula(
     ridge_lambda: float = 0.0,
     risk_halflife: float = 1440.0 * 5.0,
 ) -> Expr:
-    """Build the user's exact native Ridge-pool Sharpe graph."""
+    """Build the user's native Ridge-pool Sharpe graph."""
 
     if not alphas:
         raise ValueError("at least one alpha is required")
@@ -62,10 +63,13 @@ def build_ridge_pool_score_formula(
 
     clean_rets = where(ne(roll_rets, 0.0), roll_rets, nan)
     ridge_weights = dsl_pow(hs, -2.0)
-    scaled_alphas = cat(*(mul(alpha, vol) for alpha in alphas))
+    scaled_alphas = tuple(mul(alpha, vol) for alpha in alphas)
+    scaled_matrix = cat(*scaled_alphas)
 
+    # Keep every alpha as a separate Ridge feature. Passing the cat matrix as one
+    # feature makes the native Ridge feature count disagree with the matrix width.
     reg = Ridge(
-        shift(scaled_alphas, 1, 1),
+        *(shift(alpha, 1, 1) for alpha in scaled_alphas),
         y=clean_rets,
         weights=ridge_weights,
         hl=float(ridge_halflife),
@@ -75,7 +79,7 @@ def build_ridge_pool_score_formula(
     yhat = einsum(
         "f,nf->n",
         get_beta(reg),
-        scaled_alphas,
+        scaled_matrix,
     )
     risk_span = halflife_to_span(risk_halflife)
     denominator = mul(
@@ -89,12 +93,16 @@ def build_ridge_pool_score_formula(
             nan,
         )
     )
-    pool_pnl = reduction(
-        "sum",
+    pool_contributions = fillna(
         mul(
             shift(session_position, 1, 1),
             clean_rets,
         ),
+        0.0,
+    )
+    pool_pnl = reduction(
+        "sum",
+        pool_contributions,
         axis=1,
     )
     score = div(
