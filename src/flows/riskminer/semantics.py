@@ -28,6 +28,26 @@ GENERIC_TYPES = frozenset(
     }
 )
 
+# These tags describe provenance, book side, aggregation, or field location. They
+# are useful for operator constraints and priors, but they are not value domains
+# that make addition/min/max meaningful. For example, ``bv0`` and ``ap0`` are
+# both level-0 best quotes, but one is a quantity and the other is a price.
+DESCRIPTOR_TYPES = frozenset(
+    {
+        "activity",
+        "ask",
+        "best_quote",
+        "bid",
+        "level_0",
+        "liquidity",
+        "ohlc",
+        "quote_side",
+        "volume_weighted",
+    }
+)
+
+NON_VALUE_TYPES = GENERIC_TYPES | DESCRIPTOR_TYPES
+
 
 @dataclass(frozen=True)
 class SemanticInfo:
@@ -80,7 +100,7 @@ class TypeGraph:
         return (
             self.closure(left.types)
             & self.closure(right.types)
-        ) - GENERIC_TYPES
+        ) - NON_VALUE_TYPES
 
 
 DEFAULT_TYPE_GRAPH = TypeGraph.from_edges(
@@ -137,7 +157,7 @@ def common_output(
     shape = broadcast_shape(left.shape, right.shape)
     common = graph.meaningful_common(left, right)
     if shape is None or not common:
-        raise ValueError("operands have no compatible semantic type")
+        raise ValueError("operands have no compatible semantic value type")
     return SemanticInfo(
         types=frozenset({"numeric"}) | common,
         shape=shape,
@@ -199,8 +219,8 @@ def multiplication_output(
     elif "dimensionless" in ltypes and "dimensionless" in rtypes:
         out_types = frozenset({"numeric", "dimensionless"})
     else:
-        principal_left = sorted(ltypes - GENERIC_TYPES)
-        principal_right = sorted(rtypes - GENERIC_TYPES)
+        principal_left = sorted(ltypes - NON_VALUE_TYPES)
+        principal_right = sorted(rtypes - NON_VALUE_TYPES)
         label = "product:" + "*".join(
             (principal_left[-1:] or ["unknown"])
             + (principal_right[-1:] or ["unknown"])
@@ -219,7 +239,7 @@ def division_output(
         raise ValueError("division operands cannot broadcast")
     ltypes = graph.closure(left.types)
     rtypes = graph.closure(right.types)
-    common = (ltypes & rtypes) - GENERIC_TYPES
+    common = (ltypes & rtypes) - NON_VALUE_TYPES
     if common:
         return SemanticInfo(
             frozenset({"numeric", "dimensionless", "ratio"}),
@@ -227,8 +247,8 @@ def division_output(
         )
     if "dimensionless" in rtypes:
         return SemanticInfo(left.types | frozenset({"numeric"}), shape)
-    principal_left = sorted(ltypes - GENERIC_TYPES)
-    principal_right = sorted(rtypes - GENERIC_TYPES)
+    principal_left = sorted(ltypes - NON_VALUE_TYPES)
+    principal_right = sorted(rtypes - NON_VALUE_TYPES)
     label = "ratio:" + "/".join(
         (principal_left[-1:] or ["unknown"])
         + (principal_right[-1:] or ["unknown"])
@@ -392,7 +412,9 @@ def metadata_as_dict(
 
 __all__ = [
     "DEFAULT_TYPE_GRAPH",
+    "DESCRIPTOR_TYPES",
     "GENERIC_TYPES",
+    "NON_VALUE_TYPES",
     "SearchShape",
     "SemanticInfo",
     "TypeGraph",
