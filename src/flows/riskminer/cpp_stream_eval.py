@@ -16,6 +16,7 @@ from trading_dsl_engine.base.dsl import (
     emit,
     einsum,
     fillna,
+    mul,
     reduction,
     shift,
     var,
@@ -62,7 +63,7 @@ def build_candidate_score_formula(
     *,
     roll_rets_name: str = "roll_rets",
 ) -> Expr:
-    """Build final-only native scores for a batch of row-vector alphas.
+    """Build final-only native scores for row-vector alpha candidates.
 
     For every candidate ``w`` this computes exactly::
 
@@ -70,23 +71,32 @@ def build_candidate_score_formula(
         score = pnl.mean(axis=0) / pnl.std(axis=0, ddof=0)
 
     Pandas-style row ``sum`` returns zero when the complete shifted row is NaN.
-    Explicitly filling shifted values with zero preserves that behavior while the
-    temporal mean/std remain final-only native reductions.
-
-    ``cat`` creates row shape ``(instrument, candidate)``. Reduction axes address
-    ``(time, *row_shape)``, so axis 1 is instruments and axis 0 is time.
+    Each candidate is therefore shifted and filled *before* ``cat``. Besides
+    preserving that behavior, this avoids routing a matrix slot through the
+    scalar/vector ``fillna`` source adapter when a failed batch is bisected to a
+    single candidate.
     """
 
     if not candidates:
         raise ValueError("at least one candidate is required")
-    alpha_matrix = cat(*candidates)
-    shifted = fillna(shift(alpha_matrix, 1, 1), 0.0)
-    contributions = einsum(
-        "nf,n->nf",
-        shifted,
-        var(roll_rets_name),
+
+    roll_rets = var(roll_rets_name)
+    shifted = tuple(
+        fillna(shift(candidate, 1, 1), 0.0)
+        for candidate in candidates
     )
-    pnl = reduction("sum", contributions, axis=1)
+
+    if len(shifted) == 1:
+        pnl = reduction("sum", mul(shifted[0], roll_rets), axis=1)
+    else:
+        shifted_matrix = cat(*shifted)
+        contributions = einsum(
+            "nf,n->nf",
+            shifted_matrix,
+            roll_rets,
+        )
+        pnl = reduction("sum", contributions, axis=1)
+
     pnl_mean = reduction("mean", pnl, axis=0)
     pnl_std = reduction("std", pnl, axis=0, ddof=0)
     return emit(div(pnl_mean, pnl_std), mode="last")
