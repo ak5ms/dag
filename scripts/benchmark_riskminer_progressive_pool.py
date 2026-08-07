@@ -37,7 +37,7 @@ EVALUATION_BATCH = int(os.environ.get("RISKMINER_EVALUATION_BATCH", "4"))
 ARCHIVE_SIZE = int(os.environ.get("RISKMINER_ARCHIVE_SIZE", "24"))
 POOL_SHORTLIST = int(os.environ.get("RISKMINER_POOL_SHORTLIST", "3"))
 MIN_POOL_IMPROVEMENT = float(
-    os.environ.get("RISKMINER_MIN_POOL_IMPROVEMENT", "0")
+    os.environ.get("RISKMINER_MIN_POOL_IMPROVEMENT", "1e-8")
 )
 SEED = int(os.environ.get("RISKMINER_SEED", "42"))
 OUTPUT_DIR = os.environ.get("RISKMINER_OUTPUT_DIR")
