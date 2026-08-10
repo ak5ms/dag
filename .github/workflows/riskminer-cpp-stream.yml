@@ -9,7 +9,9 @@ on:
       - "scripts/benchmark_riskminer_cpp_stream.py"
       - "scripts/benchmark_riskminer_deep_cpp_stream.py"
       - "scripts/benchmark_riskminer_deep_quality_cpp_stream.py"
+      - "scripts/run_riskminer_inputdata.py"
       - "tests/flows/riskminer/**"
+      - "docs/riskminer_inputdata.md"
       - ".github/workflows/riskminer-cpp-stream.yml"
   workflow_dispatch:
 
@@ -28,13 +30,14 @@ jobs:
           cache: pip
       - name: Install project
         run: python -m pip install --upgrade pip && python -m pip install -e .
-      - name: Run typed RPN, MCTS, native scorer, and native pool tests
+      - name: Run typed RPN, InputData semantics, MCTS, native scorer, and native pool tests
         env:
           PYTHONPATH: src
           JAX_ENABLE_X64: "1"
         run: >-
           python -m pytest -q -o addopts=""
           tests/flows/riskminer/test_core.py
+          tests/flows/riskminer/test_inputdata_semantics.py
           tests/flows/riskminer/test_native.py
       - name: Run quality-filtered higher-depth native RiskMiner benchmark
         env:
