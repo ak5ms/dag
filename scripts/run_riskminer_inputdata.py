@@ -67,7 +67,7 @@ ROLLOUTS = int(os.environ.get("RISKMINER_ROLLOUTS", "4"))
 EVALUATION_BATCH = int(os.environ.get("RISKMINER_EVALUATION_BATCH", "16"))
 ARCHIVE_SIZE = int(os.environ.get("RISKMINER_ARCHIVE_SIZE", "256"))
 POOL_SHORTLIST = int(os.environ.get("RISKMINER_POOL_SHORTLIST", "3"))
-TARGET_POOL_SIZE = int(os.environ.get("RISKMINER_TARGET_POOL_SIZE", "12"))
+TARGET_POOL_SIZE = int(os.environ.get("RISKMINER_TARGET_POOL_SIZE", "6"))
 MIN_POOL_IMPROVEMENT = float(
     os.environ.get("RISKMINER_MIN_POOL_IMPROVEMENT", "1e-8")
 )
@@ -236,8 +236,6 @@ def _build_vol_from_roll_rets():
 
     roll_rets_gap = where(~in_session, roll_rets, float("nan"))
     roll_rets_gap = dsl_replace(roll_rets_gap, 0, float("nan"))
-    gap_time = shift(streak(isnan(roll_rets_gap)))
-    roll_rets_gap_scaled = roll_rets_gap / (gap_time / 1440) ** 0.5
     roll_rets_session = dsl_replace(
         where(in_session, roll_rets, float("nan")),
         0,
@@ -251,7 +249,7 @@ def _build_vol_from_roll_rets():
         adjust=True,
     ) ** 0.5
     vol_gap = ewm(
-        roll_rets_gap_scaled**2,
+        roll_rets_gap**2,
         5,
         ignore_na=True,
         adjust=True,
