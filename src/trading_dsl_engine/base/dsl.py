@@ -854,15 +854,55 @@ def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noq
     return call("InstrumentBasisMean", features, y, weights, hl)
 
 
-def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonneg=False) -> Expr:  # noqa: N802
+def Ridge(  # noqa: N802
+    *features,
+    y=None,
+    weights=None,
+    hl=None,
+    lambda_=None,
+    lam=None,
+    nonneg=False,
+    recompute_every=1,
+) -> Expr:
     ridge_lambda = lambda_ if lambda_ is not None else lam
+    recompute_kwargs = (
+        {}
+        if recompute_every == 1
+        else {"recompute_every": recompute_every}
+    )
     if y is None or hl is None or ridge_lambda is None:
         if weights is not None:
-            raise TypeError("Ridge positional form cannot combine positional y/hl/lambda with keyword weights")
-        return call("Ridge", *features, 3.0 if nonneg else 2.0)
+            raise TypeError(
+                "Ridge positional form cannot combine positional "
+                "y/hl/lambda with keyword weights"
+            )
+        return call(
+            "Ridge",
+            *features,
+            3.0 if nonneg else 2.0,
+            **recompute_kwargs,
+        )
     if weights is None:
-        return call("Ridge", *features, y, 1.0, hl, ridge_lambda, 3.0 if nonneg else 2.0)
-    return call("Ridge", *features, y, weights, hl, ridge_lambda, 3.0 if nonneg else 2.0)
+        return call(
+            "Ridge",
+            *features,
+            y,
+            1.0,
+            hl,
+            ridge_lambda,
+            3.0 if nonneg else 2.0,
+            **recompute_kwargs,
+        )
+    return call(
+        "Ridge",
+        *features,
+        y,
+        weights,
+        hl,
+        ridge_lambda,
+        3.0 if nonneg else 2.0,
+        **recompute_kwargs,
+    )
 
 
 get_beta = op("get_beta")

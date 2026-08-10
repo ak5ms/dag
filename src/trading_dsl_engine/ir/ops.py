@@ -342,6 +342,11 @@ class RidgeOp:
     has_weights: bool
     nonneg: bool = False
     is_stateful: bool = True
+    recompute_every: int = 1
+
+    def __post_init__(self) -> None:
+        if self.recompute_every < 1:
+            raise ValueError("Ridge recompute_every must be >= 1")
 
     @property
     def coefficient_width(self) -> int:

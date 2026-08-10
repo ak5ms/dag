@@ -1073,6 +1073,7 @@ def _stage_type(
             BoolArg(stateful),
             projection,
             execution,
+            IntArg(physical.op.recompute_every),
         )
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")

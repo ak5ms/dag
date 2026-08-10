@@ -24,6 +24,42 @@ inline constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 template <class T>
 inline constexpr bool always_false_v = false;
 
+// Reusable compile-time scheduler for expensive state refreshes.  The first
+// observation of each slot refreshes immediately; subsequent refreshes occur
+// after Every global rows.  Every=1 specializes to a zero-state, always-due
+// path so existing operators pay no counter/modulo cost.
+template <std::size_t Every, std::size_t Slots = 1>
+struct PeriodicRecompute {
+    static_assert(Every > 0, "PeriodicRecompute Every must be > 0");
+    static_assert(Slots > 0, "PeriodicRecompute Slots must be > 0");
+
+    std::array<std::uint64_t, Slots> last{};
+    std::array<std::uint8_t, Slots> initialized{};
+    std::uint64_t row = 0;
+
+    STACKDSL_HOT bool due(std::size_t slot = 0) noexcept {
+        if (!initialized[slot] || row - last[slot] >= Every) {
+            initialized[slot] = 1;
+            last[slot] = row;
+            return true;
+        }
+        return false;
+    }
+
+    STACKDSL_HOT void next_row() noexcept { ++row; }
+};
+
+template <std::size_t Slots>
+struct PeriodicRecompute<1, Slots> {
+    static_assert(Slots > 0, "PeriodicRecompute Slots must be > 0");
+
+    STACKDSL_HOT constexpr bool due(std::size_t = 0) const noexcept {
+        return true;
+    }
+
+    STACKDSL_HOT constexpr void next_row() const noexcept {}
+};
+
 template <class T>
 STACKDSL_HOT bool finite(T value) noexcept {
     if constexpr (std::is_floating_point_v<T>) return std::isfinite(value);

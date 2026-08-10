@@ -592,9 +592,26 @@ def _flatten_cat_features(expressions: tuple[Expr, ...]) -> tuple[Expr, ...]:
 
 def _normalize_ridge(
     call: Call,
-) -> tuple[tuple[Expr, ...], Expr, Expr | None, Expr, Expr, bool, bool]:
-    if call.kwargs:
-        values = dict(call.kwargs)
+) -> tuple[
+    tuple[Expr, ...],
+    Expr,
+    Expr | None,
+    Expr,
+    Expr,
+    bool,
+    bool,
+    int,
+]:
+    keyword_values = dict(call.kwargs)
+    if len(keyword_values) != len(call.kwargs):
+        raise FormulaIRCompileError("Ridge got duplicate keyword arguments")
+    recompute_every = _literal_int(
+        keyword_values.pop("recompute_every", Number(1.0)),
+        "Ridge recompute_every",
+        1,
+    )
+    if keyword_values:
+        values = keyword_values
         if set(values) - {"y", "weights", "hl", "lambda_", "nonneg"}:
             raise FormulaIRCompileError("invalid Ridge keyword")
         if any(name not in values for name in ("y", "hl", "lambda_")):
@@ -604,7 +621,9 @@ def _normalize_ridge(
         weights = values.get("weights")
         hl = values["hl"]
         lam = values["lambda_"]
-        nonneg = _literal_bool(values.get("nonneg", Number(0.0)), "Ridge nonneg")
+        nonneg = _literal_bool(
+            values.get("nonneg", Number(0.0)), "Ridge nonneg"
+        )
     else:
         args = call.args
         sentinel = (
@@ -632,6 +651,7 @@ def _normalize_ridge(
         lam,
         nonneg,
         not (isinstance(hl, Number) and float(hl.value) == 0.0),
+        recompute_every,
     )
 
 
@@ -1099,7 +1119,16 @@ class _BaseBuilder:
                 object_value(width),
             )
         if node.fn == "Ridge":
-            features, y, weights, hl, lam, nonneg, stateful = _normalize_ridge(node)
+            (
+                features,
+                y,
+                weights,
+                hl,
+                lam,
+                nonneg,
+                stateful,
+                recompute_every,
+            ) = _normalize_ridge(node)
             feature_ids = tuple(self.build(feature) for feature in features)
             widths = tuple(
                 _feature_width(self.nodes[index].value_type)
@@ -1109,7 +1138,13 @@ class _BaseBuilder:
             if weights is not None:
                 children.append(self.build(weights))
             children.extend((self.build(hl), self.build(lam)))
-            op = RidgeOp(widths, weights is not None, nonneg, stateful)
+            op = RidgeOp(
+                widths,
+                weights is not None,
+                nonneg,
+                stateful,
+                recompute_every,
+            )
             return self._append(
                 op, tuple(children), object_value(op.coefficient_width)
             )

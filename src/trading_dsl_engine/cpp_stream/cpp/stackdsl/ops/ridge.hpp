@@ -380,6 +380,101 @@ struct RidgeMetricState<Groups, K, true> {
     std::array<std::uint64_t, Groups> last_update{};
 };
 
+template <
+    std::size_t Groups,
+    std::size_t K,
+    bool NeedsMetrics,
+    bool NeedsInference,
+    bool Enabled
+>
+struct RidgeResultCache {};
+
+template <
+    std::size_t Groups,
+    std::size_t K,
+    bool NeedsMetrics,
+    bool NeedsInference
+>
+struct RidgeResultCache<Groups, K, NeedsMetrics, NeedsInference, true> {
+    std::array<double, Groups * K> beta{};
+    std::array<std::uint8_t, Groups> initialized{};
+    std::array<double, NeedsInference ? Groups * K : 0> standard_errors{};
+    std::array<double, NeedsInference ? Groups * K : 0> tstats{};
+    std::array<double, NeedsMetrics ? Groups : 0> sse{};
+    std::array<double, NeedsMetrics ? Groups : 0> sst{};
+    std::array<double, NeedsMetrics ? Groups : 0> r2{};
+    std::array<double, NeedsInference ? Groups : 0> residual_variance{};
+    std::array<double, NeedsInference ? Groups : 0> effective_df{};
+    std::array<double, NeedsMetrics ? Groups : 0> effective_n{};
+
+    STACKDSL_HOT void load(
+        std::size_t group,
+        std::array<double, K>& beta_out,
+        std::array<double, K>& standard_errors_out,
+        std::array<double, K>& tstats_out,
+        double& sse_out,
+        double& sst_out,
+        double& r2_out,
+        double& residual_variance_out,
+        double& effective_df_out,
+        double& effective_n_out
+    ) const noexcept {
+        const std::size_t vector_base = group * K;
+        for (std::size_t j = 0; j < K; ++j) {
+            beta_out[j] = beta[vector_base + j];
+        }
+        if constexpr (NeedsInference) {
+            for (std::size_t j = 0; j < K; ++j) {
+                standard_errors_out[j] =
+                    standard_errors[vector_base + j];
+                tstats_out[j] = tstats[vector_base + j];
+            }
+            residual_variance_out = residual_variance[group];
+            effective_df_out = effective_df[group];
+        }
+        if constexpr (NeedsMetrics) {
+            sse_out = sse[group];
+            sst_out = sst[group];
+            r2_out = r2[group];
+            effective_n_out = effective_n[group];
+        }
+    }
+
+    STACKDSL_HOT void store(
+        std::size_t group,
+        const std::array<double, K>& beta_in,
+        const std::array<double, K>& standard_errors_in,
+        const std::array<double, K>& tstats_in,
+        double sse_in,
+        double sst_in,
+        double r2_in,
+        double residual_variance_in,
+        double effective_df_in,
+        double effective_n_in
+    ) noexcept {
+        const std::size_t vector_base = group * K;
+        for (std::size_t j = 0; j < K; ++j) {
+            beta[vector_base + j] = beta_in[j];
+        }
+        if constexpr (NeedsInference) {
+            for (std::size_t j = 0; j < K; ++j) {
+                standard_errors[vector_base + j] =
+                    standard_errors_in[j];
+                tstats[vector_base + j] = tstats_in[j];
+            }
+            residual_variance[group] = residual_variance_in;
+            effective_df[group] = effective_df_in;
+        }
+        if constexpr (NeedsMetrics) {
+            sse[group] = sse_in;
+            sst[group] = sst_in;
+            r2[group] = r2_in;
+            effective_n[group] = effective_n_in;
+        }
+        initialized[group] = 1;
+    }
+};
+
 template <class Projection> struct projection_component {
     static constexpr std::size_t value = std::numeric_limits<std::size_t>::max();
 };
@@ -463,10 +558,50 @@ struct projection_set<RidgeProjectionBundle<Bindings...>, DefaultOut> {
 
 }  // namespace ridge_detail
 
-template <std::size_t N, class Features, class Y, class Weights, class Out, std::uint64_t AlphaBits, std::uint64_t LambdaBits, bool Nonnegative, bool Stateful, class Projection, class Execution = DirectExecution<N>> struct RidgeNode;
+template <
+    std::size_t N,
+    class Features,
+    class Y,
+    class Weights,
+    class Out,
+    std::uint64_t AlphaBits,
+    std::uint64_t LambdaBits,
+    bool Nonnegative,
+    bool Stateful,
+    class Projection,
+    class Execution = DirectExecution<N>,
+    std::size_t RecomputeEvery = 1
+>
+struct RidgeNode;
 
-template <std::size_t N, class Y, class Weights, class Out, std::uint64_t AlphaBits, std::uint64_t LambdaBits, bool Nonnegative, bool Stateful, class Projection, class Execution, class... FeatureSources>
-struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, LambdaBits, Nonnegative, Stateful, Projection, Execution> {
+template <
+    std::size_t N,
+    class Y,
+    class Weights,
+    class Out,
+    std::uint64_t AlphaBits,
+    std::uint64_t LambdaBits,
+    bool Nonnegative,
+    bool Stateful,
+    class Projection,
+    class Execution,
+    std::size_t RecomputeEvery,
+    class... FeatureSources
+>
+struct RidgeNode<
+    N,
+    FeatureList<FeatureSources...>,
+    Y,
+    Weights,
+    Out,
+    AlphaBits,
+    LambdaBits,
+    Nonnegative,
+    Stateful,
+    Projection,
+    Execution,
+    RecomputeEvery
+> {
     static constexpr std::size_t K = sizeof...(FeatureSources);
     static constexpr std::size_t Groups = Execution::cross_state_size;
     static constexpr std::size_t MaxActiveGroups = Groups < N ? Groups : N;
@@ -475,8 +610,17 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
     static constexpr bool PredProjection = Projections::predicts;
     static constexpr bool NeedsInference = Projections::needs_inference;
     static constexpr bool NeedsMetrics = Projections::needs_metrics;
+    static_assert(RecomputeEvery > 0, "Ridge recompute interval must be > 0");
     ridge_detail::RidgeState<Groups, K, Stateful> state{};
     ridge_detail::RidgeMetricState<Groups, K, Stateful && NeedsMetrics> metrics{};
+    PeriodicRecompute<RecomputeEvery, Groups> recompute_schedule{};
+    ridge_detail::RidgeResultCache<
+        Groups,
+        K,
+        NeedsMetrics,
+        NeedsInference,
+        (RecomputeEvery > 1)
+    > result_cache{};
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
@@ -650,7 +794,10 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
             effective_n_values.fill(kNaN);
         }
         for (std::size_t active = 0; active < active_count; ++active) {
-            const std::size_t group = active_groups[active], local_matrix = active * K * K, local_vector = active * K;
+            const std::size_t group = active_groups[active];
+            const std::size_t local_matrix = active * K * K;
+            const std::size_t local_vector = active * K;
+            const bool recompute = recompute_schedule.due(group);
             std::array<double, K * K> xx{};
             std::array<double, K> xy{}, fallback{};
             if constexpr (Stateful) {
@@ -797,6 +944,23 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                     metric_weight_square = metric_weight_square_new[active];
                 }
             }
+            if constexpr (RecomputeEvery > 1) {
+                if (!recompute && result_cache.initialized[group]) {
+                    result_cache.load(
+                        group,
+                        solved_betas[active],
+                        standard_errors[active],
+                        tstats[active],
+                        sse_values[active],
+                        sst_values[active],
+                        r2_values[active],
+                        residual_variances[active],
+                        effective_df_values[active],
+                        effective_n_values[active]
+                    );
+                    continue;
+                }
+            }
             std::array<double, K * K> system = xx;
             for (std::size_t j = 0; j < K; ++j) {
                 system[j * K + j] = std::fma(
@@ -910,6 +1074,21 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                     }
                 }
             }
+            if constexpr (RecomputeEvery > 1) {
+                result_cache.store(
+                    group,
+                    beta,
+                    standard_errors[active],
+                    tstats[active],
+                    sse_values[active],
+                    sst_values[active],
+                    r2_values[active],
+                    residual_variances[active],
+                    effective_df_values[active],
+                    effective_n_values[active]
+                );
+            }
+
         }
         Projections::for_each(
             [&]<class ProjectionOut, class ProjectionType>() noexcept {
@@ -1045,6 +1224,7 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
             }
         );
         if constexpr (Stateful) ++state.t;
+        recompute_schedule.next_row();
     }
 };
 
