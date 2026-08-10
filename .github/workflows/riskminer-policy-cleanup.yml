@@ -1,4 +1,4 @@
-name: Remove superseded RiskMiner policy prototype
+name: Remove obsolete RiskMiner branches
 
 on:
   push:
@@ -17,16 +17,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Remove superseded prototype and commit
+          fetch-depth: 1
+      - name: Delete only explicitly obsolete RiskMiner branches
         shell: bash
         run: |
-          if [ ! -f src/flows/riskminer/policy.py ]; then
-            echo "prototype already removed"
-            exit 0
-          fi
-          git rm src/flows/riskminer/policy.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Remove superseded RiskMiner policy prototype"
-          git push origin HEAD:agent/riskminer-cpp-stream-v1
+          set -euo pipefail
+          branches=(
+            "agent/alpha-search-mcts-pre-riskminer"
+            "agent/riskminer-cpp-stream-v1-pre-rebase-20260807"
+            "agent/riskminer-feature-export-20260807"
+            "agent/riskminer-latest-base-export-20260807"
+            "agent/riskminer-rebase-25db460"
+            "agent/riskminer-rebase-61ee0c"
+            "agent/riskminer-rebase-apply-20260807"
+            "agent/riskminer-sandbox-export-20260807"
+          )
+          for branch in "${branches[@]}"; do
+            case "$branch" in
+              main|agent/cpp-stream-operators|agent/riskminer-cpp-stream-v1)
+                echo "Refusing protected branch: $branch" >&2
+                exit 2
+                ;;
+            esac
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
+              echo "Deleting obsolete branch: $branch"
+              git push origin --delete "$branch"
+            else
+              echo "Already absent: $branch"
+            fi
+          done
