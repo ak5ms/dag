@@ -292,3 +292,29 @@ def test_paper_constant_inventory_and_covariance_units_require_normalization():
     assert environment.formula_value(state) is None
     state = environment.apply(state, vocabulary.by_name["xs_rank"].token_id)
     assert environment.formula_value(state) is not None
+
+
+def test_first_negative_pool_alpha_is_rejected():
+    class NegativeEvaluator(FakePoolEvaluator):
+        def evaluate(self, alphas, *, include_importance=False, **kwargs):
+            result = super().evaluate(
+                alphas, include_importance=include_importance, **kwargs
+            )
+            return PoolEvaluation(
+                score=-0.25,
+                alpha_count=result.alpha_count,
+                compile_seconds=0.0,
+                run_seconds=0.0,
+                native_seconds=0.0,
+                runtime_type="fake",
+                output_path="",
+                output_shape=(1,),
+                coefficient_importance=result.coefficient_importance,
+            )
+
+    pool = RidgeAlphaPool(NegativeEvaluator(), capacity=100, min_improvement=0.0)
+    transition = pool.consider(_pool_alpha("bad_first"))
+    assert transition.additive_delta == -0.25
+    assert not transition.committed
+    assert pool.entries == []
+    assert pool.score == float("-inf")

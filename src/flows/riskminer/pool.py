@@ -425,8 +425,11 @@ class RidgeAlphaPool:
             if math.isfinite(previous_score)
             else resulting_score
         )
-        committed = math.isfinite(resulting_score) and (
-            not self.entries or delta > self.min_improvement
+        # Treat an empty pool as score 0 for admission. The first alpha must
+        # improve the objective too; merely being finite is not sufficient.
+        committed = (
+            math.isfinite(resulting_score)
+            and delta > self.min_improvement
         )
         if committed:
             self.entries = resulting_entries
