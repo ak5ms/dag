@@ -318,3 +318,54 @@ def test_first_negative_pool_alpha_is_rejected():
     assert not transition.committed
     assert pool.entries == []
     assert pool.score == float("-inf")
+
+
+def test_granular_mcts_and_replay_events_are_emitted(tmp_path):
+    environment, config = _tiny_environment(seed=17)
+    events = []
+
+    def on_event(name, payload):
+        events.append((name, payload))
+
+    trainer = RiskSeekingTrainer(
+        vocabulary_size=len(environment.vocabulary),
+        config=config,
+        output_dir=tmp_path,
+        on_event=on_event,
+    )
+    trainer.run_iteration(environment, FakeRewardModel(), iteration=1)
+    names = [name for name, _ in events]
+    required = {
+        "mcts_search_start",
+        "mcts_node_choice",
+        "mcts_selection_edge",
+        "mcts_rollout_done",
+        "mcts_candidates_evaluate",
+        "mcts_candidates_scored",
+        "mcts_terminal_evaluate",
+        "mcts_terminal_result",
+        "mcts_episode_done",
+        "mcts_backprop_edge",
+        "mcts_search_done",
+        "replay_reset",
+        "replay_snapshot",
+        "replay_quantile_update",
+        "policy_train_batch_start",
+        "policy_train_batch_done",
+    }
+    assert required <= set(names)
+
+    node_choice = next(payload for name, payload in events if name == "mcts_node_choice")
+    assert node_choice["edges"]
+    assert {"token", "prior", "q", "visits", "puct"} <= set(node_choice["edges"][0])
+
+    candidates = next(payload for name, payload in events if name == "mcts_candidates_evaluate")
+    assert candidates["candidate_count"] >= 1
+    assert candidates["candidates"][0]["expr"]
+
+    snapshot = next(payload for name, payload in events if name == "replay_snapshot")
+    assert snapshot["size"] == 1
+    assert snapshot["trajectories"][0]["actions"]
+
+    backprop = next(payload for name, payload in events if name == "mcts_backprop_edge")
+    assert backprop["visits_after"] == backprop["visits_before"] + 1

@@ -84,6 +84,27 @@ REUSE_DERIVED = os.environ.get("RISKMINER_REUSE_DERIVED", "0").lower() in {
     "1", "true", "yes", "on",
 }
 RESUME_POLICY = os.environ.get("RISKMINER_RESUME_POLICY", "").strip()
+LOG_LEVEL = os.environ.get("RISKMINER_LOG_LEVEL", "trace").strip().lower()
+if LOG_LEVEL not in {"summary", "detail", "trace"}:
+    raise ValueError("RISKMINER_LOG_LEVEL must be summary, detail, or trace")
+LOG_LEVEL_RANK = {"summary": 0, "detail": 1, "trace": 2}
+TRACE_EVENTS = {
+    "mcts_node_choice",
+    "mcts_selection_edge",
+    "mcts_rollout_choice",
+    "mcts_rollout_step",
+    "mcts_backprop_edge",
+}
+DETAIL_EVENTS = {
+    "mcts_search_start", "mcts_search_done",
+    "mcts_simulation_start", "mcts_simulation_done",
+    "mcts_selection_done", "mcts_rollout_start", "mcts_rollout_done",
+    "mcts_episode_invalid", "mcts_episode_done",
+    "mcts_candidates_evaluate", "mcts_candidates_scored",
+    "mcts_archive_update", "mcts_terminal_evaluate", "mcts_terminal_result",
+    "replay_reset", "replay_snapshot", "replay_quantile_update",
+    "policy_train_batch_start", "policy_train_batch_done",
+}
 
 
 def _rows(value) -> int:
@@ -226,7 +247,13 @@ def main() -> None:
     progress = ConsoleProgress(prefix="riskminer-inputdata")
 
     def event(event_name: str, payload) -> None:
-        progress.emit(event_name, **dict(payload))
+        required = (
+            2 if event_name in TRACE_EVENTS
+            else 1 if event_name in DETAIL_EVENTS
+            else 0
+        )
+        if LOG_LEVEL_RANK[LOG_LEVEL] >= required:
+            progress.emit(event_name, **dict(payload))
 
     progress.emit(
         "start",
@@ -245,6 +272,7 @@ def main() -> None:
         train_fraction=TRAIN_FRACTION,
         validation_fraction=VALIDATION_FRACTION,
         ridge_recompute_every=RIDGE_RECOMPUTE_EVERY,
+        log_level=LOG_LEVEL,
     )
 
     started = time.perf_counter()
@@ -502,6 +530,7 @@ def main() -> None:
             "pool_importance": POOL_IMPORTANCE,
             "quantile_cdf": QUANTILE_CDF,
             "policy_learning_rate": POLICY_LEARNING_RATE,
+            "log_level": LOG_LEVEL,
         },
         "iterations": [
             {

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import math
 import random
@@ -199,6 +199,32 @@ class _TreeMixin:
     rng: random.Random
     nodes: dict[tuple, TreeNode]
 
+    def _emit(self, event: str, **payload: object) -> None:
+        sink = getattr(self, "on_event", None)
+        if sink is not None:
+            sink(event, dict(payload))
+
+    def _edge_snapshot(self, node: TreeNode) -> list[dict[str, object]]:
+        total = max(1, node.visits + node.virtual_visits)
+        rows: list[dict[str, object]] = []
+        for token_id, edge in node.edges.items():
+            visits = edge.visits + edge.virtual_visits
+            bonus = (
+                self.config.exploration
+                * edge.prior
+                * math.sqrt(total)
+                / (1 + visits)
+            )
+            rows.append({
+                "token": self.environment.vocabulary.by_id[token_id].name,
+                "prior": float(edge.prior),
+                "q": float(edge.q),
+                "visits": int(edge.visits),
+                "virtual_visits": int(edge.virtual_visits),
+                "puct": float(edge.q + bonus),
+            })
+        return sorted(rows, key=lambda row: (-float(row["puct"]), str(row["token"])))
+
     def _node(self, state: RPNState) -> TreeNode:
         key = self.environment.state_key(state)
         node = self.nodes.get(key)
@@ -245,6 +271,21 @@ class _TreeMixin:
             token_id, edge = max(
                 unvisited, key=lambda item: (item[1].prior, -item[0])
             )
+            self._emit(
+                "mcts_node_choice",
+                state_rpn=self._render_token_ids(state.token_ids),
+                stack_size=len(state.stack),
+                node_visits=node.visits,
+                node_virtual_visits=node.virtual_visits,
+                legal_count=len(legal),
+                exposed_count=len(node.edges),
+                allowed_count=allowed_count,
+                reason="new_edge",
+                selected=self.environment.vocabulary.by_id[token_id].name,
+                selected_prior=float(edge.prior),
+                selected_q=float(edge.q),
+                edges=self._edge_snapshot(node),
+            )
             return token_id, edge, True
 
         total = max(1, node.visits + node.virtual_visits)
@@ -261,6 +302,21 @@ class _TreeMixin:
             return edge.q + bonus, -token_id
 
         token_id, edge = max(node.edges.items(), key=puct)
+        self._emit(
+            "mcts_node_choice",
+            state_rpn=self._render_token_ids(state.token_ids),
+            stack_size=len(state.stack),
+            node_visits=node.visits,
+            node_virtual_visits=node.virtual_visits,
+            legal_count=len(legal),
+            exposed_count=len(node.edges),
+            allowed_count=allowed_count,
+            reason="puct",
+            selected=self.environment.vocabulary.by_id[token_id].name,
+            selected_prior=float(edge.prior),
+            selected_q=float(edge.q),
+            edges=self._edge_snapshot(node),
+        )
         return token_id, edge, False
 
     def _sample_rollout_action(
@@ -274,9 +330,25 @@ class _TreeMixin:
             end_id in legal
             and rng.random() < self.config.rollout_end_probability
         ):
+            self._emit(
+                "mcts_rollout_choice",
+                state_rpn=self._render_token_ids(state.token_ids),
+                stack_size=len(state.stack),
+                legal_count=len(legal),
+                selected=self.environment.vocabulary.by_id[end_id].name,
+                reason="end_probability",
+            )
             return end_id
         choices = [token_id for token_id in legal if token_id != end_id]
         if not choices:
+            self._emit(
+                "mcts_rollout_choice",
+                state_rpn=self._render_token_ids(state.token_ids),
+                stack_size=len(state.stack),
+                legal_count=len(legal),
+                selected=self.environment.vocabulary.by_id[end_id].name,
+                reason="only_end",
+            )
             return end_id
         priors = self.policy.priors(self.environment, state, legal)
 
@@ -307,7 +379,19 @@ class _TreeMixin:
         weights = [weights_by_id[token_id] for token_id in choices]
         if not any(weights):
             weights = [1.0] * len(choices)
-        return rng.choices(choices, weights=weights, k=1)[0]
+        selected = rng.choices(choices, weights=weights, k=1)[0]
+        self._emit(
+            "mcts_rollout_choice",
+            state_rpn=self._render_token_ids(state.token_ids),
+            stack_size=len(state.stack),
+            legal_count=len(legal),
+            selected=self.environment.vocabulary.by_id[selected].name,
+            reason="sampled",
+            raw_prior=float(priors.get(selected, 0.0)),
+            adjusted_weight=float(weights_by_id.get(selected, 0.0)),
+            group_sizes={name: len(token_ids) for name, token_ids in groups.items()},
+        )
+        return selected
 
     def _render_token_ids(self, token_ids: Sequence[int]) -> str:
         return " ".join(
@@ -326,6 +410,7 @@ class RiskMCTS(_TreeMixin):
         *,
         config: RiskMinerConfig | None = None,
         policy: ActionPolicy | None = None,
+        on_event: Callable[[str, dict[str, object]], None] | None = None,
     ) -> None:
         self.environment = environment
         self.evaluator = evaluator
@@ -334,6 +419,7 @@ class RiskMCTS(_TreeMixin):
         self.rng = random.Random(self.config.seed)
         self.nodes: dict[tuple, TreeNode] = {}
         self.archive = FormulaArchive(self.config.archive_size)
+        self.on_event = on_event
 
     def search(self) -> RiskMinerSearchResult:
         started = time.perf_counter()
@@ -419,6 +505,20 @@ class RiskMCTS(_TreeMixin):
                 return _Selection(tuple(path), state)
             token_id, edge, expanded = self._choose_edge(state, legal)
             child = self.environment.apply(state, token_id)
+            self._emit(
+                "mcts_selection_edge",
+                step=len(path) + 1,
+                state_rpn=self._render_token_ids(state.token_ids),
+                selected=self.environment.vocabulary.by_id[token_id].name,
+                child_rpn=self._render_token_ids(child.token_ids),
+                expanded=expanded,
+                selected_prior=float(edge.prior),
+                selected_q=float(edge.q),
+                selected_visits=edge.visits,
+                legal_actions=[
+                    self.environment.vocabulary.by_id[action].name for action in legal
+                ],
+            )
             edge.child_key = self.environment.state_key(child)
             edge.virtual_visits += 1
             node.virtual_visits += 1
@@ -482,6 +582,7 @@ class RewardDenseRiskMCTS(_TreeMixin):
         *,
         config: RiskMinerConfig | None = None,
         policy: ActionPolicy | None = None,
+        on_event: Callable[[str, dict[str, object]], None] | None = None,
     ) -> None:
         self.environment = environment
         self.reward_model = reward_model
@@ -490,6 +591,7 @@ class RewardDenseRiskMCTS(_TreeMixin):
         self.rng = random.Random(self.config.seed)
         self.nodes: dict[tuple, TreeNode] = {}
         self.archive = FormulaArchive(self.config.archive_size)
+        self.on_event = on_event
 
     def search(self) -> RewardDenseSearchResult:
         started = time.perf_counter()
@@ -498,9 +600,37 @@ class RewardDenseRiskMCTS(_TreeMixin):
         trajectories: list[PolicyTrajectory] = []
         simulations = rollouts = invalid = pool_updates = 0
         intermediate_requests = finite_scores = 0
+        self._emit(
+            "mcts_search_start",
+            simulations=self.config.simulations,
+            rollouts_per_expansion=self.config.rollouts_per_expansion,
+            max_depth=self.config.max_depth,
+            min_formula_depth=self.config.min_formula_depth,
+            max_tokens=self.config.max_tokens,
+            exploration=self.config.exploration,
+        )
         while simulations < self.config.simulations:
+            simulation_number = simulations + 1
+            self._emit("mcts_simulation_start", simulation=simulation_number)
             selection = self._select_and_expand(root)
-            for _ in range(self.config.rollouts_per_expansion):
+            self._emit(
+                "mcts_selection_done",
+                simulation=simulation_number,
+                path=[
+                    self.environment.vocabulary.by_id[token_id].name
+                    for _, token_id in selection.path
+                ],
+                leaf_rpn=self._render_token_ids(selection.leaf.token_ids),
+                leaf_stack_size=len(selection.leaf.stack),
+                leaf_terminated=selection.leaf.terminated,
+            )
+            for rollout_number in range(1, self.config.rollouts_per_expansion + 1):
+                self._emit(
+                    "mcts_rollout_start",
+                    simulation=simulation_number,
+                    rollout=rollout_number,
+                    leaf_rpn=self._render_token_ids(selection.leaf.token_ids),
+                )
                 completed, requested, finite = self._complete_episode(selection)
                 rollouts += 1
                 intermediate_requests += requested
@@ -521,7 +651,16 @@ class RewardDenseRiskMCTS(_TreeMixin):
                     selection.path, path_returns, path_rewards
                 )
             simulations += 1
-        return RewardDenseSearchResult(
+            self._emit(
+                "mcts_simulation_done",
+                simulation=simulation_number,
+                trajectories=len(trajectories),
+                invalid_rollouts=invalid,
+                pool_updates=pool_updates,
+                tree_nodes=len(self.nodes),
+                archive_size=len(self.archive.entries),
+            )
+        result = RewardDenseSearchResult(
             self.archive.entries,
             tuple(trajectories),
             SearchMetrics(
@@ -537,6 +676,19 @@ class RewardDenseRiskMCTS(_TreeMixin):
                 intermediate_formula_requests=intermediate_requests,
             ),
         )
+        self._emit(
+            "mcts_search_done",
+            simulations=simulations,
+            rollouts=rollouts,
+            trajectories=len(trajectories),
+            invalid_rollouts=invalid,
+            pool_updates=pool_updates,
+            tree_nodes=len(self.nodes),
+            archive_size=len(result.archive),
+            best_archive_score=(result.archive[0].score if result.archive else None),
+            wall_seconds=result.metrics.wall_seconds,
+        )
+        return result
 
     def _select_and_expand(self, root: RPNState) -> _DenseSelection:
         state = root
@@ -561,6 +713,20 @@ class RewardDenseRiskMCTS(_TreeMixin):
                 )
             token_id, edge, expanded = self._choose_edge(state, legal)
             child = self.environment.apply(state, token_id)
+            self._emit(
+                "mcts_selection_edge",
+                step=len(path) + 1,
+                state_rpn=self._render_token_ids(state.token_ids),
+                selected=self.environment.vocabulary.by_id[token_id].name,
+                child_rpn=self._render_token_ids(child.token_ids),
+                expanded=expanded,
+                selected_prior=float(edge.prior),
+                selected_q=float(edge.q),
+                selected_visits=edge.visits,
+                legal_actions=[
+                    self.environment.vocabulary.by_id[action].name for action in legal
+                ],
+            )
             edge.child_key = self.environment.state_key(child)
             edge.virtual_visits += 1
             node.virtual_visits += 1
@@ -594,6 +760,16 @@ class RewardDenseRiskMCTS(_TreeMixin):
                 break
             token_id = self._sample_rollout_action(state, legal, self.rng)
             child = self.environment.apply(state, token_id)
+            self._emit(
+                "mcts_rollout_step",
+                step=len(actions) + 1,
+                state_rpn=self._render_token_ids(state.token_ids),
+                selected=self.environment.vocabulary.by_id[token_id].name,
+                child_rpn=self._render_token_ids(child.token_ids),
+                legal_count=len(legal),
+                child_stack_size=len(child.stack),
+                child_terminated=child.terminated,
+            )
             states.append(state)
             legal_history.append(tuple(legal))
             actions.append(token_id)
@@ -608,6 +784,13 @@ class RewardDenseRiskMCTS(_TreeMixin):
                 legal_history.append(tuple(legal))
                 actions.append(end_id)
                 resulting.append(child)
+        self._emit(
+            "mcts_rollout_done",
+            actions=[self.environment.vocabulary.by_id[action].name for action in actions],
+            final_rpn=(self._render_token_ids(resulting[-1].token_ids) if resulting else self._render_token_ids(leaf.token_ids)),
+            terminated=bool(resulting and resulting[-1].terminated),
+            steps=len(actions),
+        )
         return tuple(states), tuple(legal_history), tuple(actions), tuple(resulting)
 
     def _complete_episode(
@@ -645,6 +828,13 @@ class RewardDenseRiskMCTS(_TreeMixin):
                     step_rewards[index] + self.config.discount * running
                 )
                 returns[index] = running
+            self._emit(
+                "mcts_episode_invalid",
+                full_rpn=self._render_token_ids(actions),
+                action_count=len(actions),
+                invalid_reward=self.config.invalid_reward,
+                reason="did_not_reach_END",
+            )
             trajectory = PolicyTrajectory(
                 states=tuple(state.token_ids for state in states),
                 actions=tuple(actions),
@@ -672,9 +862,33 @@ class RewardDenseRiskMCTS(_TreeMixin):
             step_values.append(value)
             if value is not None:
                 observations.setdefault(value.canonical_key, value)
+        candidate_records = [
+            {
+                "canonical_key": repr(key),
+                "depth": value.depth,
+                "expr": repr(value.expr),
+            }
+            for key, value in observations.items()
+        ]
+        self._emit(
+            "mcts_candidates_evaluate",
+            candidate_count=len(candidate_records),
+            candidates=candidate_records,
+        )
         intermediate = (
             dict(self.reward_model.intermediate_rewards(tuple(observations.values())))
             if observations else {}
+        )
+        self._emit(
+            "mcts_candidates_scored",
+            candidate_count=len(candidate_records),
+            candidates=[
+                {
+                    **record,
+                    "score": float(intermediate.get(key, float("nan"))),
+                }
+                for record, (key, _) in zip(candidate_records, observations.items())
+            ],
         )
         finite_count = sum(math.isfinite(value) for value in intermediate.values())
         step_rewards: list[float] = []
@@ -685,11 +899,20 @@ class RewardDenseRiskMCTS(_TreeMixin):
             reward = float(intermediate.get(value.canonical_key, 0.0))
             reward = reward if math.isfinite(reward) else 0.0
             step_rewards.append(reward)
+            candidate_rpn = self._render_token_ids(state.token_ids)
             self.archive.add(
                 ArchiveEntry(
                     value.expr, reward, value.depth, value.canonical_key,
-                    self._render_token_ids(state.token_ids),
+                    candidate_rpn,
                 )
+            )
+            self._emit(
+                "mcts_archive_update",
+                rpn=candidate_rpn,
+                depth=value.depth,
+                score=reward,
+                archive_size=len(self.archive.entries),
+                best_score=(self.archive.entries[0].score if self.archive.entries else None),
             )
 
         terminal_parent = states[-1]
@@ -698,8 +921,27 @@ class RewardDenseRiskMCTS(_TreeMixin):
             return None, len(observations), finite_count
         rpn = self._render_token_ids(terminal_parent.token_ids)
         individual_score = float(intermediate.get(terminal_value.canonical_key, 0.0))
+        self._emit(
+            "mcts_terminal_evaluate",
+            rpn=rpn,
+            expr=repr(terminal_value.expr),
+            depth=terminal_value.depth,
+            individual_score=individual_score,
+        )
         terminal = self.reward_model.terminal_reward(
             terminal_value, rpn=rpn, individual_score=individual_score
+        )
+        transition = terminal.transition
+        self._emit(
+            "mcts_terminal_result",
+            rpn=rpn,
+            terminal_reward=float(terminal.reward),
+            committed=bool(getattr(transition, "committed", False)),
+            previous_score=getattr(transition, "previous_score", None),
+            resulting_score=getattr(transition, "resulting_score", None),
+            additive_delta=getattr(transition, "additive_delta", None),
+            pool_size=getattr(transition, "pool_size", None),
+            evicted=(getattr(getattr(transition, "evicted", None), "rpn", None)),
         )
         terminal_reward = float(terminal.reward)
         if not math.isfinite(terminal_reward):
@@ -728,6 +970,15 @@ class RewardDenseRiskMCTS(_TreeMixin):
             terminal_formula_rpn=rpn,
             pool_changed=bool(terminal.transition.committed),
         )
+        self._emit(
+            "mcts_episode_done",
+            rpn=rpn,
+            action_count=len(actions),
+            step_rewards=[float(value) for value in step_rewards],
+            returns=[float(value) for value in returns],
+            total_reward=float(total_reward),
+            pool_changed=trajectory.pool_changed,
+        )
         return (
             trajectory,
             returns[:len(selection.path)],
@@ -748,6 +999,8 @@ class RewardDenseRiskMCTS(_TreeMixin):
         ):
             node = self.nodes[node_key]
             edge = node.edges[token_id]
+            before_q = float(edge.q)
+            before_visits = int(edge.visits)
             node.virtual_visits = max(0, node.virtual_visits - 1)
             edge.virtual_visits = max(0, edge.virtual_visits - 1)
             node.visits += 1
@@ -755,6 +1008,17 @@ class RewardDenseRiskMCTS(_TreeMixin):
             edge.reward = float(immediate)
             edge.value_sum += (
                 float(value) if math.isfinite(value) else self.config.invalid_reward
+            )
+            self._emit(
+                "mcts_backprop_edge",
+                token=self.environment.vocabulary.by_id[token_id].name,
+                immediate_reward=float(immediate),
+                cumulative_return=float(value),
+                visits_before=before_visits,
+                visits_after=edge.visits,
+                q_before=before_q,
+                q_after=float(edge.q),
+                node_visits=node.visits,
             )
 
 

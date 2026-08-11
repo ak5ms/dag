@@ -100,34 +100,105 @@ class RiskSeekingTrainer:
         # Algorithm 2 resets both tree and replay buffer each outer iteration;
         # the policy network and alpha pool persist.
         replay = ReplayBuffer(active.replay_capacity)
+        self._emit(
+            "replay_reset",
+            iteration=index,
+            capacity=active.replay_capacity,
+        )
         search = RewardDenseRiskMCTS(
-            environment, reward_model, config=active, policy=self.policy
+            environment,
+            reward_model,
+            config=active,
+            policy=self.policy,
+            on_event=self.on_event,
         ).search()
         replay.extend(search.trajectories)
+        replay_records = [
+            {
+                "index": replay_index,
+                "reward": float(trajectory.reward),
+                "step_rewards": [float(value) for value in trajectory.step_rewards],
+                "terminal_rpn": trajectory.terminal_formula_rpn,
+                "pool_changed": trajectory.pool_changed,
+                "actions": [
+                    environment.vocabulary.by_id[action].name
+                    for action in trajectory.actions
+                ],
+            }
+            for replay_index, trajectory in enumerate(replay.trajectories)
+        ]
+        self._emit(
+            "replay_snapshot",
+            iteration=index,
+            capacity=active.replay_capacity,
+            size=len(replay_records),
+            trajectories=replay_records,
+        )
         rewards = [trajectory.reward for trajectory in replay.trajectories]
         before = self.quantile.value
         trajectory_quantiles: list[float] = []
         # Algorithm 2 applies the Equation-11 recursion in trajectory order.
         # We retain each trajectory's contemporaneous threshold so batched
         # Equation-12/13 updates are equivalent to the sequential indicator.
-        for reward in rewards:
+        for trajectory_index, reward in enumerate(rewards):
             # Equations 11 and 13 use q_i for trajectory i.  Record the
             # pre-update threshold, then advance the stochastic quantile
             # recursion to q_(i+1).
-            trajectory_quantiles.append(float(self.quantile.value))
+            threshold = float(self.quantile.value)
+            trajectory_quantiles.append(threshold)
             self.quantile = self.quantile.update(float(reward))
+            self._emit(
+                "replay_quantile_update",
+                iteration=index,
+                trajectory_index=trajectory_index,
+                reward=float(reward),
+                threshold_before=threshold,
+                threshold_after=float(self.quantile.value),
+                selected_for_risk_update=bool(float(reward) <= threshold),
+            )
         after = self.quantile.value
 
         losses: list[float] = []
-        for batch in replay.batches(
-            active.policy_batch_size,
-            epochs=active.policy_train_epochs,
-            seed=active.seed + index,
-            shuffle=True,
-            reward_quantiles=trajectory_quantiles,
+        for batch_index, batch in enumerate(
+            replay.batches(
+                active.policy_batch_size,
+                epochs=active.policy_train_epochs,
+                seed=active.seed + index,
+                shuffle=True,
+                reward_quantiles=trajectory_quantiles,
+            ),
+            1,
         ):
+            batch_records = []
+            for row, trajectory in enumerate(batch.trajectories):
+                threshold = (
+                    float(batch.reward_quantiles[row])
+                    if batch.reward_quantiles
+                    else float(self.quantile.value)
+                )
+                batch_records.append({
+                    "reward": float(trajectory.reward),
+                    "threshold": threshold,
+                    "selected_for_risk_update": bool(float(trajectory.reward) <= threshold),
+                    "terminal_rpn": trajectory.terminal_formula_rpn,
+                    "pool_changed": trajectory.pool_changed,
+                    "action_count": len(trajectory.actions),
+                })
+            self._emit(
+                "policy_train_batch_start",
+                iteration=index,
+                batch=batch_index,
+                batch_size=len(batch.trajectories),
+                trajectories=batch_records,
+            )
             self.policy, loss = self.policy.train_step(batch, self.quantile.value)
             losses.append(float(loss))
+            self._emit(
+                "policy_train_batch_done",
+                iteration=index,
+                batch=batch_index,
+                loss=float(loss),
+            )
 
         checkpoint: str | None = None
         if self.output_dir is not None:
