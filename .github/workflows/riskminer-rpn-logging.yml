@@ -1,4 +1,5 @@
 name: RiskMiner RPN logging validation
+# rerun after updating legacy trace assertion
 on:
   push:
     branches:
