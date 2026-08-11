@@ -1,0 +1,146 @@
+name: RiskMiner policy memory fix
+on:
+  push:
+    branches: [agent/riskminer-cpp-stream-v1]
+    paths: [.github/workflows/riskminer-policy-memory-fix.yml]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/riskminer-cpp-stream-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e . pytest jax[cpu] psutil
+      - name: Patch policy inference and fixed training shape
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/flows/riskminer/learned_policy.py')
+          s = p.read_text()
+          if 'max_sequence_length: int = 0' not in s:
+              s = s.replace(
+                  '    mlp_hidden_2: int = 32\n    learning_rate: float = 1.0e-3\n',
+                  '    mlp_hidden_2: int = 32\n    max_sequence_length: int = 0\n    learning_rate: float = 1.0e-3\n',
+                  1,
+              )
+              s = s.replace(
+                  '        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:\n',
+                  '        if int(self.max_sequence_length) < 0:\n            raise ValueError("max_sequence_length must be nonnegative")\n        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:\n',
+                  1,
+              )
+
+          if 'def _policy_logits_numpy(' not in s:
+              marker = '\ndef _validate_trajectory_prefixes(trajectory: PolicyTrajectory) -> None:\n'
+              helper = r'''
+
+def _numpy_sigmoid(value: np.ndarray) -> np.ndarray:
+    """Stable float32 sigmoid for the tiny CPU policy inference path."""
+    value = np.asarray(value, dtype=np.float32)
+    out = np.empty_like(value)
+    positive = value >= 0.0
+    out[positive] = 1.0 / (1.0 + np.exp(-value[positive]))
+    negative_exp = np.exp(value[~positive])
+    out[~positive] = negative_exp / (1.0 + negative_exp)
+    return out
+
+
+def _policy_logits_numpy(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    token_ids: Sequence[int],
+) -> np.ndarray:
+    """Evaluate MCTS priors without creating variable-length XLA scans."""
+    host = jax.tree_util.tree_map(np.asarray, params)
+    ids = tuple(int(token_id) for token_id in token_ids)
+    if not ids:
+        ids = (config.vocabulary_size,)
+    values = host["embedding"][np.asarray(ids, dtype=np.int32)]
+    for layer in host["gru"]:
+        hidden = np.zeros((config.hidden_size,), dtype=np.float32)
+        outputs = np.empty((len(ids), config.hidden_size), dtype=np.float32)
+        for index, value in enumerate(values):
+            update = _numpy_sigmoid(
+                value @ layer["w_z"] + hidden @ layer["u_z"] + layer["b_z"]
+            )
+            reset = _numpy_sigmoid(
+                value @ layer["w_r"] + hidden @ layer["u_r"] + layer["b_r"]
+            )
+            candidate = np.tanh(
+                value @ layer["w_n"]
+                + (reset * hidden) @ layer["u_n"]
+                + layer["b_n"]
+            )
+            hidden = (1.0 - update) * candidate + update * hidden
+            outputs[index] = hidden
+        values = outputs
+    hidden = values[-1]
+    hidden = np.tanh(hidden @ host["mlp_1"]["w"] + host["mlp_1"]["b"])
+    hidden = np.tanh(hidden @ host["mlp_2"]["w"] + host["mlp_2"]["b"])
+    return hidden @ host["out"]["w"] + host["out"]["b"]
+'''
+              if marker not in s:
+                  raise SystemExit('trajectory marker not found')
+              s = s.replace(marker, helper + marker, 1)
+
+          old = '''        logits = np.asarray(\n            policy_logits(self.params, self.config, state.token_ids),\n            dtype=np.float64,\n        )\n'''
+          new = '''        logits = np.asarray(\n            _policy_logits_numpy(self.params, self.config, state.token_ids),\n            dtype=np.float64,\n        )\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif '_policy_logits_numpy(self.params, self.config, state.token_ids)' not in s:
+              raise SystemExit('priors block not found')
+
+          old = '''    lengths = np.asarray([len(t.actions) for t in values], dtype=np.int32)\n    max_steps = int(lengths.max(initial=0))\n    if max_steps <= 0:\n        return jnp.zeros((batch_size,), dtype=DTYPE)\n'''
+          new = '''    lengths = np.asarray([len(t.actions) for t in values], dtype=np.int32)\n    observed_max_steps = int(lengths.max(initial=0))\n    max_steps = (\n        int(config.max_sequence_length)\n        if int(config.max_sequence_length) > 0\n        else observed_max_steps\n    )\n    if observed_max_steps > max_steps:\n        raise ValueError(\n            "trajectory exceeds configured max_sequence_length: "\n            f"observed={observed_max_steps}, configured={max_steps}"\n        )\n    if max_steps <= 0:\n        return jnp.zeros((batch_size,), dtype=DTYPE)\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('src/flows/riskminer/trainer.py')
+          s = p.read_text()
+          old = '''                vocabulary_size=int(vocabulary_size),\n                learning_rate=config.policy_learning_rate,\n                seed=config.seed,\n'''
+          new = '''                vocabulary_size=int(vocabulary_size),\n                max_sequence_length=config.max_tokens,\n                learning_rate=config.policy_learning_rate,\n                seed=config.seed,\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif 'max_sequence_length=config.max_tokens' not in s:
+              raise SystemExit('trainer policy config block not found')
+          p.write_text(s)
+          PY
+      - name: Unit tests
+        run: PYTHONPATH=src python -m pytest -q -o addopts='' tests/flows/riskminer/test_core.py tests/flows/riskminer/test_policy.py
+      - name: Policy inference smoke
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          import time
+          import numpy as np
+          from flows.riskminer.learned_policy import GRUPolicyConfig, JaxGRUPolicy, _policy_logits_numpy, policy_logits
+          cfg = GRUPolicyConfig(vocabulary_size=132, max_sequence_length=30)
+          p = JaxGRUPolicy.initialize(cfg, token_priors=np.ones(132))
+          rng = np.random.default_rng(7)
+          tokens = tuple(int(x) for x in rng.integers(0, 132, size=30))
+          for n in (0, 1, 5, 17, 30):
+              a = np.asarray(policy_logits(p.params, cfg, tokens[:n]))
+              b = np.asarray(_policy_logits_numpy(p.params, cfg, tokens[:n]))
+              np.testing.assert_allclose(a, b, rtol=2e-6, atol=2e-6)
+          t = time.perf_counter()
+          checksum = 0.0
+          for _ in range(1000):
+              n = int(rng.integers(0, 31))
+              checksum += float(_policy_logits_numpy(p.params, cfg, tokens[:n])[0])
+          elapsed = time.perf_counter() - t
+          print({'1000_calls_seconds': elapsed, 'checksum': checksum})
+          assert elapsed < 10.0
+          PY
+      - name: Commit fix
+        run: |
+          git config user.name 'openai-agent'
+          git config user.email 'openai-agent@users.noreply.github.com'
+          git add src/flows/riskminer/learned_policy.py src/flows/riskminer/trainer.py
+          git commit -m 'Fix RiskMiner GRU inference memory growth'
+          git push origin HEAD:agent/riskminer-cpp-stream-v1
