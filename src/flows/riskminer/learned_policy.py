@@ -25,6 +25,7 @@ class GRUPolicyConfig:
     layers: int = 4
     mlp_hidden_1: int = 32
     mlp_hidden_2: int = 32
+    max_sequence_length: int = 0
     learning_rate: float = 1.0e-3
     seed: int = 42
 
@@ -35,6 +36,8 @@ class GRUPolicyConfig:
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if int(self.max_sequence_length) < 0:
+            raise ValueError("max_sequence_length must be nonnegative")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be finite and positive")
 
@@ -275,6 +278,38 @@ def policy_logits(
     return _policy_head(params, values[-1])
 
 
+
+def _numpy_sigmoid(value: np.ndarray) -> np.ndarray:
+    value = np.asarray(value, dtype=np.float32)
+    out = np.empty_like(value)
+    positive = value >= 0.0
+    out[positive] = 1.0 / (1.0 + np.exp(-value[positive]))
+    negative_exp = np.exp(value[~positive])
+    out[~positive] = negative_exp / (1.0 + negative_exp)
+    return out
+
+
+def _policy_logits_numpy(params: ArrayTree, config: GRUPolicyConfig, token_ids: Sequence[int]) -> np.ndarray:
+    host = jax.tree_util.tree_map(np.asarray, params)
+    ids = tuple(int(token_id) for token_id in token_ids)
+    if not ids:
+        ids = (config.vocabulary_size,)
+    values = host["embedding"][np.asarray(ids, dtype=np.int32)]
+    for layer in host["gru"]:
+        hidden = np.zeros((config.hidden_size,), dtype=np.float32)
+        outputs = np.empty((len(ids), config.hidden_size), dtype=np.float32)
+        for index, value in enumerate(values):
+            update = _numpy_sigmoid(value @ layer["w_z"] + hidden @ layer["u_z"] + layer["b_z"])
+            reset = _numpy_sigmoid(value @ layer["w_r"] + hidden @ layer["u_r"] + layer["b_r"])
+            candidate = np.tanh(value @ layer["w_n"] + (reset * hidden) @ layer["u_n"] + layer["b_n"])
+            hidden = (1.0 - update) * candidate + update * hidden
+            outputs[index] = hidden
+        values = outputs
+    hidden = values[-1]
+    hidden = np.tanh(hidden @ host["mlp_1"]["w"] + host["mlp_1"]["b"])
+    hidden = np.tanh(hidden @ host["mlp_2"]["w"] + host["mlp_2"]["b"])
+    return hidden @ host["out"]["w"] + host["out"]["b"]
+
 def _validate_trajectory_prefixes(trajectory: PolicyTrajectory) -> None:
     actions = tuple(int(action) for action in trajectory.actions)
     for index, state in enumerate(trajectory.states):
@@ -321,7 +356,17 @@ def _batched_trajectory_log_probabilities(
 
     batch_size = len(values)
     lengths = np.asarray([len(t.actions) for t in values], dtype=np.int32)
-    max_steps = int(lengths.max(initial=0))
+    observed_max_steps = int(lengths.max(initial=0))
+    max_steps = (
+        int(config.max_sequence_length)
+        if int(config.max_sequence_length) > 0
+        else observed_max_steps
+    )
+    if observed_max_steps > max_steps:
+        raise ValueError(
+            "trajectory exceeds configured max_sequence_length: "
+            f"observed={observed_max_steps}, configured={max_steps}"
+        )
     if max_steps <= 0:
         return jnp.zeros((batch_size,), dtype=DTYPE)
 
@@ -447,7 +492,7 @@ class JaxGRUPolicy:
         if len(environment.vocabulary) != self.config.vocabulary_size:
             raise ValueError("policy vocabulary size does not match the RPN environment")
         logits = np.asarray(
-            policy_logits(self.params, self.config, state.token_ids),
+            _policy_logits_numpy(self.params, self.config, state.token_ids),
             dtype=np.float64,
         )
         legal = np.asarray(legal_actions, dtype=np.int64)

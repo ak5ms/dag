@@ -51,6 +51,7 @@ class RiskSeekingTrainer:
         self.policy = policy or JaxGRUPolicy.initialize(
             GRUPolicyConfig(
                 vocabulary_size=int(vocabulary_size),
+                max_sequence_length=config.max_tokens,
                 learning_rate=config.policy_learning_rate,
                 seed=config.seed,
             ),
