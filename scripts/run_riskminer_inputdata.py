@@ -236,7 +236,6 @@ def _pool_tree(pool: RidgeAlphaPool) -> str:
             (
                 f"  alpha_{index:03d} depth={entry.depth} orthogonal_score={entry.individual_score:.8g}",
                 f"    rpn: {entry.rpn}",
-                f"    expr: {entry.expr!r}",
             )
         )
     return "\n".join(lines)
@@ -512,7 +511,6 @@ def main() -> None:
         "pool": [
             {
                 "rpn": entry.rpn,
-                "expr": repr(entry.expr),
                 "depth": entry.depth,
                 "orthogonal_score_at_admission": entry.individual_score,
             }

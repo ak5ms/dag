@@ -853,6 +853,7 @@ class RewardDenseRiskMCTS(_TreeMixin):
             ), 0, 0
 
         observations: dict[tuple, StackValue] = {}
+        observation_rpn: dict[tuple, str] = {}
         step_values: list[StackValue | None] = []
         for action, state in zip(actions, resulting):
             if action == end_id:
@@ -862,11 +863,14 @@ class RewardDenseRiskMCTS(_TreeMixin):
             step_values.append(value)
             if value is not None:
                 observations.setdefault(value.canonical_key, value)
+                observation_rpn.setdefault(
+                    value.canonical_key,
+                    self._render_token_ids(state.token_ids),
+                )
         candidate_records = [
             {
-                "canonical_key": repr(key),
+                "rpn": observation_rpn[key],
                 "depth": value.depth,
-                "expr": repr(value.expr),
             }
             for key, value in observations.items()
         ]
@@ -924,7 +928,6 @@ class RewardDenseRiskMCTS(_TreeMixin):
         self._emit(
             "mcts_terminal_evaluate",
             rpn=rpn,
-            expr=repr(terminal_value.expr),
             depth=terminal_value.depth,
             individual_score=individual_score,
         )

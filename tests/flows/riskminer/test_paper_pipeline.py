@@ -361,7 +361,7 @@ def test_granular_mcts_and_replay_events_are_emitted(tmp_path):
 
     candidates = next(payload for name, payload in events if name == "mcts_candidates_evaluate")
     assert candidates["candidate_count"] >= 1
-    assert candidates["candidates"][0]["expr"]
+    assert candidates["candidates"][0]["rpn"]
 
     snapshot = next(payload for name, payload in events if name == "replay_snapshot")
     assert snapshot["size"] == 1
@@ -369,3 +369,44 @@ def test_granular_mcts_and_replay_events_are_emitted(tmp_path):
 
     backprop = next(payload for name, payload in events if name == "mcts_backprop_edge")
     assert backprop["visits_after"] == backprop["visits_before"] + 1
+
+
+def test_trace_candidate_records_are_rpn_only():
+    config = RiskMinerConfig(
+        max_depth=2, min_formula_depth=2, max_tokens=6, max_stack=3,
+        simulations=1, rollouts_per_expansion=1, evaluation_batch_size=1,
+        archive_size=8, seed=19,
+    )
+    sem = _dimensionless_terminal()
+    vocabulary = build_vocabulary(
+        terminals={"x": sem, "y": sem}, literals=(1.0,)
+    )
+    environment = TypedRPNEnvironment(config=config, vocabulary=vocabulary)
+    events = []
+
+    class TraceReward(FakeRewardModel):
+        def terminal_reward(self, value, *, rpn, individual_score=float("nan")):
+            del value, rpn, individual_score
+            return SimpleNamespace(
+                reward=0.5,
+                transition=SimpleNamespace(
+                    committed=False, previous_score=0.0, resulting_score=0.5,
+                    additive_delta=0.5, pool_size=0, evicted=None,
+                ),
+            )
+
+    result = RewardDenseRiskMCTS(
+        environment, TraceReward(), config=config,
+        on_event=lambda name, payload: events.append((name, payload)),
+    ).search()
+    assert result.metrics.trajectories == 1
+    candidate_events = [payload for name, payload in events if name == "mcts_candidates_evaluate"]
+    assert candidate_events
+    for record in candidate_events[0]["candidates"]:
+        assert "rpn" in record
+        assert "expr" not in record
+        assert "canonical_key" not in record
+    terminal_events = [payload for name, payload in events if name == "mcts_terminal_evaluate"]
+    assert terminal_events
+    assert "rpn" in terminal_events[0]
+    assert "expr" not in terminal_events[0]
