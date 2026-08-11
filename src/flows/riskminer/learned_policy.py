@@ -193,9 +193,6 @@ def initialize_gru_policy(
             raise ValueError("token_priors must be finite and nonnegative")
         values = np.maximum(values, 1.0e-12)
         values /= values.sum()
-        # Bias the untrained network toward the typed schema distribution.
-        # The state-dependent GRU logits remain trainable and can override this
-        # bootstrap as soon as risk-seeking updates accumulate.
         params["out"]["w"] = 0.01 * params["out"]["w"]
         params["out"]["b"] = jnp.asarray(np.log(values), dtype=DTYPE)
     return params
@@ -224,6 +221,14 @@ def _gru_sequence(layer: Mapping[str, jax.Array], inputs: jax.Array) -> jax.Arra
     return outputs
 
 
+def _policy_head(params: ArrayTree, hidden: jax.Array) -> jax.Array:
+    """Apply the policy MLP to one or many GRU hidden states."""
+
+    hidden = jnp.tanh(hidden @ params["mlp_1"]["w"] + params["mlp_1"]["b"])
+    hidden = jnp.tanh(hidden @ params["mlp_2"]["w"] + params["mlp_2"]["b"])
+    return hidden @ params["out"]["w"] + params["out"]["b"]
+
+
 def policy_logits(
     params: ArrayTree,
     config: GRUPolicyConfig,
@@ -231,15 +236,82 @@ def policy_logits(
 ) -> jax.Array:
     ids = tuple(int(token_id) for token_id in token_ids)
     if not ids:
-        ids = (config.vocabulary_size,)  # learned BEG token
+        ids = (config.vocabulary_size,)
     tokens = jnp.asarray(ids, dtype=jnp.int32)
     values = params["embedding"][tokens]
     for layer in params["gru"]:
         values = _gru_sequence(layer, values)
-    hidden = values[-1]
-    hidden = jnp.tanh(hidden @ params["mlp_1"]["w"] + params["mlp_1"]["b"])
-    hidden = jnp.tanh(hidden @ params["mlp_2"]["w"] + params["mlp_2"]["b"])
-    return hidden @ params["out"]["w"] + params["out"]["b"]
+    return _policy_head(params, values[-1])
+
+
+def _trajectory_state_logits(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    trajectory: PolicyTrajectory,
+    beg_logits: jax.Array,
+) -> jax.Array:
+    """Return policy logits for every state in one trajectory efficiently.
+
+    ``states[i]`` is the RPN prefix before ``actions[i]``.  The old training
+    path called ``policy_logits`` independently for every prefix, so a length-T
+    episode materialized O(T) separate stacked-GRU scans inside one autodiff
+    graph.  At depth > 1 that produced a very large XLA/LLVM compilation and
+    could exhaust host memory.
+
+    A GRU is prefix-recursive, so one pass over actions[:-1] already contains
+    the hidden state for every non-root prefix.  This reduces each trajectory
+    from O(T * layers) scans to O(layers) scans while preserving exactly the
+    same logits.
+    """
+
+    actions = tuple(int(action) for action in trajectory.actions)
+    if not actions:
+        return jnp.zeros((0, config.vocabulary_size), dtype=DTYPE)
+
+    for index, state in enumerate(trajectory.states):
+        expected = actions[:index]
+        if tuple(int(token) for token in state) != expected:
+            raise ValueError(
+                "policy trajectory states must be action prefixes; "
+                f"state {index}={state!r}, expected {expected!r}"
+            )
+
+    if len(actions) == 1:
+        return beg_logits[jnp.newaxis, :]
+
+    tokens = jnp.asarray(actions[:-1], dtype=jnp.int32)
+    values = params["embedding"][tokens]
+    for layer in params["gru"]:
+        values = _gru_sequence(layer, values)
+    prefix_logits = _policy_head(params, values)
+    return jnp.concatenate((beg_logits[jnp.newaxis, :], prefix_logits), axis=0)
+
+
+def _trajectory_log_probability(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    trajectory: PolicyTrajectory,
+    beg_logits: jax.Array,
+) -> jax.Array:
+    logits = _trajectory_state_logits(params, config, trajectory, beg_logits)
+    steps = len(trajectory.actions)
+    if steps == 0:
+        return jnp.asarray(0.0, dtype=DTYPE)
+
+    legal_mask = np.zeros((steps, config.vocabulary_size), dtype=np.bool_)
+    for index, (action, legal) in enumerate(
+        zip(trajectory.actions, trajectory.legal_actions)
+    ):
+        if action not in legal:
+            raise ValueError(f"action {action} is not legal")
+        legal_mask[index, np.asarray(legal, dtype=np.int64)] = True
+
+    mask = jnp.asarray(legal_mask)
+    masked = jnp.where(mask, logits, -jnp.inf)
+    log_probs = jax.nn.log_softmax(masked, axis=-1)
+    rows = jnp.arange(steps, dtype=jnp.int32)
+    actions = jnp.asarray(trajectory.actions, dtype=jnp.int32)
+    return jnp.sum(log_probs[rows, actions])
 
 
 def masked_log_prob(
@@ -272,6 +344,7 @@ def risk_seeking_loss(
     """
 
     selected = []
+    beg_logits = policy_logits(params, config, ())
     for index, trajectory in enumerate(batch.trajectories):
         threshold = (
             float(batch.reward_quantiles[index])
@@ -280,14 +353,11 @@ def risk_seeking_loss(
         )
         if float(trajectory.reward) > threshold:
             continue
-        log_probability = jnp.asarray(0.0, dtype=DTYPE)
-        for state, action, legal in zip(
-            trajectory.states, trajectory.actions, trajectory.legal_actions
-        ):
-            log_probability = log_probability + masked_log_prob(
-                params, config, state, action, legal
+        selected.append(
+            _trajectory_log_probability(
+                params, config, trajectory, beg_logits
             )
-        selected.append(log_probability)
+        )
     if not selected:
         return jnp.asarray(0.0, dtype=DTYPE)
     return jnp.mean(jnp.stack(selected))
