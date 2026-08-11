@@ -1,0 +1,31 @@
+name: RiskMiner RPN logging validation
+on:
+  push:
+    branches:
+      - agent/riskminer-cpp-stream-v1
+    paths:
+      - .github/workflows/riskminer-rpn-logging.yml
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/riskminer-cpp-stream-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e . pytest 'jax[cpu]'
+      - name: Apply RPN-only logging patch
+        run: python scripts/.riskminer_rpn_logging_patch.py
+      - name: Focused RiskMiner tests
+        run: PYTHONPATH=src python -m pytest -q -o addopts='' tests/flows/riskminer/test_core.py tests/flows/riskminer/test_policy.py tests/flows/riskminer/test_paper_pipeline.py
+      - name: Commit implementation
+        run: |
+          git config user.name openai-agent
+          git config user.email openai-agent@users.noreply.github.com
+          git add src/flows/riskminer/mcts.py scripts/run_riskminer_inputdata.py tests/flows/riskminer/test_paper_pipeline.py
+          git commit -m 'Use RPN-only RiskMiner formula logging'
+          git push origin HEAD:agent/riskminer-cpp-stream-v1
