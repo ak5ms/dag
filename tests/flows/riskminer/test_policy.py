@@ -10,6 +10,7 @@ from flows.riskminer.learned_policy import (
     PolicyTrajectory,
     RiskQuantileTracker,
     TrajectoryBatch,
+    masked_log_prob,
 )
 from flows.riskminer.mcts import RiskMCTS
 from flows.riskminer.rpn import TypedRPNEnvironment, canonical_expr_key
@@ -182,3 +183,36 @@ def test_per_trajectory_quantile_thresholds_are_used_in_batched_loss():
         rel_tol=1e-7,
         abs_tol=1e-7,
     )
+
+
+def test_batched_trajectory_loss_matches_independent_prefix_evaluation():
+    vocabulary_size = 17
+    policy = JaxGRUPolicy.initialize(
+        GRUPolicyConfig(
+            vocabulary_size=vocabulary_size,
+            embedding_dim=8,
+            hidden_size=12,
+            layers=2,
+            mlp_hidden_1=8,
+            mlp_hidden_2=8,
+            seed=23,
+        )
+    )
+    actions = (1, 3, 5, 7, 9, 11)
+    states = tuple(actions[:index] for index in range(len(actions)))
+    legal = tuple(tuple(range(vocabulary_size)) for _ in actions)
+    trajectory = PolicyTrajectory(
+        states=states,
+        actions=actions,
+        legal_actions=legal,
+        reward=-1.0,
+    )
+    expected = sum(
+        float(masked_log_prob(policy.params, policy.config, state, action, choices))
+        for state, action, choices in zip(states, actions, legal)
+    )
+    actual = policy.loss(
+        TrajectoryBatch((trajectory,), reward_quantiles=(0.0,)),
+        reward_quantile=0.0,
+    )
+    assert math.isclose(actual, expected, rel_tol=2e-6, abs_tol=2e-6)
