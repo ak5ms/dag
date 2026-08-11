@@ -258,6 +258,16 @@ class TypedRPNEnvironment:
     def legal_actions(self, state: RPNState) -> tuple[int, ...]:
         if state.terminated:
             return ()
+        # A valid one-value formula already at max_depth cannot be extended
+        # without exceeding max_depth. Pushing another value also strands the
+        # stack because any later combine with the max-depth value would have
+        # depth max_depth + 1. END is therefore the only viable continuation.
+        terminal_value = self.formula_value(state)
+        if (
+            terminal_value is not None
+            and terminal_value.depth >= self.config.max_depth
+        ):
+            return (self.vocabulary.end.token_id,)
         legal: list[int] = []
         for token in self.vocabulary:
             if self._can_apply(state, token):

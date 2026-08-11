@@ -11,7 +11,7 @@ from trading_dsl_engine.base.parser import Expr
 
 from .config import RiskMinerConfig
 from .learned_policy import PolicyTrajectory
-from .rpn import RPNState, StackValue, TypedRPNEnvironment
+from .rpn import RPNState, StackValue, TokenKind, TypedRPNEnvironment
 
 
 class CandidateEvaluator(Protocol):
@@ -279,7 +279,32 @@ class _TreeMixin:
         if not choices:
             return end_id
         priors = self.policy.priors(self.environment, state, legal)
-        weights = [max(0.0, float(priors.get(token_id, 0.0))) for token_id in choices]
+
+        # Correct action-class cardinality bias in rollout completion. With the
+        # 69-field InputData grammar, direct token sampling gives terminals most
+        # of the aggregate probability even when each terminal is individually
+        # no more likely than an operator. Preserve learned token ranking within
+        # each structural class, but give a class total weight equal to its mean
+        # prior rather than the sum of all member priors.
+        groups: dict[str, list[int]] = {}
+        for token_id in choices:
+            token = self.environment.vocabulary.by_id[token_id]
+            if token.kind in {TokenKind.TERMINAL, TokenKind.LITERAL}:
+                group = "push"
+            else:
+                operator = token.operator
+                assert operator is not None
+                group = "unary" if operator.arity == 1 else "reduce"
+            groups.setdefault(group, []).append(token_id)
+
+        weights_by_id: dict[int, float] = {}
+        for token_ids in groups.values():
+            cardinality = len(token_ids)
+            for token_id in token_ids:
+                weights_by_id[token_id] = (
+                    max(0.0, float(priors.get(token_id, 0.0))) / cardinality
+                )
+        weights = [weights_by_id[token_id] for token_id in choices]
         if not any(weights):
             weights = [1.0] * len(choices)
         return rng.choices(choices, weights=weights, k=1)[0]
