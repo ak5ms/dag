@@ -26,6 +26,7 @@ class GRUPolicyConfig:
     mlp_hidden_1: int = 32
     mlp_hidden_2: int = 32
     max_sequence_length: int = 0
+    max_batch_size: int = 0
     learning_rate: float = 1.0e-3
     seed: int = 42
 
@@ -38,6 +39,8 @@ class GRUPolicyConfig:
                 raise ValueError(f"{name} must be positive")
         if int(self.max_sequence_length) < 0:
             raise ValueError("max_sequence_length must be nonnegative")
+        if int(self.max_batch_size) < 0:
+            raise ValueError("max_batch_size must be nonnegative")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be finite and positive")
 
@@ -334,29 +337,63 @@ def _root_policy_logits(
     return _policy_head(params, value)
 
 
-def _batched_trajectory_log_probabilities(
+def _trajectory_log_probabilities_from_arrays(
     params: ArrayTree,
     config: GRUPolicyConfig,
-    trajectories: Sequence[PolicyTrajectory],
+    actions: jax.Array,
+    legal_mask: jax.Array,
+    step_mask: jax.Array,
 ) -> jax.Array:
-    """Compute complete trajectory log-probabilities with one scan per layer.
+    """Evaluate fixed-shape trajectory arrays with one recurrent scan/layer."""
 
-    The original implementation re-ran the entire stacked GRU separately for
-    every RPN prefix.  That makes autodiff materialize O(B*T*L) scans for batch
-    size B, trajectory length T, and L GRU layers.  This function pads the
-    selected trajectories and runs all prefixes together, reducing the traced
-    recurrent graph to O(L) scans.
-    """
+    batch_size = actions.shape[0]
+    max_steps = actions.shape[1]
+    if max_steps <= 0:
+        return jnp.zeros((batch_size,), dtype=DTYPE)
 
-    values = tuple(trajectories)
-    if not values:
-        return jnp.zeros((0,), dtype=DTYPE)
+    root_logits = _root_policy_logits(params, config)
+    state_logits = jnp.broadcast_to(
+        root_logits, (batch_size, 1, config.vocabulary_size)
+    )
+    if max_steps > 1:
+        previous_actions = actions[:, :-1]
+        recurrent_active = step_mask[:, :-1]
+        hidden = params["embedding"][previous_actions]
+        for layer in params["gru"]:
+            hidden = _gru_sequence_batched(layer, hidden, recurrent_active)
+        prefix_logits = _policy_head(params, hidden)
+        state_logits = jnp.concatenate((state_logits, prefix_logits), axis=1)
+
+    masked_logits = jnp.where(legal_mask, state_logits, -jnp.inf)
+    log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
+    gathered = jnp.take_along_axis(
+        log_probs, actions[..., None], axis=-1
+    )[..., 0]
+    return jnp.sum(jnp.where(step_mask, gathered, 0.0), axis=1)
+
+
+def _pack_trajectory_batch(
+    batch: TrajectoryBatch,
+    config: GRUPolicyConfig,
+    reward_quantile: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pack trajectories to one stable batch/token shape for JAX compilation."""
+
+    values = tuple(batch.trajectories)
     for trajectory in values:
         _validate_trajectory_prefixes(trajectory)
-
-    batch_size = len(values)
-    lengths = np.asarray([len(t.actions) for t in values], dtype=np.int32)
-    observed_max_steps = int(lengths.max(initial=0))
+    observed_batch = len(values)
+    batch_size = (
+        int(config.max_batch_size)
+        if int(config.max_batch_size) > 0
+        else observed_batch
+    )
+    if observed_batch > batch_size:
+        raise ValueError(
+            "trajectory batch exceeds configured max_batch_size: "
+            f"observed={observed_batch}, configured={batch_size}"
+        )
+    observed_max_steps = max((len(t.actions) for t in values), default=0)
     max_steps = (
         int(config.max_sequence_length)
         if int(config.max_sequence_length) > 0
@@ -368,53 +405,82 @@ def _batched_trajectory_log_probabilities(
             f"observed={observed_max_steps}, configured={max_steps}"
         )
     if max_steps <= 0:
-        return jnp.zeros((batch_size,), dtype=DTYPE)
+        max_steps = 1
 
     actions = np.zeros((batch_size, max_steps), dtype=np.int32)
     legal_mask = np.zeros(
         (batch_size, max_steps, config.vocabulary_size), dtype=np.bool_
     )
+    legal_mask[:, :, 0] = True
     step_mask = np.zeros((batch_size, max_steps), dtype=np.bool_)
+    selected_mask = np.zeros((batch_size,), dtype=np.bool_)
     for row, trajectory in enumerate(values):
         steps = len(trajectory.actions)
-        if steps == 0:
-            legal_mask[row, :, 0] = True
-            continue
-        actions[row, :steps] = np.asarray(trajectory.actions, dtype=np.int32)
-        step_mask[row, :steps] = True
-        for column, (action, legal) in enumerate(
-            zip(trajectory.actions, trajectory.legal_actions)
-        ):
-            if action not in legal:
-                raise ValueError(f"action {action} is not legal")
-            legal_mask[row, column, np.asarray(legal, dtype=np.int64)] = True
-        if steps < max_steps:
-            legal_mask[row, steps:, 0] = True
+        if steps:
+            actions[row, :steps] = np.asarray(trajectory.actions, dtype=np.int32)
+            step_mask[row, :steps] = True
+            for column, (action, legal) in enumerate(
+                zip(trajectory.actions, trajectory.legal_actions)
+            ):
+                if action not in legal:
+                    raise ValueError(f"action {action} is not legal")
+                legal_mask[row, column, :] = False
+                legal_mask[row, column, np.asarray(legal, dtype=np.int64)] = True
+        threshold = (
+            float(batch.reward_quantiles[row])
+            if batch.reward_quantiles
+            else float(reward_quantile)
+        )
+        selected_mask[row] = float(trajectory.reward) <= threshold
+    return actions, legal_mask, step_mask, selected_mask
 
-    root_logits = _root_policy_logits(params, config)
-    state_logits = jnp.broadcast_to(
-        root_logits, (batch_size, 1, config.vocabulary_size)
+
+def _risk_seeking_loss_arrays(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    actions: jax.Array,
+    legal_mask: jax.Array,
+    step_mask: jax.Array,
+    selected_mask: jax.Array,
+) -> jax.Array:
+    log_probability = _trajectory_log_probabilities_from_arrays(
+        params, config, actions, legal_mask, step_mask
+    )
+    selected = selected_mask.astype(DTYPE)
+    count = jnp.sum(selected)
+    total = jnp.sum(log_probability * selected)
+    return jnp.where(
+        count > 0.0, total / count, jnp.asarray(0.0, dtype=DTYPE)
     )
 
-    if max_steps > 1:
-        previous_actions = jnp.asarray(actions[:, :-1], dtype=jnp.int32)
-        recurrent_active = jnp.asarray(step_mask[:, :-1], dtype=bool)
-        hidden = params["embedding"][previous_actions]
-        for layer in params["gru"]:
-            hidden = _gru_sequence_batched(layer, hidden, recurrent_active)
-        prefix_logits = _policy_head(params, hidden)
-        state_logits = jnp.concatenate((state_logits, prefix_logits), axis=1)
 
-    mask = jnp.asarray(legal_mask)
-    masked_logits = jnp.where(mask, state_logits, -jnp.inf)
-    log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
-    action_ids = jnp.asarray(actions, dtype=jnp.int32)
-    gathered = jnp.take_along_axis(
-        log_probs, action_ids[..., None], axis=-1
-    )[..., 0]
-    return jnp.sum(
-        jnp.where(jnp.asarray(step_mask), gathered, 0.0), axis=1
+_RISK_LOSS_AND_GRAD = jax.jit(
+    jax.value_and_grad(_risk_seeking_loss_arrays),
+    static_argnames=("config",),
+)
+
+
+def _batched_trajectory_log_probabilities(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    trajectories: Sequence[PolicyTrajectory],
+) -> jax.Array:
+    values = tuple(trajectories)
+    if not values:
+        return jnp.zeros((0,), dtype=DTYPE)
+    batch = TrajectoryBatch(values)
+    actions, legal_mask, step_mask, _ = _pack_trajectory_batch(
+        batch, config, reward_quantile=0.0
     )
+    probabilities = _trajectory_log_probabilities_from_arrays(
+        params,
+        config,
+        jnp.asarray(actions),
+        jnp.asarray(legal_mask),
+        jnp.asarray(step_mask),
+    )
+    return probabilities[: len(values)]
+
 
 
 def masked_log_prob(
@@ -439,28 +505,18 @@ def risk_seeking_loss(
     batch: TrajectoryBatch,
     reward_quantile: float,
 ) -> jax.Array:
-    """Equations 12/13 expressed as a gradient-descent loss.
+    """Equations 12/13 expressed as a gradient-descent loss."""
 
-    The paper performs gradient ascent on ``-1{R<=q} sum grad log pi``.
-    Minimizing the selected trajectories' summed log-probabilities is exactly
-    the same update direction.
-    """
-
-    selected: list[PolicyTrajectory] = []
-    for index, trajectory in enumerate(batch.trajectories):
-        threshold = (
-            float(batch.reward_quantiles[index])
-            if batch.reward_quantiles
-            else float(reward_quantile)
-        )
-        if float(trajectory.reward) <= threshold:
-            selected.append(trajectory)
-    if not selected:
-        return jnp.asarray(0.0, dtype=DTYPE)
-    return jnp.mean(
-        _batched_trajectory_log_probabilities(
-            params, config, tuple(selected)
-        )
+    actions, legal_mask, step_mask, selected_mask = _pack_trajectory_batch(
+        batch, config, reward_quantile
+    )
+    return _risk_seeking_loss_arrays(
+        params,
+        config,
+        jnp.asarray(actions),
+        jnp.asarray(legal_mask),
+        jnp.asarray(step_mask),
+        jnp.asarray(selected_mask),
     )
 
 
@@ -517,10 +573,17 @@ class JaxGRUPolicy:
         batch: TrajectoryBatch,
         reward_quantile: float,
     ) -> tuple["JaxGRUPolicy", float]:
-        loss_fn = lambda params: risk_seeking_loss(
-            params, self.config, batch, reward_quantile
+        actions, legal_mask, step_mask, selected_mask = _pack_trajectory_batch(
+            batch, self.config, reward_quantile
         )
-        loss, gradients = jax.value_and_grad(loss_fn)(self.params)
+        loss, gradients = _RISK_LOSS_AND_GRAD(
+            self.params,
+            self.config,
+            jnp.asarray(actions),
+            jnp.asarray(legal_mask),
+            jnp.asarray(step_mask),
+            jnp.asarray(selected_mask),
+        )
         updated = jax.tree_util.tree_map(
             lambda parameter, gradient: parameter - self.config.learning_rate * gradient,
             self.params,

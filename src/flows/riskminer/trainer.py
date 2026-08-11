@@ -52,6 +52,7 @@ class RiskSeekingTrainer:
             GRUPolicyConfig(
                 vocabulary_size=int(vocabulary_size),
                 max_sequence_length=config.max_tokens,
+                max_batch_size=config.policy_batch_size,
                 learning_rate=config.policy_learning_rate,
                 seed=config.seed,
             ),
