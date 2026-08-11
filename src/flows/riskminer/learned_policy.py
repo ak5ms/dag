@@ -198,27 +198,58 @@ def initialize_gru_policy(
     return params
 
 
+def _gru_step(
+    layer: Mapping[str, jax.Array],
+    hidden: jax.Array,
+    value: jax.Array,
+) -> jax.Array:
+    update = jax.nn.sigmoid(
+        value @ layer["w_z"] + hidden @ layer["u_z"] + layer["b_z"]
+    )
+    reset = jax.nn.sigmoid(
+        value @ layer["w_r"] + hidden @ layer["u_r"] + layer["b_r"]
+    )
+    candidate = jnp.tanh(
+        value @ layer["w_n"]
+        + (reset * hidden) @ layer["u_n"]
+        + layer["b_n"]
+    )
+    return (1.0 - update) * candidate + update * hidden
+
+
 def _gru_sequence(layer: Mapping[str, jax.Array], inputs: jax.Array) -> jax.Array:
     hidden_size = int(layer["b_z"].shape[0])
 
     def step(hidden, value):
-        update = jax.nn.sigmoid(
-            value @ layer["w_z"] + hidden @ layer["u_z"] + layer["b_z"]
-        )
-        reset = jax.nn.sigmoid(
-            value @ layer["w_r"] + hidden @ layer["u_r"] + layer["b_r"]
-        )
-        candidate = jnp.tanh(
-            value @ layer["w_n"]
-            + (reset * hidden) @ layer["u_n"]
-            + layer["b_n"]
-        )
-        next_hidden = (1.0 - update) * candidate + update * hidden
+        next_hidden = _gru_step(layer, hidden, value)
         return next_hidden, next_hidden
 
     initial = jnp.zeros((hidden_size,), dtype=DTYPE)
     _, outputs = jax.lax.scan(step, initial, inputs)
     return outputs
+
+
+def _gru_sequence_batched(
+    layer: Mapping[str, jax.Array],
+    inputs: jax.Array,
+    active: jax.Array,
+) -> jax.Array:
+    """Run one GRU layer for a padded batch of token sequences."""
+
+    batch_size = int(inputs.shape[0])
+    hidden_size = int(layer["b_z"].shape[0])
+
+    def step(hidden, values):
+        value, is_active = values
+        proposed = _gru_step(layer, hidden, value)
+        next_hidden = jnp.where(is_active[:, None], proposed, hidden)
+        return next_hidden, next_hidden
+
+    initial = jnp.zeros((batch_size, hidden_size), dtype=DTYPE)
+    time_inputs = jnp.swapaxes(inputs, 0, 1)
+    time_active = jnp.swapaxes(active, 0, 1)
+    _, outputs = jax.lax.scan(step, initial, (time_inputs, time_active))
+    return jnp.swapaxes(outputs, 0, 1)
 
 
 def _policy_head(params: ArrayTree, hidden: jax.Array) -> jax.Array:
@@ -244,30 +275,8 @@ def policy_logits(
     return _policy_head(params, values[-1])
 
 
-def _trajectory_state_logits(
-    params: ArrayTree,
-    config: GRUPolicyConfig,
-    trajectory: PolicyTrajectory,
-    beg_logits: jax.Array,
-) -> jax.Array:
-    """Return policy logits for every state in one trajectory efficiently.
-
-    ``states[i]`` is the RPN prefix before ``actions[i]``.  The old training
-    path called ``policy_logits`` independently for every prefix, so a length-T
-    episode materialized O(T) separate stacked-GRU scans inside one autodiff
-    graph.  At depth > 1 that produced a very large XLA/LLVM compilation and
-    could exhaust host memory.
-
-    A GRU is prefix-recursive, so one pass over actions[:-1] already contains
-    the hidden state for every non-root prefix.  This reduces each trajectory
-    from O(T * layers) scans to O(layers) scans while preserving exactly the
-    same logits.
-    """
-
+def _validate_trajectory_prefixes(trajectory: PolicyTrajectory) -> None:
     actions = tuple(int(action) for action in trajectory.actions)
-    if not actions:
-        return jnp.zeros((0, config.vocabulary_size), dtype=DTYPE)
-
     for index, state in enumerate(trajectory.states):
         expected = actions[:index]
         if tuple(int(token) for token in state) != expected:
@@ -276,42 +285,91 @@ def _trajectory_state_logits(
                 f"state {index}={state!r}, expected {expected!r}"
             )
 
-    if len(actions) == 1:
-        return beg_logits[jnp.newaxis, :]
 
-    tokens = jnp.asarray(actions[:-1], dtype=jnp.int32)
-    values = params["embedding"][tokens]
-    for layer in params["gru"]:
-        values = _gru_sequence(layer, values)
-    prefix_logits = _policy_head(params, values)
-    return jnp.concatenate((beg_logits[jnp.newaxis, :], prefix_logits), axis=0)
-
-
-def _trajectory_log_probability(
+def _root_policy_logits(
     params: ArrayTree,
     config: GRUPolicyConfig,
-    trajectory: PolicyTrajectory,
-    beg_logits: jax.Array,
 ) -> jax.Array:
-    logits = _trajectory_state_logits(params, config, trajectory, beg_logits)
-    steps = len(trajectory.actions)
-    if steps == 0:
-        return jnp.asarray(0.0, dtype=DTYPE)
+    """Evaluate the learned BEG state without constructing length-1 scans."""
 
-    legal_mask = np.zeros((steps, config.vocabulary_size), dtype=np.bool_)
-    for index, (action, legal) in enumerate(
-        zip(trajectory.actions, trajectory.legal_actions)
-    ):
-        if action not in legal:
-            raise ValueError(f"action {action} is not legal")
-        legal_mask[index, np.asarray(legal, dtype=np.int64)] = True
+    value = params["embedding"][config.vocabulary_size]
+    for layer in params["gru"]:
+        hidden = jnp.zeros((int(layer["b_z"].shape[0]),), dtype=DTYPE)
+        value = _gru_step(layer, hidden, value)
+    return _policy_head(params, value)
+
+
+def _batched_trajectory_log_probabilities(
+    params: ArrayTree,
+    config: GRUPolicyConfig,
+    trajectories: Sequence[PolicyTrajectory],
+) -> jax.Array:
+    """Compute complete trajectory log-probabilities with one scan per layer.
+
+    The original implementation re-ran the entire stacked GRU separately for
+    every RPN prefix.  That makes autodiff materialize O(B*T*L) scans for batch
+    size B, trajectory length T, and L GRU layers.  This function pads the
+    selected trajectories and runs all prefixes together, reducing the traced
+    recurrent graph to O(L) scans.
+    """
+
+    values = tuple(trajectories)
+    if not values:
+        return jnp.zeros((0,), dtype=DTYPE)
+    for trajectory in values:
+        _validate_trajectory_prefixes(trajectory)
+
+    batch_size = len(values)
+    lengths = np.asarray([len(t.actions) for t in values], dtype=np.int32)
+    max_steps = int(lengths.max(initial=0))
+    if max_steps <= 0:
+        return jnp.zeros((batch_size,), dtype=DTYPE)
+
+    actions = np.zeros((batch_size, max_steps), dtype=np.int32)
+    legal_mask = np.zeros(
+        (batch_size, max_steps, config.vocabulary_size), dtype=np.bool_
+    )
+    step_mask = np.zeros((batch_size, max_steps), dtype=np.bool_)
+    for row, trajectory in enumerate(values):
+        steps = len(trajectory.actions)
+        if steps == 0:
+            legal_mask[row, :, 0] = True
+            continue
+        actions[row, :steps] = np.asarray(trajectory.actions, dtype=np.int32)
+        step_mask[row, :steps] = True
+        for column, (action, legal) in enumerate(
+            zip(trajectory.actions, trajectory.legal_actions)
+        ):
+            if action not in legal:
+                raise ValueError(f"action {action} is not legal")
+            legal_mask[row, column, np.asarray(legal, dtype=np.int64)] = True
+        if steps < max_steps:
+            legal_mask[row, steps:, 0] = True
+
+    root_logits = _root_policy_logits(params, config)
+    state_logits = jnp.broadcast_to(
+        root_logits, (batch_size, 1, config.vocabulary_size)
+    )
+
+    if max_steps > 1:
+        previous_actions = jnp.asarray(actions[:, :-1], dtype=jnp.int32)
+        recurrent_active = jnp.asarray(step_mask[:, :-1], dtype=bool)
+        hidden = params["embedding"][previous_actions]
+        for layer in params["gru"]:
+            hidden = _gru_sequence_batched(layer, hidden, recurrent_active)
+        prefix_logits = _policy_head(params, hidden)
+        state_logits = jnp.concatenate((state_logits, prefix_logits), axis=1)
 
     mask = jnp.asarray(legal_mask)
-    masked = jnp.where(mask, logits, -jnp.inf)
-    log_probs = jax.nn.log_softmax(masked, axis=-1)
-    rows = jnp.arange(steps, dtype=jnp.int32)
-    actions = jnp.asarray(trajectory.actions, dtype=jnp.int32)
-    return jnp.sum(log_probs[rows, actions])
+    masked_logits = jnp.where(mask, state_logits, -jnp.inf)
+    log_probs = jax.nn.log_softmax(masked_logits, axis=-1)
+    action_ids = jnp.asarray(actions, dtype=jnp.int32)
+    gathered = jnp.take_along_axis(
+        log_probs, action_ids[..., None], axis=-1
+    )[..., 0]
+    return jnp.sum(
+        jnp.where(jnp.asarray(step_mask), gathered, 0.0), axis=1
+    )
 
 
 def masked_log_prob(
@@ -343,24 +401,22 @@ def risk_seeking_loss(
     the same update direction.
     """
 
-    selected = []
-    beg_logits = policy_logits(params, config, ())
+    selected: list[PolicyTrajectory] = []
     for index, trajectory in enumerate(batch.trajectories):
         threshold = (
             float(batch.reward_quantiles[index])
             if batch.reward_quantiles
             else float(reward_quantile)
         )
-        if float(trajectory.reward) > threshold:
-            continue
-        selected.append(
-            _trajectory_log_probability(
-                params, config, trajectory, beg_logits
-            )
-        )
+        if float(trajectory.reward) <= threshold:
+            selected.append(trajectory)
     if not selected:
         return jnp.asarray(0.0, dtype=DTYPE)
-    return jnp.mean(jnp.stack(selected))
+    return jnp.mean(
+        _batched_trajectory_log_probabilities(
+            params, config, tuple(selected)
+        )
+    )
 
 
 @dataclass(frozen=True)
