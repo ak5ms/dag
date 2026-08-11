@@ -18,8 +18,10 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -e . pytest 'jax[cpu]' psutil
-      - name: Apply patch
-        run: python scripts/.riskminer_policy_fix.py
+      - name: Apply patches
+        run: |
+          python scripts/.riskminer_policy_fix.py
+          python scripts/.riskminer_rollout_fix.py
       - name: Unit tests
         run: PYTHONPATH=src python -m pytest -q -o addopts='' tests/flows/riskminer/test_core.py tests/flows/riskminer/test_policy.py
       - name: Policy inference smoke
@@ -37,18 +39,58 @@ jobs:
               actual = np.asarray(_policy_logits_numpy(policy.params, cfg, tokens[:n]))
               np.testing.assert_allclose(expected, actual, rtol=2e-6, atol=2e-6)
           started = time.perf_counter()
-          checksum = 0.0
           for _ in range(1000):
               n = int(rng.integers(0, 31))
-              checksum += float(_policy_logits_numpy(policy.params, cfg, tokens[:n])[0])
+              _policy_logits_numpy(policy.params, cfg, tokens[:n])
           elapsed = time.perf_counter() - started
-          print({'1000_calls_seconds': elapsed, 'checksum': checksum})
+          print({'1000_calls_seconds': elapsed})
           assert elapsed < 10.0
           PY
-      - name: Commit fix
+      - name: Full grammar rollout smoke
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from flows.riskminer.config import RiskMinerConfig
+          from flows.riskminer.mcts import RewardDenseRiskMCTS, SchemaPriorPolicy
+          from flows.riskminer.rpn import TypedRPNEnvironment, build_vocabulary
+          from flows.riskminer.semantics import inputdata_alpha_terminal_metadata
+          class Transition:
+              committed = False
+          class Terminal:
+              def __init__(self):
+                  self.reward = 0.0
+                  self.transition = Transition()
+          class Reward:
+              def intermediate_rewards(self, values):
+                  return {value.canonical_key: 0.0 for value in values}
+              def terminal_reward(self, value, *, rpn, individual_score=float('nan')):
+                  return Terminal()
+          vocabulary = build_vocabulary(terminals=inputdata_alpha_terminal_metadata())
+          assert len(vocabulary) == 132
+          for depth in range(2, 9):
+              config = RiskMinerConfig(
+                  max_depth=depth,
+                  min_formula_depth=depth,
+                  max_tokens=30,
+                  simulations=8,
+                  rollouts_per_expansion=1,
+                  seed=42,
+              )
+              env = TypedRPNEnvironment(
+                  config=config,
+                  vocabulary=vocabulary,
+                  target_types=('dimensionless',),
+              )
+              result = RewardDenseRiskMCTS(
+                  env, Reward(), config=config, policy=SchemaPriorPolicy()
+              ).search()
+              valid = sum(t.terminal_formula_key is not None for t in result.trajectories)
+              print({'depth': depth, 'valid': valid, 'invalid': result.metrics.invalid_rollouts})
+              assert valid >= 1
+          PY
+      - name: Commit fixes
         run: |
           git config user.name openai-agent
           git config user.email openai-agent@users.noreply.github.com
-          git add src/flows/riskminer/learned_policy.py src/flows/riskminer/trainer.py
-          git commit -m 'Fix RiskMiner GRU inference memory growth'
+          git add src/flows/riskminer/learned_policy.py src/flows/riskminer/trainer.py src/flows/riskminer/rpn.py src/flows/riskminer/mcts.py
+          git commit -m 'Fix RiskMiner rollout memory and validity'
           git push origin HEAD:agent/riskminer-cpp-stream-v1
