@@ -22,29 +22,36 @@ jobs:
         run: |
           python scripts/.riskminer_policy_fix.py
           python scripts/.riskminer_rollout_fix.py
+          python scripts/.riskminer_training_jit_fix.py
       - name: Unit tests
         run: PYTHONPATH=src python -m pytest -q -o addopts='' tests/flows/riskminer/test_core.py tests/flows/riskminer/test_policy.py
-      - name: Policy inference smoke
+      - name: Repeated training smoke
         run: |
           PYTHONPATH=src python - <<'PY'
           import time
           import numpy as np
-          from flows.riskminer.learned_policy import GRUPolicyConfig, JaxGRUPolicy, _policy_logits_numpy, policy_logits
-          cfg = GRUPolicyConfig(vocabulary_size=132, max_sequence_length=30)
+          from flows.riskminer.learned_policy import GRUPolicyConfig, JaxGRUPolicy, PolicyTrajectory, TrajectoryBatch
+          cfg = GRUPolicyConfig(vocabulary_size=132, max_sequence_length=30, max_batch_size=32)
           policy = JaxGRUPolicy.initialize(cfg, token_priors=np.ones(132))
-          rng = np.random.default_rng(7)
-          tokens = tuple(int(x) for x in rng.integers(0, 132, size=30))
-          for n in (0, 1, 5, 17, 30):
-              expected = np.asarray(policy_logits(policy.params, cfg, tokens[:n]))
-              actual = np.asarray(_policy_logits_numpy(policy.params, cfg, tokens[:n]))
-              np.testing.assert_allclose(expected, actual, rtol=2e-6, atol=2e-6)
-          started = time.perf_counter()
-          for _ in range(1000):
-              n = int(rng.integers(0, 31))
-              _policy_logits_numpy(policy.params, cfg, tokens[:n])
-          elapsed = time.perf_counter() - started
-          print({'1000_calls_seconds': elapsed})
-          assert elapsed < 10.0
+          legal = tuple(range(132))
+          trajectories = tuple(
+              PolicyTrajectory(
+                  states=tuple(tuple([i % 132] * j) for j in range(12)),
+                  actions=tuple([i % 132] * 12),
+                  legal_actions=tuple([legal] * 12),
+                  reward=-1.0,
+              )
+              for i in range(8)
+          )
+          batch = TrajectoryBatch(trajectories, reward_quantiles=tuple([0.0] * 8))
+          times = []
+          for index in range(5):
+              started = time.perf_counter()
+              policy, loss = policy.train_step(batch, 0.0)
+              elapsed = time.perf_counter() - started
+              times.append(elapsed)
+              print({'step': index, 'seconds': elapsed, 'loss': loss})
+          assert max(times[1:]) < 1.0, times
           PY
       - name: Full grammar rollout smoke
         run: |
@@ -56,9 +63,8 @@ jobs:
           class Transition:
               committed = False
           class Terminal:
-              def __init__(self):
-                  self.reward = 0.0
-                  self.transition = Transition()
+              reward = 0.0
+              transition = Transition()
           class Reward:
               def intermediate_rewards(self, values):
                   return {value.canonical_key: 0.0 for value in values}
@@ -67,22 +73,9 @@ jobs:
           vocabulary = build_vocabulary(terminals=inputdata_alpha_terminal_metadata())
           assert len(vocabulary) == 132
           for depth in range(2, 9):
-              config = RiskMinerConfig(
-                  max_depth=depth,
-                  min_formula_depth=depth,
-                  max_tokens=30,
-                  simulations=8,
-                  rollouts_per_expansion=1,
-                  seed=42,
-              )
-              env = TypedRPNEnvironment(
-                  config=config,
-                  vocabulary=vocabulary,
-                  target_types=('dimensionless',),
-              )
-              result = RewardDenseRiskMCTS(
-                  env, Reward(), config=config, policy=SchemaPriorPolicy()
-              ).search()
+              config = RiskMinerConfig(max_depth=depth, min_formula_depth=depth, max_tokens=30, simulations=8, rollouts_per_expansion=1, seed=42)
+              env = TypedRPNEnvironment(config=config, vocabulary=vocabulary, target_types=('dimensionless',))
+              result = RewardDenseRiskMCTS(env, Reward(), config=config, policy=SchemaPriorPolicy()).search()
               valid = sum(t.terminal_formula_key is not None for t in result.trajectories)
               print({'depth': depth, 'valid': valid, 'invalid': result.metrics.invalid_rollouts})
               assert valid >= 1
@@ -92,5 +85,5 @@ jobs:
           git config user.name openai-agent
           git config user.email openai-agent@users.noreply.github.com
           git add src/flows/riskminer/learned_policy.py src/flows/riskminer/trainer.py src/flows/riskminer/rpn.py src/flows/riskminer/mcts.py
-          git commit -m 'Fix RiskMiner rollout memory and validity'
+          git commit -m 'Stabilize RiskMiner policy training compilation'
           git push origin HEAD:agent/riskminer-cpp-stream-v1
