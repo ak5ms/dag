@@ -64,13 +64,14 @@ def test_risk_quantile_tracker_moves_in_the_correct_direction():
     lower = higher.update(-1.0)
     assert lower.value < higher.value
     sample = np.linspace(-1.0, 1.0, 101)
+    rng = np.random.default_rng(17)
     fitted = RiskQuantileTracker(
         cdf_quantile=0.8,
         learning_rate=0.01,
         value=0.0,
     )
     for _ in range(50):
-        fitted = fitted.update_many(sample)
+        fitted = fitted.update_many(rng.permutation(sample))
     assert abs(fitted.value - np.quantile(sample, 0.8)) < 0.08
 
 
@@ -130,6 +131,12 @@ def test_learned_policy_implements_the_mcts_action_prior_interface():
             seed=config.seed,
         )
     )
+    # The interface test should not depend on a random initialized policy
+    # ranking a valid market terminal ahead of the enlarged literal inventory.
+    chosen = environment.vocabulary.by_name["soft_side_wavg"].token_id
+    policy.params["out"]["b"] = (
+        policy.params["out"]["b"].at[chosen].set(20.0)
+    )
     result = RiskMCTS(
         environment,
         StubEvaluator(),
@@ -141,3 +148,37 @@ def test_learned_policy_implements_the_mcts_action_prior_interface():
         config.simulations * config.rollouts_per_expansion
     )
     assert result.archive
+
+
+def test_per_trajectory_quantile_thresholds_are_used_in_batched_loss():
+    environment, _ = _environment()
+    root = environment.initial_state()
+    legal = environment.legal_actions(root)
+    chosen = environment.vocabulary.by_name["soft_side_wavg"].token_id
+    policy = JaxGRUPolicy.initialize(
+        GRUPolicyConfig(
+            vocabulary_size=len(environment.vocabulary),
+            hidden_size=16,
+            layers=2,
+            mlp_hidden_1=8,
+            mlp_hidden_2=8,
+            seed=13,
+        )
+    )
+    excluded = PolicyTrajectory(
+        states=((),), actions=(chosen,), legal_actions=(legal,), reward=-1.0
+    )
+    selected = PolicyTrajectory(
+        states=((),), actions=(chosen,), legal_actions=(legal,), reward=1.0
+    )
+    batched = TrajectoryBatch(
+        (excluded, selected),
+        reward_quantiles=(-2.0, 2.0),
+    )
+    selected_only = TrajectoryBatch((selected,), reward_quantiles=(2.0,))
+    assert math.isclose(
+        policy.loss(batched, reward_quantile=999.0),
+        policy.loss(selected_only, reward_quantile=-999.0),
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    )

@@ -145,7 +145,13 @@ def build_vocabulary(
     *,
     terminals: dict[str, SemanticInfo] | None = None,
     literals: Iterable[float] = (
+        -30.0,
+        -10.0,
+        -5.0,
+        -2.0,
         -1.0,
+        -0.5,
+        -0.01,
         0.0,
         0.5,
         1.0,
@@ -154,6 +160,9 @@ def build_vocabulary(
         5.0,
         10.0,
         20.0,
+        30.0,
+        40.0,
+        50.0,
         60.0,
         120.0,
         240.0,
@@ -228,6 +237,8 @@ class TypedRPNEnvironment:
         if len(state.stack) != 1:
             return None
         value = state.stack[0]
+        if value.depth < self.config.min_formula_depth:
+            return None
         if value.semantics.shape not in {
             SearchShape.ROW,
             SearchShape.BOOLEAN_ROW,

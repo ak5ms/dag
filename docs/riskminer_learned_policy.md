@@ -1,81 +1,44 @@
-# Risk-seeking learned policy checkpoint
+# Risk-seeking learned policy
 
-`flows.riskminer.learned_policy` implements the learned-policy portion of the
-RiskMiner design without changing the native alpha evaluator.
+The learned policy is fully integrated with the reward-dense MCTS pipeline.
 
 ## Architecture
 
-- learned token embedding plus a learned `BEG` embedding;
-- configurable stacked GRU, default four layers and hidden size 64;
+- learned token embeddings and a learned `BEG` embedding;
+- four GRU layers with hidden width 64;
 - two 32-unit MLP hidden layers;
 - one logit per typed-RPN token;
-- exact legal-action masking before softmax;
-- `ActionPolicy.priors(...)` compatibility with `RiskMCTS`;
-- stochastic reward-CDF quantile tracking;
-- below-quantile trajectory probability suppression with manual SGD through JAX.
+- legal-action masking before softmax.
 
-Candidate formulas and rewards continue to be computed exclusively by
-`trading_dsl_engine.cpp_stream`; JAX is used only for token-policy inference and
-training.
+The resulting probability distribution is used as both the PUCT prior and the
+rollout policy.
 
-## Use the initialized policy in native search
+## Training
 
-```python
-from flows.riskminer.config import RiskMinerConfig
-from flows.riskminer.policy_search import search_cpp_stream_alphas_with_policy
+Every complete episode records token states, selected actions, legal-action sets,
+intermediate rewards, terminal reward, and whether the pool changed. A bounded
+replay buffer is created fresh for each outer mining iteration.
 
-result, policy = search_cpp_stream_alphas_with_policy(
-    sources,
-    n_instruments=9,
-    work_dir="/tmp/riskminer-policy-search",
-    config=RiskMinerConfig(
-        max_depth=8,
-        simulations=128,
-        rollouts_per_expansion=8,
-        evaluation_batch_size=32,
-        archive_size=100,
-        seed=42,
-    ),
-)
-```
+The reward quantile is updated in trajectory order. Policy batches retain the
+pre-update `q_i` associated with each trajectory, then suppress the probability
+of trajectories at or below that threshold using the paper's risk-seeking
+gradient direction. Invalid dead-end episodes remain in replay with a finite
+negative reward instead of being silently discarded.
 
-## Train one risk-seeking step
+For a new run, the output bias is initialized from the typed token priors. The
+first MCTS cycle therefore starts from a sensible schema distribution rather
+than arbitrary random token preferences; subsequent updates remain fully
+state-dependent through the GRU.
+
+Policy checkpoints contain the GRU/MLP parameters, configuration, iteration,
+quantile, and trajectory count. They can be restored with:
 
 ```python
-from flows.riskminer.learned_policy import (
-    PolicyTrajectory,
-    RiskQuantileTracker,
-    TrajectoryBatch,
-)
-
-tracker = RiskQuantileTracker(
-    cdf_quantile=0.80,
-    learning_rate=0.01,
-)
-tracker = tracker.update_many(episode_rewards)
-
-batch = TrajectoryBatch(tuple(policy_trajectories))
-policy, loss = policy.train_step(
-    batch,
-    reward_quantile=tracker.value,
-)
+policy, metadata = JaxGRUPolicy.load(path)
 ```
 
-A `PolicyTrajectory` stores the token prefix, chosen action, exact legal-action set,
-and final reward at each decision. Gradient descent on the summed log probability
-of trajectories at or below the tracked quantile decreases their probability.
+The plug-and-play runner accepts a checkpoint through
+`RISKMINER_RESUME_POLICY`.
 
-## Current integration boundary
-
-The GRU can already supply MCTS priors and its update is independently tested.
-The next checkpoint will make `RiskMCTS` return a replay-ready trajectory record and
-add the alternating loop:
-
-1. freeze the current Ridge pool;
-2. run a native-evaluated MCTS mining cycle;
-3. evaluate exact candidate additions to the pool;
-4. update the reward quantile;
-5. train the GRU from the collected trajectories;
-6. reset the tree for the changed pool and repeat.
-
-This keeps all values within one MCTS tree conditional on one fixed pool snapshot.
+All alpha values and rewards are evaluated by `cpp_stream`. JAX is used only for
+policy inference and gradient updates.

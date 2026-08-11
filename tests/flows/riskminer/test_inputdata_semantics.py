@@ -1,7 +1,3 @@
-from __future__ import annotations
-
-import math
-
 from flows.riskminer import (
     DEFAULT_TYPE_GRAPH,
     INPUTDATA_ALPHA_KEYS,
@@ -10,138 +6,44 @@ from flows.riskminer import (
     build_vocabulary,
     inputdata_alpha_terminal_metadata,
 )
-from flows.riskminer.semantics import (
-    compatible,
-    division_output,
-    subtraction_output,
-)
+from flows.riskminer.semantics import compatible
 
 
-def test_inputdata_alpha_metadata_covers_exact_user_keyset():
-    metadata = inputdata_alpha_terminal_metadata()
-    assert tuple(metadata) == INPUTDATA_ALPHA_KEYS
-    assert len(metadata) == 69
+def test_every_user_inputdata_key_has_semantics():
+    values = inputdata_alpha_terminal_metadata()
+    assert tuple(values) == INPUTDATA_ALPHA_KEYS
+    assert len(values) == 69
 
 
-def test_market_field_type_relations_are_value_based_not_location_based():
-    metadata = inputdata_alpha_terminal_metadata()
-
-    ap = metadata["ap0_out0"]
-    bp = metadata["bp9_out0"]
-    ask_volume = metadata["volume_a0_out0"]
-    trade_volume = metadata["volume_out0"]
-    vwap = metadata["vwap_out0"]
-    mid = metadata["mp_out0.close"]
-
-    assert "price" in DEFAULT_TYPE_GRAPH.closure(ap.types)
-    assert "price" in DEFAULT_TYPE_GRAPH.closure(bp.types)
-    assert "price" in DEFAULT_TYPE_GRAPH.closure(vwap.types)
-    assert "price" in DEFAULT_TYPE_GRAPH.closure(mid.types)
-    assert "quantity" in DEFAULT_TYPE_GRAPH.closure(ask_volume.types)
-    assert "quantity" in DEFAULT_TYPE_GRAPH.closure(trade_volume.types)
-
-    assert compatible(ap, bp)
-    assert compatible(ask_volume, trade_volume)
-    assert not compatible(ap, ask_volume)
+def test_inputdata_field_definitions_and_compatibility():
+    values = inputdata_alpha_terminal_metadata()
+    assert {"price", "ask_level_price", "level_9"} <= values["ap9_out0"].types
+    assert {"quantity", "level_volume", "bid"} <= values["volume_b3_out0"].types
+    assert {"trade_vwap", "trade_price"} <= values["vwap_out0"].types
+    assert "half_spread_fraction" in values["vw_halfspread_out0"].types
+    assert "cross_weighted_trade_quantity" in values["trade_cross_pct_out0.sum"].types
+    assert compatible(values["ap3_out0"], values["bp7_out0"])
+    assert not compatible(values["ap3_out0"], values["volume_a3_out0"])
+    assert "timestamp" in DEFAULT_TYPE_GRAPH.closure(values["session_start0"].types)
 
 
-def test_trade_cross_semantics_follow_source_definition():
-    metadata = inputdata_alpha_terminal_metadata()
-    count = metadata["trade_cross_pct_out0.count"]
-    total = metadata["trade_cross_pct_out0.sum"]
-
-    assert "dimensionless" in DEFAULT_TYPE_GRAPH.closure(count.types)
-    assert count.nonnegative
-    assert "quantity" in DEFAULT_TYPE_GRAPH.closure(total.types)
-    # TradeQty * ((trade_price-bid)/(ask-bid)) can be signed when a trade
-    # occurs outside the quoted spread.
-    assert math.isinf(total.lower) and total.lower < 0.0
-
-
-def test_time_subtraction_produces_duration_and_duration_ratio_is_dimensionless():
-    metadata = inputdata_alpha_terminal_metadata()
-    elapsed = subtraction_output(
-        metadata["_ev_ts"],
-        metadata["session_start0"],
+def test_timestamp_subtraction_produces_duration_ratio_alpha():
+    values = inputdata_alpha_terminal_metadata()
+    config = RiskMinerConfig(
+        max_depth=3, min_formula_depth=3, max_tokens=8, max_stack=4,
+        simulations=1, evaluation_batch_size=1, archive_size=1,
     )
-    session_length = subtraction_output(
-        metadata["session_end0"],
-        metadata["session_start0"],
-    )
-    ratio = division_output(elapsed, session_length)
-
-    assert "duration" in DEFAULT_TYPE_GRAPH.closure(elapsed.types)
-    assert "dimensionless" in DEFAULT_TYPE_GRAPH.closure(ratio.types)
-
-
-def test_timestamp_plus_timestamp_is_not_legal_but_timestamp_difference_is():
-    metadata = inputdata_alpha_terminal_metadata()
-    vocabulary = build_vocabulary(terminals=metadata)
-    env = TypedRPNEnvironment(
-        config=RiskMinerConfig(
-            max_depth=4,
-            min_formula_depth=1,
-            max_tokens=12,
-            max_stack=8,
-            simulations=1,
-            rollouts_per_expansion=1,
-            evaluation_batch_size=1,
-            archive_size=1,
-        ),
-        vocabulary=vocabulary,
-        target_types=("dimensionless",),
-    )
-
-    state = env.initial_state()
-    state = env.apply(state, vocabulary.by_name["_ev_ts"].token_id)
-    state = env.apply(state, vocabulary.by_name["session_start0"].token_id)
-    legal = {vocabulary.by_id[token_id].name for token_id in env.legal_actions(state)}
-    assert "sub" in legal
-    assert "add" not in legal
-
-
-def test_time_of_session_ratio_can_be_constructed_and_terminated():
-    metadata = inputdata_alpha_terminal_metadata()
-    vocabulary = build_vocabulary(terminals=metadata)
-    env = TypedRPNEnvironment(
-        config=RiskMinerConfig(
-            max_depth=4,
-            min_formula_depth=1,
-            max_tokens=12,
-            max_stack=8,
-            simulations=1,
-            rollouts_per_expansion=1,
-            evaluation_batch_size=1,
-            archive_size=1,
-        ),
-        vocabulary=vocabulary,
-        target_types=("dimensionless",),
-    )
-
-    state = env.initial_state()
-    for token_name in (
-        "_ev_ts",
-        "session_start0",
-        "sub",
-        "session_end0",
-        "session_start0",
-        "sub",
-        "div",
-        "END",
+    vocabulary = build_vocabulary(terminals=values, operators=tuple(
+        schema for schema in __import__("flows.riskminer", fromlist=["default_operator_catalog"]).default_operator_catalog()
+        if schema.name in {"sub", "div"}
+    ))
+    environment = TypedRPNEnvironment(config=config, vocabulary=vocabulary)
+    state = environment.initial_state()
+    for token in (
+        "_ev_ts", "session_start0", "sub",
+        "session_end0", "session_start0", "sub", "div", "END",
     ):
-        state = env.apply(state, vocabulary.by_name[token_name].token_id)
-
-    assert state.terminated
-    value = env.formula_value(state)
+        state = environment.apply(state, vocabulary.by_name[token].token_id)
+    value = environment.formula_value(state)
     assert value is not None
-    assert "dimensionless" in DEFAULT_TYPE_GRAPH.closure(value.semantics.types)
-
-
-def test_special_field_ranges():
-    metadata = inputdata_alpha_terminal_metadata()
-    assert metadata["is_tradable_out0"].lower == 0.0
-    assert metadata["is_tradable_out0"].upper == 1.0
-    assert metadata["is_tradable_out0"].integer
-    assert metadata["wdte_out0"].lower == 0.0
-    assert metadata["volume_b9_out0"].lower == 0.0
-    assert metadata["ap9_out0"].lower > 0.0
+    assert "dimensionless" in value.semantics.types

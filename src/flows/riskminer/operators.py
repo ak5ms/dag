@@ -12,12 +12,24 @@ from trading_dsl_engine.base.dsl import (
     ewm,
     fillna,
     fraction,
+    gt,
+    isfinite,
+    le,
+    ln,
+    lt,
     maximum,
     minimum,
     mul,
+    pow as dsl_pow,
     purify,
+    rolling_decay_linear,
+    rolling_max,
     rolling_mean,
+    rolling_median,
+    rolling_min,
+    rolling_pct_rank,
     rolling_std,
+    rolling_sum,
     shift,
     sign,
     sub,
@@ -31,6 +43,7 @@ from .semantics import (
     DEFAULT_TYPE_GRAPH,
     SearchShape,
     SemanticInfo,
+    boolean_output,
     broadcast_shape,
     common_output,
     compatible,
@@ -41,10 +54,10 @@ from .semantics import (
     unary_preserve,
 )
 
-
 Validator = Callable[[Sequence[SemanticInfo]], bool]
 Infer = Callable[[Sequence[SemanticInfo]], SemanticInfo]
 Builder = Callable[[Sequence[Expr], Sequence[float | None]], Expr]
+DEFAULT_DYNAMIC_PERIODS = (5, 60, 1440)
 
 
 @dataclass(frozen=True)
@@ -67,29 +80,26 @@ def _all_numeric(args: Sequence[SemanticInfo]) -> bool:
     return all(_numeric(arg) for arg in args)
 
 
+def _row_numeric(info: SemanticInfo) -> bool:
+    return _numeric(info) and info.shape in {SearchShape.ROW, SearchShape.BOOLEAN_ROW}
+
+
 def _unary_numeric(args: Sequence[SemanticInfo]) -> bool:
     return len(args) == 1 and _numeric(args[0]) and args[0].shape in {
-        SearchShape.ROW,
-        SearchShape.SCALAR,
+        SearchShape.ROW, SearchShape.SCALAR,
     }
 
 
-def _cross_sectional_row(args: Sequence[SemanticInfo]) -> bool:
-    """Cross-sectional transforms require an actual instrument row."""
+def _positive_unary(args: Sequence[SemanticInfo]) -> bool:
+    return _unary_numeric(args) and args[0].lower > 0.0
 
-    return (
-        len(args) == 1
-        and _numeric(args[0])
-        and args[0].shape is SearchShape.ROW
-    )
+
+def _cross_sectional_row(args: Sequence[SemanticInfo]) -> bool:
+    return len(args) == 1 and _row_numeric(args[0])
 
 
 def _same_type(args: Sequence[SemanticInfo]) -> bool:
-    return (
-        len(args) == 2
-        and _all_numeric(args)
-        and compatible(args[0], args[1])
-    )
+    return len(args) == 2 and _all_numeric(args) and compatible(args[0], args[1])
 
 
 def _add_same_type(args: Sequence[SemanticInfo]) -> bool:
@@ -97,8 +107,6 @@ def _add_same_type(args: Sequence[SemanticInfo]) -> bool:
         return False
     left = DEFAULT_TYPE_GRAPH.closure(args[0].types)
     right = DEFAULT_TYPE_GRAPH.closure(args[1].types)
-    # Timestamp + timestamp is not a meaningful market feature. Timestamp
-    # subtraction is handled separately and yields a duration.
     return not ("timestamp" in left and "timestamp" in right)
 
 
@@ -127,13 +135,12 @@ def _positive_static_parameter(
     info: SemanticInfo,
     *,
     integer: bool = False,
-    minimum: float = 0.0,
     maximum_value: float = math.inf,
 ) -> bool:
     return (
         info.shape is SearchShape.SCALAR
         and info.static
-        and info.lower > minimum
+        and info.lower > 0.0
         and info.upper <= maximum_value
         and (not integer or info.integer)
     )
@@ -141,29 +148,37 @@ def _positive_static_parameter(
 
 def _temporal(args: Sequence[SemanticInfo]) -> bool:
     return (
-        len(args) == 2
-        and _numeric(args[0])
-        and args[0].shape is SearchShape.ROW
+        len(args) == 2 and _row_numeric(args[0])
         and _positive_static_parameter(args[1])
     )
 
 
 def _history(args: Sequence[SemanticInfo]) -> bool:
     return (
-        len(args) == 2
-        and _numeric(args[0])
-        and args[0].shape is SearchShape.ROW
+        len(args) == 2 and _row_numeric(args[0])
         and _positive_static_parameter(args[1], integer=True, maximum_value=4096)
     )
 
 
 def _rolling(args: Sequence[SemanticInfo]) -> bool:
+    return _history(args)
+
+
+def _rolling_pair(args: Sequence[SemanticInfo]) -> bool:
     return (
-        len(args) == 2
-        and _numeric(args[0])
-        and args[0].shape is SearchShape.ROW
-        and _positive_static_parameter(args[1], integer=True, maximum_value=4096)
+        len(args) == 3
+        and _row_numeric(args[0])
+        and _row_numeric(args[1])
+        and _positive_static_parameter(args[2], integer=True, maximum_value=4096)
     )
+
+
+def _dynamic_unary(args: Sequence[SemanticInfo]) -> bool:
+    return len(args) == 2 and _row_numeric(args[0]) and _row_numeric(args[1])
+
+
+def _dynamic_pair(args: Sequence[SemanticInfo]) -> bool:
+    return len(args) == 3 and all(_row_numeric(arg) for arg in args)
 
 
 def _same_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
@@ -176,19 +191,37 @@ def _sub_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
 
 def _preserve_first(args: Sequence[SemanticInfo]) -> SemanticInfo:
     value = unary_preserve(args[0])
-    return SemanticInfo(
-        value.types,
-        value.shape,
-        -math.inf,
-        math.inf,
-        integer=False,
-        static=False,
-        role="value",
-    )
+    return SemanticInfo(value.types, SearchShape.ROW, role="value")
 
 
 def _dimensionless(args: Sequence[SemanticInfo]) -> SemanticInfo:
     return dimensionless_output(args[0])
+
+
+def _bounded_rank(args: Sequence[SemanticInfo]) -> SemanticInfo:
+    return dimensionless_output(args[0], lower=0.0, upper=1.0)
+
+
+def _std_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
+    value = _preserve_first(args)
+    return SemanticInfo(
+        value.types, value.shape, lower=0.0, role="value"
+    )
+
+
+def _variance_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
+    value = multiplication_output(args[0], args[0])
+    return SemanticInfo(
+        value.types, value.shape, lower=0.0, role="value"
+    )
+
+
+def _covariance_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
+    return multiplication_output(args[0], args[1])
+
+
+def _bool_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
+    return boolean_output(args[0], args[1])
 
 
 def _where_infer(args: Sequence[SemanticInfo]) -> SemanticInfo:
@@ -202,192 +235,235 @@ def _literal_at(values: Sequence[float | None], index: int, name: str) -> float:
     return float(value)
 
 
-def default_operator_catalog() -> tuple[OperatorSchema, ...]:
-    """Conservative catalog whose entries are known to lower to cpp_stream."""
+def _rolling_raw_moments(x: Expr, periods: int) -> tuple[Expr, Expr, Expr, Expr]:
+    m1 = rolling_mean(x, periods)
+    m2 = rolling_mean(mul(x, x), periods)
+    m3 = rolling_mean(dsl_pow(x, 3.0), periods)
+    m4 = rolling_mean(dsl_pow(x, 4.0), periods)
+    return m1, m2, m3, m4
 
-    unary_preserving = (
-        ("abs", dsl_abs, 0.8),
-        ("purify", purify, 0.7),
+
+def _rolling_var_expr(x: Expr, periods: int) -> Expr:
+    m1 = rolling_mean(x, periods)
+    m2 = rolling_mean(mul(x, x), periods)
+    return maximum(sub(m2, mul(m1, m1)), 0.0)
+
+
+def _rolling_skew_expr(x: Expr, periods: int) -> Expr:
+    m1, m2, m3, _ = _rolling_raw_moments(x, periods)
+    var = maximum(sub(m2, mul(m1, m1)), 0.0)
+    central3 = add(sub(m3, mul(3.0, mul(m1, m2))), mul(2.0, dsl_pow(m1, 3.0)))
+    return div(central3, dsl_pow(var, 1.5))
+
+
+def _rolling_kurt_expr(x: Expr, periods: int) -> Expr:
+    m1, m2, m3, m4 = _rolling_raw_moments(x, periods)
+    var = maximum(sub(m2, mul(m1, m1)), 0.0)
+    central4 = add(
+        sub(add(m4, mul(6.0, mul(mul(m1, m1), m2))), mul(4.0, mul(m1, m3))),
+        mul(-3.0, dsl_pow(m1, 4.0)),
     )
-    ordinary_dimensionless = (
-        ("sign", sign, 0.8),
-        ("fraction", fraction, 0.35),
-        ("arctan", arctan, 0.55),
+    return sub(div(central4, mul(var, var)), 3.0)
+
+
+def _pairwise_observations(x: Expr, y: Expr) -> tuple[Expr, Expr]:
+    # Covariance/correlation must use the same observations for x, y and xy.
+    # Masking them together preserves pairwise-missing semantics when one input
+    # is absent independently of the other.
+    valid = isfinite(x) & isfinite(y)
+    nan = float("nan")
+    return where(valid, x, nan), where(valid, y, nan)
+
+
+def _rolling_cov_pair_expr(
+    x_pair: Expr, y_pair: Expr, periods: int
+) -> Expr:
+    return sub(
+        rolling_mean(mul(x_pair, y_pair), periods),
+        mul(
+            rolling_mean(x_pair, periods),
+            rolling_mean(y_pair, periods),
+        ),
     )
-    cross_sectional_dimensionless = (
-        ("xs_rank", xs_rank, 1.8),
-        ("xs_pct_rank", xs_pct_rank, 1.6),
+
+
+def _rolling_cov_expr(x: Expr, y: Expr, periods: int) -> Expr:
+    x_pair, y_pair = _pairwise_observations(x, y)
+    return _rolling_cov_pair_expr(x_pair, y_pair, periods)
+
+
+def _rolling_corr_expr(x: Expr, y: Expr, periods: int) -> Expr:
+    x_pair, y_pair = _pairwise_observations(x, y)
+    return div(
+        _rolling_cov_pair_expr(x_pair, y_pair, periods),
+        mul(
+            rolling_std(x_pair, periods, ddof=0),
+            rolling_std(y_pair, periods, ddof=0),
+        ),
     )
+
+
+def _dynamic_bank(
+    selector: Expr,
+    expressions: Sequence[Expr],
+) -> Expr:
+    if not expressions:
+        raise ValueError("dynamic operator requires at least one static branch")
+    if len(expressions) == 1:
+        return expressions[0]
+    rank = xs_pct_rank(selector)
+    result = expressions[-1]
+    count = len(expressions)
+    # Nested conditions are ordered from the largest threshold down so the
+    # smallest matching quantile wins.
+    for index in range(count - 2, -1, -1):
+        threshold = float(index + 1) / float(count)
+        result = where(le(rank, threshold), expressions[index], result)
+    return result
+
+
+def _dynamic_unary_builder(
+    fn: Callable[[Expr, int], Expr],
+    periods: Sequence[int],
+) -> Builder:
+    values = tuple(int(period) for period in periods)
+    return lambda exprs, literals: _dynamic_bank(
+        exprs[1], tuple(fn(exprs[0], period) for period in values)
+    )
+
+
+def _dynamic_pair_builder(
+    fn: Callable[[Expr, Expr, int], Expr],
+    periods: Sequence[int],
+) -> Builder:
+    values = tuple(int(period) for period in periods)
+    return lambda exprs, literals: _dynamic_bank(
+        exprs[2], tuple(fn(exprs[0], exprs[1], period) for period in values)
+    )
+
+
+def default_operator_catalog(
+    *,
+    dynamic_periods: Sequence[int] = DEFAULT_DYNAMIC_PERIODS,
+) -> tuple[OperatorSchema, ...]:
+    """Typed catalog covering the paper inventory and native-safe extensions."""
+
+    periods = tuple(sorted({int(value) for value in dynamic_periods if int(value) > 0}))
+    if not periods:
+        raise ValueError("dynamic_periods must contain a positive integer")
     out: list[OperatorSchema] = []
 
-    for name, fn, prior in unary_preserving:
-        out.append(
-            OperatorSchema(
-                name,
-                1,
-                _unary_numeric,
-                _preserve_first,
-                lambda exprs, literals, fn=fn: fn(exprs[0]),
-                prior=prior,
-                family="unary_preserving",
-            )
-        )
+    for name, fn, prior in (
+        ("abs", dsl_abs, 0.8), ("purify", purify, 0.7),
+    ):
+        out.append(OperatorSchema(
+            name, 1, _unary_numeric, _preserve_first,
+            lambda exprs, literals, fn=fn: fn(exprs[0]),
+            prior=prior, family="unary_preserving",
+        ))
+    for name, fn, validator, prior in (
+        ("sign", sign, _unary_numeric, 0.8),
+        ("fraction", fraction, _unary_numeric, 0.35),
+        ("arctan", arctan, _unary_numeric, 0.55),
+        ("log", ln, _positive_unary, 0.7),
+    ):
+        out.append(OperatorSchema(
+            name, 1, validator, _dimensionless,
+            lambda exprs, literals, fn=fn: fn(exprs[0]),
+            prior=prior, family="normalization",
+        ))
+    for name, fn, prior in (
+        ("xs_rank", xs_rank, 1.8),
+        ("xs_pct_rank", xs_pct_rank, 1.6),
+    ):
+        out.append(OperatorSchema(
+            name, 1, _cross_sectional_row, _bounded_rank,
+            lambda exprs, literals, fn=fn: fn(exprs[0]),
+            prior=prior, family="cross_sectional",
+        ))
 
-    for name, fn, prior in ordinary_dimensionless:
-        out.append(
-            OperatorSchema(
-                name,
-                1,
-                _unary_numeric,
-                _dimensionless,
-                lambda exprs, literals, fn=fn: fn(exprs[0]),
-                prior=prior,
-                family="normalization",
-            )
-        )
+    out.extend((
+        OperatorSchema("add", 2, _add_same_type, _same_infer,
+                       lambda e, l: add(e[0], e[1]), 1.25, True, "compatible_binary"),
+        OperatorSchema("sub", 2, _same_type, _sub_infer,
+                       lambda e, l: sub(e[0], e[1]), 1.35, False, "compatible_binary"),
+        OperatorSchema("minimum", 2, _same_type, _same_infer,
+                       lambda e, l: minimum(e[0], e[1]), 0.5, True, "compatible_binary"),
+        OperatorSchema("maximum", 2, _same_type, _same_infer,
+                       lambda e, l: maximum(e[0], e[1]), 0.5, True, "compatible_binary"),
+        OperatorSchema("mul", 2, _broadcast_numeric,
+                       lambda a: multiplication_output(a[0], a[1]),
+                       lambda e, l: mul(e[0], e[1]), 1.05, True, "numeric_binary"),
+        OperatorSchema("div", 2, _broadcast_numeric,
+                       lambda a: division_output(a[0], a[1]),
+                       lambda e, l: div(e[0], e[1]), 1.3, False, "numeric_binary"),
+        OperatorSchema("greater", 2, _same_type, _bool_infer,
+                       lambda e, l: gt(e[0], e[1]), 0.65, False, "comparison"),
+        OperatorSchema("less", 2, _same_type, _bool_infer,
+                       lambda e, l: lt(e[0], e[1]), 0.65, False, "comparison"),
+        OperatorSchema("fillna", 2, _fillna, _same_infer,
+                       lambda e, l: fillna(e[0], e[1]), 0.35, False, "compatible_binary"),
+        OperatorSchema("where", 3, _where, _where_infer,
+                       lambda e, l: where(e[0], e[1], e[2]), 0.35, False, "conditional"),
+    ))
 
-    for name, fn, prior in cross_sectional_dimensionless:
-        out.append(
-            OperatorSchema(
-                name,
-                1,
-                _cross_sectional_row,
-                _dimensionless,
-                lambda exprs, literals, fn=fn: fn(exprs[0]),
-                prior=prior,
-                family="cross_sectional",
-            )
-        )
-
-    out.extend(
-        (
-            OperatorSchema(
-                "add",
-                2,
-                _add_same_type,
-                _same_infer,
-                lambda exprs, literals: add(exprs[0], exprs[1]),
-                prior=1.25,
-                commutative=True,
-                family="compatible_binary",
-            ),
-            OperatorSchema(
-                "sub",
-                2,
-                _same_type,
-                _sub_infer,
-                lambda exprs, literals: sub(exprs[0], exprs[1]),
-                prior=1.35,
-                family="compatible_binary",
-            ),
-            OperatorSchema(
-                "minimum",
-                2,
-                _same_type,
-                _same_infer,
-                lambda exprs, literals: minimum(exprs[0], exprs[1]),
-                prior=0.5,
-                commutative=True,
-                family="compatible_binary",
-            ),
-            OperatorSchema(
-                "maximum",
-                2,
-                _same_type,
-                _same_infer,
-                lambda exprs, literals: maximum(exprs[0], exprs[1]),
-                prior=0.5,
-                commutative=True,
-                family="compatible_binary",
-            ),
-            OperatorSchema(
-                "mul",
-                2,
-                _broadcast_numeric,
-                lambda args: multiplication_output(args[0], args[1]),
-                lambda exprs, literals: mul(exprs[0], exprs[1]),
-                prior=1.05,
-                commutative=True,
-                family="numeric_binary",
-            ),
-            OperatorSchema(
-                "div",
-                2,
-                _broadcast_numeric,
-                lambda args: division_output(args[0], args[1]),
-                lambda exprs, literals: div(exprs[0], exprs[1]),
-                prior=1.3,
-                family="numeric_binary",
-            ),
-            OperatorSchema(
-                "fillna",
-                2,
-                _fillna,
-                _same_infer,
-                lambda exprs, literals: fillna(exprs[0], exprs[1]),
-                prior=0.35,
-                family="compatible_binary",
-            ),
-            OperatorSchema(
-                "where",
-                3,
-                _where,
-                _where_infer,
-                lambda exprs, literals: where(exprs[0], exprs[1], exprs[2]),
-                prior=0.35,
-                family="conditional",
-            ),
-            OperatorSchema(
-                "ewm",
-                2,
-                _temporal,
-                _preserve_first,
-                lambda exprs, literals: ewm(
-                    exprs[0], span=_literal_at(literals, 1, "ewm")
-                ),
-                prior=1.45,
-                family="temporal",
-            ),
-            OperatorSchema(
-                "shift",
-                2,
-                _history,
-                _preserve_first,
-                lambda exprs, literals: shift(
-                    exprs[0],
-                    int(_literal_at(literals, 1, "shift")),
-                    int(_literal_at(literals, 1, "shift")),
-                ),
-                prior=1.05,
-                family="history",
-            ),
-            OperatorSchema(
-                "rolling_mean",
-                2,
-                _rolling,
-                _preserve_first,
-                lambda exprs, literals: rolling_mean(
-                    exprs[0],
-                    int(_literal_at(literals, 1, "rolling_mean")),
-                ),
-                prior=0.9,
-                family="rolling",
-            ),
-            OperatorSchema(
-                "rolling_std",
-                2,
-                _rolling,
-                _preserve_first,
-                lambda exprs, literals: rolling_std(
-                    exprs[0],
-                    int(_literal_at(literals, 1, "rolling_std")),
-                    ddof=0,
-                ),
-                prior=0.8,
-                family="rolling",
-            ),
-        )
+    static_specs: tuple[tuple[str, Callable, Infer, float], ...] = (
+        ("ewm", lambda x, p: ewm(x, span=p), _preserve_first, 1.45),
+        ("shift", lambda x, p: shift(x, p, p), _preserve_first, 1.05),
+        ("rolling_rank", lambda x, p: rolling_pct_rank(x, p), _bounded_rank, 0.9),
+        ("rolling_skew", _rolling_skew_expr, _dimensionless, 0.55),
+        ("rolling_kurt", _rolling_kurt_expr, _dimensionless, 0.45),
+        ("rolling_mean", lambda x, p: rolling_mean(x, p), _preserve_first, 0.9),
+        ("rolling_median", lambda x, p: rolling_median(x, p), _preserve_first, 0.55),
+        ("rolling_sum", lambda x, p: rolling_sum(x, p), _preserve_first, 0.65),
+        ("rolling_std", lambda x, p: rolling_std(x, p, ddof=0), _std_infer, 0.8),
+        ("rolling_var", _rolling_var_expr, _variance_infer, 0.7),
+        ("rolling_max", lambda x, p: rolling_max(x, p), _preserve_first, 0.55),
+        ("rolling_min", lambda x, p: rolling_min(x, p), _preserve_first, 0.55),
+        ("rolling_wma", lambda x, p: rolling_decay_linear(x, p), _preserve_first, 0.65),
     )
+    for name, fn, infer, prior in static_specs:
+        validator = _temporal if name == "ewm" else (_history if name == "shift" else _rolling)
+        out.append(OperatorSchema(
+            name, 2, validator, infer,
+            lambda e, l, fn=fn, name=name: fn(e[0], int(_literal_at(l, 1, name))),
+            prior=prior, family="temporal",
+        ))
+
+    for name, fn, infer, prior in (
+        ("rolling_cov", _rolling_cov_expr, _covariance_infer, 0.65),
+        ("rolling_corr", _rolling_corr_expr, _dimensionless, 0.75),
+    ):
+        out.append(OperatorSchema(
+            name, 3, _rolling_pair, infer,
+            lambda e, l, fn=fn, name=name: fn(
+                e[0], e[1], int(_literal_at(l, 2, name))
+            ),
+            prior=prior, family="rolling_pair",
+        ))
+
+    dynamic_unary = (
+        ("dynamic_ewm", lambda x, p: ewm(x, span=p), _preserve_first, 0.8),
+        ("dynamic_shift", lambda x, p: shift(x, p, p), _preserve_first, 0.6),
+        ("dynamic_rolling_rank", lambda x, p: rolling_pct_rank(x, p), _bounded_rank, 0.55),
+        ("dynamic_rolling_mean", lambda x, p: rolling_mean(x, p), _preserve_first, 0.55),
+        ("dynamic_rolling_std", lambda x, p: rolling_std(x, p, ddof=0), _std_infer, 0.5),
+    )
+    for name, fn, infer, prior in dynamic_unary:
+        out.append(OperatorSchema(
+            name, 2, _dynamic_unary, infer,
+            _dynamic_unary_builder(fn, periods),
+            prior=prior, family="dynamic_temporal",
+        ))
+    for name, fn, infer, prior in (
+        ("dynamic_rolling_cov", _rolling_cov_expr, _covariance_infer, 0.45),
+        ("dynamic_rolling_corr", _rolling_corr_expr, _dimensionless, 0.5),
+    ):
+        out.append(OperatorSchema(
+            name, 3, _dynamic_pair, infer,
+            _dynamic_pair_builder(fn, periods),
+            prior=prior, family="dynamic_temporal_pair",
+        ))
     return tuple(out)
 
 
@@ -404,7 +480,6 @@ def catalog_by_name(
 
 
 __all__ = [
-    "OperatorSchema",
-    "catalog_by_name",
+    "DEFAULT_DYNAMIC_PERIODS", "OperatorSchema", "catalog_by_name",
     "default_operator_catalog",
 ]

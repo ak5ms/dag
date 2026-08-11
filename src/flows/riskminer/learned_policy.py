@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import math
+from pathlib import Path
+import pickle
 from typing import Any
 
 import jax
@@ -28,12 +30,8 @@ class GRUPolicyConfig:
 
     def __post_init__(self) -> None:
         for name in (
-            "vocabulary_size",
-            "embedding_dim",
-            "hidden_size",
-            "layers",
-            "mlp_hidden_1",
-            "mlp_hidden_2",
+            "vocabulary_size", "embedding_dim", "hidden_size", "layers",
+            "mlp_hidden_1", "mlp_hidden_2",
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -43,18 +41,26 @@ class GRUPolicyConfig:
 
 @dataclass(frozen=True)
 class PolicyTrajectory:
+    """One complete BEG-to-END episode used by risk-seeking training."""
+
     states: tuple[tuple[int, ...], ...]
     actions: tuple[int, ...]
     legal_actions: tuple[tuple[int, ...], ...]
     reward: float
+    step_rewards: tuple[float, ...] = ()
+    terminal_formula_key: tuple | None = None
+    terminal_formula_rpn: str | None = None
+    pool_changed: bool = False
 
     def __post_init__(self) -> None:
         if not (
-            len(self.states)
-            == len(self.actions)
-            == len(self.legal_actions)
+            len(self.states) == len(self.actions) == len(self.legal_actions)
         ):
             raise ValueError("trajectory state/action/legal lengths must match")
+        if self.step_rewards and len(self.step_rewards) != len(self.actions):
+            raise ValueError("step_rewards must be empty or match action count")
+        if not math.isfinite(float(self.reward)):
+            raise ValueError("trajectory reward must be finite")
         for action, legal in zip(self.actions, self.legal_actions):
             if action not in legal:
                 raise ValueError(f"chosen action {action} is not legal")
@@ -63,15 +69,24 @@ class PolicyTrajectory:
 @dataclass(frozen=True)
 class TrajectoryBatch:
     trajectories: tuple[PolicyTrajectory, ...]
+    reward_quantiles: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.trajectories:
             raise ValueError("trajectory batch cannot be empty")
+        if self.reward_quantiles and (
+            len(self.reward_quantiles) != len(self.trajectories)
+        ):
+            raise ValueError(
+                "reward_quantiles must be empty or match trajectory count"
+            )
+        if any(not math.isfinite(float(value)) for value in self.reward_quantiles):
+            raise ValueError("reward_quantiles must be finite")
 
 
 @dataclass(frozen=True)
 class RiskQuantileTracker:
-    """Stochastic approximation to a reward CDF quantile."""
+    """Equation-11 stochastic recursion for a reward CDF quantile."""
 
     cdf_quantile: float = 0.80
     learning_rate: float = 0.01
@@ -94,15 +109,11 @@ class RiskQuantileTracker:
             self,
             value=float(
                 self.value
-                + self.learning_rate
-                * (self.cdf_quantile - indicator)
+                + self.learning_rate * (self.cdf_quantile - indicator)
             ),
         )
 
-    def update_many(
-        self,
-        rewards: Sequence[float],
-    ) -> "RiskQuantileTracker":
+    def update_many(self, rewards: Sequence[float]) -> "RiskQuantileTracker":
         tracker = self
         for reward in rewards:
             tracker = tracker.update(float(reward))
@@ -114,7 +125,10 @@ def _normal(key, shape, fan_in: int) -> jax.Array:
     return scale * jax.random.normal(key, shape, dtype=DTYPE)
 
 
-def initialize_gru_policy(config: GRUPolicyConfig) -> ArrayTree:
+def initialize_gru_policy(
+    config: GRUPolicyConfig,
+    token_priors: Sequence[float] | None = None,
+) -> ArrayTree:
     key = jax.random.PRNGKey(config.seed)
     key_count = 1 + 6 * config.layers + 3
     keys = iter(jax.random.split(key, key_count))
@@ -129,9 +143,7 @@ def initialize_gru_policy(config: GRUPolicyConfig) -> ArrayTree:
         layer = {}
         for gate in ("z", "r", "n"):
             layer[f"w_{gate}"] = _normal(
-                next(keys),
-                (input_size, config.hidden_size),
-                input_size,
+                next(keys), (input_size, config.hidden_size), input_size
             )
             layer[f"u_{gate}"] = _normal(
                 next(keys),
@@ -143,7 +155,7 @@ def initialize_gru_policy(config: GRUPolicyConfig) -> ArrayTree:
             )
         gru_layers.append(layer)
         input_size = config.hidden_size
-    return {
+    params = {
         "embedding": embedding,
         "gru": tuple(gru_layers),
         "mlp_1": {
@@ -171,6 +183,22 @@ def initialize_gru_policy(config: GRUPolicyConfig) -> ArrayTree:
             "b": jnp.zeros((config.vocabulary_size,), dtype=DTYPE),
         },
     }
+    if token_priors is not None:
+        values = np.asarray(tuple(token_priors), dtype=np.float64)
+        if values.shape != (config.vocabulary_size,):
+            raise ValueError(
+                "token_priors must have one value per vocabulary token"
+            )
+        if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+            raise ValueError("token_priors must be finite and nonnegative")
+        values = np.maximum(values, 1.0e-12)
+        values /= values.sum()
+        # Bias the untrained network toward the typed schema distribution.
+        # The state-dependent GRU logits remain trainable and can override this
+        # bootstrap as soon as risk-seeking updates accumulate.
+        params["out"]["w"] = 0.01 * params["out"]["w"]
+        params["out"]["b"] = jnp.asarray(np.log(values), dtype=DTYPE)
+    return params
 
 
 def _gru_sequence(layer: Mapping[str, jax.Array], inputs: jax.Array) -> jax.Array:
@@ -202,20 +230,15 @@ def policy_logits(
     token_ids: Sequence[int],
 ) -> jax.Array:
     ids = tuple(int(token_id) for token_id in token_ids)
-    # The final embedding row is a learned BEG token for the empty root state.
     if not ids:
-        ids = (config.vocabulary_size,)
+        ids = (config.vocabulary_size,)  # learned BEG token
     tokens = jnp.asarray(ids, dtype=jnp.int32)
     values = params["embedding"][tokens]
     for layer in params["gru"]:
         values = _gru_sequence(layer, values)
     hidden = values[-1]
-    hidden = jnp.tanh(
-        hidden @ params["mlp_1"]["w"] + params["mlp_1"]["b"]
-    )
-    hidden = jnp.tanh(
-        hidden @ params["mlp_2"]["w"] + params["mlp_2"]["b"]
-    )
+    hidden = jnp.tanh(hidden @ params["mlp_1"]["w"] + params["mlp_1"]["b"])
+    hidden = jnp.tanh(hidden @ params["mlp_2"]["w"] + params["mlp_2"]["b"])
     return hidden @ params["out"]["w"] + params["out"]["b"]
 
 
@@ -241,24 +264,28 @@ def risk_seeking_loss(
     batch: TrajectoryBatch,
     reward_quantile: float,
 ) -> jax.Array:
-    """Decrease probability of trajectories at/below the reward quantile."""
+    """Equations 12/13 expressed as a gradient-descent loss.
+
+    The paper performs gradient ascent on ``-1{R<=q} sum grad log pi``.
+    Minimizing the selected trajectories' summed log-probabilities is exactly
+    the same update direction.
+    """
 
     selected = []
-    for trajectory in batch.trajectories:
-        if float(trajectory.reward) > float(reward_quantile):
+    for index, trajectory in enumerate(batch.trajectories):
+        threshold = (
+            float(batch.reward_quantiles[index])
+            if batch.reward_quantiles
+            else float(reward_quantile)
+        )
+        if float(trajectory.reward) > threshold:
             continue
         log_probability = jnp.asarray(0.0, dtype=DTYPE)
         for state, action, legal in zip(
-            trajectory.states,
-            trajectory.actions,
-            trajectory.legal_actions,
+            trajectory.states, trajectory.actions, trajectory.legal_actions
         ):
             log_probability = log_probability + masked_log_prob(
-                params,
-                config,
-                state,
-                action,
-                legal,
+                params, config, state, action, legal
             )
         selected.append(log_probability)
     if not selected:
@@ -272,8 +299,16 @@ class JaxGRUPolicy:
     params: ArrayTree
 
     @classmethod
-    def initialize(cls, config: GRUPolicyConfig) -> "JaxGRUPolicy":
-        return cls(config, initialize_gru_policy(config))
+    def initialize(
+        cls,
+        config: GRUPolicyConfig,
+        *,
+        token_priors: Sequence[float] | None = None,
+    ) -> "JaxGRUPolicy":
+        return cls(
+            config,
+            initialize_gru_policy(config, token_priors=token_priors),
+        )
 
     def priors(
         self,
@@ -284,9 +319,7 @@ class JaxGRUPolicy:
         if not legal_actions:
             return {}
         if len(environment.vocabulary) != self.config.vocabulary_size:
-            raise ValueError(
-                "policy vocabulary size does not match the RPN environment"
-            )
+            raise ValueError("policy vocabulary size does not match the RPN environment")
         logits = np.asarray(
             policy_logits(self.params, self.config, state.token_ids),
             dtype=np.float64,
@@ -305,19 +338,8 @@ class JaxGRUPolicy:
             for action, probability in zip(legal, probabilities)
         }
 
-    def loss(
-        self,
-        batch: TrajectoryBatch,
-        reward_quantile: float,
-    ) -> float:
-        return float(
-            risk_seeking_loss(
-                self.params,
-                self.config,
-                batch,
-                reward_quantile,
-            )
-        )
+    def loss(self, batch: TrajectoryBatch, reward_quantile: float) -> float:
+        return float(risk_seeking_loss(self.params, self.config, batch, reward_quantile))
 
     def train_step(
         self,
@@ -325,29 +347,41 @@ class JaxGRUPolicy:
         reward_quantile: float,
     ) -> tuple["JaxGRUPolicy", float]:
         loss_fn = lambda params: risk_seeking_loss(
-            params,
-            self.config,
-            batch,
-            reward_quantile,
+            params, self.config, batch, reward_quantile
         )
         loss, gradients = jax.value_and_grad(loss_fn)(self.params)
         updated = jax.tree_util.tree_map(
-            lambda parameter, gradient: parameter
-            - self.config.learning_rate * gradient,
+            lambda parameter, gradient: parameter - self.config.learning_rate * gradient,
             self.params,
             gradients,
         )
         return JaxGRUPolicy(self.config, updated), float(loss)
 
+    def save(self, path: str | Path, **metadata: object) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config": asdict(self.config),
+            "params": jax.tree_util.tree_map(np.asarray, self.params),
+            "metadata": dict(metadata),
+        }
+        with destination.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> tuple["JaxGRUPolicy", dict[str, object]]:
+        with Path(path).open("rb") as handle:
+            payload = pickle.load(handle)
+        config = GRUPolicyConfig(**payload["config"])
+        params = jax.tree_util.tree_map(
+            lambda value: jnp.asarray(value, dtype=DTYPE), payload["params"]
+        )
+        return cls(config, params), dict(payload.get("metadata", {}))
+
 
 __all__ = [
-    "GRUPolicyConfig",
-    "JaxGRUPolicy",
-    "PolicyTrajectory",
-    "RiskQuantileTracker",
-    "TrajectoryBatch",
-    "initialize_gru_policy",
-    "masked_log_prob",
-    "policy_logits",
-    "risk_seeking_loss",
+    "GRUPolicyConfig", "JaxGRUPolicy", "PolicyTrajectory",
+    "RiskQuantileTracker", "TrajectoryBatch", "initialize_gru_policy",
+    "masked_log_prob", "policy_logits", "risk_seeking_loss",
 ]
