@@ -154,6 +154,25 @@ class Expr:
             return grouped_expr
         return grouped_expr.apply(rhs, *args)
 
+    def plot(
+        self,
+        backend: str = "pydot",
+        *,
+        show: bool = True,
+        rankdir: str = "LR",
+        figsize: tuple[float, float] | None = None,
+    ):
+        """Plot this uncompiled formula graph and return the backend graph object."""
+        from trading_dsl_engine.visualization import plot
+
+        return plot(
+            self,
+            backend=backend,
+            show=show,
+            rankdir=rankdir,
+            figsize=figsize,
+        )
+
     def __getattr__(self, name: str):
         from trading_dsl_engine.base.dsl import call, get_dsl_op_signature
 

@@ -106,6 +106,22 @@ class CppStreamRuntime:
     def input_names(self) -> tuple[str, ...]:
         return self.program.input_names
 
+    def plot(
+        self,
+        backend: str = "pydot",
+        *,
+        show: bool = True,
+        rankdir: str = "LR",
+        figsize: tuple[float, float] | None = None,
+    ):
+        """Plot the compiled neutral IR retained by this runtime."""
+        return self.program.plot(
+            backend=backend,
+            show=show,
+            rankdir=rankdir,
+            figsize=figsize,
+        )
+
     def _load(self) -> ctypes.CDLL:
         if self._library is None:
             lib = ctypes.CDLL(str(self.library_path))

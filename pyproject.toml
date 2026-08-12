@@ -21,6 +21,8 @@ dependencies = [
     "Jinja2>=3.1",
     "unxt>=1.11",
     "deap",
+    "pydot",
+    "matplotlib",
 ]
 
 [tool.pytest.ini_options]
