@@ -12,7 +12,7 @@ from trading_dsl_engine.cpp_stream.python.codegen import (
     tmpl,
 )
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.ir.ops import EwmOp, FFillOp, ShiftOp
+from trading_dsl_engine.ir.ops import ColumnOp, EwmOp, FFillOp, ShiftOp
 
 
 _original_stage_type = base._stage_type
@@ -45,6 +45,7 @@ def _stage_type(
         "tensor_ffill",
         "tensor_shift",
         "tensor_ewm",
+        "tensor_column",
     }:
         return _original_stage_type(
             stage, n, execution, input_types=input_types
@@ -121,6 +122,15 @@ def _stage_type(
             IntArg(stage.op.min_periods),
             BoolArg(stage.op.ignore_na),
             BoolArg(stage.op.adjust),
+            execution,
+        )
+    if stage.kind == "tensor_column":
+        assert isinstance(stage.op, ColumnOp)
+        return tmpl(
+            "stackdsl::TensorColumnNode",
+            tensors[0],
+            out,
+            IntArg(stage.op.index),
             execution,
         )
     raise AssertionError(stage.kind)

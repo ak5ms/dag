@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/cat.hpp"
@@ -19,6 +20,29 @@ namespace stackdsl {
 
 struct RidgePredsProjection {};
 struct RidgeBetaProjection {};
+struct RidgeResidualsProjection {};
+template <std::size_t Component> struct RidgeCoefficientProjection {};
+struct RidgeStandardErrorsProjection {};
+template <std::size_t Component> struct RidgeStandardErrorProjection {};
+struct RidgeTStatsProjection {};
+template <std::size_t Component> struct RidgeTStatProjection {};
+struct RidgeSseProjection {};
+struct RidgeSstProjection {};
+struct RidgeR2Projection {};
+struct RidgeResidualVarianceProjection {};
+struct RidgeEffectiveDfProjection {};
+struct RidgeEffectiveNProjection {};
+
+template <class Out, class Projection>
+struct RidgeProjectionBinding {
+    using output_type = Out;
+    using projection_type = Projection;
+};
+
+template <class... Bindings>
+struct RidgeProjectionBundle {
+    static_assert(sizeof...(Bindings) > 1);
+};
 
 namespace ridge_detail {
 
@@ -310,6 +334,23 @@ STACKDSL_HOT bool nnqp_nonnegative_solve(
     return nnqp::solve<K>(system, rhs, fallback, solution);
 }
 
+template <std::size_t K>
+STACKDSL_HOT bool inverse(
+    const std::array<double, K * K>& system,
+    std::array<double, K * K>& result
+) noexcept {
+    for (std::size_t column = 0; column < K; ++column) {
+        std::array<double, K> rhs{};
+        std::array<double, K> solution{};
+        rhs[column] = 1.0;
+        if (!unconstrained_solve(system, rhs, solution)) return false;
+        for (std::size_t row = 0; row < K; ++row) {
+            result[row * K + column] = solution[row];
+        }
+    }
+    return true;
+}
+
 template <std::size_t Groups, std::size_t K, bool Stateful> struct RidgeState;
 template <std::size_t Groups, std::size_t K> struct RidgeState<Groups, K, true> {
     std::array<double, Groups * K * K> xx{};
@@ -325,17 +366,261 @@ template <std::size_t Groups, std::size_t K> struct RidgeState<Groups, K, true> 
 };
 template <std::size_t Groups, std::size_t K> struct RidgeState<Groups, K, false> {};
 
+template <std::size_t Groups, std::size_t K, bool Enabled>
+struct RidgeMetricState {};
+template <std::size_t Groups, std::size_t K>
+struct RidgeMetricState<Groups, K, true> {
+    std::array<double, Groups * K * K> xx{};
+    std::array<double, Groups * K> xy{};
+    std::array<double, Groups> ywy{};
+    std::array<double, Groups> wy{};
+    std::array<double, Groups> weight{};
+    std::array<double, Groups> weight_square{};
+    std::array<std::uint8_t, Groups> initialized{};
+    std::array<std::uint64_t, Groups> last_update{};
+};
+
+template <
+    std::size_t Groups,
+    std::size_t K,
+    bool NeedsMetrics,
+    bool NeedsInference,
+    bool Enabled
+>
+struct RidgeResultCache {};
+
+template <
+    std::size_t Groups,
+    std::size_t K,
+    bool NeedsMetrics,
+    bool NeedsInference
+>
+struct RidgeResultCache<Groups, K, NeedsMetrics, NeedsInference, true> {
+    std::array<double, Groups * K> beta{};
+    std::array<std::uint8_t, Groups> initialized{};
+    std::array<double, NeedsInference ? Groups * K : 0> standard_errors{};
+    std::array<double, NeedsInference ? Groups * K : 0> tstats{};
+    std::array<double, NeedsMetrics ? Groups : 0> sse{};
+    std::array<double, NeedsMetrics ? Groups : 0> sst{};
+    std::array<double, NeedsMetrics ? Groups : 0> r2{};
+    std::array<double, NeedsInference ? Groups : 0> residual_variance{};
+    std::array<double, NeedsInference ? Groups : 0> effective_df{};
+    std::array<double, NeedsMetrics ? Groups : 0> effective_n{};
+
+    STACKDSL_HOT void load(
+        std::size_t group,
+        std::array<double, K>& beta_out,
+        std::array<double, K>& standard_errors_out,
+        std::array<double, K>& tstats_out,
+        double& sse_out,
+        double& sst_out,
+        double& r2_out,
+        double& residual_variance_out,
+        double& effective_df_out,
+        double& effective_n_out
+    ) const noexcept {
+        const std::size_t vector_base = group * K;
+        for (std::size_t j = 0; j < K; ++j) {
+            beta_out[j] = beta[vector_base + j];
+        }
+        if constexpr (NeedsInference) {
+            for (std::size_t j = 0; j < K; ++j) {
+                standard_errors_out[j] =
+                    standard_errors[vector_base + j];
+                tstats_out[j] = tstats[vector_base + j];
+            }
+            residual_variance_out = residual_variance[group];
+            effective_df_out = effective_df[group];
+        }
+        if constexpr (NeedsMetrics) {
+            sse_out = sse[group];
+            sst_out = sst[group];
+            r2_out = r2[group];
+            effective_n_out = effective_n[group];
+        }
+    }
+
+    STACKDSL_HOT void store(
+        std::size_t group,
+        const std::array<double, K>& beta_in,
+        const std::array<double, K>& standard_errors_in,
+        const std::array<double, K>& tstats_in,
+        double sse_in,
+        double sst_in,
+        double r2_in,
+        double residual_variance_in,
+        double effective_df_in,
+        double effective_n_in
+    ) noexcept {
+        const std::size_t vector_base = group * K;
+        for (std::size_t j = 0; j < K; ++j) {
+            beta[vector_base + j] = beta_in[j];
+        }
+        if constexpr (NeedsInference) {
+            for (std::size_t j = 0; j < K; ++j) {
+                standard_errors[vector_base + j] =
+                    standard_errors_in[j];
+                tstats[vector_base + j] = tstats_in[j];
+            }
+            residual_variance[group] = residual_variance_in;
+            effective_df[group] = effective_df_in;
+        }
+        if constexpr (NeedsMetrics) {
+            sse[group] = sse_in;
+            sst[group] = sst_in;
+            r2[group] = r2_in;
+            effective_n[group] = effective_n_in;
+        }
+        initialized[group] = 1;
+    }
+};
+
+template <class Projection> struct projection_component {
+    static constexpr std::size_t value = std::numeric_limits<std::size_t>::max();
+};
+template <std::size_t Component>
+struct projection_component<RidgeCoefficientProjection<Component>> {
+    static constexpr std::size_t value = Component;
+};
+template <std::size_t Component>
+struct projection_component<RidgeStandardErrorProjection<Component>> {
+    static constexpr std::size_t value = Component;
+};
+template <std::size_t Component>
+struct projection_component<RidgeTStatProjection<Component>> {
+    static constexpr std::size_t value = Component;
+};
+template <class Projection> struct is_coefficient_projection : std::false_type {};
+template <std::size_t Component>
+struct is_coefficient_projection<RidgeCoefficientProjection<Component>> : std::true_type {};
+template <class Projection> struct is_standard_error_projection : std::false_type {};
+template <std::size_t Component>
+struct is_standard_error_projection<RidgeStandardErrorProjection<Component>> : std::true_type {};
+template <class Projection> struct is_tstat_projection : std::false_type {};
+template <std::size_t Component>
+struct is_tstat_projection<RidgeTStatProjection<Component>> : std::true_type {};
+
+template <class Projection>
+struct projection_traits {
+    static constexpr bool predicts =
+        std::is_same_v<Projection, RidgePredsProjection>
+        || std::is_same_v<Projection, RidgeResidualsProjection>;
+    static constexpr bool full_coefficients =
+        std::is_same_v<Projection, RidgeBetaProjection>
+        || std::is_same_v<Projection, RidgeStandardErrorsProjection>
+        || std::is_same_v<Projection, RidgeTStatsProjection>;
+    static constexpr bool needs_inference =
+        std::is_same_v<Projection, RidgeStandardErrorsProjection>
+        || std::is_same_v<Projection, RidgeTStatsProjection>
+        || std::is_same_v<Projection, RidgeResidualVarianceProjection>
+        || std::is_same_v<Projection, RidgeEffectiveDfProjection>
+        || is_standard_error_projection<Projection>::value
+        || is_tstat_projection<Projection>::value;
+    static constexpr bool needs_metrics =
+        needs_inference
+        || std::is_same_v<Projection, RidgeSseProjection>
+        || std::is_same_v<Projection, RidgeSstProjection>
+        || std::is_same_v<Projection, RidgeR2Projection>
+        || std::is_same_v<Projection, RidgeEffectiveNProjection>;
+};
+
+template <class ProjectionSpec, class DefaultOut>
+struct projection_set {
+    static constexpr bool predicts = projection_traits<ProjectionSpec>::predicts;
+    static constexpr bool needs_inference =
+        projection_traits<ProjectionSpec>::needs_inference;
+    static constexpr bool needs_metrics =
+        projection_traits<ProjectionSpec>::needs_metrics;
+
+    template <class Function>
+    STACKDSL_HOT static void for_each(Function&& function) noexcept {
+        function.template operator()<DefaultOut, ProjectionSpec>();
+    }
+};
+
+template <class DefaultOut, class... Bindings>
+struct projection_set<RidgeProjectionBundle<Bindings...>, DefaultOut> {
+    static constexpr bool predicts =
+        (projection_traits<typename Bindings::projection_type>::predicts || ...);
+    static constexpr bool needs_inference =
+        (projection_traits<typename Bindings::projection_type>::needs_inference || ...);
+    static constexpr bool needs_metrics =
+        (projection_traits<typename Bindings::projection_type>::needs_metrics || ...);
+
+    template <class Function>
+    STACKDSL_HOT static void for_each(Function&& function) noexcept {
+        (function.template operator()<
+            typename Bindings::output_type,
+            typename Bindings::projection_type
+        >(), ...);
+    }
+};
+
 }  // namespace ridge_detail
 
-template <std::size_t N, class Features, class Y, class Weights, class Out, std::uint64_t AlphaBits, std::uint64_t LambdaBits, bool Nonnegative, bool Stateful, class Projection, class Execution = DirectExecution<N>> struct RidgeNode;
+template <
+    std::size_t N,
+    class Features,
+    class Y,
+    class Weights,
+    class Out,
+    std::uint64_t AlphaBits,
+    std::uint64_t LambdaBits,
+    bool Nonnegative,
+    bool Stateful,
+    class Projection,
+    class Execution = DirectExecution<N>,
+    std::size_t RecomputeEvery = 1
+>
+struct RidgeNode;
 
-template <std::size_t N, class Y, class Weights, class Out, std::uint64_t AlphaBits, std::uint64_t LambdaBits, bool Nonnegative, bool Stateful, class Projection, class Execution, class... FeatureSources>
-struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, LambdaBits, Nonnegative, Stateful, Projection, Execution> {
+template <
+    std::size_t N,
+    class Y,
+    class Weights,
+    class Out,
+    std::uint64_t AlphaBits,
+    std::uint64_t LambdaBits,
+    bool Nonnegative,
+    bool Stateful,
+    class Projection,
+    class Execution,
+    std::size_t RecomputeEvery,
+    class... FeatureSources
+>
+struct RidgeNode<
+    N,
+    FeatureList<FeatureSources...>,
+    Y,
+    Weights,
+    Out,
+    AlphaBits,
+    LambdaBits,
+    Nonnegative,
+    Stateful,
+    Projection,
+    Execution,
+    RecomputeEvery
+> {
     static constexpr std::size_t K = sizeof...(FeatureSources);
     static constexpr std::size_t Groups = Execution::cross_state_size;
     static constexpr std::size_t MaxActiveGroups = Groups < N ? Groups : N;
     static_assert(K > 0 && Groups > 0);
+    using Projections = ridge_detail::projection_set<Projection, Out>;
+    static constexpr bool PredProjection = Projections::predicts;
+    static constexpr bool NeedsInference = Projections::needs_inference;
+    static constexpr bool NeedsMetrics = Projections::needs_metrics;
+    static_assert(RecomputeEvery > 0, "Ridge recompute interval must be > 0");
     ridge_detail::RidgeState<Groups, K, Stateful> state{};
+    ridge_detail::RidgeMetricState<Groups, K, Stateful && NeedsMetrics> metrics{};
+    PeriodicRecompute<RecomputeEvery, Groups> recompute_schedule{};
+    ridge_detail::RidgeResultCache<
+        Groups,
+        K,
+        NeedsMetrics,
+        NeedsInference,
+        (RecomputeEvery > 1)
+    > result_cache{};
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
@@ -415,13 +700,104 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                 }
             }
         }
-        if constexpr (Stateful && std::is_same_v<Projection, RidgePredsProjection>) {
-            auto* out = ctx.template write_ptr<Out>();
-            for (std::size_t lane = 0; lane < N; ++lane) out[lane] = prediction_valid[lane] ? ridge_detail::dot(features_by_lane[lane], state.beta.data() + static_cast<std::size_t>(lane_groups[lane]) * K) : kNaN;
+        std::array<double, MaxActiveGroups * K * K> metric_xx_new{};
+        std::array<double, MaxActiveGroups * K> metric_xy_new{};
+        std::array<double, MaxActiveGroups> metric_ywy_new{};
+        std::array<double, MaxActiveGroups> metric_wy_new{};
+        std::array<double, MaxActiveGroups> metric_weight_new{};
+        std::array<double, MaxActiveGroups> metric_weight_square_new{};
+        std::array<std::uint8_t, MaxActiveGroups> metric_valid{};
+        if constexpr (NeedsMetrics) {
+            for (std::size_t lane = 0; lane < N; ++lane) {
+                const double weight = weights_by_lane[lane];
+                const double y = y_by_lane[lane];
+                const auto& features = features_by_lane[lane];
+                if (
+                    !(weight > 0.0) || !std::isfinite(weight) ||
+                    !std::isfinite(y) || !ridge_detail::finite_vector(features)
+                ) continue;
+                const std::size_t active = active_index_by_lane[lane];
+                const std::size_t matrix_base = active * K * K;
+                const std::size_t vector_base = active * K;
+                metric_valid[active] = 1;
+                metric_weight_new[active] += weight;
+                metric_weight_square_new[active] = std::fma(
+                    weight, weight, metric_weight_square_new[active]
+                );
+                metric_wy_new[active] = std::fma(
+                    weight, y, metric_wy_new[active]
+                );
+                metric_ywy_new[active] = std::fma(
+                    weight * y, y, metric_ywy_new[active]
+                );
+                for (std::size_t j = 0; j < K; ++j) {
+                    metric_xy_new[vector_base + j] = std::fma(
+                        weight * features[j], y,
+                        metric_xy_new[vector_base + j]
+                    );
+                    for (std::size_t k = 0; k < K; ++k) {
+                        metric_xx_new[matrix_base + j * K + k] = std::fma(
+                            weight * features[j], features[k],
+                            metric_xx_new[matrix_base + j * K + k]
+                        );
+                    }
+                }
+            }
+        }
+        if constexpr (Stateful && PredProjection) {
+            Projections::for_each(
+                [&]<class ProjectionOut, class ProjectionType>() noexcept {
+                    if constexpr (
+                        ridge_detail::projection_traits<
+                            ProjectionType
+                        >::predicts
+                    ) {
+                        auto* projection_out =
+                            ctx.template write_ptr<ProjectionOut>();
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            if (!prediction_valid[lane]) {
+                                projection_out[lane] = kNaN;
+                                continue;
+                            }
+                            const double prediction = ridge_detail::dot(
+                                features_by_lane[lane],
+                                state.beta.data()
+                                    + static_cast<std::size_t>(
+                                        lane_groups[lane]
+                                    ) * K
+                            );
+                            projection_out[lane] = std::is_same_v<
+                                ProjectionType, RidgeResidualsProjection
+                            > ? y_by_lane[lane] - prediction : prediction;
+                        }
+                    }
+                }
+            );
         }
         std::array<std::array<double, K>, MaxActiveGroups> solved_betas{};
+        std::array<std::array<double, K>, MaxActiveGroups> standard_errors{};
+        std::array<std::array<double, K>, MaxActiveGroups> tstats{};
+        std::array<double, MaxActiveGroups> sse_values{};
+        std::array<double, MaxActiveGroups> sst_values{};
+        std::array<double, MaxActiveGroups> r2_values{};
+        std::array<double, MaxActiveGroups> residual_variances{};
+        std::array<double, MaxActiveGroups> effective_df_values{};
+        std::array<double, MaxActiveGroups> effective_n_values{};
+        if constexpr (NeedsMetrics) {
+            for (auto& values : standard_errors) values.fill(kNaN);
+            for (auto& values : tstats) values.fill(kNaN);
+            sse_values.fill(kNaN);
+            sst_values.fill(kNaN);
+            r2_values.fill(kNaN);
+            residual_variances.fill(kNaN);
+            effective_df_values.fill(kNaN);
+            effective_n_values.fill(kNaN);
+        }
         for (std::size_t active = 0; active < active_count; ++active) {
-            const std::size_t group = active_groups[active], local_matrix = active * K * K, local_vector = active * K;
+            const std::size_t group = active_groups[active];
+            const std::size_t local_matrix = active * K * K;
+            const std::size_t local_vector = active * K;
+            const bool recompute = recompute_schedule.due(group);
             std::array<double, K * K> xx{};
             std::array<double, K> xy{}, fallback{};
             if constexpr (Stateful) {
@@ -470,6 +846,121 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
                     for (std::size_t k = 0; k < K; ++k) { const std::size_t index = local_matrix + j * K + k; xx[j * K + k] = all_finite || xx_valid[index] ? xx_new[index] : 0.0; }
                 }
             }
+            std::array<double, K * K> metric_xx{};
+            std::array<double, K> metric_xy{};
+            double metric_ywy = 0.0;
+            double metric_wy = 0.0;
+            double metric_weight = 0.0;
+            double metric_weight_square = 0.0;
+            bool metric_ready = false;
+            if constexpr (NeedsMetrics) {
+                if constexpr (Stateful) {
+                    const std::size_t state_matrix = group * K * K;
+                    const std::size_t state_vector = group * K;
+                    if (metric_valid[active]) {
+                        if (metrics.initialized[group]) {
+                            const std::uint64_t gap = state.t - metrics.last_update[group];
+                            const double update = gap == 1
+                                ? alpha
+                                : std::pow(alpha, static_cast<double>(gap));
+                            const double old_factor = 1.0 - update;
+                            for (std::size_t j = 0; j < K; ++j) {
+                                metrics.xy[state_vector + j] = std::fma(
+                                    update,
+                                    metric_xy_new[local_vector + j]
+                                        - metrics.xy[state_vector + j],
+                                    metrics.xy[state_vector + j]
+                                );
+                                for (std::size_t k = 0; k < K; ++k) {
+                                    const std::size_t state_index = state_matrix + j * K + k;
+                                    metrics.xx[state_index] = std::fma(
+                                        update,
+                                        metric_xx_new[local_matrix + j * K + k]
+                                            - metrics.xx[state_index],
+                                        metrics.xx[state_index]
+                                    );
+                                }
+                            }
+                            metrics.ywy[group] = std::fma(
+                                update,
+                                metric_ywy_new[active] - metrics.ywy[group],
+                                metrics.ywy[group]
+                            );
+                            metrics.wy[group] = std::fma(
+                                update,
+                                metric_wy_new[active] - metrics.wy[group],
+                                metrics.wy[group]
+                            );
+                            metrics.weight[group] = std::fma(
+                                update,
+                                metric_weight_new[active] - metrics.weight[group],
+                                metrics.weight[group]
+                            );
+                            metrics.weight_square[group] =
+                                old_factor * old_factor * metrics.weight_square[group]
+                                + update * update * metric_weight_square_new[active];
+                        } else {
+                            for (std::size_t j = 0; j < K; ++j) {
+                                metrics.xy[state_vector + j] = metric_xy_new[local_vector + j];
+                                for (std::size_t k = 0; k < K; ++k) {
+                                    metrics.xx[state_matrix + j * K + k] =
+                                        metric_xx_new[local_matrix + j * K + k];
+                                }
+                            }
+                            metrics.ywy[group] = metric_ywy_new[active];
+                            metrics.wy[group] = metric_wy_new[active];
+                            metrics.weight[group] = metric_weight_new[active];
+                            metrics.weight_square[group] = metric_weight_square_new[active];
+                            metrics.initialized[group] = 1;
+                        }
+                        metrics.last_update[group] = state.t;
+                    }
+                    metric_ready = metrics.initialized[group];
+                    if (metric_ready) {
+                        for (std::size_t j = 0; j < K; ++j) {
+                            metric_xy[j] = metrics.xy[state_vector + j];
+                            for (std::size_t k = 0; k < K; ++k) {
+                                metric_xx[j * K + k] =
+                                    metrics.xx[state_matrix + j * K + k];
+                            }
+                        }
+                        metric_ywy = metrics.ywy[group];
+                        metric_wy = metrics.wy[group];
+                        metric_weight = metrics.weight[group];
+                        metric_weight_square = metrics.weight_square[group];
+                    }
+                } else if (metric_valid[active]) {
+                    metric_ready = true;
+                    for (std::size_t j = 0; j < K; ++j) {
+                        metric_xy[j] = metric_xy_new[local_vector + j];
+                        for (std::size_t k = 0; k < K; ++k) {
+                            metric_xx[j * K + k] =
+                                metric_xx_new[local_matrix + j * K + k];
+                        }
+                    }
+                    metric_ywy = metric_ywy_new[active];
+                    metric_wy = metric_wy_new[active];
+                    metric_weight = metric_weight_new[active];
+                    metric_weight_square = metric_weight_square_new[active];
+                }
+            }
+            if constexpr (RecomputeEvery > 1) {
+                if (!recompute && result_cache.initialized[group]) {
+                    result_cache.load(
+                        group,
+                        solved_betas[active],
+                        standard_errors[active],
+                        tstats[active],
+                        sse_values[active],
+                        sst_values[active],
+                        r2_values[active],
+                        residual_variances[active],
+                        effective_df_values[active],
+                        effective_n_values[active]
+                    );
+                    continue;
+                }
+            }
             std::array<double, K * K> system = xx;
             for (std::size_t j = 0; j < K; ++j) {
                 system[j * K + j] = std::fma(
@@ -497,18 +988,243 @@ struct RidgeNode<N, FeatureList<FeatureSources...>, Y, Weights, Out, AlphaBits, 
             }
             if (!solved) beta = fallback;
             if constexpr (Stateful) for (std::size_t j = 0; j < K; ++j) state.beta[group * K + j] = beta[j];
-        }
-        if constexpr (std::is_same_v<Projection, RidgePredsProjection>) {
-            if constexpr (!Stateful) {
-                auto* out = ctx.template write_ptr<Out>();
-                for (std::size_t lane = 0; lane < N; ++lane) out[lane] = prediction_valid[lane] ? ridge_detail::dot(features_by_lane[lane], solved_betas[active_index_by_lane[lane]].data()) : kNaN;
+            if constexpr (NeedsMetrics) {
+                if (metric_ready && metric_weight > 0.0 && metric_weight_square > 0.0) {
+                    double beta_xy = 0.0;
+                    double beta_xx_beta = 0.0;
+                    for (std::size_t j = 0; j < K; ++j) {
+                        beta_xy = std::fma(beta[j], metric_xy[j], beta_xy);
+                        double row_value = 0.0;
+                        for (std::size_t k = 0; k < K; ++k) {
+                            row_value = std::fma(
+                                metric_xx[j * K + k], beta[k], row_value
+                            );
+                        }
+                        beta_xx_beta = std::fma(beta[j], row_value, beta_xx_beta);
+                    }
+                    const double raw_sse = metric_ywy - 2.0 * beta_xy + beta_xx_beta;
+                    const double sse = raw_sse > 0.0 ? raw_sse : 0.0;
+                    const double sst = metric_ywy - metric_wy * metric_wy / metric_weight;
+                    const double effective_n = metric_weight * metric_weight /
+                        metric_weight_square;
+                    sse_values[active] = sse;
+                    sst_values[active] = sst > 0.0 ? sst : 0.0;
+                    r2_values[active] = sst > 0.0 ? 1.0 - sse / sst : kNaN;
+                    effective_n_values[active] = effective_n;
+
+                    if constexpr (NeedsInference && !Nonnegative) {
+                        std::array<double, K * K> inverse{};
+                        if (ridge_detail::inverse<K>(system, inverse)) {
+                            std::array<double, K * K> hat_core{};
+                            for (std::size_t row = 0; row < K; ++row) {
+                                for (std::size_t column = 0; column < K; ++column) {
+                                    double value = 0.0;
+                                    for (std::size_t inner = 0; inner < K; ++inner) {
+                                        value = std::fma(
+                                            inverse[row * K + inner],
+                                            metric_xx[inner * K + column],
+                                            value
+                                        );
+                                    }
+                                    hat_core[row * K + column] = value;
+                                }
+                            }
+                            double effective_df = 0.0;
+                            double hat_square_trace = 0.0;
+                            for (std::size_t row = 0; row < K; ++row) {
+                                effective_df += hat_core[row * K + row];
+                                for (std::size_t column = 0; column < K; ++column) {
+                                    hat_square_trace = std::fma(
+                                        hat_core[row * K + column],
+                                        hat_core[column * K + row],
+                                        hat_square_trace
+                                    );
+                                }
+                            }
+                            effective_df_values[active] = effective_df;
+                            const double residual_df = effective_n
+                                - 2.0 * effective_df + hat_square_trace;
+                            const double residual_variance = residual_df > 0.0
+                                ? sse / residual_df
+                                : kNaN;
+                            residual_variances[active] = residual_variance;
+                            if (std::isfinite(residual_variance)) {
+                                for (std::size_t coefficient = 0; coefficient < K; ++coefficient) {
+                                    double covariance_diagonal = 0.0;
+                                    for (std::size_t left = 0; left < K; ++left) {
+                                        for (std::size_t right = 0; right < K; ++right) {
+                                            covariance_diagonal = std::fma(
+                                                inverse[coefficient * K + left]
+                                                    * metric_xx[left * K + right],
+                                                inverse[coefficient * K + right],
+                                                covariance_diagonal
+                                            );
+                                        }
+                                    }
+                                    const double standard_error = std::sqrt(
+                                        std::max(0.0, residual_variance * covariance_diagonal)
+                                    );
+                                    standard_errors[active][coefficient] = standard_error;
+                                    tstats[active][coefficient] = standard_error > 0.0
+                                        ? beta[coefficient] / standard_error
+                                        : kNaN;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        } else {
-            static_assert(std::is_same_v<Projection, RidgeBetaProjection> && std::is_same_v<Out, OutputDst>);
-            if constexpr (Groups == 1) for (std::size_t j = 0; j < K; ++j) ctx.output[j] = solved_betas[0][j];
-            else for (std::size_t lane = 0; lane < N; ++lane) for (std::size_t j = 0; j < K; ++j) ctx.output[lane * K + j] = solved_betas[active_index_by_lane[lane]][j];
+            if constexpr (RecomputeEvery > 1) {
+                result_cache.store(
+                    group,
+                    beta,
+                    standard_errors[active],
+                    tstats[active],
+                    sse_values[active],
+                    sst_values[active],
+                    r2_values[active],
+                    residual_variances[active],
+                    effective_df_values[active],
+                    effective_n_values[active]
+                );
+            }
+
         }
+        Projections::for_each(
+            [&]<class ProjectionOut, class ProjectionType>() noexcept {
+                using Traits = ridge_detail::projection_traits<ProjectionType>;
+                if constexpr (Traits::predicts) {
+                    if constexpr (!Stateful) {
+                        auto* projection_out =
+                            ctx.template write_ptr<ProjectionOut>();
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            if (!prediction_valid[lane]) {
+                                projection_out[lane] = kNaN;
+                                continue;
+                            }
+                            const double prediction = ridge_detail::dot(
+                                features_by_lane[lane],
+                                solved_betas[
+                                    active_index_by_lane[lane]
+                                ].data()
+                            );
+                            projection_out[lane] = std::is_same_v<
+                                ProjectionType, RidgeResidualsProjection
+                            > ? y_by_lane[lane] - prediction : prediction;
+                        }
+                    }
+                } else if constexpr (Traits::full_coefficients) {
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    if constexpr (Groups == 1) {
+                        for (std::size_t j = 0; j < K; ++j) {
+                            if constexpr (std::is_same_v<
+                                ProjectionType, RidgeBetaProjection
+                            >) {
+                                projection_out[j] = solved_betas[0][j];
+                            } else if constexpr (std::is_same_v<
+                                ProjectionType, RidgeStandardErrorsProjection
+                            >) {
+                                projection_out[j] = standard_errors[0][j];
+                            } else {
+                                projection_out[j] = tstats[0][j];
+                            }
+                        }
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            const std::size_t active =
+                                active_index_by_lane[lane];
+                            for (std::size_t j = 0; j < K; ++j) {
+                                if constexpr (std::is_same_v<
+                                    ProjectionType, RidgeBetaProjection
+                                >) {
+                                    projection_out[lane * K + j] =
+                                        solved_betas[active][j];
+                                } else if constexpr (std::is_same_v<
+                                    ProjectionType,
+                                    RidgeStandardErrorsProjection
+                                >) {
+                                    projection_out[lane * K + j] =
+                                        standard_errors[active][j];
+                                } else {
+                                    projection_out[lane * K + j] =
+                                        tstats[active][j];
+                                }
+                            }
+                        }
+                    }
+                } else if constexpr (
+                    ridge_detail::projection_component<ProjectionType>::value
+                    != std::numeric_limits<std::size_t>::max()
+                ) {
+                    constexpr std::size_t component =
+                        ridge_detail::projection_component<
+                            ProjectionType
+                        >::value;
+                    static_assert(component < K);
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    auto projected = [&](std::size_t active) {
+                        if constexpr (
+                            ridge_detail::is_coefficient_projection<
+                                ProjectionType
+                            >::value
+                        ) {
+                            return solved_betas[active][component];
+                        } else if constexpr (
+                            ridge_detail::is_standard_error_projection<
+                                ProjectionType
+                            >::value
+                        ) {
+                            return standard_errors[active][component];
+                        } else {
+                            return tstats[active][component];
+                        }
+                    };
+                    if constexpr (Groups == 1) {
+                        projection_out[0] = projected(0);
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            projection_out[lane] = projected(
+                                active_index_by_lane[lane]
+                            );
+                        }
+                    }
+                } else {
+                    auto* projection_out =
+                        ctx.template write_ptr<ProjectionOut>();
+                    const auto& values = [&]() -> const auto& {
+                        if constexpr (std::is_same_v<
+                            ProjectionType, RidgeSseProjection
+                        >) return sse_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeSstProjection
+                        >) return sst_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeR2Projection
+                        >) return r2_values;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeResidualVarianceProjection
+                        >) return residual_variances;
+                        else if constexpr (std::is_same_v<
+                            ProjectionType, RidgeEffectiveDfProjection
+                        >) return effective_df_values;
+                        else return effective_n_values;
+                    }();
+                    if constexpr (Groups == 1) {
+                        projection_out[0] = values[0];
+                    } else {
+                        for (std::size_t lane = 0; lane < N; ++lane) {
+                            projection_out[lane] = values[
+                                active_index_by_lane[lane]
+                            ];
+                        }
+                    }
+                }
+            }
+        );
         if constexpr (Stateful) ++state.t;
+        recompute_schedule.next_row();
     }
 };
 

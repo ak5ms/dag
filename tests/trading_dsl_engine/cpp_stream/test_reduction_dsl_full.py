@@ -118,6 +118,40 @@ def test_supplied_default_alpha_pnl_sharpe_graphs(tmp_path: Path) -> None:
     assert reduced_result.output_shape == ()
     assert reduced_result.output_mode == "final"
 
+def test_temporal_mean_std_per_feature_matches_numpy_when_width_differs_from_n(
+    tmp_path: Path,
+) -> None:
+    """Regression for lane-sharding temporal reductions over feature vectors."""
+    rng = np.random.default_rng(11)
+    rows, instruments, features = 64, 9, 19
+    x = rng.normal(scale=0.01, size=(rows, instruments, features))
+    pnl = var("x").sum(axis=1)
+    expression = pnl.mean(axis=0) / pnl.std(axis=0)
+
+    pnl_runtime = compile_formula(
+        pnl, {"x": x}, n_instruments=instruments
+    )
+    pnl_result = pnl_runtime.run(out_path=tmp_path / "feature-pnl.bin")
+    pnl_values = np.asarray(pnl_result.load())
+
+    runtime = compile_formula(
+        expression, {"x": x}, n_instruments=instruments
+    )
+    result = runtime.run(out_path=tmp_path / "feature-sharpe.bin")
+    actual = np.asarray(result.load())
+    expected = np.nanmean(pnl_values, axis=0) / np.nanstd(pnl_values, axis=0)
+
+    np.testing.assert_allclose(
+        actual,
+        expected,
+        rtol=1e-11,
+        atol=1e-11,
+        equal_nan=True,
+    )
+    assert result.output_mode == "final"
+    assert result.output_shape == (features,)
+    assert not np.allclose(actual[instruments:], 0.0)
+
 
 def test_fixed_tensor_elementwise_broadcasting_after_reduction(
     tmp_path: Path,

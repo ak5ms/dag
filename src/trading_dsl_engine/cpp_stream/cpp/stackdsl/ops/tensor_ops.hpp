@@ -8,6 +8,7 @@
 
 #include "stackdsl/engine.hpp"
 #include "stackdsl/ops/einsum.hpp"
+#include "stackdsl/ops/naryop.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -59,6 +60,85 @@ STACKDSL_HOT double tensor_broadcast_read(
         tensor_broadcast_index<typename Tensor::shape, OutputShape>(output_index)
     );
 }
+
+template <class OutputShape, class Result, class Op, class... Inputs>
+struct TensorNaryExpressionSource {
+    static_assert(sizeof...(Inputs) == Op::arity);
+    static_assert((tensor_broadcast_compatible<
+        typename Inputs::shape, OutputShape
+    >() && ...));
+    using shape = OutputShape;
+
+    template <class Context>
+    STACKDSL_HOT static Result read_flat(
+        const Context& ctx, std::size_t index
+    ) noexcept {
+        return Op::template apply<Result>(
+            tensor_broadcast_read<Inputs, OutputShape>(ctx, index)...
+        );
+    }
+
+    template <class Context>
+    STACKDSL_HOT static void load_contiguous(
+        const Context& ctx,
+        std::size_t base,
+        std::size_t count,
+        double* STACKDSL_RESTRICT out
+    ) noexcept {
+        for (std::size_t index = 0; index < count; ++index) {
+            out[index] = read_flat(ctx, base + index);
+        }
+    }
+};
+
+template <
+    class OutputShape,
+    class Result,
+    class Base,
+    class Exponent
+>
+struct TensorNaryExpressionSource<
+    OutputShape,
+    Result,
+    PowOp,
+    Base,
+    ScalarTensorSource<Exponent>
+> {
+    static_assert(tensor_broadcast_compatible<
+        typename Base::shape, OutputShape
+    >());
+    using shape = OutputShape;
+
+    template <class Context>
+    STACKDSL_HOT static Result read_flat(
+        const Context& ctx, std::size_t index
+    ) noexcept {
+        const Result base = static_cast<Result>(
+            tensor_broadcast_read<Base, OutputShape>(ctx, index)
+        );
+        if constexpr (nary_detail::has_small_integer_exponent<Exponent>()) {
+            return nary_detail::integer_power<
+                static_cast<long long>(Exponent::value)
+            >(base);
+        } else {
+            return PowOp::template apply<Result>(
+                base, ctx.template read<Exponent>(0)
+            );
+        }
+    }
+
+    template <class Context>
+    STACKDSL_HOT static void load_contiguous(
+        const Context& ctx,
+        std::size_t base,
+        std::size_t count,
+        double* STACKDSL_RESTRICT out
+    ) noexcept {
+        for (std::size_t index = 0; index < count; ++index) {
+            out[index] = read_flat(ctx, base + index);
+        }
+    }
+};
 
 template <
     class Input,
@@ -162,6 +242,27 @@ struct TensorCopyNode {
         const auto [begin, end] = execution_output_range<Shape::size, Execution>(ctx);
         for (std::size_t index = begin; index < end; ++index) {
             out[index] = Input::read_flat(ctx, index);
+        }
+    }
+};
+
+template <class Input, class Out, std::size_t Index, class Execution>
+struct TensorColumnNode {
+    using Shape = typename Input::shape;
+    static_assert(Shape::rank > 0);
+    static constexpr std::size_t Width = Shape::dims[Shape::rank - 1];
+    static constexpr std::size_t OutputSize = Shape::size / Width;
+    static_assert(Index < Width);
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        auto* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const auto [begin, end] =
+            execution_output_range<OutputSize, Execution>(ctx);
+        for (std::size_t output = begin; output < end; ++output) {
+            out[output] = Input::read_flat(ctx, output * Width + Index);
         }
     }
 };

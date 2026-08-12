@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import math
+import struct
 
 from trading_dsl_engine.base.custom import StatelessCall
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -19,6 +21,7 @@ from trading_dsl_engine.base.parser import (
 from trading_dsl_engine.ir.einsum import EinsumParseError, parse_einsum
 from trading_dsl_engine.ir.ops import (
     CatOp,
+    ColumnOp,
     CumsumOp,
     CustomCallOp,
     EmitOp,
@@ -36,8 +39,26 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingOp,
     ReductionOp,
     ShiftOp,
+    TheilSenOp,
+    PeriodsSinceChangeOp,
+    HumpOp,
+    TradeWhenOp,
+    LinearFilterOp,
+    RollingProductOp,
+    RollingKthOp,
+    RollingPrevDiffOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    VectorQuantileOp,
+    XsPctRankOp,
+    XsAggregateOp,
+    XsWeightedMeanOp,
+    XsProjectionOp,
+    XsGeneralizedRankOp,
+    XsDensifyOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Node, Program
@@ -57,13 +78,40 @@ class FormulaIRCompileError(ValueError):
 
 
 _NARY_ARITY = {
-    "floor": 1,
+    **{
+        name: 1
+        for name in {
+            "abs",
+            "ceil",
+            "floor",
+            "exp",
+            "ln",
+            "round",
+            "sign",
+            "fraction",
+            "purify",
+            "arctan",
+            "acos",
+            "asin",
+            "sin",
+            "cos",
+            "tan",
+            "tanh",
+            "sqrt",
+            "isnan",
+            "isfinite",
+            "logical_not",
+            "norm_inv",
+        }
+    },
     "add": 2,
     "sub": 2,
     "mul": 2,
     "div": 2,
     "mod": 2,
     "pow": 2,
+    "minimum": 2,
+    "maximum": 2,
     "eq": 2,
     "ne": 2,
     "lt": 2,
@@ -77,16 +125,39 @@ _NARY_ARITY = {
     "where": 3,
 }
 _LOGICAL_OPS = {"eq", "ne", "lt", "gt", "le", "ge", "and_", "or_", "xor"}
+_COMMUTATIVE_NARY = {
+    "add",
+    "mul",
+    "eq",
+    "ne",
+    "and_",
+    "or_",
+    "xor",
+}
 _DERIVED_TERMINALS: dict[str, Expr] = {
     "minute": Call("minute", (Identifier("_ev_ts"),), ())
 }
+
+
+def _number_key(value: float) -> tuple:
+    """Return a stable semantic key for a parsed numeric literal.
+
+    All NaNs are equivalent in the DSL.  Other values use their IEEE encoding so
+    signed zero remains distinct for order-sensitive operations such as minimum
+    and maximum.
+    """
+
+    numeric = float(value)
+    if math.isnan(numeric):
+        return ("nan",)
+    return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
 def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
-        return ("num", node.value)
+        return ("num", _number_key(node.value))
     if isinstance(node, String):
         return ("str", node.value)
     if isinstance(node, Universe):
@@ -99,6 +170,7 @@ def _expr_key(node: Expr) -> tuple:
             node.offset,
             node.row_scalar,
             node.dtype,
+            node.monotonic,
         )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
@@ -111,10 +183,13 @@ def _expr_key(node: Expr) -> tuple:
             tuple(_expr_key(arg) for arg in node.args),
         )
     if isinstance(node, Call):
+        args = tuple(_expr_key(arg) for arg in node.args)
+        if node.fn in _COMMUTATIVE_NARY and len(args) == 2:
+            args = tuple(sorted(args, key=repr))
         return (
             "call",
             node.fn,
-            tuple(_expr_key(arg) for arg in node.args),
+            args,
             tuple((name, _expr_key(value)) for name, value in node.kwargs),
         )
     raise FormulaIRCompileError(f"unhandled expression {node!r}")
@@ -165,6 +240,16 @@ def _literal_string(node: Expr, name: str) -> str:
     if not isinstance(node, String):
         raise FormulaIRCompileError(f"{name} must be a string literal")
     return node.value
+
+
+def _literal_float_tuple(node: Expr, name: str) -> tuple[float, ...]:
+    if isinstance(node, Number):
+        return (float(node.value),)
+    text = _literal_string(node, name).replace(",", " ")
+    try:
+        return tuple(float(value) for value in text.split())
+    except ValueError as exc:
+        raise FormulaIRCompileError(f"{name} contains a non-numeric weight") from exc
 
 
 def _literal_optimize(node: Expr) -> object:
@@ -247,8 +332,15 @@ def _custom_value_type(node: StatelessCall, children: list[Node]) -> ValueType:
 
 def _reduction_arguments(
     call: Call,
-) -> tuple[Expr, Expr | None, int, bool]:
-    if call.fn not in {"sum", "mean", "std"}:
+) -> tuple[str, Expr, Expr | None, int, bool]:
+    kinds = {
+        "sum": "sum",
+        "mean": "mean",
+        "std": "std",
+        "reduce_min": "min",
+        "reduce_max": "max",
+    }
+    if call.fn not in kinds:
         raise FormulaIRCompileError(f"invalid reduction {call.fn!r}")
     names = (
         ("x", "axis", "ddof", "ignore_na")
@@ -273,7 +365,7 @@ def _reduction_arguments(
     ignore_na = _literal_bool(
         values.get("ignore_na", Number(1.0)), "reduction ignore_na"
     )
-    return values["x"], values.get("axis"), ddof, ignore_na
+    return kinds[call.fn], values["x"], values.get("axis"), ddof, ignore_na
 
 
 def _reduction_axes(axis: Expr | None, stream_rank: int) -> tuple[int, ...]:
@@ -337,6 +429,102 @@ def _normalize_ewm(call: Call) -> tuple[Expr, float, int, bool, bool]:
         _literal_bool(values["ignore_na"], "ignore_na"),
         _literal_bool(values["adjust"], "adjust"),
     )
+
+
+def _bind_literal_call(
+    call: Call,
+    names: tuple[str, ...],
+    defaults: dict[str, Expr],
+) -> dict[str, Expr]:
+    if len(call.args) > len(names):
+        raise FormulaIRCompileError(f"{call.fn} received too many arguments")
+    values = dict(defaults)
+    explicit: set[str] = set()
+    for name, value in zip(names, call.args):
+        values[name] = value
+        explicit.add(name)
+    for name, value in call.kwargs:
+        if name not in names or name in explicit:
+            raise FormulaIRCompileError(f"invalid {call.fn} argument {name!r}")
+        values[name] = value
+        explicit.add(name)
+    return values
+
+
+_ROLLING_KIND = {
+    "roll_mean": "mean",
+    "rolling_sum": "sum",
+    "rolling_mean": "mean",
+    "rolling_std": "std",
+    "rolling_min": "min",
+    "rolling_max": "max",
+    "rolling_median": "median",
+    "rolling_quantile": "quantile",
+    "rolling_pct_rank": "pct_rank",
+    "rolling_argmin": "argmin",
+    "rolling_argmax": "argmax",
+}
+
+_XS_AGGREGATE_KIND = {
+    "xs_count": "count",
+    "xs_sum": "sum",
+    "xs_mean": "mean",
+    "xs_std": "std",
+    "xs_min": "min",
+    "xs_max": "max",
+    "xs_median": "quantile",
+    "xs_quantile_value": "quantile",
+}
+
+
+def _normalize_rolling(call: Call) -> tuple[Expr, RollingOp]:
+    kind = _ROLLING_KIND[call.fn]
+    if kind == "quantile":
+        names = ("x", "periods", "q", "min_periods")
+        defaults = {"q": Number(0.5)}
+    elif kind == "std":
+        names = ("x", "periods", "min_periods", "ddof")
+        defaults = {"ddof": Number(0.0)}
+    else:
+        names = ("x", "periods", "min_periods")
+        defaults = {}
+    values = _bind_literal_call(call, names, defaults)
+    if "x" not in values or "periods" not in values:
+        raise FormulaIRCompileError(f"{call.fn} requires x and periods")
+    periods = _literal_int(values["periods"], f"{call.fn} periods", 1)
+    minimum = _literal_int(
+        values.get("min_periods", Number(float(periods))),
+        f"{call.fn} min_periods",
+        0,
+    )
+    if minimum > periods:
+        raise FormulaIRCompileError(f"{call.fn} min_periods exceeds periods")
+    return values["x"], RollingOp(
+        kind,
+        periods,
+        minimum,
+        _literal_int(values.get("ddof", Number(0.0)), f"{call.fn} ddof", 0),
+        _literal_number(values.get("q", Number(0.5)), f"{call.fn} q"),
+    )
+
+
+def _normalize_theilsen(call: Call) -> tuple[Expr, Expr, TheilSenOp]:
+    values = _bind_literal_call(
+        call,
+        ("y", "x", "periods", "min_periods"),
+        {},
+    )
+    if any(name not in values for name in ("y", "x", "periods")):
+        raise FormulaIRCompileError("rolling_theilsen requires y, x, and periods")
+    periods = _literal_int(values["periods"], "rolling_theilsen periods", 2)
+    minimum = _literal_int(
+        values.get("min_periods", Number(float(periods))),
+        "rolling_theilsen min_periods",
+        2,
+    )
+    if minimum > periods:
+        raise FormulaIRCompileError("rolling_theilsen min_periods exceeds periods")
+    return values["y"], values["x"], TheilSenOp(periods, minimum)
 
 
 def _normalize_shift(call: Call) -> tuple[Expr, int, int]:
@@ -404,9 +592,26 @@ def _flatten_cat_features(expressions: tuple[Expr, ...]) -> tuple[Expr, ...]:
 
 def _normalize_ridge(
     call: Call,
-) -> tuple[tuple[Expr, ...], Expr, Expr | None, Expr, Expr, bool, bool]:
-    if call.kwargs:
-        values = dict(call.kwargs)
+) -> tuple[
+    tuple[Expr, ...],
+    Expr,
+    Expr | None,
+    Expr,
+    Expr,
+    bool,
+    bool,
+    int,
+]:
+    keyword_values = dict(call.kwargs)
+    if len(keyword_values) != len(call.kwargs):
+        raise FormulaIRCompileError("Ridge got duplicate keyword arguments")
+    recompute_every = _literal_int(
+        keyword_values.pop("recompute_every", Number(1.0)),
+        "Ridge recompute_every",
+        1,
+    )
+    if keyword_values:
+        values = keyword_values
         if set(values) - {"y", "weights", "hl", "lambda_", "nonneg"}:
             raise FormulaIRCompileError("invalid Ridge keyword")
         if any(name not in values for name in ("y", "hl", "lambda_")):
@@ -416,7 +621,9 @@ def _normalize_ridge(
         weights = values.get("weights")
         hl = values["hl"]
         lam = values["lambda_"]
-        nonneg = _literal_bool(values.get("nonneg", Number(0.0)), "Ridge nonneg")
+        nonneg = _literal_bool(
+            values.get("nonneg", Number(0.0)), "Ridge nonneg"
+        )
     else:
         args = call.args
         sentinel = (
@@ -444,6 +651,7 @@ def _normalize_ridge(
         lam,
         nonneg,
         not (isinstance(hl, Number) and float(hl.value) == 0.0),
+        recompute_every,
     )
 
 
@@ -527,8 +735,8 @@ class _BaseBuilder:
                     node.fn, [self.nodes[index] for index in children]
                 ),
             )
-        if node.fn in {"sum", "mean", "std"}:
-            expression, axis, ddof, ignore_na = _reduction_arguments(node)
+        if node.fn in {"sum", "mean", "std", "reduce_min", "reduce_max"}:
+            kind, expression, axis, ddof, ignore_na = _reduction_arguments(node)
             child = self.build(expression)
             child_type = self.nodes[child].value_type
             try:
@@ -544,7 +752,7 @@ class _BaseBuilder:
                 if full_axis not in axes
             )
             return self._append(
-                ReductionOp(node.fn, axes, ddof, ignore_na),
+                ReductionOp(kind, axes, ddof, ignore_na),
                 (child,),
                 tensor(output_shape, dtype=child_type.dtype),
             )
@@ -591,8 +799,274 @@ class _BaseBuilder:
                 (child,),
                 _lane_state_result_type("ewm", self.nodes[child]),
             )
+        if node.fn in _ROLLING_KIND:
+            expression, op = _normalize_rolling(node)
+            child = self.build(expression)
+            return self._append(
+                op,
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn == "rolling_theilsen":
+            y, x, op = _normalize_theilsen(node)
+            children = (self.build(y), self.build(x))
+            return self._append(
+                op,
+                children,
+                _nary_result_type(
+                    node.fn, [self.nodes[index] for index in children]
+                ),
+            )
+        if node.fn == "periods_since_last_change":
+            values = _bind_literal_call(node, ("x",), {})
+            if "x" not in values:
+                raise FormulaIRCompileError("periods_since_last_change requires x")
+            child = self.build(values["x"])
+            return self._append(
+                PeriodsSinceChangeOp(),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn in {"hump", "hump_decay"}:
+            if node.fn == "hump":
+                values = _bind_literal_call(
+                    node, ("x", "hump"), {"hump": Number(0.01)}
+                )
+                values["threshold"] = values["hump"]
+                relative = False
+                move = True
+            else:
+                values = _bind_literal_call(
+                    node,
+                    ("x", "p", "relative"),
+                    {"p": Number(0.1), "relative": Number(0.0)},
+                )
+                values["threshold"] = values["p"]
+                relative = _literal_bool(values["relative"], "hump_decay relative")
+                move = False
+            if "x" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x")
+            child = self.build(values["x"])
+            return self._append(
+                HumpOp(
+                    _literal_number(values["threshold"], f"{node.fn} threshold"),
+                    relative,
+                    move,
+                ),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn == "trade_when":
+            values = _bind_literal_call(
+                node, ("trigger", "alpha", "exit"), {}
+            )
+            if any(name not in values for name in ("trigger", "alpha", "exit")):
+                raise FormulaIRCompileError("trade_when requires trigger, alpha, exit")
+            children = tuple(self.build(values[name]) for name in ("trigger", "alpha", "exit"))
+            return self._append(
+                TradeWhenOp(),
+                children,
+                _nary_result_type(
+                    node.fn, [self.nodes[index] for index in children]
+                ),
+            )
+        if node.fn == "filter":
+            values = _bind_literal_call(
+                node,
+                ("x", "h", "t"),
+                {"h": String("1,2,3,4"), "t": String("0.5")},
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("filter requires x")
+            child = self.build(values["x"])
+            return self._append(
+                LinearFilterOp(
+                    _literal_float_tuple(values["h"], "filter h"),
+                    _literal_float_tuple(values["t"], "filter t"),
+                ),
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
+        if node.fn in {
+            "rolling_product",
+            "rolling_kth",
+            "rolling_prev_diff",
+            "rolling_decay_linear",
+            "rolling_entropy",
+        }:
+            if node.fn == "rolling_kth":
+                names = ("x", "periods", "k", "ignore", "min_periods")
+                defaults = {"k": Number(1.0), "ignore": String("NAN 0")}
+            elif node.fn == "rolling_entropy":
+                names = ("x", "periods", "buckets", "min_periods")
+                defaults = {"buckets": Number(10.0)}
+            elif node.fn == "rolling_prev_diff":
+                names = ("x", "periods")
+                defaults = {}
+            else:
+                names = ("x", "periods", "min_periods")
+                defaults = {}
+            values = _bind_literal_call(node, names, defaults)
+            if "x" not in values or "periods" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x and periods")
+            periods = _literal_int(values["periods"], f"{node.fn} periods", 1)
+            default_minimum = (
+                _literal_int(values.get("k", Number(1.0)), "rolling_kth k", 1)
+                if node.fn == "rolling_kth"
+                else periods
+            )
+            minimum = _literal_int(
+                values.get("min_periods", Number(float(default_minimum))),
+                f"{node.fn} min_periods",
+                0,
+            )
+            if minimum > periods:
+                raise FormulaIRCompileError(f"{node.fn} min_periods exceeds periods")
+            child = self.build(values["x"])
+            if node.fn == "rolling_product":
+                op = RollingProductOp(periods, minimum)
+            elif node.fn == "rolling_kth":
+                ignored = {
+                    value.upper()
+                    for value in _literal_string(values["ignore"], "rolling_kth ignore")
+                    .replace(",", " ")
+                    .split()
+                }
+                unsupported = ignored - {"NAN", "NA", "0", "0.0"}
+                if unsupported:
+                    raise FormulaIRCompileError(
+                        f"rolling_kth unsupported ignore values {sorted(unsupported)}"
+                    )
+                op = RollingKthOp(
+                    periods,
+                    minimum,
+                    _literal_int(values["k"], "rolling_kth k", 1),
+                    bool(ignored & {"0", "0.0"}),
+                )
+            elif node.fn == "rolling_prev_diff":
+                op = RollingPrevDiffOp(periods)
+            elif node.fn == "rolling_decay_linear":
+                op = RollingDecayOp(periods, minimum)
+            else:
+                op = RollingEntropyOp(
+                    periods,
+                    minimum,
+                    _literal_int(values["buckets"], "rolling_entropy buckets", 1),
+                )
+            return self._append(
+                op,
+                (child,),
+                _lane_state_result_type(node.fn, self.nodes[child]),
+            )
         if node.fn == "xs_rank":
             return self._append(XsRankOp(), (self.build(node.args[0]),), VECTOR)
+        if node.fn == "xs_pct_rank":
+            return self._append(XsPctRankOp(), (self.build(node.args[0]),), VECTOR)
+        if node.fn in _XS_AGGREGATE_KIND:
+            names = ("x", "q") if node.fn == "xs_quantile_value" else ("x",)
+            defaults = {"q": Number(0.5)}
+            values = _bind_literal_call(node, names, defaults)
+            if "x" not in values:
+                raise FormulaIRCompileError(f"{node.fn} requires x")
+            child = self.build(values["x"])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError(f"{node.fn} requires a vector")
+            quantile = _literal_number(
+                values.get("q", Number(0.5)), f"{node.fn} q"
+            )
+            return self._append(
+                XsAggregateOp(_XS_AGGREGATE_KIND[node.fn], quantile),
+                (child,),
+                VECTOR,
+            )
+        if node.fn == "xs_weighted_mean":
+            if node.kwargs or len(node.args) != 2:
+                raise FormulaIRCompileError("xs_weighted_mean expects x, weight")
+            children = tuple(self.build(arg) for arg in node.args)
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError("xs_weighted_mean requires vectors")
+            return self._append(XsWeightedMeanOp(), children, VECTOR)
+        if node.fn in {"xs_vector_projection", "xs_regression_projection"}:
+            if node.kwargs or len(node.args) != 2:
+                raise FormulaIRCompileError(f"{node.fn} expects target, regressor")
+            children = tuple(self.build(arg) for arg in node.args)
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError(f"{node.fn} requires vectors")
+            return self._append(
+                XsProjectionOp(node.fn == "xs_regression_projection"),
+                children,
+                VECTOR,
+            )
+        if node.fn == "xs_generalized_rank":
+            values = _bind_literal_call(
+                node, ("x", "m"), {"m": Number(1.0)}
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("xs_generalized_rank requires x")
+            child = self.build(values["x"])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("xs_generalized_rank requires a vector")
+            return self._append(
+                XsGeneralizedRankOp(
+                    _literal_number(values["m"], "xs_generalized_rank m")
+                ),
+                (child,),
+                VECTOR,
+            )
+        if node.fn == "densify":
+            if node.kwargs or len(node.args) != 1:
+                raise FormulaIRCompileError("densify expects x")
+            child = self.build(node.args[0])
+            if self.nodes[child].value_type.kind != "vector":
+                raise FormulaIRCompileError("densify requires a vector")
+            return self._append(XsDensifyOp(), (child,), VECTOR)
+        if node.fn == "vec_quantile":
+            values = _bind_literal_call(
+                node, ("x", "q"), {"q": Number(0.5)}
+            )
+            if "x" not in values:
+                raise FormulaIRCompileError("vec_quantile requires x")
+            child = self.build(values["x"])
+            child_type = self.nodes[child].value_type
+            try:
+                shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError(
+                    "vec_quantile requires a numeric tensor"
+                ) from exc
+            if not shape:
+                raise FormulaIRCompileError(
+                    "vec_quantile requires at least one row dimension"
+                )
+            return self._append(
+                VectorQuantileOp(
+                    _literal_number(values["q"], "vec_quantile q")
+                ),
+                (child,),
+                tensor(shape[:-1], dtype=child_type.dtype),
+            )
+        if node.fn == "col":
+            values = _bind_literal_call(node, ("matrix", "index"), {})
+            if "matrix" not in values or "index" not in values:
+                raise FormulaIRCompileError("col requires matrix and index")
+            child = self.build(values["matrix"])
+            child_type = self.nodes[child].value_type
+            try:
+                shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError("col requires a numeric tensor") from exc
+            if not shape or not isinstance(shape[-1], int):
+                raise FormulaIRCompileError("col requires a fixed final dimension")
+            index = _literal_int(values["index"], "col index", 0)
+            if index >= shape[-1]:
+                raise FormulaIRCompileError(
+                    f"col index {index} outside final dimension {shape[-1]}"
+                )
+            return self._append(
+                ColumnOp(index),
+                (child,),
+                tensor(shape[:-1], dtype=child_type.dtype),
+            )
         if node.fn == "rbf_basis":
             width = _literal_int(node.args[3], "n_basis", 1)
             return self._append(
@@ -645,7 +1119,16 @@ class _BaseBuilder:
                 object_value(width),
             )
         if node.fn == "Ridge":
-            features, y, weights, hl, lam, nonneg, stateful = _normalize_ridge(node)
+            (
+                features,
+                y,
+                weights,
+                hl,
+                lam,
+                nonneg,
+                stateful,
+                recompute_every,
+            ) = _normalize_ridge(node)
             feature_ids = tuple(self.build(feature) for feature in features)
             widths = tuple(
                 _feature_width(self.nodes[index].value_type)
@@ -655,24 +1138,69 @@ class _BaseBuilder:
             if weights is not None:
                 children.append(self.build(weights))
             children.extend((self.build(hl), self.build(lam)))
-            op = RidgeOp(widths, weights is not None, nonneg, stateful)
+            op = RidgeOp(
+                widths,
+                weights is not None,
+                nonneg,
+                stateful,
+                recompute_every,
+            )
             return self._append(
                 op, tuple(children), object_value(op.coefficient_width)
             )
-        if node.fn in {"get_beta", "get_preds"}:
-            child = self.build(node.args[0])
-            child_node = self.nodes[child]
-            field = "beta" if node.fn == "get_beta" else "preds"
-            if isinstance(child_node.op, RidgeOp):
-                value_type = (
-                    matrix(child_node.op.coefficient_width)
-                    if field == "beta" and self.grouped
-                    else fixed(child_node.op.coefficient_width)
-                    if field == "beta"
-                    else VECTOR
+        ridge_projections = {
+            "get_beta": "beta",
+            "get_preds": "preds",
+            "get_residuals": "residuals",
+            "get_coefficient": "coefficient",
+            "get_sse": "sse",
+            "get_sst": "sst",
+            "get_r2": "r2",
+            "get_residual_variance": "residual_variance",
+            "get_standard_errors": "standard_errors",
+            "get_standard_error": "standard_error",
+            "get_tstats": "tstats",
+            "get_tstat": "tstat",
+            "get_effective_df": "effective_df",
+            "get_effective_n": "effective_n",
+        }
+        if node.fn in ridge_projections:
+            component_fields = {"coefficient", "standard_error", "tstat"}
+            field = ridge_projections[node.fn]
+            names = ("model", "component") if field in component_fields else ("model",)
+            values = _bind_literal_call(node, names, {})
+            missing = [name for name in names if name not in values]
+            if missing:
+                raise FormulaIRCompileError(
+                    f"{node.fn} missing {', '.join(missing)}"
                 )
-                return self._append(RidgeProjectionOp(field), (child,), value_type)
+            child = self.build(values["model"])
+            child_node = self.nodes[child]
+            component = (
+                _literal_int(values["component"], f"{node.fn} component", 0)
+                if field in component_fields
+                else None
+            )
+            if isinstance(child_node.op, RidgeOp):
+                width = child_node.op.coefficient_width
+                if component is not None and component >= width:
+                    raise FormulaIRCompileError(
+                        f"{node.fn} component {component} outside coefficient width {width}"
+                    )
+                if field in {"beta", "standard_errors", "tstats"}:
+                    value_type = matrix(width) if self.grouped else fixed(width)
+                elif field in {"preds", "residuals"}:
+                    value_type = VECTOR
+                else:
+                    value_type = VECTOR if self.grouped else SCALAR
+                return self._append(
+                    RidgeProjectionOp(field, component), (child,), value_type
+                )
             if isinstance(child_node.op, InstrumentBasisMeanOp):
+                if field not in {"beta", "preds"}:
+                    raise FormulaIRCompileError(
+                        f"{node.fn} requires Ridge rather than InstrumentBasisMean"
+                    )
                 return self._append(
                     InstrumentBasisProjectionOp(field),
                     (child,),
@@ -759,6 +1287,7 @@ class _OuterBuilder(_BaseBuilder):
                         item.offset,
                         item.row_scalar,
                         item.dtype,
+                        item.monotonic,
                     )
                 )
             else:

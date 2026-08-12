@@ -8,6 +8,7 @@ from typing import Mapping
 from trading_dsl_engine.ir.einsum import ContractionStep, build_contraction_plan
 from trading_dsl_engine.ir.ops import (
     CatOp,
+    ColumnOp,
     CumsumOp,
     CustomCallOp,
     EmitOp,
@@ -15,18 +16,36 @@ from trading_dsl_engine.ir.ops import (
     EwmOp,
     FFillOp,
     FutureRbfBasisSumOp,
+    HumpOp,
     GroupByOp,
     GroupKeySpec,
     InputOp,
     InstrumentBasisMeanOp,
     InstrumentBasisProjectionOp,
     LiteralOp,
+    LinearFilterOp,
     NaryOp,
     RbfBasisOp,
+    PeriodsSinceChangeOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    RollingKthOp,
+    RollingOp,
+    RollingPrevDiffOp,
+    RollingProductOp,
     ReductionOp,
     ShiftOp,
+    TheilSenOp,
+    TradeWhenOp,
+    VectorQuantileOp,
+    XsPctRankOp,
+    XsAggregateOp,
+    XsWeightedMeanOp,
+    XsProjectionOp,
+    XsGeneralizedRankOp,
+    XsDensifyOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
@@ -93,11 +112,14 @@ class Stage:
     op_name: str | None = None
     op: object | None = None
     projection: str | None = None
+    projection_component: int | None = None
     half_life: float | None = None
     ridge_lambda: float | None = None
     group: "GroupStage | None" = None
     einsum_step: ContractionStep | None = None
     final_only: bool = False
+    members: tuple["Stage", ...] = ()
+    epilogues: tuple["Stage", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,13 +238,32 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
     float_ops = (
         CustomCallOp,
         CatOp,
+        ColumnOp,
         CumsumOp,
         ReductionOp,
         EmitOp,
         FFillOp,
         ShiftOp,
         EwmOp,
+        PeriodsSinceChangeOp,
+        HumpOp,
+        TradeWhenOp,
+        LinearFilterOp,
+        RollingProductOp,
+        RollingKthOp,
+        RollingPrevDiffOp,
+        RollingDecayOp,
+        RollingEntropyOp,
+        RollingOp,
+        TheilSenOp,
+        VectorQuantileOp,
         XsRankOp,
+        XsPctRankOp,
+        XsAggregateOp,
+        XsWeightedMeanOp,
+        XsProjectionOp,
+        XsGeneralizedRankOp,
+        XsDensifyOp,
         RbfBasisOp,
         FutureRbfBasisSumOp,
         EinsumOp,
@@ -780,11 +821,19 @@ def _build_plan(
             specs = _resolved_key_specs(
                 program, node.child_ids, op, key_cardinalities
             )
-            dense = bool(specs) and all(
-                spec.num_keys is not None for spec in specs
+            monotonic_specs = tuple(spec for spec in specs if spec.monotonic)
+            if any(spec.row_scalar is not True for spec in monotonic_specs):
+                raise CppStreamLoweringError(
+                    "monotonic group keys require row_scalar=True"
+                )
+            retained_specs = tuple(spec for spec in specs if not spec.monotonic)
+            dense = bool(retained_specs) and all(
+                spec.num_keys is not None for spec in retained_specs
             )
             capacity = (
-                _dense_capacity(specs)
+                1
+                if not retained_specs
+                else _dense_capacity(retained_specs)
                 if dense
                 else (op.capacity or default_group_capacity)
             )

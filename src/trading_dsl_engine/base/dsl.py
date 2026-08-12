@@ -216,18 +216,42 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "exp",
             "sign",
             "arctan",
+            "acos",
+            "asin",
+            "sin",
+            "cos",
+            "tan",
+            "tanh",
+            "sqrt",
             "isnan",
+            "isfinite",
+            "logical_not",
             "purify",
             "fraction",
             "norm_inv",
             "xs_norm",
             "xs_rank",
-            "get_beta",
-            "get_preds",
+            "xs_pct_rank",
             "xs_sort",
             "xstd",
             "outer",
             "cumsum",
+        }
+    },
+    **{
+        name: _dsl_signature("x")
+        for name in {
+            "get_beta",
+            "get_preds",
+            "get_residuals",
+            "get_sse",
+            "get_sst",
+            "get_r2",
+            "get_residual_variance",
+            "get_standard_errors",
+            "get_tstats",
+            "get_effective_df",
+            "get_effective_n",
         }
     },
     **{
@@ -250,13 +274,215 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
             "or_",
             "xor",
             "fillna",
+            "minimum",
+            "maximum",
         }
     },
     "where": _dsl_signature("condition", "true", "false"),
     "clip": _dsl_signature("x", "lo", "hi"),
     "round": _dsl_signature("x", "decimals"),
     "ewm": _dsl_signature("x", "span", "min_periods", "ignore_na", "adjust", defaults={"min_periods": 0, "ignore_na": True, "adjust": False}),
-    "roll_mean": _dsl_signature("x", "lookback", "min_periods"),
+    "ewm_moment": _dsl_signature(
+        "x",
+        "span",
+        "k",
+        "min_periods",
+        "ignore_na",
+        "adjust",
+        defaults={
+            "k": 2,
+            "min_periods": 0,
+            "ignore_na": True,
+            "adjust": False,
+        },
+    ),
+    **{
+        name: _dsl_signature(
+            "x",
+            "span",
+            "min_periods",
+            "ignore_na",
+            "adjust",
+            defaults={"min_periods": 0, "ignore_na": True, "adjust": False},
+        )
+        for name in {"ewm_var", "ewm_std", "ewm_skewness", "ewm_kurtosis"}
+    },
+    **{
+        name: _dsl_signature(
+            "x",
+            "y",
+            "span",
+            "min_periods",
+            "ignore_na",
+            "adjust",
+            defaults={"min_periods": 0, "ignore_na": True, "adjust": False},
+        )
+        for name in {"ewm_cov", "ewm_corr"}
+    },
+    **{
+        name: _dsl_signature(
+            "y",
+            "x",
+            "span",
+            "min_periods",
+            "ignore_na",
+            "adjust",
+            defaults={"min_periods": 0, "ignore_na": True, "adjust": False},
+        )
+        for name in {"ewm_co_skewness", "ewm_co_kurtosis"}
+    },
+    **{
+        name: _dsl_signature(
+            "x",
+            "y",
+            "z",
+            "span",
+            "min_periods",
+            "ignore_na",
+            "adjust",
+            defaults={"min_periods": 0, "ignore_na": True, "adjust": False},
+        )
+        for name in {"ewm_triple_corr", "ewm_partial_corr"}
+    },
+    "roll_mean": _dsl_signature(
+        "x", "periods", "min_periods", defaults={"min_periods": None}
+    ),
+    **{
+        name: _dsl_signature(
+            "x", "periods", "min_periods", defaults={"min_periods": None}
+        )
+        for name in {
+            "rolling_sum",
+            "rolling_mean",
+            "rolling_min",
+            "rolling_max",
+            "rolling_median",
+            "rolling_pct_rank",
+            "rolling_argmin",
+            "rolling_argmax",
+        }
+    },
+    "rolling_std": _dsl_signature(
+        "x",
+        "periods",
+        "min_periods",
+        "ddof",
+        defaults={"min_periods": None, "ddof": 0},
+    ),
+    "rolling_quantile": _dsl_signature(
+        "x",
+        "periods",
+        "q",
+        "min_periods",
+        defaults={"q": 0.5, "min_periods": None},
+    ),
+    "rolling_theilsen": _dsl_signature(
+        "y", "x", "periods", "min_periods", defaults={"min_periods": None}
+    ),
+    "periods_since_last_change": _dsl_signature("x"),
+    "hump": _dsl_signature("x", "hump", defaults={"hump": 0.01}),
+    "hump_decay": _dsl_signature(
+        "x", "p", "relative", defaults={"p": 0.1, "relative": False}
+    ),
+    "trade_when": _dsl_signature("trigger", "alpha", "exit"),
+    "filter": _dsl_signature(
+        "x", "h", "t", defaults={"h": "1,2,3,4", "t": "0.5"}
+    ),
+    **{
+        name: _dsl_signature(
+            "x", "periods", "min_periods", defaults={"min_periods": None}
+        )
+        for name in {
+            "rolling_product",
+            "rolling_decay_linear",
+        }
+    },
+    "rolling_prev_diff": _dsl_signature("x", "periods"),
+    "rolling_kth": _dsl_signature(
+        "x",
+        "periods",
+        "k",
+        "ignore",
+        "min_periods",
+        defaults={"k": 1, "ignore": "NAN 0", "min_periods": None},
+    ),
+    "rolling_entropy": _dsl_signature(
+        "x",
+        "periods",
+        "buckets",
+        "min_periods",
+        defaults={"buckets": 10, "min_periods": None},
+    ),
+    "vec_quantile": _dsl_signature("x", "q", defaults={"q": 0.5}),
+    **{
+        name: _dsl_signature("x")
+        for name in {
+            "xs_count",
+            "xs_sum",
+            "xs_mean",
+            "xs_std",
+            "xs_min",
+            "xs_max",
+            "xs_median",
+            "densify",
+        }
+    },
+    "xs_quantile_value": _dsl_signature("x", "q", defaults={"q": 0.5}),
+    "xs_weighted_mean": _dsl_signature("x", "weight"),
+    "xs_vector_projection": _dsl_signature("target", "regressor"),
+    "xs_regression_projection": _dsl_signature("target", "regressor"),
+    "xs_generalized_rank": _dsl_signature("x", "m", defaults={"m": 1.0}),
+    **{
+        name: _dsl_signature("x")
+        for name in {"xs_demean", "xs_zscore", "xs_direction"}
+    },
+    "xs_scale": _dsl_signature(
+        "x",
+        "scale",
+        "longscale",
+        "shortscale",
+        defaults={
+            "scale": 1.0,
+            "longscale": None,
+            "shortscale": None,
+        },
+    ),
+    **{
+        name: _dsl_signature("x", "y")
+        for name in {"xs_vector_proj", "xs_vector_neut"}
+    },
+    **{
+        name: _dsl_signature(
+            "x", "periods", "min_periods", defaults={"min_periods": None}
+        )
+        for name in {"rolling_range", "rolling_zscore"}
+    },
+    "rolling_scale": _dsl_signature(
+        "x",
+        "periods",
+        "constant",
+        "min_periods",
+        defaults={"constant": 0.0, "min_periods": None},
+    ),
+    "ts_regression": _dsl_signature(
+        "y",
+        "x",
+        "periods",
+        "lag",
+        "rettype",
+        "weights",
+        "lambda_",
+        defaults={
+            "lag": 0,
+            "rettype": "residual",
+            "weights": 1.0,
+            "lambda_": 0.0,
+        },
+    ),
+    **{
+        name: _dsl_signature("x", "component")
+        for name in {"get_coefficient", "get_standard_error", "get_tstat"}
+    },
     "ffill": _dsl_signature("x", "limit"),
     "shift": _dsl_signature("x", "lag", "max_lag", defaults={"lag": 1, "max_lag": None}),
     "buffer": _dsl_signature("shift_expr", "min", "max"),
@@ -281,6 +507,12 @@ _DSL_OP_SIGNATURES: dict[str, Signature] = {
         "ddof",
         "ignore_na",
         defaults={"axis": None, "ddof": 0, "ignore_na": True},
+    ),
+    "reduce_min": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
+    ),
+    "reduce_max": _dsl_signature(
+        "x", "axis", "ignore_na", defaults={"axis": None, "ignore_na": True}
     ),
     "emit": _dsl_signature("x", "mode", defaults={"mode": "last"}),
 }
@@ -343,6 +575,17 @@ sign = op("sign")
 fraction = op("fraction")
 purify = op("purify")
 arctan = op("arctan")
+acos = op("acos")
+asin = op("asin")
+sin = op("sin")
+cos = op("cos")
+tan = op("tan")
+tanh = op("tanh")
+sqrt = op("sqrt")
+isfinite = op("isfinite")
+logical_not = op("logical_not")
+minimum = op("minimum")
+maximum = op("maximum")
 pow = op("pow")
 cumsum = op("cumsum")
 shift = op("shift")
@@ -350,6 +593,7 @@ buffer = op("buffer")
 ewm = op("ewm")
 roll_mean = op("roll_mean")
 xs_rank = op("xs_rank")
+xs_pct_rank = op("xs_pct_rank")
 norm_inv = op("norm_inv")
 xs_norm = op("xs_norm")
 clip = op("clip")
@@ -360,12 +604,60 @@ rbf_basis = op("rbf_basis")
 future_rbf_basis_sum = op("future_rbf_basis_sum")
 col = op("col")
 einsum = op("einsum")
+ewm_moment = op("ewm_moment")
+ewm_var = op("ewm_var")
+ewm_std = op("ewm_std")
+ewm_skewness = op("ewm_skewness")
+ewm_kurtosis = op("ewm_kurtosis")
+ewm_cov = op("ewm_cov")
+ewm_corr = op("ewm_corr")
+ewm_co_skewness = op("ewm_co_skewness")
+ewm_co_kurtosis = op("ewm_co_kurtosis")
+ewm_triple_corr = op("ewm_triple_corr")
+ewm_partial_corr = op("ewm_partial_corr")
+rolling_sum = op("rolling_sum")
+rolling_mean = op("rolling_mean")
+rolling_std = op("rolling_std")
+rolling_min = op("rolling_min")
+rolling_max = op("rolling_max")
+rolling_median = op("rolling_median")
+rolling_quantile = op("rolling_quantile")
+rolling_pct_rank = op("rolling_pct_rank")
+rolling_argmin = op("rolling_argmin")
+rolling_argmax = op("rolling_argmax")
+rolling_theilsen = op("rolling_theilsen")
+periods_since_last_change = op("periods_since_last_change")
+hump = op("hump")
+hump_decay = op("hump_decay")
+trade_when = op("trade_when")
+filter = op("filter")
+rolling_product = op("rolling_product")
+rolling_kth = op("rolling_kth")
+rolling_prev_diff = op("rolling_prev_diff")
+rolling_decay_linear = op("rolling_decay_linear")
+rolling_entropy = op("rolling_entropy")
+vec_quantile = op("vec_quantile")
+xs_count = op("xs_count")
+xs_sum = op("xs_sum")
+xs_mean = op("xs_mean")
+xs_std = op("xs_std")
+xs_min = op("xs_min")
+xs_max = op("xs_max")
+xs_median = op("xs_median")
+xs_quantile_value = op("xs_quantile_value")
+xs_weighted_mean = op("xs_weighted_mean")
+xs_vector_projection = op("xs_vector_projection")
+xs_regression_projection = op("xs_regression_projection")
+xs_generalized_rank = op("xs_generalized_rank")
+densify = op("densify")
 
 cat = op("cat")
 groupby = op("groupby")
 sum = op("sum")
 mean = op("mean")
 std = op("std")
+reduce_min = op("reduce_min")
+reduce_max = op("reduce_max")
 
 
 def _literal_string(value, name: str) -> str:
@@ -540,9 +832,12 @@ def ceil(x: Expr, freq: str | int | float | None = None) -> Expr:
 @register_dsl_function("round")
 def round(x: Expr, *args, freq: str | int | float | None = None) -> Expr:
     if freq is None:
-        # Construct the builtin call directly. Calling the registered helper
-        # recursively re-enters overload dispatch for the one-argument form.
-        return call("round", x, *args)
+        if len(args) > 1:
+            raise TypeError("round accepts at most one decimals argument")
+        if not args:
+            return call("round", x)
+        factor = pow(10.0, args[0])
+        return div(call("round", mul(x, factor)), factor)
     if args:
         raise TypeError("round cannot combine decimals with freq")
     micros = _duration_microseconds(freq)
@@ -559,20 +854,71 @@ def InstrumentBasisMean(features, y=None, weights=None, hl=None) -> Expr:  # noq
     return call("InstrumentBasisMean", features, y, weights, hl)
 
 
-def Ridge(*features, y=None, weights=None, hl=None, lambda_=None, lam=None, nonneg=False) -> Expr:  # noqa: N802
+def Ridge(  # noqa: N802
+    *features,
+    y=None,
+    weights=None,
+    hl=None,
+    lambda_=None,
+    lam=None,
+    nonneg=False,
+    recompute_every=1,
+) -> Expr:
     ridge_lambda = lambda_ if lambda_ is not None else lam
+    recompute_kwargs = (
+        {}
+        if recompute_every == 1
+        else {"recompute_every": recompute_every}
+    )
     if y is None or hl is None or ridge_lambda is None:
         if weights is not None:
-            raise TypeError("Ridge positional form cannot combine positional y/hl/lambda with keyword weights")
-        return call("Ridge", *features, 3.0 if nonneg else 2.0)
+            raise TypeError(
+                "Ridge positional form cannot combine positional "
+                "y/hl/lambda with keyword weights"
+            )
+        return call(
+            "Ridge",
+            *features,
+            3.0 if nonneg else 2.0,
+            **recompute_kwargs,
+        )
     if weights is None:
-        return call("Ridge", *features, y, 1.0, hl, ridge_lambda, 3.0 if nonneg else 2.0)
-    return call("Ridge", *features, y, weights, hl, ridge_lambda, 3.0 if nonneg else 2.0)
+        return call(
+            "Ridge",
+            *features,
+            y,
+            1.0,
+            hl,
+            ridge_lambda,
+            3.0 if nonneg else 2.0,
+            **recompute_kwargs,
+        )
+    return call(
+        "Ridge",
+        *features,
+        y,
+        weights,
+        hl,
+        ridge_lambda,
+        3.0 if nonneg else 2.0,
+        **recompute_kwargs,
+    )
 
 
 get_beta = op("get_beta")
 get_preds = op("get_preds")
-rolling_quantile = op("rolling_quantile")
+get_residuals = op("get_residuals")
+get_coefficient = op("get_coefficient")
+get_sse = op("get_sse")
+get_sst = op("get_sst")
+get_r2 = op("get_r2")
+get_residual_variance = op("get_residual_variance")
+get_standard_errors = op("get_standard_errors")
+get_standard_error = op("get_standard_error")
+get_tstats = op("get_tstats")
+get_tstat = op("get_tstat")
+get_effective_df = op("get_effective_df")
+get_effective_n = op("get_effective_n")
 mean = op("mean")
 
 

@@ -115,8 +115,10 @@ def test_key_hints_drive_dense_row_scalar_minute_groupby_on_npy(tmp_path: Path):
     generated = runtime.generated_cpp.read_text()
     assert "DenseTupleGroupResolver" in generated
     assert "InputSrc<0, std::int64_t, 1>" in generated
-    assert "stackdsl::BinaryNode<1," in generated
-    assert "stackdsl::UnaryNode<1," in generated
+    assert "stackdsl::CopyNode<1," in generated
+    assert "stackdsl::NaryExpressionSrc<std::int64_t" in generated
+    assert "stackdsl::BinaryNode<" not in generated
+    assert "stackdsl::UnaryNode<" not in generated
     assert "stackdsl::SlotSrc<" in generated and ", true>" in generated
     assert "std::int64_t, stackdsl::DivOp" in generated
     assert "std::int64_t, stackdsl::ModOp" in generated

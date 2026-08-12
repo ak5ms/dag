@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 
@@ -19,12 +19,29 @@ from trading_dsl_engine.ir.ops import (
     EwmOp,
     FFillOp,
     FutureRbfBasisSumOp,
+    HumpOp,
     GroupKeySpec,
     InstrumentBasisMeanOp,
+    LinearFilterOp,
+    PeriodsSinceChangeOp,
     RbfBasisOp,
     ReductionOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    RollingKthOp,
     RidgeOp,
+    RollingOp,
+    RollingPrevDiffOp,
+    RollingProductOp,
     ShiftOp,
+    TheilSenOp,
+    TradeWhenOp,
+    VectorQuantileOp,
+    XsAggregateOp,
+    XsDensifyOp,
+    XsGeneralizedRankOp,
+    XsProjectionOp,
+    XsWeightedMeanOp,
 )
 
 
@@ -101,7 +118,13 @@ class DoubleArg(CppType):
     value: float
 
     def render(self) -> str:
-        text = repr(float(self.value))
+        value = float(self.value)
+        if math.isnan(value):
+            return "std::numeric_limits<double>::quiet_NaN()"
+        if math.isinf(value):
+            sign = "-" if value < 0.0 else ""
+            return f"{sign}std::numeric_limits<double>::infinity()"
+        text = repr(value)
         return text if any(char in text for char in ".eE") else text + ".0"
 
 
@@ -193,6 +216,47 @@ def _source_type(
                     else "stackdsl::NegativeInfinityLiteralSrc"
                 )
         return tmpl("stackdsl::LiteralSrc", _literal_arg(source))
+    if source.kind == "ewm_component":
+        return tmpl("stackdsl::EwmComponentSrc", IntArg(int(source.value)))
+    if source.kind == "expression":
+        op_name = getattr(source.op, "name", None)
+        arity = getattr(source.op, "arity", None)
+        policies = (
+            _UNARY_POLICIES
+            if arity == 1
+            else _BINARY_POLICIES
+            if arity == 2
+            else _TERNARY_POLICIES
+        )
+        try:
+            policy = policies[op_name]
+        except KeyError as exc:
+            raise ValueError(f"no native expression policy for {op_name!r}") from exc
+        return tmpl(
+            "stackdsl::NaryExpressionSrc",
+            _cpp_type(source.dtype),
+            Name(policy),
+            *(
+                _source_type(part, n=n, input_types=input_types)
+                for part in source.parts
+            ),
+        )
+    if source.kind == "stateless_expression":
+        op_name = getattr(source.op, "name", None)
+        try:
+            policy = _CUSTOM_POLICIES[op_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"no native policy for stateless expression {op_name!r}"
+            ) from exc
+        return tmpl(
+            "stackdsl::StatelessExpressionSrc",
+            Name(policy),
+            *(
+                _source_type(part, n=n, input_types=input_types)
+                for part in source.parts
+            ),
+        )
     if source.kind == "rbf":
         assert isinstance(source.op, RbfBasisOp) and len(source.parts) == 3
         return tmpl(
@@ -248,6 +312,13 @@ def _tensor_shape(shape: tuple[int, ...]) -> CppType:
     return tmpl("stackdsl::TensorShape", *(IntArg(extent) for extent in shape))
 
 
+def _double_list(values: tuple[float, ...]) -> CppType:
+    return tmpl(
+        "stackdsl::DoubleList",
+        *(UInt64Arg(double_bits(value)) for value in values),
+    )
+
+
 def _index_map(labels: tuple[str, ...], loop_labels: tuple[str, ...]) -> CppType:
     positions = {label: index for index, label in enumerate(loop_labels)}
     return tmpl(
@@ -261,6 +332,32 @@ def _tensor_source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
+    if source.kind == "expression":
+        op_name = getattr(source.op, "name", None)
+        arity = getattr(source.op, "arity", None)
+        policies = (
+            _UNARY_POLICIES
+            if arity == 1
+            else _BINARY_POLICIES
+            if arity == 2
+            else _TERNARY_POLICIES
+        )
+        try:
+            policy = policies[op_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"no native tensor expression policy for {op_name!r}"
+            ) from exc
+        return tmpl(
+            "stackdsl::TensorNaryExpressionSource",
+            _tensor_shape(source.shape),
+            _cpp_type(source.dtype),
+            Name(policy),
+            *(
+                _tensor_source_type(part, n=n, input_types=input_types)
+                for part in source.parts
+            ),
+        )
     if source.kind == "input" and len(source.shape) >= 2:
         return tmpl(
             "stackdsl::DenseTensorSource",
@@ -327,6 +424,8 @@ _BINARY_POLICIES = {
     "div": "stackdsl::DivOp",
     "mod": "stackdsl::ModOp",
     "pow": "stackdsl::PowOp",
+    "minimum": "stackdsl::MinOp",
+    "maximum": "stackdsl::MaxOp",
     "eq": "stackdsl::EqOp",
     "ne": "stackdsl::NeOp",
     "lt": "stackdsl::LtOp",
@@ -338,7 +437,29 @@ _BINARY_POLICIES = {
     "xor": "stackdsl::XorOp",
     "fillna": "stackdsl::FillNaOp",
 }
-_UNARY_POLICIES = {"floor": "stackdsl::FloorOp"}
+_UNARY_POLICIES = {
+    "abs": "stackdsl::AbsOp",
+    "ceil": "stackdsl::CeilOp",
+    "floor": "stackdsl::FloorOp",
+    "exp": "stackdsl::ExpOp",
+    "ln": "stackdsl::LogOp",
+    "round": "stackdsl::RoundOp",
+    "sign": "stackdsl::SignOp",
+    "fraction": "stackdsl::FractionOp",
+    "purify": "stackdsl::PurifyOp",
+    "arctan": "stackdsl::AtanOp",
+    "acos": "stackdsl::AcosOp",
+    "asin": "stackdsl::AsinOp",
+    "sin": "stackdsl::SinOp",
+    "cos": "stackdsl::CosOp",
+    "tan": "stackdsl::TanOp",
+    "tanh": "stackdsl::TanhOp",
+    "sqrt": "stackdsl::SqrtOp",
+    "isnan": "stackdsl::IsNanOp",
+    "isfinite": "stackdsl::IsFiniteOp",
+    "logical_not": "stackdsl::LogicalNotOp",
+    "norm_inv": "stackdsl::NormInvOp",
+}
 _TERNARY_POLICIES = {"where": "stackdsl::WhereOp"}
 _CUSTOM_POLICIES = {
     "volume_for_fit_session": "stackdsl::VolumeForFitSessionPolicy",
@@ -352,6 +473,56 @@ def _stateful_alpha(half_life: float) -> float:
     if not math.isfinite(half_life) or half_life <= 0.0:
         return 1.0
     return 1.0 - math.exp(math.log(0.5) / half_life)
+
+
+def _replace_ewm_components(
+    source: Source,
+    components: dict[int, int],
+) -> Source:
+    if source.kind == "slot" and int(source.value) in components:
+        return Source(
+            "ewm_component",
+            value=components[int(source.value)],
+            row_scalar=source.row_scalar,
+            dtype=source.dtype,
+            width=1,
+            shape=source.shape,
+            final_only=source.final_only,
+        )
+    if not source.parts:
+        return source
+    return replace(
+        source,
+        parts=tuple(
+            _replace_ewm_components(part, components)
+            for part in source.parts
+        ),
+    )
+
+
+def _ridge_projection_type(stage: Stage) -> CppType:
+    assert stage.projection is not None
+    component = stage.projection_component
+    if stage.projection in {"coefficient", "standard_error", "tstat"}:
+        assert component is not None
+        return tmpl({
+            "coefficient": "stackdsl::RidgeCoefficientProjection",
+            "standard_error": "stackdsl::RidgeStandardErrorProjection",
+            "tstat": "stackdsl::RidgeTStatProjection",
+        }[stage.projection], IntArg(component))
+    return Name({
+        "beta": "stackdsl::RidgeBetaProjection",
+        "preds": "stackdsl::RidgePredsProjection",
+        "residuals": "stackdsl::RidgeResidualsProjection",
+        "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
+        "tstats": "stackdsl::RidgeTStatsProjection",
+        "sse": "stackdsl::RidgeSseProjection",
+        "sst": "stackdsl::RidgeSstProjection",
+        "r2": "stackdsl::RidgeR2Projection",
+        "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
+        "effective_df": "stackdsl::RidgeEffectiveDfProjection",
+        "effective_n": "stackdsl::RidgeEffectiveNProjection",
+    }[stage.projection])
 
 
 def _stage_type(
@@ -373,6 +544,8 @@ def _stage_type(
             "sum": "stackdsl::SumReductionPolicy",
             "mean": "stackdsl::MeanReductionPolicy",
             "std": "stackdsl::StdReductionPolicy",
+            "min": "stackdsl::MinReductionPolicy",
+            "max": "stackdsl::MaxReductionPolicy",
         }[stage.op.kind]
         return tmpl(
             "stackdsl::ReductionNode",
@@ -383,6 +556,37 @@ def _stage_type(
             IntArg(stage.op.ddof),
             BoolArg(stage.op.ignore_na),
             BoolArg(stage.op.temporal),
+            execution,
+        )
+    if stage.kind == "reduction_bundle":
+        assert isinstance(stage.op, ReductionOp) and stage.members
+        row_axes = tuple(axis - 1 for axis in stage.op.axes if axis != 0)
+        policy = {
+            "sum": "stackdsl::SumReductionPolicy",
+            "mean": "stackdsl::MeanReductionPolicy",
+            "std": "stackdsl::StdReductionPolicy",
+            "min": "stackdsl::MinReductionPolicy",
+            "max": "stackdsl::MaxReductionPolicy",
+        }[stage.op.kind]
+        bindings = tuple(
+            tmpl(
+                "stackdsl::ReductionBinding",
+                _tensor_source_type(
+                    member.inputs[0], n=n, input_types=input_types
+                ),
+                _dest_type(member),
+            )
+            for member in stage.members
+        )
+        return tmpl(
+            "stackdsl::ReductionBundleNode",
+            tmpl("stackdsl::AxisList", *(IntArg(axis) for axis in row_axes)),
+            Name(policy),
+            IntArg(stage.op.ddof),
+            BoolArg(stage.op.ignore_na),
+            BoolArg(stage.op.temporal),
+            execution,
+            *bindings,
         )
     if stage.kind == "emit_last":
         assert isinstance(stage.op, EmitOp)
@@ -527,8 +731,287 @@ def _stage_type(
             BoolArg(stage.op.adjust),
             execution,
         )
+    if stage.kind == "ewm_bundle":
+        assert isinstance(stage.op, EwmOp) and stage.members
+        component_slots = {
+            int(member.out.slot): index
+            for index, member in enumerate(stage.members)
+            if member.out.slot is not None
+        }
+        bindings = tuple(
+            tmpl(
+                "stackdsl::EwmBinding",
+                _source_type(
+                    member.inputs[0], n=n, input_types=input_types
+                ),
+                Name("stackdsl::EwmDiscardDst")
+                if stage.epilogues
+                else _dest_type(member),
+            )
+            for member in stage.members
+        )
+        epilogue_bindings: list[CppType] = []
+        for epilogue in stage.epilogues:
+            stride = len(epilogue.inputs) if epilogue.kind == "cat" else 1
+            for offset, source in enumerate(epilogue.inputs):
+                epilogue_bindings.append(
+                    tmpl(
+                        "stackdsl::EwmEpilogueBinding",
+                        _source_type(
+                            _replace_ewm_components(source, component_slots),
+                            n=n,
+                            input_types=input_types,
+                        ),
+                        _dest_type(epilogue),
+                        IntArg(stride),
+                        IntArg(offset),
+                    )
+                )
+        return tmpl(
+            "stackdsl::EwmBundleNode",
+            stage_n,
+            UInt64Arg(double_bits(stage.op.span)),
+            IntArg(stage.op.min_periods),
+            BoolArg(stage.op.ignore_na),
+            BoolArg(stage.op.adjust),
+            execution,
+            tmpl("stackdsl::EwmBindingList", *bindings),
+            tmpl("stackdsl::EwmEpilogueList", *epilogue_bindings),
+        )
+    if stage.kind == "periods_since_change":
+        assert isinstance(stage.op, PeriodsSinceChangeOp)
+        return tmpl(
+            "stackdsl::PeriodsSinceChangeNode",
+            stage_n,
+            inputs[0],
+            out,
+            execution,
+        )
+    if stage.kind == "hump":
+        assert isinstance(stage.op, HumpOp)
+        return tmpl(
+            "stackdsl::HumpNode",
+            stage_n,
+            inputs[0],
+            out,
+            UInt64Arg(double_bits(stage.op.threshold)),
+            BoolArg(stage.op.relative),
+            BoolArg(stage.op.move_by_threshold),
+            execution,
+        )
+    if stage.kind == "trade_when":
+        assert isinstance(stage.op, TradeWhenOp)
+        return tmpl(
+            "stackdsl::TradeWhenNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            out,
+            execution,
+        )
+    if stage.kind == "linear_filter":
+        assert isinstance(stage.op, LinearFilterOp)
+        return tmpl(
+            "stackdsl::LinearFilterNode",
+            stage_n,
+            inputs[0],
+            out,
+            _double_list(stage.op.feedforward),
+            _double_list(stage.op.recursive),
+            execution,
+        )
+    if stage.kind == "rolling_product":
+        assert isinstance(stage.op, RollingProductOp)
+        return tmpl(
+            "stackdsl::RollingProductNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "rolling_kth":
+        assert isinstance(stage.op, RollingKthOp)
+        return tmpl(
+            "stackdsl::RollingKthNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            IntArg(stage.op.k),
+            BoolArg(stage.op.ignore_zero),
+            execution,
+        )
+    if stage.kind == "rolling_prev_diff":
+        assert isinstance(stage.op, RollingPrevDiffOp)
+        return tmpl(
+            "stackdsl::RollingPrevDiffNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            execution,
+        )
+    if stage.kind == "rolling_decay":
+        assert isinstance(stage.op, RollingDecayOp)
+        return tmpl(
+            "stackdsl::RollingLinearDecayNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "rolling_entropy":
+        assert isinstance(stage.op, RollingEntropyOp)
+        return tmpl(
+            "stackdsl::RollingEntropyNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            IntArg(stage.op.buckets),
+            execution,
+        )
     if stage.kind == "xs_rank":
         return tmpl("stackdsl::XsRankNode", stage_n, inputs[0], out, execution)
+    if stage.kind == "xs_pct_rank":
+        return tmpl("stackdsl::XsPctRankNode", stage_n, inputs[0], out, execution)
+    if stage.kind == "xs_aggregate":
+        assert isinstance(stage.op, XsAggregateOp)
+        policy = Name({
+            "count": "stackdsl::XsCountProjection",
+            "sum": "stackdsl::XsSumProjection",
+            "mean": "stackdsl::XsMeanProjection",
+            "std": "stackdsl::XsStdProjection",
+            "min": "stackdsl::XsMinProjection",
+            "max": "stackdsl::XsMaxProjection",
+            "quantile": "stackdsl::XsQuantileProjection",
+        }[stage.op.kind])
+        return tmpl(
+            "stackdsl::XsAggregateNode",
+            stage_n,
+            inputs[0],
+            out,
+            policy,
+            UInt64Arg(double_bits(stage.op.quantile)),
+            execution,
+        )
+    if stage.kind == "xs_weighted_mean":
+        assert isinstance(stage.op, XsWeightedMeanOp)
+        return tmpl(
+            "stackdsl::XsWeightedMeanNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            execution,
+        )
+    if stage.kind == "xs_projection":
+        assert isinstance(stage.op, XsProjectionOp)
+        return tmpl(
+            "stackdsl::XsProjectionNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            BoolArg(stage.op.intercept),
+            execution,
+        )
+    if stage.kind == "xs_generalized_rank":
+        assert isinstance(stage.op, XsGeneralizedRankOp)
+        return tmpl(
+            "stackdsl::XsGeneralizedRankNode",
+            stage_n,
+            inputs[0],
+            out,
+            UInt64Arg(double_bits(stage.op.power)),
+            execution,
+        )
+    if stage.kind == "xs_densify":
+        assert isinstance(stage.op, XsDensifyOp)
+        return tmpl(
+            "stackdsl::XsDensifyNode",
+            stage_n,
+            inputs[0],
+            out,
+            execution,
+        )
+    if stage.kind == "rolling":
+        assert isinstance(stage.op, RollingOp)
+        if stage.op.kind in {"sum", "mean", "std"}:
+            projection = Name({
+                "sum": "stackdsl::RollingSumProjection",
+                "mean": "stackdsl::RollingMeanProjection",
+                "std": "stackdsl::RollingStdProjection",
+            }[stage.op.kind])
+            return tmpl(
+                "stackdsl::RollingMomentsNode",
+                stage_n,
+                inputs[0],
+                out,
+                IntArg(stage.op.periods),
+                IntArg(stage.op.min_periods),
+                IntArg(stage.op.ddof),
+                projection,
+                execution,
+            )
+        if stage.op.kind in {"min", "max", "argmin", "argmax"}:
+            return tmpl(
+                "stackdsl::RollingExtremaNode",
+                stage_n,
+                inputs[0],
+                out,
+                IntArg(stage.op.periods),
+                IntArg(stage.op.min_periods),
+                BoolArg(stage.op.kind in {"max", "argmax"}),
+                BoolArg(stage.op.kind in {"argmin", "argmax"}),
+                execution,
+            )
+        projection = Name(
+            "stackdsl::RollingPctRankProjection"
+            if stage.op.kind == "pct_rank"
+            else "stackdsl::RollingQuantileProjection"
+        )
+        quantile = 0.5 if stage.op.kind == "median" else stage.op.quantile
+        return tmpl(
+            "stackdsl::RollingOrderNode",
+            stage_n,
+            inputs[0],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            UInt64Arg(double_bits(quantile)),
+            projection,
+            execution,
+        )
+    if stage.kind == "theilsen":
+        assert isinstance(stage.op, TheilSenOp)
+        return tmpl(
+            "stackdsl::RollingTheilSenNode",
+            stage_n,
+            inputs[0],
+            inputs[1],
+            out,
+            IntArg(stage.op.periods),
+            IntArg(stage.op.min_periods),
+            execution,
+        )
+    if stage.kind == "vector_quantile":
+        assert isinstance(stage.op, VectorQuantileOp)
+        return tmpl(
+            "stackdsl::VectorQuantileNode",
+            stage_n,
+            _tensor_source_type(stage.inputs[0], n=n, input_types=input_types),
+            out,
+            UInt64Arg(double_bits(stage.op.quantile)),
+            execution,
+        )
     if stage.kind == "instrument_basis":
         assert isinstance(stage.op, InstrumentBasisMeanOp)
         assert stage.projection in {"beta", "preds"}
@@ -551,35 +1034,46 @@ def _stage_type(
             Name(projection),
             execution,
         )
-    if stage.kind == "ridge":
-        assert isinstance(stage.op, RidgeOp)
-        assert stage.projection in {"beta", "preds"}
-        assert stage.half_life is not None and stage.ridge_lambda is not None
-        features = stage.inputs[:-2]
-        y_source, weight_source = stage.inputs[-2:]
+    if stage.kind in {"ridge", "ridge_bundle"}:
+        physical = stage.members[0] if stage.members else stage
+        assert isinstance(physical.op, RidgeOp)
+        assert physical.projection is not None
+        assert physical.half_life is not None and physical.ridge_lambda is not None
+        features = physical.inputs[:-2]
+        y_source, weight_source = physical.inputs[-2:]
         stateful = (
-            stage.op.is_stateful
-            and math.isfinite(stage.half_life)
-            and stage.half_life > 0.0
+            physical.op.is_stateful
+            and math.isfinite(physical.half_life)
+            and physical.half_life > 0.0
         )
-        projection = (
-            "stackdsl::RidgeBetaProjection"
-            if stage.projection == "beta"
-            else "stackdsl::RidgePredsProjection"
-        )
+        if stage.members:
+            projection = tmpl(
+                "stackdsl::RidgeProjectionBundle",
+                *(
+                    tmpl(
+                        "stackdsl::RidgeProjectionBinding",
+                        _dest_type(member),
+                        _ridge_projection_type(member),
+                    )
+                    for member in stage.members
+                ),
+            )
+        else:
+            projection = _ridge_projection_type(physical)
         return tmpl(
             "stackdsl::RidgeNode",
             n,
             _feature_list(features, n=n, input_types=input_types),
             _source_type(y_source, n=n, input_types=input_types),
             _source_type(weight_source, n=n, input_types=input_types),
-            out,
-            UInt64Arg(double_bits(_stateful_alpha(stage.half_life))),
-            UInt64Arg(double_bits(stage.ridge_lambda)),
-            BoolArg(stage.op.nonneg),
+            _dest_type(physical),
+            UInt64Arg(double_bits(_stateful_alpha(physical.half_life))),
+            UInt64Arg(double_bits(physical.ridge_lambda)),
+            BoolArg(physical.op.nonneg),
             BoolArg(stateful),
-            Name(projection),
+            projection,
             execution,
+            IntArg(physical.op.recompute_every),
         )
     if stage.kind == "groupby":
         raise AssertionError("groupby type is rendered separately")
@@ -693,17 +1187,30 @@ def _group_type(
     input_types: tuple[InputTypeSpec, ...],
 ) -> CppType:
     keys = _key_list(group, n=n, input_types=input_types)
-    if not keys:
+    described = tuple(zip(keys, group.key_specs))
+    epoch_keys = tuple(key for key, spec in described if spec.monotonic)
+    retained_keys = tuple(key for key, spec in described if not spec.monotonic)
+    if not retained_keys:
         resolver = tmpl("stackdsl::NoKeyResolver", IntArg(n))
     elif group.dense:
-        resolver = tmpl("stackdsl::DenseTupleGroupResolver", IntArg(n), *keys)
+        resolver = tmpl(
+            "stackdsl::DenseTupleGroupResolver", IntArg(n), *retained_keys
+        )
     else:
         resolver = tmpl(
             "stackdsl::HashGroupResolver",
             IntArg(n),
             IntArg(group.capacity),
             IntArg(group.hash_capacity),
-            *keys,
+            *retained_keys,
+        )
+    if epoch_keys:
+        resolver = tmpl(
+            "stackdsl::MonotonicGroupResolver",
+            IntArg(n),
+            resolver,
+            tmpl("stackdsl::KeyList", *epoch_keys),
+            tmpl("stackdsl::KeyList", *retained_keys),
         )
     partitions = tmpl(
         "stackdsl::StaticPartitions",
@@ -791,7 +1298,9 @@ def render_translation_unit(
                         stage, n, direct, input_types=input_types
                     ).render(),
                     final_on_data=stage.final_only,
-                    finalizer=stage.kind in {"reduce", "emit_last"}
+                    finalizer=stage.kind in {
+                        "reduce", "reduction_bundle", "emit_last"
+                    }
                     and plan.output_mode == "final",
                 )
             )

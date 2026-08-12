@@ -22,6 +22,8 @@ from trading_dsl_engine.cpp_stream.python.sources import (
     register_source_adapter,
     source,
 )
+from trading_dsl_engine.cpp_stream.python.utils import *  # noqa: F403
+from trading_dsl_engine.cpp_stream.python.utils import __all__ as _utils_all
 
 
 def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
@@ -99,4 +101,5 @@ __all__ = [
     "open_source",
     "register_source_adapter",
     "source",
+    *_utils_all,
 ]

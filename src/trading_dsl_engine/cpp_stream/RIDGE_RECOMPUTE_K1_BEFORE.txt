@@ -1,0 +1,24 @@
+rows=250,000 instruments=9 warmups=1 runs=10
+prefetch_rows=16
+---
+case=stateful_cat
+formula=get_preds(Ridge(cat(x1, x2, x3), y=y, hl=64, lambda_=0.1))
+output_row_width=9
+scratch_slots=0
+median=6.620 M rows/s
+mean=6.613 M rows/s
+best=6.631 M rows/s
+runs=6.607, 6.620, 6.624, 6.619, 6.625, 6.576, 6.594, 6.624, 6.631, 6.608 M rows/s
+checksum=-5.72303205956
+generated_cpp=/home/runner/.cache/trading_dsl_engine/cpp_stream/e903636f1b21189400112deb17e70da098334dd25cba04b9f3cd3634897dc13e/formula.cpp
+---
+case=stateless_beta
+formula=get_beta(Ridge(cat(x1, x2, x3), y=y, hl=0, lambda_=0.1))
+output_row_width=3
+scratch_slots=0
+median=9.296 M rows/s
+mean=9.287 M rows/s
+best=9.317 M rows/s
+runs=9.220, 9.247, 9.301, 9.290, 9.275, 9.307, 9.306, 9.317, 9.291, 9.316 M rows/s
+checksum=272.134686801
+generated_cpp=/home/runner/.cache/trading_dsl_engine/cpp_stream/b91446b808b45bc114349508813c50f4e529855f711eb739eed948a6d11c02bb/formula.cpp

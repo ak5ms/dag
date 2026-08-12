@@ -16,6 +16,7 @@ from trading_dsl_engine.cpp_stream.python.lowering import (
 from trading_dsl_engine.ir.einsum import build_contraction_plan
 from trading_dsl_engine.ir.ops import (
     CatOp,
+    ColumnOp,
     CumsumOp,
     CustomCallOp,
     EmitOp,
@@ -23,17 +24,35 @@ from trading_dsl_engine.ir.ops import (
     EwmOp,
     FFillOp,
     FutureRbfBasisSumOp,
+    HumpOp,
     GroupByOp,
     InputOp,
     InstrumentBasisMeanOp,
     InstrumentBasisProjectionOp,
     LiteralOp,
+    LinearFilterOp,
     NaryOp,
     RbfBasisOp,
+    PeriodsSinceChangeOp,
     ReductionOp,
     RidgeOp,
     RidgeProjectionOp,
+    RollingDecayOp,
+    RollingEntropyOp,
+    RollingKthOp,
+    RollingOp,
+    RollingPrevDiffOp,
+    RollingProductOp,
     ShiftOp,
+    TheilSenOp,
+    TradeWhenOp,
+    VectorQuantileOp,
+    XsPctRankOp,
+    XsAggregateOp,
+    XsWeightedMeanOp,
+    XsProjectionOp,
+    XsGeneralizedRankOp,
+    XsDensifyOp,
     XsRankOp,
 )
 from trading_dsl_engine.ir.program import Program
@@ -57,6 +76,17 @@ def _build_plan(
     next_slot = 0
     next_matrix_slot = 0
     max_matrix_width = 1
+    materialized_sources: dict[Source, Source] = {}
+
+    def source_slot_dependencies(source: Source) -> frozenset[tuple[str, int]]:
+        dependencies: set[tuple[str, int]] = set()
+        if source.kind == "slot":
+            dependencies.add(("scalar", int(source.value)))
+        elif source.kind in {"matrix_slot", "tensor_slot"}:
+            dependencies.add(("tensor", int(source.value)))
+        for part in source.parts:
+            dependencies.update(source_slot_dependencies(part))
+        return frozenset(dependencies)
 
     def scalar_dest(is_root: bool, shape: tuple[int, ...] = ()) -> Dest:
         nonlocal next_slot
@@ -159,6 +189,174 @@ def _build_plan(
     def scalar_width_shape(shape: tuple[int, ...]) -> bool:
         return shape == () or shape == (n_instruments,)
 
+    def materialize_source(
+        source: Source,
+        shape: tuple[int, ...],
+        *,
+        dtype: str,
+    ) -> Source:
+        """Materialize a lazy expression at a pointer ABI boundary."""
+
+        if source.kind not in {"expression", "stateless_expression"}:
+            return source
+        previous = materialized_sources.get(source)
+        if previous is not None:
+            return previous
+        scalar_width = scalar_width_shape(shape)
+        out = value_dest(False, shape)
+        stages.append(
+            Stage(
+                "copy" if scalar_width else "tensor_copy",
+                (source,),
+                out,
+                1 if shape == () else n_instruments,
+                dtype=dtype,
+                output_kind="scalar" if shape == () else "vector",
+                final_only=source.final_only,
+            )
+        )
+        materialized = source_from_dest(
+            out,
+            shape,
+            dtype=dtype,
+            final_only=source.final_only,
+        )
+        materialized_sources[source] = materialized
+        return materialized
+
+    def bundle_physical_stages(items: list[Stage]) -> list[Stage]:
+        """Bundle compatible sibling state machines without reordering stages."""
+
+        bundled: list[Stage] = []
+        cursor = 0
+        while cursor < len(items):
+            first = items[cursor]
+            bundle_kind = {
+                "ewm": "ewm_bundle",
+                "reduce": "reduction_bundle",
+                "ridge": "ridge_bundle",
+            }.get(first.kind)
+            if bundle_kind is None:
+                bundled.append(first)
+                cursor += 1
+                continue
+            members = [first]
+            produced: set[tuple[str, int]] = set()
+            if first.out.slot is not None:
+                produced.add(
+                    (
+                        "tensor"
+                        if first.out.matrix or first.out.tensor
+                        else "scalar",
+                        first.out.slot,
+                    )
+                )
+            following = cursor + 1
+            while following < len(items):
+                candidate = items[following]
+                if (
+                    candidate.kind != first.kind
+                    or candidate.op != first.op
+                    or candidate.lane_count != first.lane_count
+                    or candidate.dtype != first.dtype
+                    or candidate.final_only != first.final_only
+                    or (
+                        first.kind == "reduce"
+                        and candidate.inputs[0].shape != first.inputs[0].shape
+                    )
+                    or (
+                        first.kind == "ridge"
+                        and (
+                            candidate.inputs != first.inputs
+                            or candidate.half_life != first.half_life
+                            or candidate.ridge_lambda != first.ridge_lambda
+                        )
+                    )
+                    or any(
+                        source_slot_dependencies(source) & produced
+                        for source in candidate.inputs
+                    )
+                ):
+                    break
+                members.append(candidate)
+                if candidate.out.slot is not None:
+                    produced.add(
+                        (
+                            "tensor"
+                            if candidate.out.matrix or candidate.out.tensor
+                            else "scalar",
+                            candidate.out.slot,
+                        )
+                    )
+                following += 1
+            if len(members) == 1:
+                bundled.append(first)
+            else:
+                bundled.append(
+                    replace(
+                        first,
+                        kind=bundle_kind,
+                        inputs=tuple(
+                            source
+                            for member in members
+                            for source in member.inputs
+                        ),
+                        members=tuple(members),
+                    )
+                )
+            cursor = following
+        fused: list[Stage] = []
+        cursor = 0
+        while cursor < len(bundled):
+            stage = bundled[cursor]
+            if stage.kind != "ewm_bundle" or cursor + 1 >= len(bundled):
+                fused.append(stage)
+                cursor += 1
+                continue
+            epilogue = bundled[cursor + 1]
+            scalar_epilogue = (
+                epilogue.kind == "copy"
+                and len(epilogue.inputs) == 1
+                and epilogue.inputs[0].width == 1
+            ) or (
+                epilogue.kind == "cat"
+                and epilogue.inputs
+                and all(source.width == 1 for source in epilogue.inputs)
+            )
+            member_outputs = {
+                ("scalar", member.out.slot)
+                for member in stage.members
+                if member.out.slot is not None
+                and not member.out.matrix
+                and not member.out.tensor
+            }
+            epilogue_dependencies = frozenset().union(
+                *(
+                    source_slot_dependencies(source)
+                    for source in epilogue.inputs
+                )
+            )
+            future_dependencies = frozenset().union(
+                *(
+                    source_slot_dependencies(source)
+                    for later in bundled[cursor + 2 :]
+                    for source in later.inputs
+                )
+            )
+            if (
+                scalar_epilogue
+                and epilogue_dependencies
+                and epilogue_dependencies <= member_outputs
+                and not (member_outputs & future_dependencies)
+                and epilogue.final_only == stage.final_only
+            ):
+                fused.append(replace(stage, epilogues=(epilogue,)))
+                cursor += 2
+            else:
+                fused.append(stage)
+                cursor += 1
+        return fused
+
     for node_id, node in enumerate(program.nodes):
         op = node.op
         dtype = node_dtypes[node_id]
@@ -242,7 +440,15 @@ def _build_plan(
         if isinstance(op, CatOp):
             parts: list[Source] = []
             for child in children:
-                parts.extend(base._flatten_features(child))
+                feature = (
+                    materialize_source(
+                        child, child.shape, dtype=child.dtype
+                    )
+                    if child.kind in {"expression", "stateless_expression"}
+                    and not scalar_width_shape(child.shape)
+                    else child
+                )
+                parts.extend(base._flatten_features(feature))
             width = sum(part.width for part in parts)
             source = Source(
                 "cat",
@@ -349,7 +555,17 @@ def _build_plan(
                 )
             basis_op = object_source.op
             object_children = object_source.parts
-            feature_sources = base._flatten_features(object_children[0])
+            feature_object = object_children[0]
+            if (
+                feature_object.kind in {"expression", "stateless_expression"}
+                and not scalar_width_shape(feature_object.shape)
+            ):
+                feature_object = materialize_source(
+                    feature_object,
+                    feature_object.shape,
+                    dtype=feature_object.dtype,
+                )
+            feature_sources = base._flatten_features(feature_object)
             y_source = object_children[1]
             if basis_op.has_weights:
                 weight_source = object_children[2]
@@ -393,6 +609,13 @@ def _build_plan(
             feature_count = len(ridge_op.feature_widths)
             feature_sources: list[Source] = []
             for feature in object_children[:feature_count]:
+                if (
+                    feature.kind in {"expression", "stateless_expression"}
+                    and not scalar_width_shape(feature.shape)
+                ):
+                    feature = materialize_source(
+                        feature, feature.shape, dtype=feature.dtype
+                    )
                 feature_sources.extend(base._flatten_features(feature))
             y_source = object_children[feature_count]
             cursor = feature_count + 1
@@ -420,6 +643,7 @@ def _build_plan(
                     output_width=int(node.value_type.width),
                     op=ridge_op,
                     projection=op.field,
+                    projection_component=op.component,
                     half_life=half_life,
                     ridge_lambda=ridge_lambda,
                     final_only=final_only,
@@ -478,52 +702,69 @@ def _build_plan(
             continue
 
         if isinstance(op, NaryOp):
-            out = value_dest(is_root, node_shape)
             scalar_width = (
                 scalar_width_shape(node_shape)
                 and all(child.width == 1 for child in children)
             )
-            if scalar_width:
-                kind = (
-                    "unary"
-                    if op.arity == 1
-                    else "binary"
-                    if op.arity == 2
-                    else "ternary"
+            expression_width = 1
+            if not scalar_width:
+                expression_width = (
+                    node_shape[1]
+                    if len(node_shape) == 2 and node_shape[0] == n_instruments
+                    else shape_size(node_shape)
                 )
-            else:
-                kind = (
-                    "tensor_unary"
-                    if op.arity == 1
-                    else "tensor_binary"
-                    if op.arity == 2
-                    else "tensor_ternary"
-                )
+            expression = Source(
+                "expression",
+                row_scalar=row_scalar,
+                dtype=dtype,
+                width=expression_width,
+                shape=node_shape,
+                parts=children,
+                op=op,
+                final_only=final_only,
+            )
+            if not is_root:
+                sources[node_id] = expression
+                continue
+            out = value_dest(True, node_shape)
             stage = Stage(
-                kind,
-                children,
+                "copy" if scalar_width else "tensor_copy",
+                (expression,),
                 out,
                 lane_count,
                 dtype=dtype,
-                op_name=op.name,
                 output_kind=node.value_type.kind,
                 output_width=int(node.value_type.width),
+                final_only=final_only,
             )
         elif isinstance(op, CustomCallOp):
             if any(child.width != 1 for child in children):
                 raise CppStreamLoweringError(
                     "named stateless calls currently require scalar-width inputs"
                 )
-            out = scalar_dest(is_root, node_shape)
+            expression = Source(
+                "stateless_expression",
+                row_scalar=row_scalar,
+                dtype=dtype,
+                width=1,
+                shape=node_shape,
+                parts=children,
+                op=op,
+                final_only=final_only,
+            )
+            if not is_root:
+                sources[node_id] = expression
+                continue
+            out = scalar_dest(True, node_shape)
             stage = Stage(
-                "custom",
-                children,
+                "copy",
+                (expression,),
                 out,
                 lane_count,
-                op_name=op.name,
-                op=op,
+                dtype=dtype,
                 output_kind=node.value_type.kind,
                 output_width=int(node.value_type.width),
+                final_only=final_only,
             )
         elif isinstance(op, CumsumOp):
             out = value_dest(is_root, node_shape)
@@ -561,6 +802,100 @@ def _build_plan(
                 lane_count,
                 op=op,
             )
+        elif isinstance(
+            op,
+            (
+                PeriodsSinceChangeOp,
+                HumpOp,
+                TradeWhenOp,
+                LinearFilterOp,
+                RollingProductOp,
+                RollingKthOp,
+                RollingPrevDiffOp,
+                RollingDecayOp,
+                RollingEntropyOp,
+            ),
+        ):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    f"{type(op).__name__} currently requires scalar/vector inputs"
+                )
+            stage_kind = {
+                PeriodsSinceChangeOp: "periods_since_change",
+                HumpOp: "hump",
+                TradeWhenOp: "trade_when",
+                LinearFilterOp: "linear_filter",
+                RollingProductOp: "rolling_product",
+                RollingKthOp: "rolling_kth",
+                RollingPrevDiffOp: "rolling_prev_diff",
+                RollingDecayOp: "rolling_decay",
+                RollingEntropyOp: "rolling_entropy",
+            }[type(op)]
+            out = value_dest(is_root, node_shape)
+            stage = Stage(stage_kind, children, out, lane_count, op=op)
+        elif isinstance(op, RollingOp):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    f"rolling_{op.kind} currently requires a scalar/vector input"
+                )
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "rolling",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
+        elif isinstance(op, VectorQuantileOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "vector_quantile",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
+        elif isinstance(op, ColumnOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage("tensor_column", children, out, lane_count, op=op)
+        elif isinstance(op, XsAggregateOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_aggregate", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsWeightedMeanOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_weighted_mean", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsProjectionOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_projection", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsGeneralizedRankOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_generalized_rank", children, out, lane_count, op=op
+            )
+        elif isinstance(op, XsDensifyOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "xs_densify", children, out, lane_count, op=op
+            )
+        elif isinstance(op, TheilSenOp):
+            if not scalar_width_shape(node_shape):
+                raise CppStreamLoweringError(
+                    "rolling_theilsen currently requires scalar/vector inputs"
+                )
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "theilsen",
+                children,
+                out,
+                lane_count,
+                op=op,
+            )
         elif isinstance(op, XsRankOp):
             if node_shape != (n_instruments,):
                 raise CppStreamLoweringError(
@@ -568,12 +903,27 @@ def _build_plan(
                 )
             out = scalar_dest(is_root, node_shape)
             stage = Stage("xs_rank", children, out, lane_count, op=op)
+        elif isinstance(op, XsPctRankOp):
+            if node_shape != (n_instruments,):
+                raise CppStreamLoweringError(
+                    "xs_pct_rank requires an instrument vector"
+                )
+            out = scalar_dest(is_root, node_shape)
+            stage = Stage("xs_pct_rank", children, out, lane_count, op=op)
         elif isinstance(op, GroupByOp):
             if grouped:
                 raise CppStreamLoweringError("nested groupby is not supported")
             key_count = op.n_dynamic_keys
-            key_sources = children[:key_count]
-            feed_sources = children[key_count:]
+            materialized_children = tuple(
+                materialize_source(
+                    source,
+                    source.shape,
+                    dtype=source.dtype,
+                )
+                for source in children
+            )
+            key_sources = materialized_children[:key_count]
+            feed_sources = materialized_children[key_count:]
             if any(
                 source.width != 1 for source in key_sources + feed_sources
             ):
@@ -583,11 +933,19 @@ def _build_plan(
             specs = base._resolved_key_specs(
                 program, node.child_ids, op, key_cardinalities
             )
-            dense = bool(specs) and all(
-                spec.num_keys is not None for spec in specs
+            monotonic_specs = tuple(spec for spec in specs if spec.monotonic)
+            if any(spec.row_scalar is not True for spec in monotonic_specs):
+                raise CppStreamLoweringError(
+                    "monotonic group keys require row_scalar=True"
+                )
+            retained_specs = tuple(spec for spec in specs if not spec.monotonic)
+            dense = bool(retained_specs) and all(
+                spec.num_keys is not None for spec in retained_specs
             )
             capacity = (
-                base._dense_capacity(specs)
+                1
+                if not retained_specs
+                else base._dense_capacity(retained_specs)
                 if dense
                 else (op.capacity or default_group_capacity)
             )
@@ -615,7 +973,7 @@ def _build_plan(
             out = scalar_dest(is_root, node_shape)
             stage = Stage(
                 "groupby",
-                children,
+                materialized_children,
                 out,
                 n_instruments,
                 output_kind=node.value_type.kind,
@@ -657,7 +1015,7 @@ def _build_plan(
         )
 
     return Plan(
-        tuple(stages),
+        tuple(bundle_physical_stages(stages)),
         next_slot,
         next_matrix_slot,
         max_matrix_width,
