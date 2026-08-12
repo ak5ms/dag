@@ -39,6 +39,7 @@ from flows.riskminer import (
 )
 from flows.riskminer.diagnostics import ConsoleProgress, Heartbeat
 from flows.riskminer.semantics import DEFAULT_TYPE_GRAPH, NON_VALUE_TYPES
+from flows.riskminer.tracking import MLflowTrackerConfig, RiskMinerExperimentTracker
 from flows.utils import replace as dsl_replace, streak
 from trading_dsl_engine.base.dsl import ewm, ffill, isnan, var, where
 from trading_dsl_engine.cpp_stream import compile_formula
@@ -82,6 +83,12 @@ MAX_DEPTH = int(os.environ.get("RISKMINER_MAX_DEPTH", "8"))
 # RiskMiner paper also caps episodes at 30. Increase only if valid formulas are
 # frequently hitting the token ceiling; larger values make rollouts much harder.
 MAX_TOKENS = int(os.environ.get("RISKMINER_MAX_TOKENS", "30"))
+
+# Maximum number of unresolved RPN stack values. Higher values allow broader
+# expressions to be assembled before reducing them with operators, but also make
+# dead-end rollouts easier. This was previously fixed at 8; it is exposed so
+# Optuna can sweep it if you choose to extend the default sweep space.
+MAX_STACK = int(os.environ.get("RISKMINER_MAX_STACK", "8"))
 
 # Number of complete MCTS -> replay -> neural-policy-update cycles run at EACH
 # exact depth. A new MCTS tree and replay buffer are created every iteration, as
@@ -190,6 +197,17 @@ QUANTILE_LEARNING_RATE = float(
 # actions more aggressively; smaller values exploit actions with high observed Q.
 EXPLORATION = float(os.environ.get("RISKMINER_EXPLORATION", "1.25"))
 
+# Progressive widening controls how many legal children a tree node exposes as
+# the node receives visits: roughly K * visits ** ALPHA. Larger K/ALPHA open the
+# very large 132-token action space faster; smaller values force MCTS to spend
+# more evidence on the currently exposed high-prior actions before widening.
+PROGRESSIVE_WIDENING_K = float(
+    os.environ.get("RISKMINER_PROGRESSIVE_WIDENING_K", "4.0")
+)
+PROGRESSIVE_WIDENING_ALPHA = float(
+    os.environ.get("RISKMINER_PROGRESSIVE_WIDENING_ALPHA", "0.5")
+)
+
 # Probability that a stochastic rollout chooses END when END is legal. Higher
 # values prefer shorter formulas; lower values keep extending them. In THIS
 # exact-depth staged runner its effect is limited because END is illegal below
@@ -203,6 +221,15 @@ ROLLOUT_END_PROBABILITY = float(
 # long-term experience store. If simulations*rollouts exceed the capacity, the
 # oldest trajectories from that iteration are dropped and the newest are kept.
 REPLAY_CAPACITY = int(os.environ.get("RISKMINER_REPLAY_CAPACITY", "256"))
+
+# Reward assigned to a rollout that cannot produce a valid END-terminated formula.
+# More negative values teach the policy/tree to avoid dead ends more aggressively.
+INVALID_REWARD = float(os.environ.get("RISKMINER_INVALID_REWARD", "-5.0"))
+
+# Discount applied while backing immediate rewards up a trajectory. 1.0 gives all
+# later rewards their full weight (the current/paper-style default); values below
+# one increasingly emphasize rewards closer to the selected edge.
+DISCOUNT = float(os.environ.get("RISKMINER_DISCOUNT", "1.0"))
 
 # How a time-varying Ridge beta series is reduced to one importance number when
 # the pool is full and one alpha must be evicted:
@@ -236,6 +263,14 @@ OUTPUT_DIR = Path(
     os.environ.get("RISKMINER_OUTPUT_DIR", "/tmp/riskminer-inputdata")
 )
 
+# Optional separate directory for roll_rets/vol materialization. Hyperparameter
+# sweeps can point every sequential trial at one shared directory because these
+# arrays depend on the input data, not on MCTS hyperparameters. Do not share it
+# across concurrently starting trials unless the files have already been built.
+DERIVED_DIR = Path(
+    os.environ.get("RISKMINER_DERIVED_DIR", str(OUTPUT_DIR / "derived"))
+)
+
 # Reuse already-materialized roll_rets.npy and vol.npy when their shape/dtype
 # match the requested run. WARNING: the current reuse check does NOT fingerprint
 # the underlying InputData contents. Leave this off after changing input files if
@@ -259,10 +294,32 @@ LOG_LEVEL = os.environ.get("RISKMINER_LOG_LEVEL", "trace").strip().lower()
 if LOG_LEVEL not in {"summary", "detail", "trace"}:
     raise ValueError("RISKMINER_LOG_LEVEL must be summary, detail, or trace")
 
-# Important RiskMinerConfig knobs that are intentionally fixed in this script
-# rather than exposed as environment variables: max_stack=8, invalid_reward=-5,
-# discount=1.0. Progressive widening uses RiskMinerConfig defaults k=4.0 and
-# alpha=0.5. Change those in base_config/config.py if experimenting with them.
+# MLflow experiment tracking is ON by default. It logs low-frequency scalar
+# progress (pool score, rewards, candidate score summaries, policy loss), replay
+# tables, policy checkpoints, final reports, and optional CPU/memory metrics. The
+# complete high-cardinality MCTS event stream is always written to JSONL under
+# OUTPUT_DIR/trace and uploaded as an MLflow artifact at the end.
+#
+# RISKMINER_MLFLOW_ENABLED=1|0
+#   Master switch. Disable for minimum tracking overhead. JSONL trace is still kept.
+# RISKMINER_MLFLOW_TRACKING_URI
+#   Default: sqlite:///<OUTPUT_DIR>/mlflow.db. For truly live browser monitoring,
+#   start `mlflow server` and set this to http://127.0.0.1:5000.
+# RISKMINER_MLFLOW_EXPERIMENT
+#   MLflow experiment/group name. Default: riskminer.
+# RISKMINER_MLFLOW_RUN_NAME
+#   Optional human-readable run name. MLflow generates one when omitted.
+# RISKMINER_MLFLOW_PARENT_RUN_ID
+#   Optional parent run. sweep_riskminer.py sets this so every Optuna trial appears
+#   as a child beneath one sweep run in MLflow.
+# RISKMINER_MLFLOW_SYSTEM_METRICS=1|0
+#   Log CPU, process/system memory, disk and network metrics. Recommended while
+#   diagnosing compilation/JAX memory behavior.
+# RISKMINER_MLFLOW_SYSTEM_METRICS_INTERVAL
+#   Sampling interval in seconds for MLflow system metrics. Default: 5.
+# RISKMINER_MLFLOW_TAGS_JSON
+#   Optional JSON object of searchable tags, e.g. '{"dataset":"aks_out3"}'.
+MLFLOW_CONFIG = MLflowTrackerConfig.from_env(OUTPUT_DIR)
 LOG_LEVEL_RANK = {"summary": 0, "detail": 1, "trace": 2}
 TRACE_EVENTS = {
     "mcts_node_choice",
@@ -420,15 +477,66 @@ def _pool_tree(pool: RidgeAlphaPool) -> str:
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     progress = ConsoleProgress(prefix="riskminer-inputdata")
+    tracker = RiskMinerExperimentTracker(MLFLOW_CONFIG, OUTPUT_DIR)
+    tracker.start(
+        params={
+            "rows_requested": ROWS,
+            "max_depth": MAX_DEPTH,
+            "max_tokens": MAX_TOKENS,
+            "max_stack": MAX_STACK,
+            "progressive_widening_k": PROGRESSIVE_WIDENING_K,
+            "progressive_widening_alpha": PROGRESSIVE_WIDENING_ALPHA,
+            "invalid_reward": INVALID_REWARD,
+            "discount": DISCOUNT,
+            "max_stack": MAX_STACK,
+            "iterations_per_depth": ITERATIONS_PER_DEPTH,
+            "simulations": SIMULATIONS,
+            "rollouts": ROLLOUTS,
+            "evaluation_batch": EVALUATION_BATCH,
+            "archive_size": ARCHIVE_SIZE,
+            "pool_capacity": POOL_CAPACITY,
+            "pool_min_improvement": POOL_MIN_IMPROVEMENT,
+            "pool_importance": POOL_IMPORTANCE,
+            "ridge_recompute_every": RIDGE_RECOMPUTE_EVERY,
+            "train_fraction": TRAIN_FRACTION,
+            "validation_fraction": VALIDATION_FRACTION,
+            "policy_epochs": POLICY_EPOCHS,
+            "policy_batch_size": POLICY_BATCH_SIZE,
+            "policy_learning_rate": POLICY_LEARNING_RATE,
+            "quantile_cdf": QUANTILE_CDF,
+            "quantile_learning_rate": QUANTILE_LEARNING_RATE,
+            "exploration": EXPLORATION,
+            "progressive_widening_k": PROGRESSIVE_WIDENING_K,
+            "progressive_widening_alpha": PROGRESSIVE_WIDENING_ALPHA,
+            "rollout_end_probability": ROLLOUT_END_PROBABILITY,
+            "replay_capacity": REPLAY_CAPACITY,
+            "invalid_reward": INVALID_REWARD,
+            "discount": DISCOUNT,
+            "threads": THREADS,
+            "seed": SEED,
+            "input_glob": INPUT_GLOB,
+        },
+        tags={"riskminer.log_level": LOG_LEVEL},
+    )
+    progress.emit(
+        "mlflow_run_started",
+        enabled=MLFLOW_CONFIG.enabled,
+        run_id=tracker.run_id,
+        tracking_uri=MLFLOW_CONFIG.tracking_uri,
+        experiment=MLFLOW_CONFIG.experiment_name,
+        trace_path=str(tracker.trace_path) if tracker.trace_path else None,
+    )
 
     def event(event_name: str, payload) -> None:
+        payload = dict(payload)
+        tracker.emit(event_name, payload)
         required = (
             2 if event_name in TRACE_EVENTS
             else 1 if event_name in DETAIL_EVENTS
             else 0
         )
         if LOG_LEVEL_RANK[LOG_LEVEL] >= required:
-            progress.emit(event_name, **dict(payload))
+            progress.emit(event_name, **payload)
 
     progress.emit(
         "start",
@@ -478,7 +586,7 @@ def main() -> None:
         semantic_families=_semantic_summary(terminals),
     )
 
-    derived_dir = OUTPUT_DIR / "derived"
+    derived_dir = DERIVED_DIR
     roll_rets_path = _materialize(
         "roll_rets",
         RollRets().roll_rets(),
@@ -525,14 +633,17 @@ def main() -> None:
         max_depth=MAX_DEPTH,
         min_formula_depth=1,
         max_tokens=MAX_TOKENS,
-        max_stack=8,
+        max_stack=MAX_STACK,
         simulations=SIMULATIONS,
         rollouts_per_expansion=ROLLOUTS,
         evaluation_batch_size=EVALUATION_BATCH,
         archive_size=ARCHIVE_SIZE,
         exploration=EXPLORATION,
+        progressive_widening_k=PROGRESSIVE_WIDENING_K,
+        progressive_widening_alpha=PROGRESSIVE_WIDENING_ALPHA,
         rollout_end_probability=ROLLOUT_END_PROBABILITY,
-        invalid_reward=-5.0,
+        invalid_reward=INVALID_REWARD,
+        discount=DISCOUNT,
         replay_capacity=REPLAY_CAPACITY,
         policy_train_epochs=POLICY_EPOCHS,
         policy_batch_size=POLICY_BATCH_SIZE,
@@ -582,7 +693,7 @@ def main() -> None:
             token.prior for token in vocabulary
         ),
         output_dir=OUTPUT_DIR / "policy",
-        on_event=lambda name, payload: progress.emit(name, **payload),
+        on_event=event,
     )
 
     reports = []
@@ -629,18 +740,21 @@ def main() -> None:
                     iteration=iteration,
                 )
             reports.append(report)
-            progress.emit(
+            event(
                 "depth_iteration_done",
-                depth=depth,
-                depth_iteration=depth_iteration,
-                trajectories=report.search.metrics.trajectories,
-                pool_updates=report.search.metrics.pool_updates,
-                pool_size=len(pool.entries),
-                pool_score=(pool.score if math.isfinite(pool.score) else None),
-                quantile=trainer.quantile.value,
-                best_archive_score=(
-                    report.search.archive[0].score if report.search.archive else None
-                ),
+                {
+                    "depth": depth,
+                    "depth_iteration": depth_iteration,
+                    "global_iteration": iteration,
+                    "trajectories": report.search.metrics.trajectories,
+                    "pool_updates": report.search.metrics.pool_updates,
+                    "pool_size": len(pool.entries),
+                    "pool_score": (pool.score if math.isfinite(pool.score) else None),
+                    "quantile": trainer.quantile.value,
+                    "best_archive_score": (
+                        report.search.archive[0].score if report.search.archive else None
+                    ),
+                },
             )
             print(_pool_tree(pool), flush=True)
 
@@ -673,6 +787,9 @@ def main() -> None:
 
     result = {
         "backend": "trading_dsl_engine.cpp_stream",
+        "mlflow_run_id": tracker.run_id,
+        "mlflow_tracking_uri": MLFLOW_CONFIG.tracking_uri if MLFLOW_CONFIG.enabled else None,
+        "trace_path": str(tracker.trace_path) if tracker.trace_path else None,
         "input_glob": INPUT_GLOB,
         "rows": rows,
         "instruments": instruments,
@@ -731,14 +848,17 @@ def main() -> None:
     }
     report_path = OUTPUT_DIR / "riskminer_inputdata_report.json"
     report_path.write_text(json.dumps(result, indent=2, sort_keys=True))
-    progress.emit(
+    event(
         "done",
-        report=str(report_path),
-        pool_size=len(pool.entries),
-        validation_score=result["pool_score_validation"],
-        test_score=result["pool_score_test"],
-        search_seconds=result["search_seconds"],
+        {
+            "report": str(report_path),
+            "pool_size": len(pool.entries),
+            "validation_score": result["pool_score_validation"],
+            "test_score": result["pool_score_test"],
+            "search_seconds": result["search_seconds"],
+        },
     )
+    tracker.finalize(report_path)
     print("=== FINAL ROOT-LEVEL RIDGE POOL ===", flush=True)
     print(_pool_tree(pool), flush=True)
 
