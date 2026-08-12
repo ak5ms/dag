@@ -347,7 +347,7 @@ def _materialize(
         return path
     progress.emit("derived_compile_start", name=name)
     started = time.perf_counter()
-    runtime = compile_formula(formula, sources, n_instruments=instruments)
+    runtime = compile_formula(formula, sources, n_instruments=instruments, default_group_capacity=365*15)
     progress.emit(
         "derived_compile_done",
         name=name,
