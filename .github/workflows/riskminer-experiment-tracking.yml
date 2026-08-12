@@ -1,0 +1,98 @@
+name: RiskMiner experiment tracking validation
+on:
+  push:
+    branches:
+      - agent/riskminer-cpp-stream-v1
+    paths:
+      - .github/workflows/riskminer-experiment-tracking.yml
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/riskminer-cpp-stream-v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply tracking and sweep integration
+        run: python scripts/.riskminer_experiment_tracking_patch.py
+      - name: Install project with experiment dependencies
+        run: pip install -e .
+      - name: Syntax and focused RiskMiner tests
+        run: |
+          python -m py_compile src/flows/riskminer/tracking.py scripts/run_riskminer_inputdata.py scripts/sweep_riskminer.py
+          PYTHONPATH=src python -m pytest -q -o addopts='' tests/flows/riskminer/test_core.py tests/flows/riskminer/test_policy.py tests/flows/riskminer/test_paper_pipeline.py
+      - name: MLflow tracker smoke
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          import json
+          from pathlib import Path
+          import mlflow
+          from flows.riskminer.tracking import MLflowTrackerConfig, RiskMinerExperimentTracker
+
+          root = Path('/tmp/riskminer-mlflow-smoke')
+          uri = f"sqlite:///{root / 'mlflow.db'}"
+          tracker = RiskMinerExperimentTracker(
+              MLflowTrackerConfig(
+                  enabled=True,
+                  tracking_uri=uri,
+                  experiment_name='riskminer-smoke',
+                  run_name='smoke',
+                  log_system_metrics=True,
+                  system_metrics_interval=1,
+              ),
+              root,
+          )
+          run_id = tracker.start(params={'simulations': 8, 'exploration': 1.25})
+          tracker.emit('mcts_simulation_done', {
+              'tree_nodes': 7, 'archive_size': 3, 'invalid_rollouts': 1, 'pool_updates': 1,
+          })
+          tracker.emit('mcts_candidates_scored', {
+              'candidates': [
+                  {'rpn': 'x xs_rank', 'score': 0.2},
+                  {'rpn': 'y xs_rank', 'score': -0.1},
+              ]
+          })
+          tracker.emit('replay_snapshot', {
+              'iteration': 1,
+              'trajectories': [{
+                  'index': 0, 'reward': 0.2, 'terminal_rpn': 'x xs_rank',
+                  'pool_changed': True, 'actions': ['x', 'xs_rank', 'END'],
+                  'step_rewards': [0.0, 0.1, 0.2],
+              }],
+          })
+          report = root / 'report.json'
+          report.write_text(json.dumps({'ok': True}))
+          trace = tracker.trace_path
+          tracker.finalize(report)
+          assert trace and trace.is_file() and trace.stat().st_size > 0
+          client = mlflow.MlflowClient(tracking_uri=uri)
+          run = client.get_run(run_id)
+          assert run.data.metrics['mcts/tree_nodes'] == 7.0
+          assert run.data.metrics['candidate/max_score'] == 0.2
+          assert run.data.params['simulations'] == '8'
+          print({'mlflow_run_id': run_id, 'trace': str(trace)})
+          PY
+      - name: Optuna plus MLflow dry sweep smoke
+        env:
+          RISKMINER_SWEEP_DIR: /tmp/riskminer-sweep-smoke
+          RISKMINER_SWEEP_STUDY: smoke-study
+          RISKMINER_SWEEP_TRIALS: '3'
+          RISKMINER_SWEEP_JOBS: '1'
+          RISKMINER_SWEEP_DRY_RUN: '1'
+          RISKMINER_MLFLOW_SYSTEM_METRICS: '0'
+        run: |
+          PYTHONPATH=src python scripts/sweep_riskminer.py
+          test -s /tmp/riskminer-sweep-smoke/smoke-study.journal
+          test -s /tmp/riskminer-sweep-smoke/mlflow.db
+          optuna-dashboard --help >/dev/null
+      - name: Commit implementation
+        run: |
+          git config user.name openai-agent
+          git config user.email openai-agent@users.noreply.github.com
+          git add pyproject.toml src/flows/riskminer/tracking.py scripts/run_riskminer_inputdata.py scripts/sweep_riskminer.py docs/riskminer_experiment_tracking.md
+          git commit -m 'Add MLflow tracking and Optuna sweeps to RiskMiner'
+          git push origin HEAD:agent/riskminer-cpp-stream-v1
