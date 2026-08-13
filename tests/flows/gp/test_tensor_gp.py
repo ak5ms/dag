@@ -29,15 +29,17 @@ def test_default_books_are_composed_matrix_terminals():
     pset = make_pset(config)
     assert pset.gp_tensor_ranks == (2,)
     assert set(pset.gp_tensor_field_terminals) == {"book_price", "book_volume"}
-    price = pset.mapping[pset.gp_tensor_field_terminals["book_price"]]
-    volume = pset.mapping[pset.gp_tensor_field_terminals["book_volume"]]
-    assert price.ret is BookPriceMatrix
-    assert volume.ret is BookVolumeMatrix
+    price_terminal = pset.mapping[pset.gp_tensor_field_terminals["book_price"]]
+    volume_terminal = pset.mapping[pset.gp_tensor_field_terminals["book_volume"]]
+    assert price_terminal.ret is BookPriceMatrix
+    assert volume_terminal.ret is BookVolumeMatrix
     assert gp_input_types(config, 9) == {}
-    assert price.value.expr.fn == "cat"
-    assert volume.value.expr.fn == "cat"
-    assert len(price.value.expr.args) == 20
-    assert len(volume.value.expr.args) == 20
+    price = pset.context[price_terminal.value]
+    volume = pset.context[volume_terminal.value]
+    assert price.expr.fn == "cat"
+    assert volume.expr.fn == "cat"
+    assert len(price.expr.args) == 20
+    assert len(volume.expr.args) == 20
 
 
 def test_vec_reductions_turn_book_matrices_into_rows():
