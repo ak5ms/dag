@@ -32,3 +32,10 @@ A direct reference loop can know the exact output and semantic options. The
 compositional runtime may preserve arbitrary missing-value behavior,
 intermediate consumers, generic destinations, shapes, and dtypes. These are
 real instructions unless compile-time analysis proves that they are unnecessary.
+
+## Preferred optimization model
+
+Do not add a handwritten node for every slow formula. Derive simpler physical
+policies from proven graph properties so equivalent GP expressions receive the
+same optimization. The most important proofs are shared validity masks, dead
+intermediate outputs, direct epilogue consumption, and compact state storage.
