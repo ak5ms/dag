@@ -25,3 +25,10 @@ C++20 `requires`, `if constexpr`, index sequences, and fold expressions are
 sufficient. C++26 reflection could enumerate fields, but cannot infer whether a
 field must be summed, Welford-combined, overwritten in row order, or copied by
 lane. The semantic merge law must remain explicit somewhere.
+
+## Why a generic kernel has overhead
+
+A direct reference loop can know the exact output and semantic options. The
+compositional runtime may preserve arbitrary missing-value behavior,
+intermediate consumers, generic destinations, shapes, and dtypes. These are
+real instructions unless compile-time analysis proves that they are unnecessary.
