@@ -1,0 +1,31 @@
+name: Apply tensor shape fix
+on:
+  push:
+    branches: [agent/strongly-typed-gp-tensor-work]
+    paths: [.github/workflows/gp-fix-tensor-shapes.yml]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/flows/gp/factory.py')
+          s=p.read_text()
+          old='''        shapes: dict[int, tuple[int, ...]] = {}\n        for field in fields:\n            previous = shapes.setdefault(field.logical_rank, field.feature_shape)\n            if previous != field.feature_shape:\n                raise ValueError("tensor fields with the same rank must share feature_shape")\n'''
+          new='''        shapes: dict[int, tuple[int, ...]] = {}\n        for field in fields:\n            for rank in range(2, field.logical_rank + 1):\n                feature_shape = field.feature_shape[: rank - 1]\n                previous = shapes.setdefault(rank, feature_shape)\n                if previous != feature_shape:\n                    raise ValueError(\n                        f"incompatible shapes at logical rank {rank}: "\n                        f"{previous} versus {feature_shape}"\n                    )\n'''
+          assert old in s
+          s=s.replace(old,new,1)
+          old='''    pset.gp_tensor_ranks = ranks\n    pset.gp_cpp_stream_utility_families = ALL_CPP_STREAM_UTIL_NAMES if ranks else ROW_SHAPED_CPP_STREAM_UTIL_NAMES\n'''
+          new='''    pset.gp_tensor_ranks = ranks\n    pset.gp_tensor_feature_shapes = {\n        rank: next(field.feature_shape[: rank - 1] for field in config.tensor_fields if field.logical_rank >= rank)\n        for rank in ranks\n    }\n    pset.gp_cpp_stream_utility_families = ALL_CPP_STREAM_UTIL_NAMES if ranks else ROW_SHAPED_CPP_STREAM_UTIL_NAMES\n'''
+          assert old in s
+          p.write_text(s.replace(old,new,1))
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/flows/gp/factory.py
+          git commit -m 'Validate tensor reduction prefix shapes'
+          git push
