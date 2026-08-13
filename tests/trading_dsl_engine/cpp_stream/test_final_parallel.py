@@ -124,7 +124,9 @@ def test_stateful_cross_sectional_candidate_sharpe_stays_serial(tmp_path: Path) 
     assert runtime.parallel_plan.mode == "serial"
     assert result.threads == 1
     assert "(shift)" in runtime.parallel_plan.reason
-    assert "row reduction removes the instrument axis" in runtime.parallel_plan.reason
+    # The row sum has already collapsed the instrument axis, so no lane-owned
+    # terminal state remains for the final mean/std pair to merge.
+    assert "no terminal state can be merged by instrument lane" in runtime.parallel_plan.reason
     shifted = np.empty_like(alpha)
     shifted[0] = np.nan
     shifted[1:] = alpha[:-1]
