@@ -51,7 +51,7 @@ def _roll_data(rows: int, n: int) -> dict[str, np.ndarray]:
     }
 
 
-def test_default_execution_is_serial_when_plan_supports_multicore(
+def test_default_automatic_execution_avoids_threads_for_tiny_workloads(
     tmp_path: Path,
 ) -> None:
     rows, n = 128, 8
@@ -59,25 +59,22 @@ def test_default_execution_is_serial_when_plan_supports_multicore(
     runtime = compile_formula("x + 1.0", {"x": x}, n_instruments=n)
     assert runtime.parallel_plan.mode == "rows"
     assert runtime.parallel_plan.auto_multicore
-
-    result = runtime.run(out_path=tmp_path / "default_serial.bin")
-
+    result = runtime.run(out_path=tmp_path / "default_auto.bin")
     assert result.threads == 1
 
 
-def test_automatic_mode_keeps_low_work_ewm_single_threaded(tmp_path: Path) -> None:
+def test_automatic_mode_uses_row_count_for_low_work_ewm(tmp_path: Path) -> None:
     rows, n = 4096, 32
     x = np.arange(rows * n, dtype=np.float64).reshape(rows, n)
     runtime = compile_formula(ewm(var("x"), 21), {"x": x}, n_instruments=n)
     assert runtime.parallel_plan.mode == "lanes"
-    assert not runtime.parallel_plan.auto_multicore
-    assert runtime.parallel_plan.work_score < 16
-    result = runtime.run(out_path=tmp_path / "ewm_auto.bin", threads=0)
+    assert runtime.parallel_plan.auto_multicore
+    result = runtime.run(out_path=tmp_path / "ewm_auto.bin")
     assert result.threads == 1
 
 
 @pytest.mark.skipif(_available_cpus() < 2, reason="requires at least two available CPUs")
-def test_opt_in_automatic_mode_parallelizes_roll_rets(tmp_path: Path) -> None:
+def test_default_automatic_mode_parallelizes_roll_rets(tmp_path: Path) -> None:
     rows, n = 2048, 9
     data = _roll_data(rows, n)
     runtime = compile_formula(
@@ -88,10 +85,5 @@ def test_opt_in_automatic_mode_parallelizes_roll_rets(tmp_path: Path) -> None:
     )
     assert runtime.parallel_plan.mode == "lanes"
     assert runtime.parallel_plan.auto_multicore
-    assert runtime.parallel_plan.work_score >= 16
-    result = runtime.run(
-        out_path=tmp_path / "roll_auto.bin",
-        threads=0,
-        pin_threads=True,
-    )
+    result = runtime.run(out_path=tmp_path / "roll_auto.bin", pin_threads=True)
     assert result.threads >= 2
