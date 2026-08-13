@@ -29,7 +29,7 @@ A row reduction after temporal work can remain lane-sharded only when it retains
 
 ### Terminal reductions
 
-A temporal reduction, meaning its axes include logical axis `0`, emits one fixed-size final result. `emit("last")` has the same final-output behavior. These plans currently use one accumulator owner even when more threads are requested. This preserves deterministic streaming semantics and avoids a formula-specific merge implementation. A future generic merge layer can parallelize these without changing the expression API.
+Final-output plans may also use row or lane workers when the planner proves that their private results have a valid combination rule. The combination is implemented in ordinary compile-time C++, followed by one final write.
 
 ### Serial fallback
 
@@ -45,8 +45,8 @@ Cat does not create a nested task pool. A root Cat is row-sharded at the whole-p
 - Row workers process disjoint row ranges.
 - Lane workers process disjoint lane ranges in original time order.
 - Lane-aware reductions read and write only their owned lanes.
-- Terminal reductions and final emission have one owner.
+- Final output is written once after worker results are combined.
 - Cross-sectional temporal graphs are not lane-sharded.
 - Benchmarks validate checksums, NaN placement, finite output fractions, actual thread counts, and output byte counts.
 
-See `REDUCTIONS_PARALLEL_BENCHMARK.md` for the reduction, Cat, Ridge, einsum, and `roll_rets` measurements from the final validation run.
+See `CEILING_ARCHITECTURE.md` for the generated-code boundary and the plan for closing remaining reference-ceiling gaps.
