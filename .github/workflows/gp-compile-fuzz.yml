@@ -40,6 +40,13 @@ jobs:
           cache: pip
       - name: Install project
         run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Package local GP test dependencies
+        run: mkdir -p /tmp/gp-wheels && python -m pip download --no-deps --dest /tmp/gp-wheels deap includeigen
+      - name: Upload local GP test dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: gp-wheels
+          path: /tmp/gp-wheels
       - name: Dump exact GP signatures
         run: python -m flows.gp.signatures | tee /tmp/gp-signatures.txt
       - name: Run focused GP grammar tests
