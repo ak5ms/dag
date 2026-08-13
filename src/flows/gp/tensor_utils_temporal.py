@@ -3,8 +3,8 @@ from __future__ import annotations
 from functools import partial
 
 from flows.gp.tensor_types import tensor_type, tensor_types_for_rank
-from flows.gp.types import PositiveFloat, PositiveInt
-from flows.gp.utils_primitives import _call, _ewm_vector, _ts_returns
+from flows.gp.types import ExprValue, PositiveFloat, PositiveInt
+from flows.gp.utils_primitives import _call, _ewm_vector
 from trading_dsl_engine.cpp_stream.python import utils as cpp_utils
 
 TENSOR_TEMPORAL_UTILS = frozenset({
@@ -16,6 +16,10 @@ TENSOR_TEMPORAL_UTILS = frozenset({
 
 def _add(reg, name, ret, args, variant):
     reg.add(name, partial(_call, getattr(cpp_utils, name), ret), args, ret, variant=variant)
+
+
+def _tensor_returns(mode: int, ret: type[ExprValue], value: ExprValue, periods: PositiveInt):
+    return ret(cpp_utils.ts_returns(value.expr, periods.value, mode=mode))
 
 
 def register_tensor_temporal_utils(reg, ranks):
@@ -30,7 +34,7 @@ def register_tensor_temporal_utils(reg, ranks):
             _add(reg, "ts_weighted_delay", type_, (type_,), tag + "_default")
             _add(reg, "ts_weighted_delay", type_, (type_, PositiveFloat), tag + "_weight")
         for mode in (1, 2):
-            reg.add("ts_returns", partial(_ts_returns, mode), (root, PositiveInt), dim, variant=f"tensor_rank_{rank}_mode_{mode}")
+            reg.add("ts_returns", partial(_tensor_returns, mode, dim), (root, PositiveInt), dim, variant=f"tensor_rank_{rank}_mode_{mode}")
         for name in ("ts_pct_change", "ts_ln_change"):
             _add(reg, name, dim, (root, PositiveInt), f"tensor_rank_{rank}")
         for name in ("ewm_vector_proj", "ewm_vector_neut", "ts_vector_proj", "ts_vector_neut"):
