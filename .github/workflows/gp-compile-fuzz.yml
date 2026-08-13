@@ -7,6 +7,7 @@ on:
       - agent/strongly-typed-gp-tensor-work
     paths:
       - "src/flows/gp/**"
+      - "src/trading_dsl_engine/cpp_stream/**"
       - "tests/flows/gp/**"
       - ".github/workflows/gp-compile-fuzz.yml"
   workflow_dispatch:
@@ -26,6 +27,8 @@ jobs:
       GP_NATIVE_FUZZ_SAMPLES: "40"
     steps:
       - uses: actions/checkout@v4
+      - name: Package exact checkout
+        run: tar --exclude=.git -czf /tmp/dag-source.tar.gz .
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -67,6 +70,7 @@ jobs:
         with:
           name: gp-compile-fuzz-and-signatures
           path: |
+            /tmp/dag-source.tar.gz
             /tmp/gp-compile-fuzz.log
             /tmp/gp-deep-fuzz.log
             /tmp/gp-signatures.txt
