@@ -7,7 +7,7 @@ from typing import ClassVar, Literal
 from flows.gp.types import BoolRow, CountRow, DerivedNumericRow, DimensionlessRow, ExprValue, PriceRow, QuantityRow, StaticValue
 from trading_dsl_engine.cpp_stream.python.source_types import InputTypeSpec
 
-TensorSemantic = Literal["derived", "dimensionless", "bool", "count", "price", "volume"]
+TensorSemantic = Literal["numeric", "derived", "dimensionless", "bool", "count", "price", "volume"]
 
 
 class NumericTensor(ExprValue):
@@ -17,12 +17,13 @@ class NumericTensor(ExprValue):
 
 _CLASSES: dict[tuple[int, TensorSemantic], type[NumericTensor]] = {}
 _PARENTS = {
-    "derived": NumericTensor,
+    "numeric": NumericTensor,
+    "derived": "numeric",
     "dimensionless": "derived",
     "bool": "dimensionless",
     "count": "dimensionless",
-    "price": NumericTensor,
-    "volume": NumericTensor,
+    "price": "numeric",
+    "volume": "numeric",
 }
 
 
@@ -38,15 +39,16 @@ def tensor_type(rank: int, semantic: TensorSemantic) -> type[NumericTensor]:
         raise ValueError(f"unknown tensor semantic {semantic!r}")
     if isinstance(parent, str):
         parent = tensor_type(rank, parent)
-    name = {
+    prefix = {
+        "numeric": "NumericTensor",
         "derived": "DerivedNumericTensor",
         "dimensionless": "DimensionlessTensor",
         "bool": "BoolTensor",
         "count": "CountTensor",
         "price": "BookPriceTensor",
         "volume": "BookVolumeTensor",
-    }[semantic] + str(rank)
-    result = type(name, (parent,), {"tensor_rank": rank, "tensor_semantic": semantic})
+    }[semantic]
+    result = type(prefix + str(rank), (parent,), {"tensor_rank": rank, "tensor_semantic": semantic})
     _CLASSES[key] = result
     return result
 
@@ -60,7 +62,7 @@ def tensor_semantic(type_: type[NumericTensor]) -> TensorSemantic:
 
 
 def tensor_types_for_rank(rank: int) -> tuple[type[NumericTensor], ...]:
-    return tuple(tensor_type(rank, semantic) for semantic in _PARENTS)
+    return tuple(tensor_type(rank, semantic) for semantic in _PARENTS if semantic != "numeric")
 
 
 def reduced_type(type_: type[NumericTensor], semantic: TensorSemantic | None = None):
@@ -69,6 +71,7 @@ def reduced_type(type_: type[NumericTensor], semantic: TensorSemantic | None = N
     if rank > 2:
         return tensor_type(rank - 1, semantic)
     return {
+        "numeric": DerivedNumericRow,
         "derived": DerivedNumericRow,
         "dimensionless": DimensionlessRow,
         "bool": BoolRow,
@@ -90,24 +93,33 @@ class TensorIndex(StaticValue):
 
 @dataclass(frozen=True)
 class TensorFieldSpec:
-    """Source stored as (rows, instruments, *feature_shape)."""
+    """Tensor terminal, either external or composed from existing row columns."""
 
     name: str
     semantic: TensorSemantic
-    feature_shape: tuple[int, ...] = (10,)
+    feature_shape: tuple[int, ...]
+    columns: tuple[str, ...] = ()
     dtype: str = "float64"
 
     def __post_init__(self) -> None:
         name = str(self.name).strip()
         shape = tuple(int(value) for value in self.feature_shape)
-        if not name or self.semantic not in _PARENTS or not shape or any(value <= 0 for value in shape):
+        columns = tuple(str(value) for value in self.columns)
+        if not name or self.semantic not in _PARENTS or self.semantic == "numeric" or not shape or any(value <= 0 for value in shape):
             raise ValueError("invalid tensor field specification")
+        if columns and (len(shape) != 1 or len(columns) != shape[0]):
+            raise ValueError("composed tensor columns must equal its single feature extent")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "feature_shape", shape)
+        object.__setattr__(self, "columns", columns)
 
     @property
     def logical_rank(self) -> int:
         return len(self.feature_shape) + 1
+
+    @property
+    def external(self) -> bool:
+        return not self.columns
 
     def gp_type(self) -> type[NumericTensor]:
         return tensor_type(self.logical_rank, self.semantic)
@@ -117,16 +129,21 @@ class TensorFieldSpec:
         return InputTypeSpec(dtype=self.dtype, row_width=prod(shape), row_shape=shape)
 
 
+def _levels(prefixes: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(f"{prefix}{level}_out0" for prefix in prefixes for level in range(10))
+
+
 DEFAULT_TENSOR_FIELDS = (
-    TensorFieldSpec("book_price", "price"),
-    TensorFieldSpec("book_volume", "volume"),
+    TensorFieldSpec("book_price", "price", (20,), _levels(("ap", "bp"))),
+    TensorFieldSpec("book_volume", "volume", (20,), _levels(("volume_a", "volume_b"))),
 )
 
 
 def tensor_input_types(fields, n_instruments: int) -> dict[str, InputTypeSpec]:
-    return {field.name: field.input_type(n_instruments) for field in fields}
+    return {field.name: field.input_type(n_instruments) for field in fields if field.external}
 
 
+NumericMatrix = tensor_type(2, "numeric")
 DerivedNumericMatrix = tensor_type(2, "derived")
 DimensionlessMatrix = tensor_type(2, "dimensionless")
 BoolMatrix = tensor_type(2, "bool")
