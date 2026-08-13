@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/strongly-typed-gp
+      - agent/strongly-typed-gp-tensor-work
     paths:
       - "src/flows/gp/**"
       - "tests/flows/gp/**"
