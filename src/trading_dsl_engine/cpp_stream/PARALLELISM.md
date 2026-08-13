@@ -1,17 +1,17 @@
 # cpp_stream parallel execution
 
-`cpp_stream` selects a safe partitioning strategy from the lowered physical graph, while the caller controls whether parallel execution is requested:
+`cpp_stream` selects a safe partitioning strategy from the lowered physical graph. Automatic execution is the runtime default:
 
 ```python
 runtime = compile_formula(formula, sources, n_instruments=9)
-serial = runtime.run(out_path="serial.bin")
+automatic = runtime.run(out_path="automatic.bin")
+serial = runtime.run(out_path="serial.bin", threads=1)
 parallel = runtime.run(out_path="parallel.bin", threads=4, pin_threads=True)
-automatic = runtime.run(out_path="automatic.bin", threads=0, pin_threads=True)
 ```
 
-- omitted `threads` or `threads=1`: serial execution;
-- `threads>1`: request that degree of parallelism, capped by CPU affinity and safe work partitioning;
-- `threads=0`: opt into the retained profitability heuristic.
+- omitted `threads` or `threads=0`: select a useful count from the proven strategy, observed rows, instruments, fused-expression work, and CPU affinity;
+- `threads=1`: force serial execution;
+- `threads>1`: request that degree of parallelism, capped by CPU affinity and safe work partitioning.
 
 Every worker owns an independent plan, scratch space, group resolver, and mutable operator state. Eigen remains internally single-threaded so only the outer `cpp_stream` scheduler owns worker parallelism.
 
