@@ -9,6 +9,7 @@ from flows.gp.utils_primitives import (
 )
 
 
+_BASE_MAKE_PSET = base_pset.make_pset
 BASE_EXPECTED_GP_OPERATOR_NAMES = base_pset.EXPECTED_GP_OPERATOR_NAMES
 ALREADY_EXPOSED_CPP_STREAM_UTIL_NAMES = (
     ROW_SHAPED_CPP_STREAM_UTIL_NAMES & BASE_EXPECTED_GP_OPERATOR_NAMES
@@ -31,7 +32,15 @@ primitive_names_for_operator = base_pset.primitive_names_for_operator
 
 
 def make_pset(config: GPConfig | None = None):
-    pset = base_pset.make_pset(config)
+    # The base constructor validates only the direct/custom grammar. Keep its
+    # original expected set while it runs, then layer canonical utils on top.
+    public_expected = base_pset.EXPECTED_GP_OPERATOR_NAMES
+    base_pset.EXPECTED_GP_OPERATOR_NAMES = BASE_EXPECTED_GP_OPERATOR_NAMES
+    try:
+        pset = _BASE_MAKE_PSET(config)
+    finally:
+        base_pset.EXPECTED_GP_OPERATOR_NAMES = public_expected
+
     reg = base_pset._Registrar(pset)
     reg.families = set(pset.gp_operator_families)
     reg.primitive_family = dict(pset.gp_primitive_family)
@@ -51,6 +60,7 @@ def make_pset(config: GPConfig | None = None):
         raise AssertionError(
             f"full GP coverage mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}"
         )
+
     pset.gp_operator_families = frozenset(reg.families)
     pset.gp_primitive_family = dict(reg.primitive_family)
     pset.gp_cpp_stream_utility_families = ROW_SHAPED_CPP_STREAM_UTIL_NAMES
@@ -58,6 +68,12 @@ def make_pset(config: GPConfig | None = None):
     pset.gp_added_cpp_stream_utility_families = added
     pset.gp_non_row_cpp_stream_utility_families = NON_ROW_CPP_STREAM_UTIL_NAMES
     return pset
+
+
+# generation.py imports this module before flows.gp.__init__ imports from pset,
+# so both public import paths resolve to the complete layered constructor.
+base_pset.make_pset = make_pset
+base_pset.EXPECTED_GP_OPERATOR_NAMES = EXPECTED_GP_OPERATOR_NAMES
 
 
 __all__ = [
