@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from deap import gp
 
-from flows.gp.pset import make_pset
+from flows.gp.factory import make_pset
 
 
 def signature_rows(pset: gp.PrimitiveSetTyped) -> list[tuple[str, str, str, str]]:
@@ -28,6 +28,8 @@ def format_signature_table(pset: gp.PrimitiveSetTyped | None = None) -> str:
         f"TOTAL_FAMILIES={len(pset.gp_operator_families)}",
         f"DSL_FAMILIES={len(pset.gp_dsl_operator_families)}",
         f"COMPOSITE_FAMILIES={len(pset.gp_composite_operator_families)}",
+        f"TENSOR_FAMILIES={len(pset.gp_tensor_operator_families)}",
+        f"TENSOR_RANKS={','.join(map(str, pset.gp_tensor_ranks))}",
     ]
     lines.extend(
         f"{family}\t{name}\t({args}) -> {ret}"
