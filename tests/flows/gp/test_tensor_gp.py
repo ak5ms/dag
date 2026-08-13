@@ -75,3 +75,19 @@ def test_higher_rank_tensors_reduce_one_axis_at_a_time():
     spec = gp_input_types(config, 9)["book4"]
     assert spec.row_shape == (9, 4, 3)
     assert spec.row_width == 108
+
+
+def test_tensor_runtime_suite(tmp_path):
+    from tests.flows.gp import test_tensor_runtime as runtime
+
+    checks = (
+        runtime.test_matrix_vec_average_matches_numpy,
+        runtime.test_rank3_tensor_reduces_one_final_axis_per_vec_call,
+        runtime.test_rank3_elementwise_broadcasting_matches_numpy,
+        runtime.test_matrix_temporal_diff_then_vec_sum_matches_numpy,
+        runtime.test_matrix_regression_composite_compiles_and_runs,
+    )
+    for check in checks:
+        case = tmp_path / check.__name__
+        case.mkdir()
+        check(case)
