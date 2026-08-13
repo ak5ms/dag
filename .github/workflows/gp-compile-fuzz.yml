@@ -27,33 +27,22 @@ jobs:
       GP_NATIVE_FUZZ_SAMPLES: "40"
     steps:
       - uses: actions/checkout@v4
-      - name: Package exact checkout
-        run: tar --exclude=.git -czf /tmp/dag-source.tar.gz .
-      - name: Upload exact checkout
-        uses: actions/upload-artifact@v4
-        with:
-          name: dag-source
-          path: /tmp/dag-source.tar.gz
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
       - name: Install project
         run: python -m pip install --upgrade pip && python -m pip install -e .
-      - name: Package local GP test dependencies
-        run: mkdir -p /tmp/gp-wheels && python -m pip download --no-deps --dest /tmp/gp-wheels deap includeigen
-      - name: Upload local GP test dependencies
-        uses: actions/upload-artifact@v4
-        with:
-          name: gp-wheels
-          path: /tmp/gp-wheels
       - name: Dump exact GP signatures
         run: python -m flows.gp.signatures | tee /tmp/gp-signatures.txt
-      - name: Run focused GP grammar tests
+      - name: Run focused GP and tensor tests
         run: >-
           python -m pytest -q -o addopts=""
           tests/flows/gp/test_pset.py
           tests/flows/gp/test_tensor_gp.py
+          tests/flows/gp/test_tensor_shape_safety.py
+          tests/flows/gp/test_tensor_runtime.py
+          tests/flows/gp/test_tensor_higher_rank_runtime.py
           tests/flows/gp/test_regression_utils_reuse.py
       - name: Run GP compile fuzz
         id: fuzz
