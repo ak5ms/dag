@@ -3,8 +3,8 @@ from __future__ import annotations
 from functools import partial
 
 from flows.gp.tensor_types import tensor_type, tensor_types_for_rank
-from flows.gp.types import BoolParam, PositiveFloat, PositiveInt, PositiveNumber
-from flows.gp.utils_primitives import _bucket, _call, _nan_out, _replace
+from flows.gp.types import BoolParam, ExprValue, PositiveFloat, PositiveInt, PositiveNumber
+from flows.gp.utils_primitives import _call, _nan_out, _replace
 from trading_dsl_engine.cpp_stream.python import utils as cpp_utils
 
 TENSOR_ELEMENTWISE_UTILS = frozenset({
@@ -20,6 +20,12 @@ TENSOR_ELEMENTWISE_UTILS = frozenset({
 
 def _add(reg, name, ret, args, variant):
     reg.add(name, partial(_call, getattr(cpp_utils, name), ret), args, ret, variant=variant)
+
+
+def _tensor_bucket(spec, ret: type[ExprValue], value: ExprValue):
+    mode, text = spec
+    kwargs = {"buckets": text} if mode == "buckets" else {"range_": text}
+    return ret(cpp_utils.bucket(value.expr, **kwargs))
 
 
 def register_tensor_elementwise_utils(reg, ranks, config):
@@ -67,7 +73,7 @@ def register_tensor_elementwise_utils(reg, ranks, config):
             _add(reg, name, boolean, (boolean, boolean), f"tensor_rank_{rank}")
         _add(reg, "get_df", derived, (root, PositiveNumber), f"tensor_rank_{rank}")
         for index, spec in enumerate(config.bucket_specs):
-            reg.add("bucket", partial(_bucket, tuple(spec)), (root,), count, variant=f"tensor_rank_{rank}_{index}")
+            reg.add("bucket", partial(_tensor_bucket, tuple(spec), count), (root,), count, variant=f"tensor_rank_{rank}_{index}")
     return TENSOR_ELEMENTWISE_UTILS
 
 
