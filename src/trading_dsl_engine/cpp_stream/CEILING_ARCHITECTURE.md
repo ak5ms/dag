@@ -39,3 +39,12 @@ Do not add a handwritten node for every slow formula. Derive simpler physical
 policies from proven graph properties so equivalent GP expressions receive the
 same optimization. The most important proofs are shared validity masks, dead
 intermediate outputs, direct epilogue consumption, and compact state storage.
+
+The implementation order should be:
+
+1. prove equivalent validity masks and remove divergence machinery;
+2. eliminate intermediate outputs with no observable consumer;
+3. evaluate fused epilogues directly from current state;
+4. select smaller state layouts from those proofs;
+5. add bounded-history row halos where they remove artificial statefulness;
+6. prototype a tiled hybrid scheduler only for important remaining pipelines.
