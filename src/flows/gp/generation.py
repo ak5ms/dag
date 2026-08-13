@@ -8,6 +8,51 @@ from deap import gp, tools
 from flows.gp.types import ExprValue
 
 
+_GROUP_WRAPPER_FAMILIES = frozenset({
+    "xs_group_neutralize",
+    "xs_market_neutralize",
+})
+
+
+def _is_group_utility_family(family: str | None) -> bool:
+    return bool(family) and (
+        family.startswith("group_") or family in _GROUP_WRAPPER_FAMILIES
+    )
+
+
+def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
+    """Reject compositions the cpp_stream groupby IR cannot represent.
+
+    Canonical ``cpp_stream.python.utils`` group helpers are row-shaped and are
+    valid GP primitives, but the current cpp_stream IR rejects nested groupby
+    and non-terminal expression trees in groupby inputs. Keep those helpers in
+    the grammar while requiring each group helper's GP children to terminate
+    at fields/static terminals. Its output is still an ordinary row and can be
+    composed by any outer GP primitive.
+    """
+
+    families = getattr(pset, "gp_primitive_family", {})
+
+    def visit(index: int, inside_group_input: bool) -> tuple[bool, int]:
+        node = individual[index]
+        index += 1
+        if not isinstance(node, gp.Primitive):
+            return True, index
+        if inside_group_input:
+            return False, index
+
+        family = families.get(node.name)
+        children_are_group_inputs = _is_group_utility_family(family)
+        for _ in range(node.arity):
+            ok, index = visit(index, children_are_group_inputs)
+            if not ok:
+                return False, index
+        return True, index
+
+    ok, end = visit(0, False)
+    return ok and end == len(individual)
+
+
 def make_toolbox(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: int = 4) -> deap_base.Toolbox:
     if min_depth < 0 or max_depth < min_depth:
         raise ValueError("require 0 <= min_depth <= max_depth")
@@ -27,14 +72,26 @@ def individual_to_expr(individual, pset: gp.PrimitiveSetTyped):
     return value.expr
 
 
-def _generate(toolbox: deap_base.Toolbox, max_attempts: int) -> gp.PrimitiveTree:
+def _generate(
+    toolbox: deap_base.Toolbox,
+    pset: gp.PrimitiveSetTyped,
+    max_attempts: int,
+) -> gp.PrimitiveTree:
     error = None
+    rejected = 0
     for _ in range(max_attempts):
         try:
-            return toolbox.individual()
+            individual = toolbox.individual()
         except IndexError as exc:
             error = exc
-    raise RuntimeError(f"DEAP could not generate a typed tree after {max_attempts} attempts") from error
+            continue
+        if _compiler_safe_tree(individual, pset):
+            return individual
+        rejected += 1
+    detail = f"; rejected {rejected} compiler-unsafe group compositions" if rejected else ""
+    raise RuntimeError(
+        f"DEAP could not generate a typed tree after {max_attempts} attempts{detail}"
+    ) from error
 
 
 def random_tree(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: int = 4, seed: int | None = None, max_attempts: int = 128) -> gp.PrimitiveTree:
@@ -42,11 +99,11 @@ def random_tree(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: in
         raise ValueError("max_attempts must be >= 1")
     toolbox = make_toolbox(pset, min_depth=min_depth, max_depth=max_depth)
     if seed is None:
-        return _generate(toolbox, max_attempts)
+        return _generate(toolbox, pset, max_attempts)
     state = random.getstate()
     random.seed(seed)
     try:
-        return _generate(toolbox, max_attempts)
+        return _generate(toolbox, pset, max_attempts)
     finally:
         random.setstate(state)
 
