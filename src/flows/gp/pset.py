@@ -41,6 +41,11 @@ from flows.gp.types import (
     VALUE_TYPES,
     unwrap,
 )
+from flows.gp.utils_primitives import (
+    NON_ROW_CPP_STREAM_UTIL_NAMES,
+    ROW_SHAPED_CPP_STREAM_UTIL_NAMES,
+    register_cpp_stream_utils,
+)
 from flows.gp.wrappers import broadcast_reduction, broadcast_xs_unary
 from flows.riskminer.semantics import (
     DEFAULT_TYPE_GRAPH,
@@ -94,7 +99,12 @@ GP_COMPOSITE_OPERATOR_NAMES = ROWWISE_RIDGE_COMPOSITE_NAMES | frozenset({
     "ts_poly_regression",
     "xs_regression_neut",
 })
-EXPECTED_GP_OPERATOR_NAMES = EXPECTED_DSL_OPERATOR_NAMES | GP_COMPOSITE_OPERATOR_NAMES
+GP_CPP_STREAM_UTILITY_OPERATOR_NAMES = ROW_SHAPED_CPP_STREAM_UTIL_NAMES
+EXPECTED_GP_OPERATOR_NAMES = (
+    EXPECTED_DSL_OPERATOR_NAMES
+    | GP_COMPOSITE_OPERATOR_NAMES
+    | GP_CPP_STREAM_UTILITY_OPERATOR_NAMES
+)
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,11 @@ class GPConfig:
     filter_h: tuple[str, ...] = ("1,2,3,4",)
     filter_t: tuple[str, ...] = ("0.5",)
     kth_ignore: tuple[str, ...] = ("NAN 0", "NAN")
+    replace_specs: tuple[tuple[str, str], ...] = (("NAN", "0"), ("0", "NAN"))
+    bucket_specs: tuple[tuple[str, str], ...] = (
+        ("buckets", "0,0.25,0.5,0.75,1"),
+        ("range", "0,1,0.1"),
+    )
 
     def __post_init__(self) -> None:
         if not self.positive_ints or any(
@@ -129,6 +144,13 @@ class GPConfig:
             raise ValueError("axes cannot be empty")
         for axis in self.axes:
             AxisSpec(axis)
+        if not self.replace_specs:
+            raise ValueError("replace_specs cannot be empty")
+        if not self.bucket_specs:
+            raise ValueError("bucket_specs cannot be empty")
+        for mode, text in self.bucket_specs:
+            if mode not in {"buckets", "range"} or not str(text).strip():
+                raise ValueError("bucket_specs entries must be ('buckets'|'range', nonempty_text)")
 
 
 def _semantic_expr_type(info: SemanticInfo) -> type[NumericRow]:
@@ -704,7 +726,12 @@ def _reductions(reg: _Registrar) -> None:
 
 
 def make_pset(config: GPConfig | None = None) -> gp.PrimitiveSetTyped:
-    """Build the row-preserving strongly typed GP primitive set."""
+    """Build the full strongly typed GP grammar.
+
+    Precedence is direct/core DSL first, then canonical row-shaped cpp_stream
+    utilities, then only the GP-specific composites needed for otherwise
+    unrepresentable intermediate shapes.
+    """
 
     config = config or GPConfig()
     pset = gp.PrimitiveSetTyped("alpha", [], NumericRow)
@@ -725,6 +752,13 @@ def make_pset(config: GPConfig | None = None) -> gp.PrimitiveSetTyped:
         _reductions,
     ):
         register(reg)
+
+    added_utility_families = register_cpp_stream_utils(
+        reg,
+        config,
+        skip_names=reg.families,
+    )
+
     missing = EXPECTED_GP_OPERATOR_NAMES - reg.families
     unexpected = reg.families - EXPECTED_GP_OPERATOR_NAMES
     if missing or unexpected:
@@ -735,6 +769,9 @@ def make_pset(config: GPConfig | None = None) -> gp.PrimitiveSetTyped:
     pset.gp_operator_families = frozenset(reg.families)
     pset.gp_dsl_operator_families = EXPECTED_DSL_OPERATOR_NAMES
     pset.gp_composite_operator_families = GP_COMPOSITE_OPERATOR_NAMES
+    pset.gp_cpp_stream_utility_families = GP_CPP_STREAM_UTILITY_OPERATOR_NAMES
+    pset.gp_added_cpp_stream_utility_families = added_utility_families
+    pset.gp_non_row_cpp_stream_utility_families = NON_ROW_CPP_STREAM_UTIL_NAMES
     pset.gp_excluded_operator_families = EXCLUDED_DSL_OPERATOR_NAMES
     pset.gp_primitive_family = dict(reg.primitive_family)
     pset.gp_field_terminals = dict(field_terminal_names)
@@ -754,8 +791,11 @@ __all__ = [
     "EXPECTED_GP_OPERATOR_NAMES",
     "EXTRA_DSL_OPERATOR_NAMES",
     "GP_COMPOSITE_OPERATOR_NAMES",
+    "GP_CPP_STREAM_UTILITY_OPERATOR_NAMES",
     "GPConfig",
+    "NON_ROW_CPP_STREAM_UTIL_NAMES",
     "ROWWISE_RIDGE_COMPOSITE_NAMES",
+    "ROW_SHAPED_CPP_STREAM_UTIL_NAMES",
     "make_pset",
     "primitive_names_for_operator",
 ]
