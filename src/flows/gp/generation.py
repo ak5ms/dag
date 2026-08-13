@@ -12,6 +12,20 @@ _GROUP_WRAPPER_FAMILIES = frozenset({
     "xs_group_neutralize",
     "xs_market_neutralize",
 })
+_GROUP_RHS_REDUCTION_FAMILIES = frozenset({
+    "sum",
+    "mean",
+    "std",
+    "reduce_min",
+    "reduce_max",
+})
+# Only these utility arguments are spliced into the groupby RHS as captures.
+# Other group-helper arguments (key/lhs) are built by the outer builder and may
+# themselves be arbitrary row expressions, including earlier groupby results.
+_GROUP_RHS_CAPTURE_ARGUMENTS = {
+    "group_vector_proj": frozenset({1}),
+    "group_vector_neut": frozenset({1}),
+}
 
 
 def _is_group_utility_family(family: str | None) -> bool:
@@ -20,34 +34,43 @@ def _is_group_utility_family(family: str | None) -> bool:
     )
 
 
-def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
-    """Reject compositions the cpp_stream groupby IR cannot represent.
+def _forbidden_inside_group_rhs(family: str | None) -> bool:
+    return _is_group_utility_family(family) or family in _GROUP_RHS_REDUCTION_FAMILIES
 
-    Canonical ``cpp_stream.python.utils`` group helpers are row-shaped and are
-    valid GP primitives, but the current cpp_stream IR rejects nested groupby
-    and non-terminal expression trees in groupby inputs. Keep those helpers in
-    the grammar while requiring each group helper's GP children to terminate
-    at fields/static terminals. Its output is still an ordinary row and can be
-    composed by any outer GP primitive.
+
+def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
+    """Reject only GP compositions the cpp_stream groupby IR cannot represent.
+
+    Most arguments to the canonical group helpers are evaluated by the outer
+    IR builder and can be arbitrary row expressions. ``group_vector_proj`` and
+    ``group_vector_neut`` are different: their regressor argument is captured
+    inside the groupby RHS. The current neutral IR supports ordinary pointwise,
+    cross-sectional, rolling, and stateful nodes there, but rejects a nested
+    groupby and any reduction/emit node. ``emit`` is not present in this GP
+    grammar, so generation only needs to exclude group-helper and reduction
+    families from those captured subtrees.
+
+    The output of a group helper remains an ordinary row, so it can be freely
+    composed by outer GP primitives and can also feed the outer key/lhs of a
+    later group helper.
     """
 
     families = getattr(pset, "gp_primitive_family", {})
 
-    def visit(index: int, inside_group_input: bool) -> tuple[bool, int]:
+    def visit(index: int, inside_group_rhs: bool) -> tuple[bool, int]:
         node = individual[index]
         index += 1
         if not isinstance(node, gp.Primitive):
             return True, index
-        if inside_group_input:
-            return False, index
 
         family = families.get(node.name)
-        children_are_group_inputs = _is_group_utility_family(family)
-        for _ in range(node.arity):
-            ok, index = visit(index, children_are_group_inputs)
-            if not ok:
-                return False, index
-        return True, index
+        valid = not (inside_group_rhs and _forbidden_inside_group_rhs(family))
+        captured_positions = _GROUP_RHS_CAPTURE_ARGUMENTS.get(family, frozenset())
+        for child_position in range(node.arity):
+            child_inside_group_rhs = inside_group_rhs or child_position in captured_positions
+            child_valid, index = visit(index, child_inside_group_rhs)
+            valid = valid and child_valid
+        return valid, index
 
     ok, end = visit(0, False)
     return ok and end == len(individual)
