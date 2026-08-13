@@ -32,7 +32,7 @@ def _is_group_utility_family(family: str | None) -> bool:
 
 
 def _forbidden_inside_group_rhs(family: str | None) -> bool:
-    return _is_group_utility_family(family) or family in _GROUP_RHS_REDUCTION_FAMILIES
+    return _is_group_utility_family(family) or family in _GROUP_RHS_REDUCTION_FAMILIES or bool(family) and family.startswith("vec_")
 
 
 def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
