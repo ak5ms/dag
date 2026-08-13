@@ -9,6 +9,7 @@ from flows.gp.types import (
     CountRow,
     DerivedNumericRow,
     DimensionlessRow,
+    DurationRow,
     ExprValue,
     KthIgnoreSpec,
     NumericRow,
@@ -16,8 +17,8 @@ from flows.gp.types import (
     PositiveFloat,
     PositiveInt,
     PositiveNumber,
+    QuantileParam,
     TimestampRow,
-    DurationRow,
     TradingDayHorizonRow,
     VALUE_TYPES,
     unwrap,
@@ -25,8 +26,9 @@ from flows.gp.types import (
 from trading_dsl_engine.cpp_stream.python import utils as cpp_stream_utils
 
 
-# These utilities genuinely leave lane-shaped GP expression space. They are the
-# only canonical cpp_stream utility functions intentionally unavailable to GP.
+# These canonical utilities genuinely leave lane-shaped GP expression space.
+# Everything else in cpp_stream_utils.__all__ must either already be exposed or
+# be registered by register_cpp_stream_utils().
 NON_ROW_CPP_STREAM_UTIL_NAMES = frozenset({
     "vec_avg",
     "vec_choose",
@@ -43,10 +45,12 @@ NON_ROW_CPP_STREAM_UTIL_NAMES = frozenset({
     "vec_stddev",
     "vec_sum",
 })
-
 ALL_CPP_STREAM_UTIL_NAMES = frozenset(cpp_stream_utils.__all__)
 ROW_SHAPED_CPP_STREAM_UTIL_NAMES = ALL_CPP_STREAM_UTIL_NAMES - NON_ROW_CPP_STREAM_UTIL_NAMES
 
+# Restrict group keys to discrete semantic rows. The utility compositions are
+# row-shaped, but allowing arbitrary continuous GP expressions as group keys
+# creates unbounded/high-cardinality grammars.
 _GROUP_KEY_TYPES = (CountRow, BoolRow, TradingDayHorizonRow)
 
 
@@ -59,7 +63,17 @@ def _call(fn, ret: type[ExprValue], *values, **kwargs):
     )
 
 
-def _preserve(reg, name: str, *, fn=None, tails: Sequence[tuple[Sequence[type], str]] = ((), "default")) -> None:
+def _add_numeric(reg, name: str, ret: type[NumericRow], args: Sequence[type], *, fn=None, variant: str = "numeric") -> None:
+    reg.add(
+        name,
+        partial(_call, fn or getattr(cpp_stream_utils, name), ret),
+        args,
+        ret,
+        variant=variant,
+    )
+
+
+def _add_preserving(reg, name: str, tails: Sequence[tuple[Sequence[type], str]], *, fn=None) -> None:
     fn = fn or getattr(cpp_stream_utils, name)
     for row_type in VALUE_TYPES:
         for tail, variant in tails:
@@ -72,30 +86,22 @@ def _preserve(reg, name: str, *, fn=None, tails: Sequence[tuple[Sequence[type], 
             )
 
 
-def _numeric(reg, name: str, ret: type[NumericRow], args: Sequence[type], *, fn=None, variant: str = "numeric") -> None:
-    reg.add(
-        name,
-        partial(_call, fn or getattr(cpp_stream_utils, name), ret),
-        args,
-        ret,
-        variant=variant,
-    )
-
-
 def _nan_out(mode: str, ret: type[ExprValue], value: ExprValue, *bounds):
-    kwargs = {}
-    if mode in {"lower", "both"}:
-        kwargs["lower"] = unwrap(bounds[0])
-    if mode == "upper":
-        kwargs["upper"] = unwrap(bounds[0])
-    elif mode == "both":
-        kwargs["upper"] = unwrap(bounds[1])
-    return ret(cpp_stream_utils.nan_out(value.expr, **kwargs))
+    if mode == "lower":
+        expr = cpp_stream_utils.nan_out(value.expr, lower=unwrap(bounds[0]))
+    elif mode == "upper":
+        expr = cpp_stream_utils.nan_out(value.expr, upper=unwrap(bounds[0]))
+    else:
+        expr = cpp_stream_utils.nan_out(
+            value.expr,
+            lower=unwrap(bounds[0]),
+            upper=unwrap(bounds[1]),
+        )
+    return ret(expr)
 
 
 def _replace(spec: tuple[str, str], ret: type[ExprValue], value: ExprValue):
-    target, dest = spec
-    return ret(cpp_stream_utils.replace(value.expr, target, dest))
+    return ret(cpp_stream_utils.replace(value.expr, spec[0], spec[1]))
 
 
 def _bucket(spec: tuple[str, str], value: ExprValue):
@@ -146,7 +152,7 @@ def _ewm_vector(fn, ret: type[ExprValue], x: ExprValue, y: ExprValue, span: Posi
     )
 
 
-def _rank_gmean_time(arity: int, *values):
+def _ts_rank_gmean(arity: int, *values):
     rows = values[:arity]
     periods = values[arity]
     return DimensionlessRow(
@@ -176,8 +182,7 @@ def _group_normalize(ret: type[ExprValue], x: ExprValue, group: ExprValue, *para
     return ret(cpp_stream_utils.group_normalize(x.expr, group.expr, **kwargs))
 
 
-def _register_group_ops(reg) -> set[str]:
-    families: set[str] = set()
+def _register_group_utilities(reg, skip: set[str], added: set[str]) -> None:
     preserving = {
         "group_extra": _group_extra,
         "group_max": None,
@@ -192,26 +197,29 @@ def _register_group_ops(reg) -> set[str]:
         "xs_market_neutralize": None,
         "group_backfill": None,
     }
+    scalarish = {
+        "group_count": CountRow,
+        "group_na_count": CountRow,
+        "group_rank": DimensionlessRow,
+        "group_scale": DimensionlessRow,
+        "group_std_dev": DerivedNumericRow,
+        "group_zscore": DimensionlessRow,
+    }
+    names = set(preserving) | set(scalarish) | {"group_percentage", "group_normalize"}
+    names -= skip
+
     for group_type in _GROUP_KEY_TYPES:
         for row_type in VALUE_TYPES:
             tag = f"{row_type.__name__}_{group_type.__name__}"
             for name, adapter in preserving.items():
+                if name not in names:
+                    continue
                 if name in {"group_vector_neut", "group_vector_proj"}:
-                    reg.add(
-                        name,
-                        partial(_call, getattr(cpp_stream_utils, name), row_type),
-                        (row_type, NumericRow, group_type),
-                        row_type,
-                        variant=tag,
-                    )
+                    args = (row_type, NumericRow, group_type)
+                    fn = partial(_call, getattr(cpp_stream_utils, name), row_type)
                 elif name == "xs_market_neutralize":
-                    reg.add(
-                        name,
-                        partial(_call, cpp_stream_utils.xs_market_neutralize, row_type),
-                        (row_type, group_type),
-                        row_type,
-                        variant=tag,
-                    )
+                    args = (row_type, group_type)
+                    fn = partial(_call, cpp_stream_utils.xs_market_neutralize, row_type)
                 elif name == "group_backfill":
                     reg.add(
                         name,
@@ -227,66 +235,50 @@ def _register_group_ops(reg) -> set[str]:
                         row_type,
                         variant=f"{tag}_std",
                     )
+                    continue
                 elif adapter is not None:
-                    reg.add(
-                        name,
-                        partial(adapter, row_type),
-                        (row_type, group_type),
-                        row_type,
-                        variant=tag,
-                    )
+                    args = (row_type, group_type)
+                    fn = partial(adapter, row_type)
                 else:
+                    args = (row_type, group_type)
+                    fn = partial(_call, getattr(cpp_stream_utils, name), row_type)
+                reg.add(name, fn, args, row_type, variant=tag)
+
+            for name, ret in scalarish.items():
+                if name in names:
                     reg.add(
                         name,
-                        partial(_call, getattr(cpp_stream_utils, name), row_type),
+                        partial(_call, getattr(cpp_stream_utils, name), ret),
                         (row_type, group_type),
-                        row_type,
+                        ret,
                         variant=tag,
                     )
-                families.add(name)
 
-            for name, ret in (
-                ("group_count", CountRow),
-                ("group_na_count", CountRow),
-                ("group_rank", DimensionlessRow),
-                ("group_scale", DimensionlessRow),
-                ("group_std_dev", DerivedNumericRow),
-                ("group_zscore", DimensionlessRow),
-            ):
+            if "group_percentage" in names:
                 reg.add(
-                    name,
-                    partial(_call, getattr(cpp_stream_utils, name), ret),
-                    (row_type, group_type),
-                    ret,
+                    "group_percentage",
+                    partial(_call, cpp_stream_utils.group_percentage, row_type),
+                    (row_type, group_type, QuantileParam),
+                    row_type,
                     variant=tag,
                 )
-                families.add(name)
 
-            reg.add(
-                "group_percentage",
-                partial(_call, cpp_stream_utils.group_percentage, row_type),
-                (row_type, group_type, PositiveFloat),
-                row_type,
-                variant=tag,
-            )
-            families.add("group_percentage")
-
-            reg.add(
-                "group_normalize",
-                partial(_group_normalize, DerivedNumericRow),
-                (row_type, group_type),
-                DerivedNumericRow,
-                variant=f"{tag}_default",
-            )
-            reg.add(
-                "group_normalize",
-                partial(_group_normalize, DerivedNumericRow),
-                (row_type, group_type, BoolParam, PositiveFloat, PositiveFloat),
-                DerivedNumericRow,
-                variant=f"{tag}_full",
-            )
-            families.add("group_normalize")
-    return families
+            if "group_normalize" in names:
+                reg.add(
+                    "group_normalize",
+                    partial(_group_normalize, DerivedNumericRow),
+                    (row_type, group_type),
+                    DerivedNumericRow,
+                    variant=f"{tag}_default",
+                )
+                reg.add(
+                    "group_normalize",
+                    partial(_group_normalize, DerivedNumericRow),
+                    (row_type, group_type, BoolParam, PositiveFloat, PositiveFloat),
+                    DerivedNumericRow,
+                    variant=f"{tag}_full",
+                )
+    added.update(names)
 
 
 def register_cpp_stream_utils(reg, config, *, skip_names: Iterable[str] = ()) -> frozenset[str]:
@@ -295,13 +287,13 @@ def register_cpp_stream_utils(reg, config, *, skip_names: Iterable[str] = ()) ->
     skip = set(skip_names)
     added: set[str] = set()
 
-    def mark(name: str) -> bool:
-        if name in skip:
+    def take(name: str) -> bool:
+        if name in skip or name in added:
             return False
         added.add(name)
         return True
 
-    # Straightforward scalar/row compositions.
+    # Generic numeric transforms.
     for name, ret in (
         ("log", DimensionlessRow),
         ("inverse", DerivedNumericRow),
@@ -312,11 +304,11 @@ def register_cpp_stream_utils(reg, config, *, skip_names: Iterable[str] = ()) ->
         ("arc_sin", DimensionlessRow),
         ("arc_tan", DimensionlessRow),
     ):
-        if mark(name):
-            _numeric(reg, name, ret, (NumericRow,))
+        if take(name):
+            _add_numeric(reg, name, ret, (NumericRow,))
 
     for name in ("elementwise_max", "elementwise_min"):
-        if mark(name):
+        if take(name):
             fn = getattr(cpp_stream_utils, name)
             for row_type in VALUE_TYPES:
                 for arity in (2, 3, 4):
@@ -328,23 +320,23 @@ def register_cpp_stream_utils(reg, config, *, skip_names: Iterable[str] = ()) ->
                         variant=f"{row_type.__name__}_{arity}",
                     )
 
-    if mark("clamp"):
+    if take("clamp"):
         for row_type in VALUE_TYPES:
             reg.add("clamp", partial(_call, cpp_stream_utils.clamp, row_type), (row_type,), row_type, variant=f"{row_type.__name__}_default")
             reg.add("clamp", partial(_call, cpp_stream_utils.clamp, row_type), (row_type, PositiveNumber, PositiveNumber), row_type, variant=f"{row_type.__name__}_bounds")
             reg.add("clamp", partial(_call, cpp_stream_utils.clamp, row_type), (row_type, PositiveNumber, PositiveNumber, BoolParam), row_type, variant=f"{row_type.__name__}_inverse")
 
-    if mark("nan_mask"):
+    if take("nan_mask"):
         for row_type in VALUE_TYPES:
             reg.add("nan_mask", partial(_call, cpp_stream_utils.nan_mask, row_type), (row_type, NumericRow), row_type, variant=row_type.__name__)
 
-    if mark("nan_out"):
+    if take("nan_out"):
         for row_type in VALUE_TYPES:
             reg.add("nan_out", partial(_nan_out, "lower", row_type), (row_type, PositiveNumber), row_type, variant=f"{row_type.__name__}_lower")
             reg.add("nan_out", partial(_nan_out, "upper", row_type), (row_type, PositiveNumber), row_type, variant=f"{row_type.__name__}_upper")
             reg.add("nan_out", partial(_nan_out, "both", row_type), (row_type, PositiveNumber, PositiveNumber), row_type, variant=f"{row_type.__name__}_both")
 
-    if mark("replace"):
+    if take("replace"):
         specs = tuple(getattr(config, "replace_specs", (("NAN", "0"), ("0", "NAN"))))
         for row_type in VALUE_TYPES:
             for index, spec in enumerate(specs):
@@ -361,188 +353,181 @@ def register_cpp_stream_utils(reg, config, *, skip_names: Iterable[str] = ()) ->
         ("pasteurize", (((), "default"),)),
         ("convert_float", (((), "default"),)),
     ):
-        if mark(name):
-            _preserve(reg, name, tails=tails)
+        if take(name):
+            _add_preserving(reg, name, tails)
 
-    if mark("round_df"):
-        _preserve(reg, "round_df", tails=(((PositiveInt,), "decimals"),))
+    if take("round_df"):
+        _add_preserving(reg, "round_df", (((PositiveInt,), "decimals"),))
 
-    if mark("signed_power"):
-        _numeric(reg, "signed_power", DerivedNumericRow, (NumericRow, NumericRow), variant="row")
-        _numeric(reg, "signed_power", DerivedNumericRow, (NumericRow, PositiveNumber), variant="scalar")
+    if take("signed_power"):
+        _add_numeric(reg, "signed_power", DerivedNumericRow, (NumericRow, NumericRow), variant="row")
+        _add_numeric(reg, "signed_power", DerivedNumericRow, (NumericRow, PositiveNumber), variant="scalar")
 
     for name in ("negate", "logical_and", "logical_or"):
-        if mark(name):
+        if take(name):
             args = (BoolRow,) if name == "negate" else (BoolRow, BoolRow)
-            _numeric(reg, name, BoolRow, args, variant="bool")
+            _add_numeric(reg, name, BoolRow, args, variant="bool")
 
     for name in ("is_not_nan", "is_nan", "is_finite", "is_not_finite"):
-        if mark(name):
-            _numeric(reg, name, BoolRow, (NumericRow,))
+        if take(name):
+            _add_numeric(reg, name, BoolRow, (NumericRow,))
 
     for name in ("equal", "less"):
-        if mark(name):
-            _numeric(reg, name, BoolRow, (NumericRow, NumericRow))
+        if take(name):
+            _add_numeric(reg, name, BoolRow, (NumericRow, NumericRow))
 
-    if mark("if_else"):
+    if take("if_else"):
         for row_type in VALUE_TYPES:
             reg.add("if_else", partial(_call, cpp_stream_utils.if_else, row_type), (BoolRow, row_type, row_type), row_type, variant=row_type.__name__)
 
-    if mark("get_df"):
-        _numeric(reg, "get_df", DerivedNumericRow, (NumericRow, PositiveNumber))
+    if take("get_df"):
+        _add_numeric(reg, "get_df", DerivedNumericRow, (NumericRow, PositiveNumber))
 
-    if mark("bucket"):
+    if take("bucket"):
         specs = tuple(getattr(config, "bucket_specs", (("buckets", "0,0.25,0.5,0.75,1"), ("range", "0,1,0.1"))))
         for index, spec in enumerate(specs):
             reg.add("bucket", partial(_bucket, tuple(spec)), (NumericRow,), CountRow, variant=f"spec_{index}")
 
-    # Cross-sectional row utilities.
-    if mark("xs_normalize"):
-        _numeric(reg, "xs_normalize", DerivedNumericRow, (NumericRow,), variant="default")
-        _numeric(reg, "xs_normalize", DerivedNumericRow, (NumericRow, BoolParam, PositiveFloat), variant="full")
+    # Cross-sectional utilities.
+    if take("xs_normalize"):
+        _add_numeric(reg, "xs_normalize", DerivedNumericRow, (NumericRow,), variant="default")
+        _add_numeric(reg, "xs_normalize", DerivedNumericRow, (NumericRow, BoolParam, PositiveFloat), variant="full")
 
-    if mark("xs_one_side"):
+    if take("xs_one_side"):
         for row_type in VALUE_TYPES:
             for side in ("long", "short"):
                 reg.add("xs_one_side", partial(_one_side, side, row_type), (row_type,), row_type, variant=f"{row_type.__name__}_{side}")
 
-    if mark("xs_prob_density"):
-        for driver in ("gaussian", "uniform", "cauchy"):
-            reg.add("xs_prob_density", partial(_density, cpp_stream_utils.xs_prob_density, driver), (NumericRow,), DimensionlessRow, variant=f"{driver}_default")
-            reg.add("xs_prob_density", partial(_density, cpp_stream_utils.xs_prob_density, driver), (NumericRow, PositiveFloat), DimensionlessRow, variant=f"{driver}_sigma")
+    for family, fn in (("xs_prob_density", cpp_stream_utils.xs_prob_density), ("xs_quantile", cpp_stream_utils.xs_quantile)):
+        if take(family):
+            for driver in ("gaussian", "uniform", "cauchy"):
+                reg.add(family, partial(_density, fn, driver), (NumericRow,), DimensionlessRow, variant=f"{driver}_default")
+                reg.add(family, partial(_density, fn, driver), (NumericRow, PositiveFloat), DimensionlessRow, variant=f"{driver}_sigma")
 
-    for name, ret, tails in (
+    for name, ret, signatures in (
         ("xs_scale_down", DimensionlessRow, ((NumericRow,), (NumericRow, PositiveFloat))),
         ("xs_scale_by_side", DimensionlessRow, ((NumericRow,),)),
         ("xs_rank_by_side", DimensionlessRow, ((NumericRow,), (NumericRow, PositiveFloat, PositiveFloat))),
         ("generalized_rank", DimensionlessRow, ((NumericRow,), (NumericRow, PositiveFloat))),
         ("xs_regression_proj", DerivedNumericRow, ((NumericRow, NumericRow),)),
     ):
-        if mark(name):
-            for index, args in enumerate(tails):
-                _numeric(reg, name, ret, args, variant=str(index))
+        if take(name):
+            for index, args in enumerate(signatures):
+                _add_numeric(reg, name, ret, args, variant=str(index))
 
     for name in ("xs_winsorize", "xs_truncate"):
-        if mark(name):
-            _preserve(reg, name, tails=(((), "default"), ((PositiveFloat,), "param")))
+        if take(name):
+            _add_preserving(reg, name, (((), "default"), ((PositiveFloat,), "param")))
 
-    if mark("xs_filter"):
+    if take("xs_filter"):
         for row_type in VALUE_TYPES:
-            reg.add("xs_filter", partial(_call, cpp_stream_utils.xs_filter, row_type), (row_type, PositiveFloat), row_type, variant=f"{row_type.__name__}_default")
-            reg.add("xs_filter", partial(_call, cpp_stream_utils.xs_filter, row_type), (row_type, PositiveFloat, BoolParam), row_type, variant=f"{row_type.__name__}_full")
+            reg.add("xs_filter", partial(_call, cpp_stream_utils.xs_filter, row_type), (row_type, QuantileParam), row_type, variant=f"{row_type.__name__}_default")
+            reg.add("xs_filter", partial(_call, cpp_stream_utils.xs_filter, row_type), (row_type, QuantileParam, BoolParam), row_type, variant=f"{row_type.__name__}_full")
 
-    if mark("xs_rank_gmean_amean_diff"):
+    if take("xs_rank_gmean_amean_diff"):
         for arity in (2, 3, 4):
             reg.add("xs_rank_gmean_amean_diff", partial(_call, cpp_stream_utils.xs_rank_gmean_amean_diff, DimensionlessRow), (NumericRow,) * arity, DimensionlessRow, variant=f"arity_{arity}")
 
-    # Group utilities are row-shaped compositions. Restrict generated group keys
-    # to discrete semantic row types to keep cardinality manageable.
-    group_names = _register_group_ops(reg)
-    for name in group_names:
-        if name in skip:
-            # Registration above is intentionally deterministic; skipped names are
-            # removed from expected accounting only when already directly exposed.
-            continue
-        added.add(name)
+    _register_group_utilities(reg, skip, added)
 
-    # Time-series row utilities.
-    if mark("periods_from_last_change"):
-        _numeric(reg, "periods_from_last_change", CountRow, (NumericRow,))
+    # Time-series utilities.
+    if take("periods_from_last_change"):
+        _add_numeric(reg, "periods_from_last_change", CountRow, (NumericRow,))
 
-    if mark("ts_hump_decay"):
-        _preserve(reg, "ts_hump_decay", tails=(((), "default"), ((PositiveFloat, BoolParam), "full")))
+    if take("ts_hump_decay"):
+        _add_preserving(reg, "ts_hump_decay", (((), "default"), ((PositiveFloat, BoolParam), "full")))
 
-    if mark("jump_decay"):
-        _preserve(reg, "jump_decay", tails=(((PositiveInt,), "default"), ((PositiveInt, BoolParam, PositiveFloat, PositiveFloat), "full")))
+    if take("jump_decay"):
+        _add_preserving(reg, "jump_decay", (((PositiveInt,), "default"), ((PositiveInt, BoolParam, PositiveFloat, PositiveFloat), "full")))
 
-    if mark("keep"):
+    if take("keep"):
         for row_type in VALUE_TYPES:
             reg.add("keep", partial(_call, cpp_stream_utils.keep, row_type), (row_type, NumericRow), row_type, variant=f"{row_type.__name__}_default")
             reg.add("keep", partial(_call, cpp_stream_utils.keep, row_type), (row_type, NumericRow, PositiveInt), row_type, variant=f"{row_type.__name__}_period")
 
-    if mark("ts_inst_tvr"):
-        _numeric(reg, "ts_inst_tvr", DimensionlessRow, (NumericRow, PositiveInt))
+    if take("ts_inst_tvr"):
+        _add_numeric(reg, "ts_inst_tvr", DimensionlessRow, (NumericRow, PositiveInt))
 
-    if mark("ts_backfill"):
+    if take("ts_backfill"):
         for row_type in VALUE_TYPES:
             reg.add("ts_backfill", partial(_ts_backfill, row_type), (row_type, PositiveInt), row_type, variant=f"{row_type.__name__}_default")
             reg.add("ts_backfill", partial(_ts_backfill, row_type), (row_type, PositiveInt, KthIgnoreSpec), row_type, variant=f"{row_type.__name__}_ignore")
 
-    if mark("prev_diff_value"):
-        _preserve(reg, "prev_diff_value", tails=(((PeriodAtLeastTwo,), "period"),))
+    if take("prev_diff_value"):
+        _add_preserving(reg, "prev_diff_value", (((PeriodAtLeastTwo,), "period"),))
 
-    if mark("ts_weighted_delay"):
-        _preserve(reg, "ts_weighted_delay", tails=(((), "default"), ((PositiveFloat,), "weight")))
+    if take("ts_weighted_delay"):
+        _add_preserving(reg, "ts_weighted_delay", (((), "default"), ((PositiveFloat,), "weight")))
 
     for name in ("ts_shift", "ts_sum", "ts_product", "ts_mean", "ts_median", "ts_min", "ts_max", "ts_std", "ts_decay_linear"):
-        if mark(name):
-            _preserve(reg, name, tails=(((PositiveInt,), "period"),))
+        if take(name):
+            _add_preserving(reg, name, (((PositiveInt,), "period"),))
 
-    if mark("ts_diff"):
+    if take("ts_diff"):
         for row_type in VALUE_TYPES:
             ret = DurationRow if row_type is TimestampRow else row_type
             reg.add("ts_diff", partial(_call, cpp_stream_utils.ts_diff, ret), (row_type, PositiveInt), ret, variant=row_type.__name__)
 
-    if mark("ts_returns"):
+    if take("ts_returns"):
         for mode in (1, 2):
             reg.add("ts_returns", partial(_ts_returns, mode), (NumericRow, PositiveInt), DimensionlessRow, variant=f"mode_{mode}")
 
-    for name in ("ts_pct_change", "ts_ln_change", "ts_ir", "ts_rank", "ts_zscore", "ts_inst_tvr"):
-        if mark(name):
-            _numeric(reg, name, DimensionlessRow, (NumericRow, PositiveInt))
+    for name in ("ts_pct_change", "ts_ln_change", "ts_ir", "ts_rank", "ts_zscore"):
+        if take(name):
+            _add_numeric(reg, name, DimensionlessRow, (NumericRow, PositiveInt))
 
-    if mark("ts_prob_density"):
+    if take("ts_prob_density"):
         for driver in ("gaussian", "uniform", "cauchy"):
             reg.add("ts_prob_density", partial(_density, cpp_stream_utils.ts_prob_density, driver), (NumericRow, PositiveInt), DimensionlessRow, variant=f"{driver}_default")
             reg.add("ts_prob_density", partial(_density, cpp_stream_utils.ts_prob_density, driver), (NumericRow, PositiveInt, PositiveFloat), DimensionlessRow, variant=f"{driver}_sigma")
 
-    if mark("ts_percentage"):
+    if take("ts_percentage"):
         for row_type in VALUE_TYPES:
-            reg.add("ts_percentage", partial(_call, cpp_stream_utils.ts_percentage, row_type), (row_type, PositiveInt, PositiveFloat), row_type, variant=row_type.__name__)
+            reg.add("ts_percentage", partial(_call, cpp_stream_utils.ts_percentage, row_type), (row_type, PositiveInt, QuantileParam), row_type, variant=row_type.__name__)
 
     for name, ret in (("ts_argmax", CountRow), ("ts_argmin", CountRow)):
-        if mark(name):
-            _numeric(reg, name, ret, (NumericRow, PositiveInt))
+        if take(name):
+            _add_numeric(reg, name, ret, (NumericRow, PositiveInt))
 
     for name in ("ts_mean_diff", "ts_max_diff", "ts_min_diff"):
-        if mark(name):
-            _preserve(reg, name, tails=(((PositiveInt,), "period"),))
+        if take(name):
+            _add_preserving(reg, name, (((PositiveInt,), "period"),))
 
     for name in ("ts_min_max_cps", "ts_min_max_diff"):
-        if mark(name):
-            _preserve(reg, name, tails=(((PositiveInt,), "default"), ((PositiveInt, PositiveFloat), "factor")))
+        if take(name):
+            _add_preserving(reg, name, (((PositiveInt,), "default"), ((PositiveInt, PositiveFloat), "factor")))
 
-    if mark("ts_scale"):
-        _numeric(reg, "ts_scale", DimensionlessRow, (NumericRow, PositiveInt), variant="default")
-        _numeric(reg, "ts_scale", DimensionlessRow, (NumericRow, PositiveInt, PositiveFloat), variant="constant")
+    if take("ts_scale"):
+        _add_numeric(reg, "ts_scale", DimensionlessRow, (NumericRow, PositiveInt), variant="default")
+        _add_numeric(reg, "ts_scale", DimensionlessRow, (NumericRow, PositiveInt, PositiveFloat), variant="constant")
 
     for name in ("ts_count_nans", "ts_count_nonnumeric"):
-        if mark(name):
-            _numeric(reg, name, CountRow, (NumericRow, PositiveInt))
+        if take(name):
+            _add_numeric(reg, name, CountRow, (NumericRow, PositiveInt))
 
-    if mark("ts_entropy"):
-        _numeric(reg, "ts_entropy", DimensionlessRow, (NumericRow, PositiveInt), variant="default")
-        _numeric(reg, "ts_entropy", DimensionlessRow, (NumericRow, PositiveInt, PositiveInt), variant="buckets")
+    if take("ts_entropy"):
+        _add_numeric(reg, "ts_entropy", DimensionlessRow, (NumericRow, PositiveInt), variant="default")
+        _add_numeric(reg, "ts_entropy", DimensionlessRow, (NumericRow, PositiveInt, PositiveInt), variant="buckets")
 
     for name in ("ewm_vector_proj", "ewm_vector_neut", "ts_vector_proj", "ts_vector_neut"):
-        if mark(name):
+        if take(name):
             fn = getattr(cpp_stream_utils, name)
             for row_type in VALUE_TYPES:
                 reg.add(name, partial(_ewm_vector, fn, row_type), (row_type, NumericRow, PositiveInt), row_type, variant=row_type.__name__)
 
-    if mark("ts_rank_gmean_amean_diff"):
+    if take("ts_rank_gmean_amean_diff"):
         for arity in (2, 3, 4):
-            reg.add("ts_rank_gmean_amean_diff", partial(_rank_gmean_time, arity), (NumericRow,) * arity + (PositiveInt,), DimensionlessRow, variant=f"arity_{arity}")
+            reg.add("ts_rank_gmean_amean_diff", partial(_ts_rank_gmean, arity), (NumericRow,) * arity + (PositiveInt,), DimensionlessRow, variant=f"arity_{arity}")
 
-    if mark("ts_geomean"):
-        _numeric(reg, "ts_geomean", DerivedNumericRow, (NumericRow, PositiveInt), variant="default")
-        _numeric(reg, "ts_geomean", DerivedNumericRow, (NumericRow, PositiveInt, PositiveNumber), variant="replacement")
+    if take("ts_geomean"):
+        _add_numeric(reg, "ts_geomean", DerivedNumericRow, (NumericRow, PositiveInt), variant="default")
+        _add_numeric(reg, "ts_geomean", DerivedNumericRow, (NumericRow, PositiveInt, PositiveNumber), variant="replacement")
 
-    if mark("slope"):
-        _numeric(reg, "slope", DerivedNumericRow, (NumericRow, PositiveInt))
+    if take("slope"):
+        _add_numeric(reg, "slope", DerivedNumericRow, (NumericRow, PositiveInt))
 
-    if mark("ts_theilsen"):
-        _numeric(reg, "ts_theilsen", DerivedNumericRow, (NumericRow, NumericRow, PeriodAtLeastTwo))
+    if take("ts_theilsen"):
+        _add_numeric(reg, "ts_theilsen", DerivedNumericRow, (NumericRow, NumericRow, PeriodAtLeastTwo))
 
     expected = ROW_SHAPED_CPP_STREAM_UTIL_NAMES - skip
     missing = expected - added
