@@ -1,0 +1,45 @@
+name: GP vec work validation
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-vec-work
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: src
+      TRADING_DSL_ENGINE_CPP_LTO: "0"
+      TRADING_DSL_ENGINE_CPP_NATIVE: "0"
+      GP_IR_FUZZ_SAMPLES: "2000"
+      GP_NATIVE_FUZZ_SAMPLES: "40"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package exact checkout
+        run: tar --exclude=.git -czf /tmp/dag-source.tar.gz .
+      - name: Upload exact checkout
+        uses: actions/upload-artifact@v4
+        with:
+          name: dag-source
+          path: /tmp/dag-source.tar.gz
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Run focused GP tests
+        run: python -m pytest -q -o addopts="" tests/flows/gp/test_pset.py tests/flows/gp/test_compile_fuzz.py tests/flows/gp/test_tensor_vec.py
+      - name: Run deep random formulas
+        env:
+          GP_FUZZ_MIN_DEPTH: "4"
+          GP_FUZZ_MAX_DEPTH: "7"
+          GP_IR_FUZZ_SAMPLES: "500"
+          GP_NATIVE_FUZZ_SAMPLES: "6"
+        run: python -m pytest -q -s -o addopts="" tests/flows/gp/test_compile_fuzz.py -k random_gp_formulas
