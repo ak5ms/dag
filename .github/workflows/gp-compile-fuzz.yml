@@ -29,6 +29,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Package exact checkout
         run: tar --exclude=.git -czf /tmp/dag-source.tar.gz .
+      - name: Upload exact checkout
+        uses: actions/upload-artifact@v4
+        with:
+          name: dag-source
+          path: /tmp/dag-source.tar.gz
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -70,7 +75,6 @@ jobs:
         with:
           name: gp-compile-fuzz-and-signatures
           path: |
-            /tmp/dag-source.tar.gz
             /tmp/gp-compile-fuzz.log
             /tmp/gp-deep-fuzz.log
             /tmp/gp-signatures.txt
