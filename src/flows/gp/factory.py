@@ -48,9 +48,14 @@ class GPConfig(row_pset.GPConfig):
             raise ValueError("tensor field names must be unique")
         shapes: dict[int, tuple[int, ...]] = {}
         for field in fields:
-            previous = shapes.setdefault(field.logical_rank, field.feature_shape)
-            if previous != field.feature_shape:
-                raise ValueError("tensor fields with the same rank must share feature_shape")
+            for rank in range(2, field.logical_rank + 1):
+                feature_shape = field.feature_shape[: rank - 1]
+                previous = shapes.setdefault(rank, feature_shape)
+                if previous != feature_shape:
+                    raise ValueError(
+                        f"incompatible shapes at logical rank {rank}: "
+                        f"{previous} versus {feature_shape}"
+                    )
         indices = tuple(int(value) for value in self.tensor_indices)
         if any(value < 0 for value in indices) or len(indices) != len(set(indices)):
             raise ValueError("tensor_indices must be unique nonnegative integers")
@@ -143,6 +148,10 @@ def make_pset(config: GPConfig | None = None):
     pset.gp_tensor_operator_families = frozenset(tensor_families)
     pset.gp_tensor_field_terminals = terminals
     pset.gp_tensor_ranks = ranks
+    pset.gp_tensor_feature_shapes = {
+        rank: next(field.feature_shape[: rank - 1] for field in config.tensor_fields if field.logical_rank >= rank)
+        for rank in ranks
+    }
     pset.gp_cpp_stream_utility_families = ALL_CPP_STREAM_UTIL_NAMES if ranks else ROW_SHAPED_CPP_STREAM_UTIL_NAMES
     pset.gp_non_row_cpp_stream_utility_families = NON_ROW_CPP_STREAM_UTIL_NAMES - (TENSOR_VEC_FAMILIES if ranks else frozenset())
     pset.gp_tensor_cpp_stream_utility_families = TENSOR_CPP_STREAM_UTIL_NAMES if ranks else frozenset()
