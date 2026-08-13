@@ -19,9 +19,6 @@ _GROUP_RHS_REDUCTION_FAMILIES = frozenset({
     "reduce_min",
     "reduce_max",
 })
-# Only these utility arguments are spliced into the groupby RHS as captures.
-# Other group-helper arguments (key/lhs) are built by the outer builder and may
-# themselves be arbitrary row expressions, including earlier groupby results.
 _GROUP_RHS_CAPTURE_ARGUMENTS = {
     "group_vector_proj": frozenset({1}),
     "group_vector_neut": frozenset({1}),
@@ -39,21 +36,7 @@ def _forbidden_inside_group_rhs(family: str | None) -> bool:
 
 
 def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
-    """Reject only GP compositions the cpp_stream groupby IR cannot represent.
-
-    Most arguments to the canonical group helpers are evaluated by the outer
-    IR builder and can be arbitrary row expressions. ``group_vector_proj`` and
-    ``group_vector_neut`` are different: their regressor argument is captured
-    inside the groupby RHS. The current neutral IR supports ordinary pointwise,
-    cross-sectional, rolling, and stateful nodes there, but rejects a nested
-    groupby and any reduction/emit node. ``emit`` is not present in this GP
-    grammar, so generation only needs to exclude group-helper and reduction
-    families from those captured subtrees.
-
-    The output of a group helper remains an ordinary row, so it can be freely
-    composed by outer GP primitives and can also feed the outer key/lhs of a
-    later group helper.
-    """
+    """Reject only GP compositions the cpp_stream groupby IR cannot represent."""
 
     families = getattr(pset, "gp_primitive_family", {})
 
@@ -62,13 +45,14 @@ def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped
         index += 1
         if not isinstance(node, gp.Primitive):
             return True, index
-
         family = families.get(node.name)
         valid = not (inside_group_rhs and _forbidden_inside_group_rhs(family))
         captured_positions = _GROUP_RHS_CAPTURE_ARGUMENTS.get(family, frozenset())
         for child_position in range(node.arity):
-            child_inside_group_rhs = inside_group_rhs or child_position in captured_positions
-            child_valid, index = visit(index, child_inside_group_rhs)
+            child_valid, index = visit(
+                index,
+                inside_group_rhs or child_position in captured_positions,
+            )
             valid = valid and child_valid
         return valid, index
 
@@ -76,11 +60,22 @@ def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped
     return ok and end == len(individual)
 
 
-def make_toolbox(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: int = 4) -> deap_base.Toolbox:
+def make_toolbox(
+    pset: gp.PrimitiveSetTyped,
+    *,
+    min_depth: int = 1,
+    max_depth: int = 4,
+) -> deap_base.Toolbox:
     if min_depth < 0 or max_depth < min_depth:
         raise ValueError("require 0 <= min_depth <= max_depth")
     toolbox = deap_base.Toolbox()
-    toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=min_depth, max_=max_depth)
+    toolbox.register(
+        "expr",
+        gp.genHalfAndHalf,
+        pset=pset,
+        min_=min_depth,
+        max_=max_depth,
+    )
     toolbox.register("individual", tools.initIterate, gp.PrimitiveTree, toolbox.expr)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     return toolbox
@@ -91,15 +86,13 @@ def individual_to_expr(individual, pset: gp.PrimitiveSetTyped):
     if callable(value):
         value = value()
     if not isinstance(value, ExprValue):
-        raise TypeError(f"GP individual compiled to {type(value).__name__}, expected ExprValue")
+        raise TypeError(
+            f"GP individual compiled to {type(value).__name__}, expected ExprValue"
+        )
     return value.expr
 
 
-def _generate(
-    toolbox: deap_base.Toolbox,
-    pset: gp.PrimitiveSetTyped,
-    max_attempts: int,
-) -> gp.PrimitiveTree:
+def _generate(toolbox, pset, max_attempts: int) -> gp.PrimitiveTree:
     error = None
     rejected = 0
     for _ in range(max_attempts):
@@ -117,7 +110,14 @@ def _generate(
     ) from error
 
 
-def random_tree(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: int = 4, seed: int | None = None, max_attempts: int = 128) -> gp.PrimitiveTree:
+def random_tree(
+    pset: gp.PrimitiveSetTyped,
+    *,
+    min_depth: int = 1,
+    max_depth: int = 4,
+    seed: int | None = None,
+    max_attempts: int = 128,
+) -> gp.PrimitiveTree:
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
     toolbox = make_toolbox(pset, min_depth=min_depth, max_depth=max_depth)
@@ -131,9 +131,17 @@ def random_tree(pset: gp.PrimitiveSetTyped, *, min_depth: int = 1, max_depth: in
         random.setstate(state)
 
 
-def random_formula(pset: gp.PrimitiveSetTyped | None = None, *, config=None, min_depth: int = 1, max_depth: int = 4, seed: int | None = None):
+def random_formula(
+    pset: gp.PrimitiveSetTyped | None = None,
+    *,
+    config=None,
+    min_depth: int = 1,
+    max_depth: int = 4,
+    seed: int | None = None,
+):
     if pset is None:
-        from flows.gp.pset import make_pset
+        from flows.gp.factory import make_pset
+
         pset = make_pset(config)
     tree = random_tree(pset, min_depth=min_depth, max_depth=max_depth, seed=seed)
     return tree, individual_to_expr(tree, pset)
