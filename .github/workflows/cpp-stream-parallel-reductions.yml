@@ -46,6 +46,7 @@ jobs:
             tests/trading_dsl_engine/cpp_stream/test_reductions.py \
             tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py \
             tests/trading_dsl_engine/cpp_stream/test_final_parallel.py \
+            tests/trading_dsl_engine/cpp_stream/test_runner_template_structure.py \
             tests/flows/gp/test_compile_fuzz.py \
             tests/flows/riskminer/test_native.py
       - name: Codegen and strongly typed GP planner audits
