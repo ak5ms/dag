@@ -4,27 +4,48 @@ import os
 
 import pytest
 
-from trading_dsl_engine.cpp_stream import compile_formula
-from trading_dsl_engine.cpp_stream.python import utils as cpp_stream_utils
-from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
-from trading_dsl_engine.base import dsl
-from trading_dsl_engine.base.dsl import ffill, shift, var
-from trading_dsl_engine.base.parser import Call
 from flows.alpha_search import default_alpha_pnl
 from flows.gp import (
+    BoolParam,
+    BoolRow,
+    CountRow,
+    DerivedNumericRow,
+    DimensionlessRow,
+    DurationRow,
+    KthIgnoreSpec,
+    NumericRow,
+    PeriodAtLeastTwo,
+    PositiveFloat,
     PositiveInt,
+    PositiveNumber,
     PriceRow,
+    QuantileParam,
+    QuantityRow,
     REGRESSION_PROJECTIONS,
+    TimestampRow,
+    TradingDayHorizonRow,
     make_pset,
     primitive_names_for_operator,
     random_formula,
 )
+from flows.gp.pset import GP_CPP_STREAM_UTILITY_OPERATOR_NAMES
 from flows.gp.regression import (
     temporal_poly_regression_residual,
     temporal_ridge_projection,
     xs_regression_neutralize,
 )
 from flows.gp.signatures import format_signature_table
+from flows.gp.utils_primitives import (
+    ALL_CPP_STREAM_UTIL_NAMES,
+    NON_ROW_CPP_STREAM_UTIL_NAMES,
+    ROW_SHAPED_CPP_STREAM_UTIL_NAMES,
+)
+from trading_dsl_engine.base import dsl
+from trading_dsl_engine.base.dsl import ffill, shift, var
+from trading_dsl_engine.base.parser import Call
+from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream.python import utils as cpp_stream_utils
+from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
 
 
 _MIN_DEPTH = int(os.environ.get("GP_FUZZ_MIN_DEPTH", "1"))
@@ -60,8 +81,102 @@ def _failure_text(failures):
     return "\n\n".join(chunks)
 
 
+def _sample_arg(type_):
+    samples = {
+        PriceRow: PriceRow(dsl.var("ap0_out0")),
+        QuantityRow: QuantityRow(dsl.var("volume_a0_out0")),
+        TimestampRow: TimestampRow(dsl.var("_ev_ts")),
+        DurationRow: DurationRow(dsl.var("wdte_out0")),
+        TradingDayHorizonRow: TradingDayHorizonRow(dsl.var("wdte_out0")),
+        DimensionlessRow: DimensionlessRow(dsl.var("vw_halfspread_out0")),
+        BoolRow: BoolRow(dsl.var("is_tradable_out0")),
+        CountRow: CountRow(dsl.var("trade_cross_pct_out0.count")),
+        DerivedNumericRow: DerivedNumericRow(dsl.var("ap1_out0")),
+        NumericRow: PriceRow(dsl.var("ap0_out0")),
+        PositiveInt: PositiveInt(20),
+        PeriodAtLeastTwo: PeriodAtLeastTwo(20),
+        PositiveFloat: PositiveFloat(0.5),
+        PositiveNumber: PositiveInt(2),
+        QuantileParam: QuantileParam(0.5),
+        BoolParam: BoolParam(True),
+        KthIgnoreSpec: KthIgnoreSpec("NAN 0"),
+    }
+    try:
+        return samples[type_]
+    except KeyError as exc:
+        raise AssertionError(f"no compiler-test sample for GP type {type_.__name__}") from exc
+
+
+def _family_primitives(pset, family: str):
+    return [pset.mapping[name] for name in primitive_names_for_operator(pset, family)]
+
+
+def _primitive_expr(pset, primitive):
+    args = [_sample_arg(type_) for type_ in primitive.args]
+    return pset.context[primitive.name](*args).expr
+
+
 def test_print_exact_gp_signature_table():
     print(format_signature_table(make_pset()))
+
+
+def test_all_cpp_stream_utils_are_accounted_for_by_shape():
+    pset = make_pset()
+    assert ALL_CPP_STREAM_UTIL_NAMES == (
+        ROW_SHAPED_CPP_STREAM_UTIL_NAMES | NON_ROW_CPP_STREAM_UTIL_NAMES
+    )
+    assert not (ROW_SHAPED_CPP_STREAM_UTIL_NAMES & NON_ROW_CPP_STREAM_UTIL_NAMES)
+    assert pset.gp_cpp_stream_utility_families == ROW_SHAPED_CPP_STREAM_UTIL_NAMES
+    assert pset.gp_non_row_cpp_stream_utility_families == NON_ROW_CPP_STREAM_UTIL_NAMES
+    assert GP_CPP_STREAM_UTILITY_OPERATOR_NAMES <= pset.gp_operator_families
+    for family in ROW_SHAPED_CPP_STREAM_UTIL_NAMES:
+        assert primitive_names_for_operator(pset, family), family
+    for family in NON_ROW_CPP_STREAM_UTIL_NAMES:
+        assert not primitive_names_for_operator(pset, family), family
+
+
+def test_every_added_cpp_stream_utility_primitive_lowers_to_vector_ir():
+    pset = make_pset()
+    failures = []
+    checked = 0
+    for family in sorted(pset.gp_added_cpp_stream_utility_families):
+        for primitive in _family_primitives(pset, family):
+            checked += 1
+            try:
+                expr = _primitive_expr(pset, primitive)
+                program = compile_ir(expr)
+                kind = program.nodes[program.output_id].value_type.kind
+                if kind != "vector":
+                    raise AssertionError(f"output kind is {kind}, expected vector")
+            except Exception as exc:  # pragma: no cover - failure diagnostics
+                failures.append((family, primitive.name, tuple(primitive.args), exc))
+                if len(failures) >= 30:
+                    break
+        if len(failures) >= 30:
+            break
+    text = "\n\n".join(
+        f"family={family}\nprimitive={name}\nargs={[t.__name__ for t in args]}\nerror={type(error).__name__}: {error}"
+        for family, name, args, error in failures
+    )
+    assert checked > 0
+    assert not failures, text
+
+
+def test_one_from_every_added_cpp_stream_utility_family_compiles_natively():
+    pset = make_pset()
+    expressions = []
+    families = sorted(pset.gp_added_cpp_stream_utility_families)
+    for family in families:
+        primitive = _family_primitives(pset, family)[0]
+        expressions.append(_primitive_expr(pset, primitive))
+    assert expressions
+    runtime = compile_formula(
+        dsl.cat(*expressions),
+        n_instruments=9,
+        default_group_capacity=365 * 15,
+        prefetch_rows=16,
+    )
+    assert runtime.program.output_id >= 0
 
 
 def test_regression_gp_adapters_reuse_cpp_stream_utils():
@@ -156,10 +271,6 @@ def test_random_gp_formulas_compile_natively(seed):
             pytrace=True,
         )
     assert runtime.program.output_id >= 0
-
-
-def _family_primitives(pset, family: str):
-    return [pset.mapping[name] for name in primitive_names_for_operator(pset, family)]
 
 
 def test_all_regression_composite_families_compile_natively():
