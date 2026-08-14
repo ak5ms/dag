@@ -5,7 +5,7 @@ import random
 from deap import base as deap_base
 from deap import gp, tools
 
-from flows.gp.types import ExprValue
+from flows.gp.types import ExprValue, StaticValue
 
 
 _GROUP_WRAPPER_FAMILIES = frozenset({
@@ -32,10 +32,17 @@ def _is_group_utility_family(family: str | None) -> bool:
 
 
 def _forbidden_inside_group_rhs(family: str | None) -> bool:
-    return _is_group_utility_family(family) or family in _GROUP_RHS_REDUCTION_FAMILIES or bool(family) and family.startswith("vec_")
+    return (
+        _is_group_utility_family(family)
+        or family in _GROUP_RHS_REDUCTION_FAMILIES
+        or bool(family) and family.startswith("vec_")
+    )
 
 
-def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped) -> bool:
+def _compiler_safe_tree(
+    individual: gp.PrimitiveTree,
+    pset: gp.PrimitiveSetTyped,
+) -> bool:
     """Reject only GP compositions the cpp_stream groupby IR cannot represent."""
 
     families = getattr(pset, "gp_primitive_family", {})
@@ -60,6 +67,44 @@ def _compiler_safe_tree(individual: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped
     return ok and end == len(individual)
 
 
+def _static_passthrough(value):
+    """Generation-only identity used to extend compile-time parameter branches."""
+
+    return value
+
+
+def _ensure_static_generation_primitives(pset: gp.PrimitiveSetTyped) -> None:
+    """Make every terminal-backed static GP type reachable at internal depths.
+
+    DEAP's standard ``genFull`` requires a primitive whenever the requested
+    minimum depth has not yet been reached. Static parameter types naturally
+    only need terminals, so without this identity scaffold a perfectly valid
+    operator such as ``vec_powersum(x, PositiveNumber)`` can make deep
+    ``genHalfAndHalf`` generation fail before compilation is attempted.
+
+    The identities are installed lazily by ``make_toolbox`` rather than by
+    ``make_pset``. They are therefore generation scaffolding, not public DSL
+    operator families, and they disappear when the tree is compiled.
+    """
+
+    for type_, terminals in tuple(pset.terminals.items()):
+        if (
+            not terminals
+            or not isinstance(type_, type)
+            or not issubclass(type_, StaticValue)
+        ):
+            continue
+        name = f"__gp_static_passthrough_{type_.__name__}"
+        if name in pset.mapping:
+            continue
+        pset.addPrimitive(
+            _static_passthrough,
+            (type_,),
+            type_,
+            name=name,
+        )
+
+
 def make_toolbox(
     pset: gp.PrimitiveSetTyped,
     *,
@@ -68,6 +113,7 @@ def make_toolbox(
 ) -> deap_base.Toolbox:
     if min_depth < 0 or max_depth < min_depth:
         raise ValueError("require 0 <= min_depth <= max_depth")
+    _ensure_static_generation_primitives(pset)
     toolbox = deap_base.Toolbox()
     toolbox.register(
         "expr",
@@ -104,7 +150,11 @@ def _generate(toolbox, pset, max_attempts: int) -> gp.PrimitiveTree:
         if _compiler_safe_tree(individual, pset):
             return individual
         rejected += 1
-    detail = f"; rejected {rejected} compiler-unsafe group compositions" if rejected else ""
+    detail = (
+        f"; rejected {rejected} compiler-unsafe group compositions"
+        if rejected
+        else ""
+    )
     raise RuntimeError(
         f"DEAP could not generate a typed tree after {max_attempts} attempts{detail}"
     ) from error
