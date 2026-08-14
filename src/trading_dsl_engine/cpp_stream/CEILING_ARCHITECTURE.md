@@ -48,3 +48,56 @@ The implementation order should be:
 4. select smaller state layouts from those proofs;
 5. add bounded-history row halos where they remove artificial statefulness;
 6. prototype a tiled hybrid scheduler only for important remaining pipelines.
+
+## Implemented generic fusion passes
+
+The projection-fusion work follows the same boundary: Python lowering proves
+relationships, ordinary C++ templates encode the physical capability, and Jinja
+only emits topology.
+
+### Shared reduction projections
+
+Adjacent reductions with the same lazy source, axes, missing-value policy, and
+execution scope are represented by one `ReductionProjectionBundleNode`. The
+requested projection set determines the minimum sufficient statistics at compile
+time:
+
+- sum requests total and count;
+- mean requests total/count unless Welford moments are already required;
+- standard deviation requests count, mean, and M2;
+- min/max request only their extrema and count.
+
+Thus mean plus standard deviation shares count/mean/M2 without maintaining a
+redundant total. The mechanism is projection based rather than Sharpe based.
+
+### Lazy producer-to-reduction fusion
+
+A sole-consumer Cat or no-contraction einsum is represented as a typed lazy
+tensor source. A dead current-row reduction can likewise become a lazy
+`RowReductionTensorSource` feeding a temporal accumulator. Static einsum offset
+maps and reduction inverse maps are computed before native compilation, so the
+hot loop contains direct indexed reads rather than tensor/PnL scratch writes.
+
+The pass is fail-closed: only consumers whose native source contract supports
+arbitrary lazy tensors are eligible. Other stages retain the existing pointer
+ABI.
+
+### EWM observation proofs and compact fallback state
+
+Sibling EWM expressions of the form `where(common_mask, value, NaN)` factor the
+common predicate and evaluate it once. Per-component finite checks remain, so an
+expression that overflows while a sibling remains finite still triggers exact
+metadata divergence. If structural analysis proves observation equivalence, the
+per-component fallback metadata is an empty `[[no_unique_address]]` member and
+is compiled out completely.
+
+### Dead projections and direct epilogues
+
+Bundle members with no observable consumer receive compile-time discard
+destinations. Scalar suffix algebra reads current bundle component values through
+a typed epilogue context, avoiding scratch stores and reloads. The same mechanism
+is used by heterogeneous reductions and EWM bundles.
+
+See `PROJECTION_FUSION_BENCHMARK.md` for alternating-order before/after results
+on direct ceilings, candidate batches, stateful formulas, and deep typed-GP
+programs.
