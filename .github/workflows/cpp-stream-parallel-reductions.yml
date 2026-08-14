@@ -1,50 +1,62 @@
-name: cpp_stream parallel reductions
+name: cpp_stream GP parallelism and ceilings
 
 on:
   pull_request:
-    branches: [cpp-stream-backend]
+    branches: [cpp-stream-backend, agent/strongly-typed-gp]
     paths:
       - "src/trading_dsl_engine/cpp_stream/**"
-      - "tests/trading_dsl_engine/cpp_stream/test_reductions.py"
-      - "tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py"
-      - "scripts/benchmark_cpp_stream_parallel_reductions.py"
+      - "src/flows/gp/**"
+      - "src/flows/riskminer/cpp_stream_eval.py"
+      - "tests/**/cpp_stream/**"
+      - "tests/flows/gp/**"
+      - "tests/flows/riskminer/test_native.py"
+      - "scripts/*cpp_stream*"
       - ".github/workflows/cpp-stream-parallel-reductions.yml"
   workflow_dispatch:
 
 jobs:
-  reduction-scaling:
+  correctness-fuzz-and-ceilings:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Verify multicore runner
+      - name: Verify four available CPUs
         run: |
           lscpu
-          lscpu -e=CPU,CORE,SOCKET,NODE
           python - <<'PY'
           import os
-          affinity = tuple(sorted(os.sched_getaffinity(0)))
-          print(f"affinity={affinity}")
-          if len(affinity) < 4:
-              raise SystemExit(
-                  f"parallel reduction benchmark requires four CPUs, found {len(affinity)}"
-              )
+          cpus = tuple(sorted(os.sched_getaffinity(0)))
+          print(f"affinity={cpus}")
+          assert len(cpus) >= 4, cpus
           PY
-      - name: Install focused dependencies
-        run: >-
-          python -m pip install --upgrade
-          pip numpy numba pytest jinja2 includeigen pybind11
-      - name: Verify reduction parallel correctness
+      - name: Install project
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Correctness and native GP fuzz
         env:
           PYTHONPATH: src
-        run: >-
-          python -m pytest -q -o addopts=""
-          tests/trading_dsl_engine/cpp_stream/test_reductions.py
-          tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py
-      - name: Benchmark serial versus parallel reductions
+          GP_IR_FUZZ_SAMPLES: "200"
+          GP_NATIVE_FUZZ_SAMPLES: "8"
+        run: |
+          python -m pytest -q -o addopts="" \
+            tests/trading_dsl_engine/cpp_stream/test_parallel.py \
+            tests/trading_dsl_engine/cpp_stream/test_parallel_auto.py \
+            tests/trading_dsl_engine/cpp_stream/test_reductions.py \
+            tests/trading_dsl_engine/cpp_stream/test_reductions_parallel.py \
+            tests/trading_dsl_engine/cpp_stream/test_final_parallel.py \
+            tests/trading_dsl_engine/cpp_stream/test_runner_template_structure.py \
+            tests/flows/gp/test_compile_fuzz.py \
+            tests/flows/riskminer/test_native.py
+      - name: Codegen and strongly typed GP planner audits
+        env:
+          PYTHONPATH: src
+          GP_PARALLEL_AUDIT_SAMPLES: "12"
+        run: |
+          python scripts/audit_cpp_stream_stateless_codegen.py
+          python scripts/audit_cpp_stream_gp_parallelism.py
+      - name: Five-million-row reduction scaling
         env:
           PYTHONPATH: src
           CPP_STREAM_PARALLEL_REDUCTION_ROWS: "5000000"
@@ -56,3 +68,27 @@ jobs:
           CPP_STREAM_PARALLEL_REDUCTION_LANE_MIN_SPEEDUP: "1.01"
           CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
         run: python scripts/benchmark_cpp_stream_parallel_reductions.py
+      - name: Native ceilings and GP population scaling
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_GP_CEILING_ROWS: "5000000"
+          CPP_STREAM_GP_CEILING_INSTRUMENTS: "9"
+          CPP_STREAM_GP_CEILING_RUNS: "10"
+          CPP_STREAM_GP_CEILING_WARMUPS: "1"
+          CPP_STREAM_GP_POPULATION_ROWS: "500000"
+          CPP_STREAM_GP_POPULATION_CANDIDATES: "16"
+          CPP_STREAM_GP_POPULATION_BATCH_SIZE: "4"
+          CPP_STREAM_GP_POPULATION_WORKERS: "4"
+          CPP_STREAM_GP_CEILING_JSON: benchmark-results/gp-ceiling.json
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_gp_ceiling.py
+      - name: Representative physical operator families
+        env:
+          PYTHONPATH: src
+        run: python scripts/benchmark_cpp_stream_operator_fusion.py --rows 200000 --lanes 9 --warmups 1 --repeats 5 --cases copy,ewm,xs_rank_ewm,co_skew,co_kurt,co_skew_general,vec_skew,vec_kurt,ridge_metrics,rolling_median_257,backfill_257,prev_diff_257 --native-ceiling --json benchmark-results/operator-families.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpp-stream-gp-performance-results
+          path: benchmark-results
+          if-no-files-found: warn

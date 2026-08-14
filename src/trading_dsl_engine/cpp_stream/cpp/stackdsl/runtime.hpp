@@ -1,5 +1,6 @@
 #pragma once
 
+// Aggregation header used by generated formula translation units.
 #include "stackdsl/utils.hpp"
 #include "stackdsl/engine.hpp"
 #include "stackdsl/io.hpp"
@@ -22,3 +23,8 @@
 #include "stackdsl/ops/custom.hpp"
 #include "stackdsl/ops/ridge.hpp"
 #include "stackdsl/ops/groupby.hpp"
+
+// Compile-time worker-state merging is kept out of generated Jinja. This include
+// appears after the node definitions so existing node adapters can be selected,
+// while future nodes may provide merge_state_from(source, partition) themselves.
+#include "stackdsl/state_merge.hpp"

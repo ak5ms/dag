@@ -1,0 +1,19 @@
+name: source snapshot
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-speedups
+    paths:
+      - ".github/workflows/source-snapshot.yml"
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-source-snapshot
+          path: .
+          include-hidden-files: true

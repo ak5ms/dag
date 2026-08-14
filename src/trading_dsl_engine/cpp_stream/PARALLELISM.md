@@ -1,17 +1,17 @@
 # cpp_stream parallel execution
 
-`cpp_stream` selects a safe partitioning strategy from the lowered physical graph, while the caller controls whether parallel execution is requested:
+`cpp_stream` selects a safe partitioning strategy from the lowered physical graph. Automatic execution is the runtime default:
 
 ```python
 runtime = compile_formula(formula, sources, n_instruments=9)
-serial = runtime.run(out_path="serial.bin")
+automatic = runtime.run(out_path="automatic.bin")
+serial = runtime.run(out_path="serial.bin", threads=1)
 parallel = runtime.run(out_path="parallel.bin", threads=4, pin_threads=True)
-automatic = runtime.run(out_path="automatic.bin", threads=0, pin_threads=True)
 ```
 
-- omitted `threads` or `threads=1`: serial execution;
-- `threads>1`: request that degree of parallelism, capped by CPU affinity and safe work partitioning;
-- `threads=0`: opt into the retained profitability heuristic.
+- omitted `threads` or `threads=0`: select a useful count from the proven strategy, observed rows, instruments, fused-expression work, and CPU affinity;
+- `threads=1`: force serial execution;
+- `threads>1`: request that degree of parallelism, capped by CPU affinity and safe work partitioning.
 
 Every worker owns an independent plan, scratch space, group resolver, and mutable operator state. Eigen remains internally single-threaded so only the outer `cpp_stream` scheduler owns worker parallelism.
 
@@ -29,7 +29,7 @@ A row reduction after temporal work can remain lane-sharded only when it retains
 
 ### Terminal reductions
 
-A temporal reduction, meaning its axes include logical axis `0`, emits one fixed-size final result. `emit("last")` has the same final-output behavior. These plans currently use one accumulator owner even when more threads are requested. This preserves deterministic streaming semantics and avoids a formula-specific merge implementation. A future generic merge layer can parallelize these without changing the expression API.
+Final-output plans may also use row or lane workers when the planner proves that their private results have a valid combination rule. The combination is implemented in ordinary compile-time C++, followed by one final write.
 
 ### Serial fallback
 
@@ -45,8 +45,8 @@ Cat does not create a nested task pool. A root Cat is row-sharded at the whole-p
 - Row workers process disjoint row ranges.
 - Lane workers process disjoint lane ranges in original time order.
 - Lane-aware reductions read and write only their owned lanes.
-- Terminal reductions and final emission have one owner.
+- Final output is written once after worker results are combined.
 - Cross-sectional temporal graphs are not lane-sharded.
 - Benchmarks validate checksums, NaN placement, finite output fractions, actual thread counts, and output byte counts.
 
-See `REDUCTIONS_PARALLEL_BENCHMARK.md` for the reduction, Cat, Ridge, einsum, and `roll_rets` measurements from the final validation run.
+See `CEILING_ARCHITECTURE.md` for the generated-code boundary and the plan for closing remaining reference-ceiling gaps.
