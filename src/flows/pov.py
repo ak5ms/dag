@@ -6,6 +6,7 @@ import jax.numpy as jnp
 
 from flows.utils import mask, pct_change, cumprod
 from trading_dsl_engine.base.dsl import *
+from trading_dsl_engine.base.keys import key
 from trading_dsl_engine.jax_flat import stateless
 
 
@@ -76,8 +77,18 @@ def pov(n_basis: int = 6, h: int = 1440, f: SimpleNamespace = PovFields):
     fit_y = volume_for_fit(volume, ts, session_start, session_end)
     beta = get_beta(InstrumentBasisMean(features, fit_y, 1.0, 21 * h))
     forecast = nonnegative(einsum(beta, future_rbf_basis_sum(ts, session_start, session_end, n_basis, h), "nf,nf->n"))
+
+    # session_start0 is lane-invariant and advances monotonically through the
+    # stream.  Key tells cpp_stream it may recycle one grouped-state slot at
+    # every session transition instead of retaining one slot per historical day.
+    session_key = key(
+        session_start,
+        row_scalar=True,
+        dtype="float64",
+        monotonic=True,
+    )
     seen = groupby(
-        (session_start,),
+        (session_key,),
         volume_for_seen(volume, ts, session_start, session_end, is_tradable),
         cumsum(self_),
     )
