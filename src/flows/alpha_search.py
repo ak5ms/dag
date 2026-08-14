@@ -14,6 +14,7 @@ from trading_dsl_engine.base.dsl import abs as dsl_abs
 from trading_dsl_engine.base.dsl import add, arctan, ceil, div, ewm, exp, floor, fraction, ln, mul, norm_inv, purify, shift, sign, sub, var, xs_norm, xs_pct_rank, xs_rank
 from trading_dsl_engine.base.metadata import analyze_formula_metadata
 from trading_dsl_engine.base.parser import Expr
+from flows.utils import ewm_std
 
 Objective = Callable[[Expr, Sequence[Expr]], float]
 ExprPredicate = Callable[[Expr], bool]
@@ -50,7 +51,7 @@ class SemanticSearchConfig:
 
 
 def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:
-    w = alpha / ewm_var(roll_rets, span=hl)
+    w = alpha / ewm_std(roll_rets, span=hl)
     return shift(ffill(where(is_tradable, w, float("nan")))) * roll_rets
 
 
