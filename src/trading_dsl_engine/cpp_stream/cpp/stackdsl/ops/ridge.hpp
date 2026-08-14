@@ -602,7 +602,7 @@ struct RidgeNode<
     Execution,
     RecomputeEvery
 > {
-    static constexpr std::size_t K = sizeof...(FeatureSources);
+    static constexpr std::size_t K = FeatureList<FeatureSources...>::width;
     static constexpr std::size_t Groups = Execution::cross_state_size;
     static constexpr std::size_t MaxActiveGroups = Groups < N ? Groups : N;
     static_assert(K > 0 && Groups > 0);
