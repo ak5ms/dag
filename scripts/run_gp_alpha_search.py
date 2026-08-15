@@ -1,16 +1,27 @@
-"""Simple end-to-end strongly typed GP alpha search.
+"""End-to-end strongly typed GP alpha search with timed cpp_stream execution.
 
-Edit the constants below and run this file directly. The search uses Sharpe as
-individual fitness and a rolling Ridge over normalized signals to keep a small
-persistent pool of candidates with meaningful marginal coefficients.
+The search uses Sharpe as individual fitness and a persistent nonnegative
+rolling Ridge as a marginal-contribution screen.  Configuration is controlled
+by the constants below or by the matching ``GP_*`` environment variables so
+the same file can be used for full data and reproducible benchmark runs.
 """
 
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import json
 import operator
+import os
+from pathlib import Path
 import random
+import time
+
+import matplotlib
+
+if not os.environ.get("DISPLAY"):
+    matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,71 +31,240 @@ from deap import base, creator, gp, tools
 from flows.alpha_search import default_alpha_pnl
 from flows.gp import GPConfig, GrammarPolicy, individual_to_expr, make_pset, make_toolbox
 from flows.load import InputData
+from flows.riskminer.semantics import inputdata_alpha_terminal_metadata
 from flows.riskmodel import roll_rets
-from flows.utils import replace
+from flows.utils import ewm_std, replace
 from trading_dsl_engine.base.dsl import Ridge, cat, get_beta, purify, shift, var, where
 from trading_dsl_engine.cpp_stream import compile_formula
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_names(name: str) -> tuple[str, ...]:
+    value = os.environ.get(name, "")
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 # Search controls. Depth is 1 for the first DEPTH_GROW_EVERY generations, then
 # increases by one for each subsequent block of that many generations.
-N_INSTRUMENTS = 9
-POPULATION_SIZE = 64
-GENERATIONS = 40
-DEPTH_GROW_EVERY = 5
-ELITE_COUNT = 8
-TOURNAMENT_SIZE = 3
-CROSSOVER_PROB = 0.50
-MUTATION_PROB = 0.40
-IMMIGRANTS = 8
-SEED = 42
+N_INSTRUMENTS = int(os.environ.get("GP_N_INSTRUMENTS", "9"))
+ROWS = int(os.environ.get("GP_ROWS", "5000000"))
+POPULATION_SIZE = int(os.environ.get("GP_POPULATION_SIZE", "64"))
+GENERATIONS = int(os.environ.get("GP_GENERATIONS", "50"))
+DEPTH_GROW_EVERY = int(os.environ.get("GP_DEPTH_GROW_EVERY", "5"))
+ELITE_COUNT = int(os.environ.get("GP_ELITE_COUNT", "8"))
+TOURNAMENT_SIZE = int(os.environ.get("GP_TOURNAMENT_SIZE", "3"))
+CROSSOVER_PROB = float(os.environ.get("GP_CROSSOVER_PROB", "0.50"))
+MUTATION_PROB = float(os.environ.get("GP_MUTATION_PROB", "0.40"))
+IMMIGRANTS = int(os.environ.get("GP_IMMIGRANTS", "8"))
+SEED = int(os.environ.get("GP_SEED", "42"))
 
-# Fitness / execution controls.
-ALPHA_PNL_HL = 1440 * 21
-PREFETCH_ROWS = 16
+# Fitness / execution controls. Terminal temporal reductions are single-owner
+# cpp_stream plans, so independent candidate batches are the useful unit of
+# concurrency for fitness evaluation.
+ALPHA_PNL_HL = int(os.environ.get("GP_ALPHA_PNL_HL", str(1440 * 21)))
+PREFETCH_ROWS = int(os.environ.get("GP_PREFETCH_ROWS", "16"))
+THREADS = int(os.environ.get("GP_THREADS", "1"))
+FITNESS_SHARDS = int(
+    os.environ.get(
+        "GP_FITNESS_SHARDS",
+        str(max(1, min(4, os.cpu_count() or 1))),
+    )
+)
+PARALLEL_DIAGNOSTIC = _env_bool("GP_PARALLEL_DIAGNOSTIC", False)
+DIAGNOSTIC_CANDIDATES = int(os.environ.get("GP_DIAGNOSTIC_CANDIDATES", "16"))
+INPUT_GLOB = os.environ.get(
+    "GP_INPUT_GLOB",
+    "/mnt/extra/qrt/data/aks_out3/*.npy",
+)
+OUTPUT_DIR = Path(os.environ.get("GP_OUTPUT_DIR", "/tmp/gp-alpha-search"))
+SHOW_PLOT = _env_bool("GP_SHOW_PLOT", True)
+FIELD_NAMES = _env_names("GP_FIELD_NAMES")
+DISABLE_TENSORS = _env_bool("GP_DISABLE_TENSORS", False)
 
-# Persistent Ridge pool. The Ridge coefficient is not the GP fitness; it is a
-# simple marginal-contribution screen among the best candidates seen recently.
-POOL_SIZE = 16
-POOL_CANDIDATES_PER_GENERATION = 8
-POOL_RIDGE_HL = 1440 * 5
-POOL_RIDGE_LAMBDA = 1e-3
-POOL_RIDGE_RECOMPUTE_EVERY = 60
+# A bounded run can extrapolate rather than consume an hour. Projection excludes
+# the optional one-off serial-vs-sharded diagnostic and preprocessing.
+PROJECTED_GENERATIONS = int(os.environ.get("GP_PROJECTED_GENERATIONS", "50"))
+STOP_IF_PROJECTED_OVER_SECONDS = float(
+    os.environ.get("GP_STOP_IF_PROJECTED_OVER_SECONDS", "0")
+)
+MIN_GENERATIONS_BEFORE_STOP = int(
+    os.environ.get("GP_MIN_GENERATIONS_BEFORE_STOP", "1")
+)
+MAX_SEARCH_WALL_SECONDS = float(
+    os.environ.get("GP_MAX_SEARCH_WALL_SECONDS", "0")
+)
 
-# This is the one place to trim the grammar. Group utilities are enabled: their
-# GP key arguments are bounded Key terminals, so they do not need a large generic
-# group-capacity override.
+# Persistent Ridge pool. mean(abs(beta)) is only the marginal-contribution
+# screen; individual evolutionary fitness remains candidate Sharpe.
+POOL_SIZE = int(os.environ.get("GP_POOL_SIZE", "16"))
+POOL_CANDIDATES_PER_GENERATION = int(
+    os.environ.get("GP_POOL_CANDIDATES_PER_GENERATION", "8")
+)
+POOL_RIDGE_HL = int(os.environ.get("GP_POOL_RIDGE_HL", str(1440 * 5)))
+POOL_RIDGE_LAMBDA = float(os.environ.get("GP_POOL_RIDGE_LAMBDA", "1e-3"))
+POOL_RIDGE_RECOMPUTE_EVERY = 1
+
+# Group utilities remain enabled. Their GP key arguments are bounded Key
+# terminals, so no generic default_group_capacity override is required.
 GRAMMAR = GrammarPolicy()
 
 
 def l1_norm(x):
+    """Cross-sectionally normalize a signal with finite-value purification."""
+
     return purify(x / abs(x).sum(axis=-1))
+
+
+def clean_returns_expr():
+    """The exact cleaned return expression used by the alpha-PnL denominator."""
+
+    roll_rets_value = var("roll_rets")
+    return where(
+        abs(roll_rets_value) <= 0.05,
+        replace(roll_rets_value, 0, float("nan")),
+        float("nan"),
+    )
 
 
 def depth_for_generation(generation: int) -> int:
     return 1 + (generation - 1) // DEPTH_GROW_EVERY
 
 
-def load_sources():
-    """Load InputData and materialize roll_rets once for all GP evaluations."""
+def _slice_sources(data, rows: int):
+    if rows <= 0:
+        return dict(data)
+    sliced = {}
+    for name, value in data.items():
+        shape = tuple(getattr(value, "shape", ()))
+        if not shape:
+            sliced[name] = value
+            continue
+        if int(shape[0]) < rows:
+            raise ValueError(
+                f"source {name!r} has {int(shape[0]):,} rows; "
+                f"requested {rows:,}"
+            )
+        sliced[name] = value[:rows]
+    return sliced
 
-    data = InputData()
-    sources = data.get_data()
+
+def _run_summary(result, runtime, *, compile_seconds: float, wall_seconds: float):
+    return {
+        "compile_seconds": float(compile_seconds),
+        "wall_seconds": float(wall_seconds),
+        "native_seconds": float(result.seconds),
+        "cpu_seconds": float(result.cpu_seconds),
+        "average_busy_cores": float(result.average_busy_cores),
+        "threads": int(result.threads),
+        "available_cpus": int(result.available_cpus),
+        "parallel_mode": str(result.parallel_mode),
+        "parallel_plan_mode": str(runtime.parallel_plan.mode),
+        "parallel_plan_reason": str(runtime.parallel_plan.reason),
+        "work_score": int(runtime.parallel_plan.work_score),
+    }
+
+
+def _derived_source(name, formula, sources):
+    out_path = OUTPUT_DIR / "derived" / f"{name}.npy"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    compile_started = time.perf_counter()
     runtime = compile_formula(
-        roll_rets,
+        formula,
         sources,
         n_instruments=N_INSTRUMENTS,
         prefetch_rows=PREFETCH_ROWS,
     )
-    values = runtime.run().load()
-    return sources | {"roll_rets": values}
+    compile_seconds = time.perf_counter() - compile_started
+
+    run_started = time.perf_counter()
+    result = runtime.run(out_path=out_path, threads=THREADS)
+    wall_seconds = time.perf_counter() - run_started
+
+    metrics = _run_summary(
+        result,
+        runtime,
+        compile_seconds=compile_seconds,
+        wall_seconds=wall_seconds,
+    )
+    metrics.update({"name": name, "output_path": str(out_path)})
+    print(
+        f"derived={name} compile={compile_seconds:.3f}s "
+        f"run={wall_seconds:.3f}s mode={metrics['parallel_mode']} "
+        f"busy_cores={metrics['average_busy_cores']:.2f}"
+    )
+    return result.load(), metrics
+
+
+def load_sources():
+    """Load exactly ROWS rows and materialize reusable derived sources once."""
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    load_started = time.perf_counter()
+    data = InputData(fp=INPUT_GLOB, idx=None, nrows=None)
+    raw_sources = data.get_data()
+    if not raw_sources:
+        raise FileNotFoundError(f"no input arrays matched {INPUT_GLOB!r}")
+    sources = _slice_sources(raw_sources, ROWS)
+    load_seconds = time.perf_counter() - load_started
+
+    derived_metrics = {}
+    if "roll_rets" not in sources:
+        values, metrics = _derived_source("roll_rets", roll_rets, sources)
+        sources = sources | {"roll_rets": values}
+        derived_metrics["roll_rets"] = metrics
+    else:
+        print("derived=roll_rets reused precomputed input")
+
+    # This is the exact ewm_std denominator used by default_alpha_pnl. It is
+    # materialized once so the Ridge feature scaling does not rebuild it in
+    # every generation.
+    if "volatility" not in sources:
+        volatility_formula = ewm_std(
+            clean_returns_expr(),
+            span=ALPHA_PNL_HL,
+        )
+        values, metrics = _derived_source(
+            "volatility",
+            volatility_formula,
+            sources,
+        )
+        sources = sources | {"volatility": values}
+        derived_metrics["volatility"] = metrics
+    else:
+        print("derived=volatility reused precomputed input")
+
+    return sources, {
+        "load_seconds": float(load_seconds),
+        "derived": derived_metrics,
+        "rows": int(ROWS),
+        "n_instruments": int(N_INSTRUMENTS),
+    }
 
 
 def build_search_state():
-    pset = make_pset(GPConfig(grammar=GRAMMAR))
+    config_kwargs = {"grammar": GRAMMAR}
+    if FIELD_NAMES:
+        available = inputdata_alpha_terminal_metadata()
+        missing = sorted(set(FIELD_NAMES) - set(available))
+        if missing:
+            raise KeyError(f"unknown GP field names: {missing}")
+        config_kwargs["fields"] = {
+            name: available[name] for name in FIELD_NAMES
+        }
+    if DISABLE_TENSORS:
+        config_kwargs["tensor_fields"] = ()
 
-    # Installs generation-only typed leaf witnesses for standard DEAP generation.
-    # There is no reject/retry path.
+    pset = make_pset(GPConfig(**config_kwargs))
+
+    # Installs generation-only typed leaf witnesses for standard DEAP
+    # generation. There is no reject/retry path.
     make_toolbox(pset, min_depth=1, max_depth=1)
 
     if not hasattr(creator, "GPAlphaFitness"):
@@ -98,7 +278,11 @@ def build_search_state():
 
     toolbox = base.Toolbox()
     toolbox.register("clone", copy.deepcopy)
-    toolbox.register("select", tools.selTournament, tournsize=TOURNAMENT_SIZE)
+    toolbox.register(
+        "select",
+        tools.selTournament,
+        tournsize=TOURNAMENT_SIZE,
+    )
     return pset, toolbox
 
 
@@ -107,78 +291,493 @@ def new_individual(pset, depth: int):
     return creator.GPAlphaIndividual(nodes)
 
 
+def raw_alpha_expr(individual, pset):
+    return individual_to_expr(individual, pset)
+
+
 def alpha_expr(individual, pset):
-    return l1_norm(individual_to_expr(individual, pset))
+    return l1_norm(raw_alpha_expr(individual, pset))
 
 
-def evaluate_individuals(individuals, pset, sources, clean_rets):
-    """Evaluate all invalid individuals together as a vector of Sharpes."""
+def _split_batches(items, requested_shards: int):
+    if not items:
+        return []
+    count = max(1, min(int(requested_shards), len(items)))
+    width = (len(items) + count - 1) // count
+    return [
+        items[start : start + width]
+        for start in range(0, len(items), width)
+    ]
 
-    pending = [individual for individual in individuals if not individual.fitness.valid]
-    if not pending:
-        return
 
+def _fitness_batch(
+    batch,
+    sources,
+    clean_rets,
+    generation: int,
+    shard: int,
+    label: str,
+):
     pnls = [
         default_alpha_pnl(
-            alpha_expr(individual, pset),
+            alpha,
             roll_rets=clean_rets,
             is_tradable=var("is_tradable_out0"),
             hl=ALPHA_PNL_HL,
         )
-        for individual in pending
+        for _, alpha in batch
     ]
-
-    # cat gives (instrument, candidate) per streaming row. axis=1 therefore
-    # aggregates instruments independently for every candidate, while axis=0
-    # below is the temporal reduction that produces one Sharpe per candidate.
-    pnl = pnls[0].sum(axis=1) if len(pnls) == 1 else cat(*pnls).sum(axis=1)
+    pnl = (
+        pnls[0].sum(axis=1)
+        if len(pnls) == 1
+        else cat(*pnls).sum(axis=1)
+    )
     score = pnl.mean(axis=0) / pnl.std(axis=0)
+
+    compile_started = time.perf_counter()
     runtime = compile_formula(
         score,
         sources,
         n_instruments=N_INSTRUMENTS,
         prefetch_rows=PREFETCH_ROWS,
     )
-    values = np.asarray(runtime.run().load(), dtype=np.float64).reshape(-1)
-    if values.size != len(pending):
+    compile_seconds = time.perf_counter() - compile_started
+
+    out_path = (
+        OUTPUT_DIR
+        / "scratch"
+        / f"fitness_{label}_g{generation:03d}_s{shard:02d}.npy"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_started = time.perf_counter()
+    result = runtime.run(out_path=out_path, threads=THREADS)
+    wall_seconds = time.perf_counter() - run_started
+    values = np.asarray(
+        result.load(mmap_mode=None),
+        dtype=np.float64,
+    ).reshape(-1)
+    out_path.unlink(missing_ok=True)
+
+    if values.size != len(batch):
         raise RuntimeError(
-            f"fitness returned {values.size} values for {len(pending)} candidates"
+            f"fitness returned {values.size} values for "
+            f"{len(batch)} candidates"
         )
 
-    for individual, value in zip(pending, values):
-        individual.fitness.values = (
-            float(value) if np.isfinite(value) else -np.inf,
+    metrics = _run_summary(
+        result,
+        runtime,
+        compile_seconds=compile_seconds,
+        wall_seconds=wall_seconds,
+    )
+    metrics.update(
+        {
+            "candidate_count": len(batch),
+            "shard": shard,
+            "label": label,
+        }
+    )
+    return [key for key, _ in batch], values, metrics
+
+
+def _evaluate_alpha_batches(
+    batch,
+    sources,
+    clean_rets,
+    generation: int,
+    shards: int,
+    label: str,
+):
+    chunks = _split_batches(batch, shards)
+    started = time.perf_counter()
+    if len(chunks) == 1:
+        outcomes = [
+            _fitness_batch(
+                chunks[0],
+                sources,
+                clean_rets,
+                generation,
+                0,
+                label,
+            )
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = [
+                executor.submit(
+                    _fitness_batch,
+                    chunk,
+                    sources,
+                    clean_rets,
+                    generation,
+                    index,
+                    label,
+                )
+                for index, chunk in enumerate(chunks)
+            ]
+            outcomes = [future.result() for future in futures]
+    wall_seconds = time.perf_counter() - started
+
+    scores = {}
+    stages = []
+    for keys, values, metrics in outcomes:
+        stages.append(metrics)
+        for key, value in zip(keys, values):
+            scores[key] = (
+                float(value)
+                if np.isfinite(value)
+                else -np.inf
+            )
+
+    native_sum = sum(item["native_seconds"] for item in stages)
+    run_wall_sum = sum(item["wall_seconds"] for item in stages)
+    cpu_sum = sum(item["cpu_seconds"] for item in stages)
+    return scores, {
+        "wall_seconds": float(wall_seconds),
+        "shards": len(chunks),
+        "candidate_count": len(batch),
+        "compile_seconds_sum": float(
+            sum(item["compile_seconds"] for item in stages)
+        ),
+        "run_wall_seconds_sum": float(run_wall_sum),
+        "native_seconds_sum": float(native_sum),
+        "cpu_seconds_sum": float(cpu_sum),
+        "effective_native_concurrency": float(
+            native_sum / wall_seconds if wall_seconds else 0.0
+        ),
+        "effective_cpu_concurrency": float(
+            cpu_sum / wall_seconds if wall_seconds else 0.0
+        ),
+        "plans": sorted(
+            {
+                (
+                    f"{item['parallel_plan_mode']}: "
+                    f"{item['parallel_plan_reason']}"
+                )
+                for item in stages
+            }
+        ),
+        "stages": stages,
+    }
+
+
+def _compare_score_maps(left, right):
+    if set(left) != set(right):
+        raise RuntimeError("serial and sharded fitness keys differ")
+    for key, left_value in left.items():
+        right_value = right[key]
+        if left_value == right_value:
+            continue
+        if not np.isclose(
+            left_value,
+            right_value,
+            rtol=1e-10,
+            atol=1e-12,
+            equal_nan=True,
+        ):
+            raise RuntimeError(
+                f"serial/sharded fitness mismatch for {key}: "
+                f"{left_value} versus {right_value}"
+            )
+
+
+def evaluate_individuals(
+    individuals,
+    pset,
+    sources,
+    clean_rets,
+    generation: int,
+    fitness_cache,
+):
+    """Evaluate unique invalid formulas in concurrent cpp_stream batches."""
+
+    pending = [
+        individual
+        for individual in individuals
+        if not individual.fitness.valid
+    ]
+    representatives = {}
+    duplicate_groups = {}
+    cached = 0
+    for individual in pending:
+        key = str(individual)
+        if key in fitness_cache:
+            individual.fitness.values = (fitness_cache[key],)
+            cached += 1
+            continue
+        duplicate_groups.setdefault(key, []).append(individual)
+        representatives.setdefault(key, individual)
+
+    batch = [
+        (key, alpha_expr(individual, pset))
+        for key, individual in representatives.items()
+    ]
+
+    diagnostic = None
+    if (
+        batch
+        and PARALLEL_DIAGNOSTIC
+        and generation == 1
+        and FITNESS_SHARDS > 1
+    ):
+        count = max(1, min(DIAGNOSTIC_CANDIDATES, len(batch)))
+        diagnostic_batch = batch[:count]
+        remainder = batch[count:]
+
+        serial_scores, serial_metrics = _evaluate_alpha_batches(
+            diagnostic_batch,
+            sources,
+            clean_rets,
+            generation,
+            1,
+            "diagnostic_serial",
         )
+        sharded_scores, sharded_metrics = _evaluate_alpha_batches(
+            diagnostic_batch,
+            sources,
+            clean_rets,
+            generation,
+            FITNESS_SHARDS,
+            "diagnostic_sharded",
+        )
+        _compare_score_maps(serial_scores, sharded_scores)
+
+        scores = dict(sharded_scores)
+        if remainder:
+            remainder_scores, remainder_metrics = _evaluate_alpha_batches(
+                remainder,
+                sources,
+                clean_rets,
+                generation,
+                FITNESS_SHARDS,
+                "search_remainder",
+            )
+            scores.update(remainder_scores)
+        else:
+            remainder_metrics = {
+                "wall_seconds": 0.0,
+                "shards": 0,
+                "candidate_count": 0,
+                "compile_seconds_sum": 0.0,
+                "run_wall_seconds_sum": 0.0,
+                "native_seconds_sum": 0.0,
+                "cpu_seconds_sum": 0.0,
+                "effective_native_concurrency": 0.0,
+                "effective_cpu_concurrency": 0.0,
+                "plans": [],
+                "stages": [],
+            }
+
+        steady_wall = (
+            sharded_metrics["wall_seconds"]
+            + remainder_metrics["wall_seconds"]
+        )
+        metrics = {
+            "wall_seconds": (
+                serial_metrics["wall_seconds"] + steady_wall
+            ),
+            "steady_state_wall_seconds": steady_wall,
+            "shards": FITNESS_SHARDS,
+            "candidate_count": len(batch),
+            "compile_seconds_sum": (
+                sharded_metrics["compile_seconds_sum"]
+                + remainder_metrics["compile_seconds_sum"]
+            ),
+            "run_wall_seconds_sum": (
+                sharded_metrics["run_wall_seconds_sum"]
+                + remainder_metrics["run_wall_seconds_sum"]
+            ),
+            "native_seconds_sum": (
+                sharded_metrics["native_seconds_sum"]
+                + remainder_metrics["native_seconds_sum"]
+            ),
+            "cpu_seconds_sum": (
+                sharded_metrics["cpu_seconds_sum"]
+                + remainder_metrics["cpu_seconds_sum"]
+            ),
+            "effective_native_concurrency": (
+                (
+                    sharded_metrics["native_seconds_sum"]
+                    + remainder_metrics["native_seconds_sum"]
+                )
+                / steady_wall
+                if steady_wall
+                else 0.0
+            ),
+            "effective_cpu_concurrency": (
+                (
+                    sharded_metrics["cpu_seconds_sum"]
+                    + remainder_metrics["cpu_seconds_sum"]
+                )
+                / steady_wall
+                if steady_wall
+                else 0.0
+            ),
+            "plans": sorted(
+                set(sharded_metrics["plans"])
+                | set(remainder_metrics["plans"])
+            ),
+            "stages": (
+                sharded_metrics["stages"]
+                + remainder_metrics["stages"]
+            ),
+        }
+        diagnostic = {
+            "candidate_count": count,
+            "serial_wall_seconds": serial_metrics["wall_seconds"],
+            "sharded_wall_seconds": sharded_metrics["wall_seconds"],
+            "speedup": (
+                serial_metrics["wall_seconds"]
+                / sharded_metrics["wall_seconds"]
+                if sharded_metrics["wall_seconds"]
+                else float("inf")
+            ),
+            "serial": serial_metrics,
+            "sharded": sharded_metrics,
+        }
+    elif batch:
+        scores, metrics = _evaluate_alpha_batches(
+            batch,
+            sources,
+            clean_rets,
+            generation,
+            FITNESS_SHARDS,
+            "search",
+        )
+        metrics["steady_state_wall_seconds"] = metrics["wall_seconds"]
+    else:
+        scores = {}
+        metrics = {
+            "wall_seconds": 0.0,
+            "steady_state_wall_seconds": 0.0,
+            "shards": 0,
+            "candidate_count": 0,
+            "compile_seconds_sum": 0.0,
+            "run_wall_seconds_sum": 0.0,
+            "native_seconds_sum": 0.0,
+            "cpu_seconds_sum": 0.0,
+            "effective_native_concurrency": 0.0,
+            "effective_cpu_concurrency": 0.0,
+            "plans": [],
+            "stages": [],
+        }
+
+    for key, group in duplicate_groups.items():
+        score = scores[key]
+        fitness_cache[key] = score
+        for individual in group:
+            individual.fitness.values = (score,)
+
+    metrics.update(
+        {
+            "pending_count": len(pending),
+            "unique_evaluated": len(batch),
+            "cache_hits": cached,
+            "duplicates_within_batch": (
+                sum(len(group) for group in duplicate_groups.values())
+                - len(duplicate_groups)
+            ),
+            "diagnostic": diagnostic,
+        }
+    )
+    return metrics
 
 
-def ridge_contributions(individuals, pset, sources, clean_rets):
-    """Return mean absolute rolling Ridge beta for each supplied alpha."""
+def ridge_contributions(
+    individuals,
+    pset,
+    sources,
+    clean_rets,
+    generation: int,
+):
+    """Return mean(abs(beta)) using the requested scaled nonnegative Ridge."""
 
-    alphas = [alpha_expr(individual, pset) for individual in individuals]
+    # alpha_expr is explicitly l1_norm(raw_alpha). Ridge therefore receives
+    # shift(l1_norm(alpha), 1, 1) multiplied by the exact volatility used in the
+    # default_alpha_pnl denominator.
+    normalized_alphas = [
+        alpha_expr(individual, pset)
+        for individual in individuals
+    ]
+    volatility = var("volatility")
+    ridge_alphas = [
+        shift(alpha, 1, 1) * volatility
+        for alpha in normalized_alphas
+    ]
+
+    hs = var("vw_halfspread_out0")
+    # W is inverse half-spread variance. Parentheses avoid Python's left-to-right
+    # interpretation of ``1 / hs * hs``, which would collapse to roughly one.
+    ridge_weights = purify(1.0 / (hs * hs))
+
     regression = Ridge(
-        *(shift(alpha, 1, 1) for alpha in alphas),
+        *ridge_alphas,
         y=clean_rets,
+        weights=ridge_weights,
         hl=float(POOL_RIDGE_HL),
         lambda_=POOL_RIDGE_LAMBDA,
-        nonneg=False,
+        nonneg=True,
         recompute_every=POOL_RIDGE_RECOMPUTE_EVERY,
     )
     mean_abs_beta = abs(get_beta(regression)).mean(axis=0)
+
+    compile_started = time.perf_counter()
     runtime = compile_formula(
         mean_abs_beta,
         sources,
         n_instruments=N_INSTRUMENTS,
         prefetch_rows=PREFETCH_ROWS,
     )
-    values = np.asarray(runtime.run().load(), dtype=np.float64).reshape(-1)
+    compile_seconds = time.perf_counter() - compile_started
+
+    out_path = (
+        OUTPUT_DIR
+        / "scratch"
+        / f"ridge_g{generation:03d}.npy"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    run_started = time.perf_counter()
+    result = runtime.run(out_path=out_path, threads=THREADS)
+    wall_seconds = time.perf_counter() - run_started
+    values = np.asarray(
+        result.load(mmap_mode=None),
+        dtype=np.float64,
+    ).reshape(-1)
+    out_path.unlink(missing_ok=True)
+
     if values.size != len(individuals):
         raise RuntimeError(
-            f"Ridge returned {values.size} coefficients for {len(individuals)} alphas"
+            f"Ridge returned {values.size} coefficients for "
+            f"{len(individuals)} alphas"
         )
-    return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    metrics = _run_summary(
+        result,
+        runtime,
+        compile_seconds=compile_seconds,
+        wall_seconds=wall_seconds,
+    )
+    metrics["candidate_count"] = len(individuals)
+    return (
+        np.nan_to_num(
+            values,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ),
+        metrics,
+    )
 
 
-def update_pool(pool, population, pset, sources, clean_rets, toolbox):
+def update_pool(
+    pool,
+    population,
+    pset,
+    sources,
+    clean_rets,
+    toolbox,
+    generation: int,
+):
     """Merge strong population members into the pool and rerank by Ridge beta."""
 
     candidates = list(pool.values()) + tools.selBest(
@@ -190,7 +789,29 @@ def update_pool(pool, population, pset, sources, clean_rets, toolbox):
         unique.setdefault(str(individual), individual)
     candidates = list(unique.values())
 
-    contribution = ridge_contributions(candidates, pset, sources, clean_rets)
+    if not candidates:
+        return {}, {}, {
+            "candidate_count": 0,
+            "compile_seconds": 0.0,
+            "wall_seconds": 0.0,
+            "native_seconds": 0.0,
+            "cpu_seconds": 0.0,
+            "average_busy_cores": 0.0,
+            "threads": THREADS,
+            "available_cpus": os.cpu_count() or 1,
+            "parallel_mode": "serial",
+            "parallel_plan_mode": "serial",
+            "parallel_plan_reason": "no candidates",
+            "work_score": 0,
+        }
+
+    contribution, ridge_metrics = ridge_contributions(
+        candidates,
+        pset,
+        sources,
+        clean_rets,
+        generation,
+    )
     order = np.argsort(contribution)[::-1][:POOL_SIZE]
     next_pool = {
         str(candidates[index]): toolbox.clone(candidates[index])
@@ -202,12 +823,19 @@ def update_pool(pool, population, pset, sources, clean_rets, toolbox):
         for index in order
         if contribution[index] > 0.0
     }
-    return next_pool, next_contribution
+    return next_pool, next_contribution, ridge_metrics
 
 
 def vary(population, pset, toolbox, next_depth: int):
-    elites = [toolbox.clone(x) for x in tools.selBest(population, ELITE_COUNT)]
+    elites = [
+        toolbox.clone(x)
+        for x in tools.selBest(population, ELITE_COUNT)
+    ]
     child_count = POPULATION_SIZE - ELITE_COUNT - IMMIGRANTS
+    if child_count < 0:
+        raise ValueError(
+            "POPULATION_SIZE must be at least ELITE_COUNT + IMMIGRANTS"
+        )
     children = [
         toolbox.clone(x)
         for x in toolbox.select(population, child_count)
@@ -217,15 +845,28 @@ def vary(population, pset, toolbox, next_depth: int):
         key=operator.attrgetter("height"),
         max_value=next_depth,
     )(gp.cxOnePoint)
-    mutation_expr = partial(gp.genFull, min_=0, max_=min(2, next_depth))
+    mutation_expr = partial(
+        gp.genFull,
+        min_=0,
+        max_=min(2, next_depth),
+    )
     mutate = gp.staticLimit(
         key=operator.attrgetter("height"),
         max_value=next_depth,
-    )(partial(gp.mutUniform, expr=mutation_expr, pset=pset))
+    )(
+        partial(
+            gp.mutUniform,
+            expr=mutation_expr,
+            pset=pset,
+        )
+    )
 
     for index in range(1, len(children), 2):
         if random.random() < CROSSOVER_PROB:
-            left, right = mate(children[index - 1], children[index])
+            left, right = mate(
+                children[index - 1],
+                children[index],
+            )
             children[index - 1], children[index] = left, right
             if left.fitness.valid:
                 del left.fitness.values
@@ -239,57 +880,303 @@ def vary(population, pset, toolbox, next_depth: int):
             if child.fitness.valid:
                 del child.fitness.values
 
-    immigrants = [new_individual(pset, next_depth) for _ in range(IMMIGRANTS)]
+    immigrants = [
+        new_individual(pset, next_depth)
+        for _ in range(IMMIGRANTS)
+    ]
     return elites + children + immigrants
 
 
+def _settings():
+    return {
+        "n_instruments": N_INSTRUMENTS,
+        "rows": ROWS,
+        "population_size": POPULATION_SIZE,
+        "generations_requested": GENERATIONS,
+        "projected_generations": PROJECTED_GENERATIONS,
+        "depth_grow_every": DEPTH_GROW_EVERY,
+        "elite_count": ELITE_COUNT,
+        "tournament_size": TOURNAMENT_SIZE,
+        "crossover_probability": CROSSOVER_PROB,
+        "mutation_probability": MUTATION_PROB,
+        "immigrants": IMMIGRANTS,
+        "seed": SEED,
+        "alpha_pnl_span": ALPHA_PNL_HL,
+        "prefetch_rows": PREFETCH_ROWS,
+        "threads": THREADS,
+        "fitness_shards": FITNESS_SHARDS,
+        "parallel_diagnostic": PARALLEL_DIAGNOSTIC,
+        "diagnostic_candidates": DIAGNOSTIC_CANDIDATES,
+        "field_names": list(FIELD_NAMES),
+        "disable_tensors": DISABLE_TENSORS,
+        "pool_size": POOL_SIZE,
+        "pool_candidates_per_generation": (
+            POOL_CANDIDATES_PER_GENERATION
+        ),
+        "pool_ridge_span": POOL_RIDGE_HL,
+        "pool_ridge_lambda": POOL_RIDGE_LAMBDA,
+        "pool_ridge_recompute_every": POOL_RIDGE_RECOMPUTE_EVERY,
+        "pool_ridge_nonnegative": True,
+        "ridge_weights": "purify(1 / (vw_halfspread_out0 ** 2))",
+        "ridge_feature": (
+            "shift(l1_norm(alpha), 1, 1) "
+            "* ewm_std(clean_roll_rets, span=alpha_pnl_span)"
+        ),
+        "stop_if_projected_over_seconds": (
+            STOP_IF_PROJECTED_OVER_SECONDS
+        ),
+        "max_search_wall_seconds": MAX_SEARCH_WALL_SECONDS,
+    }
+
+
+def _write_outputs(history, summary):
+    frame = pd.DataFrame(history)
+    csv_path = OUTPUT_DIR / "gp_search_history.csv"
+    json_path = OUTPUT_DIR / "gp_search_summary.json"
+    plot_path = OUTPUT_DIR / "gp_search_history.png"
+
+    frame.to_csv(csv_path, index=False)
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+
+    if not frame.empty:
+        plt.figure(figsize=(9, 5))
+        plt.plot(
+            frame["generation"],
+            frame["best_sharpe"],
+            label="best Sharpe",
+        )
+        plt.plot(
+            frame["generation"],
+            frame["mean_sharpe"],
+            label="mean Sharpe",
+        )
+        plt.plot(
+            frame["generation"],
+            frame["median_sharpe"],
+            label="median Sharpe",
+        )
+        plt.xlabel("Generation")
+        plt.ylabel("Fitness (Sharpe)")
+        plt.title(
+            f"Strongly typed GP fitness: "
+            f"{ROWS:,} rows × {N_INSTRUMENTS}"
+        )
+        plt.grid(True, alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=160)
+        if SHOW_PLOT:
+            plt.show()
+        plt.close()
+
+    return csv_path, json_path, plot_path
+
+
 def main():
+    if GENERATIONS <= 0:
+        raise ValueError("GP_GENERATIONS must be positive")
+    if POPULATION_SIZE <= 0:
+        raise ValueError("GP_POPULATION_SIZE must be positive")
+    if FITNESS_SHARDS <= 0:
+        raise ValueError("GP_FITNESS_SHARDS must be positive")
+    if POOL_RIDGE_RECOMPUTE_EVERY != 1:
+        raise AssertionError("Ridge recompute_every must remain 1")
+
     random.seed(SEED)
     np.random.seed(SEED)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    sources = load_sources()
-    clean_rets = where(
-        abs(var("roll_rets")) <= 0.05,
-        replace(var("roll_rets"), 0, float("nan")),
-        float("nan"),
-    )
+    total_started = time.perf_counter()
+    sources, preprocessing = load_sources()
+    clean_rets = clean_returns_expr()
     pset, toolbox = build_search_state()
 
-    population = [new_individual(pset, 1) for _ in range(POPULATION_SIZE)]
+    population = [
+        new_individual(pset, 1)
+        for _ in range(POPULATION_SIZE)
+    ]
     hall_of_fame = tools.HallOfFame(20)
     pool = {}
     pool_contribution = {}
+    fitness_cache = {}
     history = []
+    stop_reason = None
+    search_started = time.perf_counter()
+    steady_state_cumulative = 0.0
+
+    summary = {
+        "settings": _settings(),
+        "preprocessing": preprocessing,
+        "operator_family_count": len(
+            getattr(pset, "gp_operator_families", ())
+        ),
+        "history": history,
+        "stop_reason": None,
+    }
 
     for generation in range(1, GENERATIONS + 1):
+        generation_started = time.perf_counter()
         depth = depth_for_generation(generation)
-        evaluate_individuals(population, pset, sources, clean_rets)
+
+        fitness_metrics = evaluate_individuals(
+            population,
+            pset,
+            sources,
+            clean_rets,
+            generation,
+            fitness_cache,
+        )
         hall_of_fame.update(population)
-        pool, pool_contribution = update_pool(
+        pool, pool_contribution, ridge_metrics = update_pool(
             pool,
             population,
             pset,
             sources,
             clean_rets,
             toolbox,
+            generation,
         )
 
-        fitness = np.array([x.fitness.values[0] for x in population])
+        generation_wall = time.perf_counter() - generation_started
+        diagnostic_extra = max(
+            0.0,
+            fitness_metrics["wall_seconds"]
+            - fitness_metrics["steady_state_wall_seconds"],
+        )
+        steady_generation_wall = max(
+            0.0,
+            generation_wall - diagnostic_extra,
+        )
+        steady_state_cumulative += steady_generation_wall
+        cumulative_search = time.perf_counter() - search_started
+        projected_total = (
+            steady_state_cumulative
+            / generation
+            * PROJECTED_GENERATIONS
+        )
+
+        fitness = np.array(
+            [x.fitness.values[0] for x in population],
+            dtype=np.float64,
+        )
         finite = fitness[np.isfinite(fitness)]
         row = {
             "generation": generation,
             "max_depth": depth,
-            "best_sharpe": float(np.max(fitness)),
-            "mean_sharpe": float(np.mean(finite)) if finite.size else np.nan,
-            "median_sharpe": float(np.median(finite)) if finite.size else np.nan,
+            "best_sharpe": (
+                float(np.max(fitness))
+                if fitness.size
+                else float("nan")
+            ),
+            "mean_sharpe": (
+                float(np.mean(finite))
+                if finite.size
+                else float("nan")
+            ),
+            "median_sharpe": (
+                float(np.median(finite))
+                if finite.size
+                else float("nan")
+            ),
             "pool_size": len(pool),
+            "fitness_pending": fitness_metrics["pending_count"],
+            "fitness_unique_evaluated": (
+                fitness_metrics["unique_evaluated"]
+            ),
+            "fitness_cache_hits": fitness_metrics["cache_hits"],
+            "fitness_shards": fitness_metrics["shards"],
+            "fitness_wall_seconds": fitness_metrics["wall_seconds"],
+            "fitness_steady_state_wall_seconds": (
+                fitness_metrics["steady_state_wall_seconds"]
+            ),
+            "fitness_compile_seconds_sum": (
+                fitness_metrics["compile_seconds_sum"]
+            ),
+            "fitness_run_wall_seconds_sum": (
+                fitness_metrics["run_wall_seconds_sum"]
+            ),
+            "fitness_effective_native_concurrency": (
+                fitness_metrics["effective_native_concurrency"]
+            ),
+            "fitness_effective_cpu_concurrency": (
+                fitness_metrics["effective_cpu_concurrency"]
+            ),
+            "fitness_parallel_plans": " | ".join(
+                fitness_metrics["plans"]
+            ),
+            "ridge_candidates": ridge_metrics["candidate_count"],
+            "ridge_compile_seconds": ridge_metrics["compile_seconds"],
+            "ridge_wall_seconds": ridge_metrics["wall_seconds"],
+            "ridge_native_seconds": ridge_metrics["native_seconds"],
+            "ridge_cpu_seconds": ridge_metrics["cpu_seconds"],
+            "ridge_average_busy_cores": (
+                ridge_metrics["average_busy_cores"]
+            ),
+            "ridge_parallel_mode": ridge_metrics["parallel_mode"],
+            "ridge_parallel_plan": (
+                f"{ridge_metrics['parallel_plan_mode']}: "
+                f"{ridge_metrics['parallel_plan_reason']}"
+            ),
+            "generation_wall_seconds": generation_wall,
+            "generation_steady_state_seconds": steady_generation_wall,
+            "cumulative_search_seconds": cumulative_search,
+            "projected_50_generation_seconds": projected_total,
         }
         history.append(row)
+
+        diagnostic = fitness_metrics.get("diagnostic")
+        if diagnostic is not None:
+            print(
+                f"parallel_diagnostic candidates="
+                f"{diagnostic['candidate_count']} "
+                f"serial={diagnostic['serial_wall_seconds']:.3f}s "
+                f"sharded={diagnostic['sharded_wall_seconds']:.3f}s "
+                f"speedup={diagnostic['speedup']:.3f}x"
+            )
+
         print(
-            f"generation={generation:3d} depth={depth} "
-            f"best={row['best_sharpe']:8.4f} mean={row['mean_sharpe']:8.4f} "
-            f"pool={len(pool):2d}"
+            f"generation={generation:3d} depth={depth:2d} "
+            f"best={row['best_sharpe']:9.5f} "
+            f"mean={row['mean_sharpe']:9.5f} "
+            f"pool={len(pool):2d} "
+            f"fitness={row['fitness_steady_state_wall_seconds']:.2f}s "
+            f"ridge={row['ridge_wall_seconds']:.2f}s "
+            f"generation={steady_generation_wall:.2f}s "
+            f"projected_{PROJECTED_GENERATIONS}="
+            f"{projected_total / 60.0:.2f}min"
         )
+
+        summary["history"] = history
+        if diagnostic is not None:
+            summary["parallel_diagnostic"] = diagnostic
+        summary["latest_projection_seconds"] = projected_total
+        summary["actual_search_seconds"] = cumulative_search
+        _write_outputs(history, summary)
+
+        if (
+            MAX_SEARCH_WALL_SECONDS > 0
+            and cumulative_search >= MAX_SEARCH_WALL_SECONDS
+        ):
+            stop_reason = (
+                f"search wall {cumulative_search:.3f}s reached "
+                f"GP_MAX_SEARCH_WALL_SECONDS="
+                f"{MAX_SEARCH_WALL_SECONDS:.3f}s"
+            )
+        elif (
+            STOP_IF_PROJECTED_OVER_SECONDS > 0
+            and generation >= MIN_GENERATIONS_BEFORE_STOP
+            and projected_total > STOP_IF_PROJECTED_OVER_SECONDS
+        ):
+            stop_reason = (
+                f"steady-state projection {projected_total:.3f}s for "
+                f"{PROJECTED_GENERATIONS} generations exceeds "
+                f"{STOP_IF_PROJECTED_OVER_SECONDS:.3f}s"
+            )
+
+        if stop_reason is not None:
+            print(f"stopping: {stop_reason}")
+            break
 
         if generation < GENERATIONS:
             population = vary(
@@ -299,27 +1186,76 @@ def main():
                 depth_for_generation(generation + 1),
             )
 
-    frame = pd.DataFrame(history)
-    frame.to_csv("gp_search_history.csv", index=False)
-
     print("\nBest formulas by Sharpe:")
     for rank, individual in enumerate(hall_of_fame[:10], 1):
-        print(f"{rank:2d}  sharpe={individual.fitness.values[0]:9.5f}  {individual}")
+        print(
+            f"{rank:2d}  "
+            f"sharpe={individual.fitness.values[0]:9.5f}  "
+            f"{individual}"
+        )
 
     print("\nPersistent Ridge pool:")
     for rank, (text, individual) in enumerate(
-        sorted(pool.items(), key=lambda item: pool_contribution[item[0]], reverse=True),
+        sorted(
+            pool.items(),
+            key=lambda item: pool_contribution[item[0]],
+            reverse=True,
+        ),
         1,
     ):
         print(
-            f"{rank:2d}  mean_abs_beta={pool_contribution[text]:.8g}  "
-            f"sharpe={individual.fitness.values[0]:9.5f}  {text}"
+            f"{rank:2d}  "
+            f"mean_abs_beta={pool_contribution[text]:.8g}  "
+            f"sharpe={individual.fitness.values[0]:9.5f}  "
+            f"{text}"
         )
 
-    frame.plot(x="generation", y=["best_sharpe", "mean_sharpe"])
-    plt.tight_layout()
-    plt.savefig("gp_search_history.png", dpi=150)
-    plt.show()
+    summary.update(
+        {
+            "history": history,
+            "stop_reason": stop_reason,
+            "completed_generations": len(history),
+            "actual_search_seconds": (
+                time.perf_counter() - search_started
+            ),
+            "total_wall_seconds": time.perf_counter() - total_started,
+            "best_formulas": [
+                {
+                    "rank": rank,
+                    "fitness": float(individual.fitness.values[0]),
+                    "formula": str(individual),
+                }
+                for rank, individual in enumerate(
+                    hall_of_fame[:10],
+                    1,
+                )
+            ],
+            "ridge_pool": [
+                {
+                    "rank": rank,
+                    "mean_abs_beta": (
+                        pool_contribution[text]
+                    ),
+                    "fitness": float(
+                        individual.fitness.values[0]
+                    ),
+                    "formula": text,
+                }
+                for rank, (text, individual) in enumerate(
+                    sorted(
+                        pool.items(),
+                        key=lambda item: pool_contribution[item[0]],
+                        reverse=True,
+                    ),
+                    1,
+                )
+            ],
+        }
+    )
+    csv_path, json_path, plot_path = _write_outputs(history, summary)
+    print(f"\nhistory_csv={csv_path}")
+    print(f"summary_json={json_path}")
+    print(f"fitness_plot={plot_path}")
 
 
 if __name__ == "__main__":
