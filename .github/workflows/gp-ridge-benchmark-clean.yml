@@ -1,0 +1,266 @@
+name: Benchmark strongly typed GP Ridge search
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/gp-ridge-benchmark-clean.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gp-ridge-benchmark-agent-strongly-typed-gp
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    env:
+      PYTHONPATH: src
+      MPLBACKEND: Agg
+      TRADING_DSL_ENGINE_CPP_LTO: "0"
+      TRADING_DSL_ENGINE_CPP_NATIVE: "1"
+      TRADING_DSL_ENGINE_CPP_STREAM_CACHE: /tmp/gp-cpp-cache
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m py_compile \
+            scripts/run_gp_alpha_search.py \
+            scripts/generate_gp_alpha_search_benchmark_data.py
+
+      - name: Record runner information
+        shell: bash
+        run: |
+          mkdir -p /tmp/gp-alpha-search-report
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "workflow_sha=${GITHUB_SHA}"
+            echo "nproc=$(nproc)"
+            echo
+            lscpu
+            echo
+            free -h
+            echo
+            df -h
+            echo
+            g++ --version
+            echo
+            python --version
+          } | tee /tmp/gp-alpha-search-report/runner_info.txt
+
+      - name: Generate deterministic 5,000,000 x 9 inputs
+        id: data
+        env:
+          GP_SYNTHETIC_ROWS: "5000000"
+          GP_SYNTHETIC_INSTRUMENTS: "9"
+          GP_SYNTHETIC_CHUNK_ROWS: "100000"
+          GP_SYNTHETIC_SEED: "42"
+          GP_SYNTHETIC_OUTPUT_DIR: /tmp/gp-alpha-search-data
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/gp-alpha-search-report/data_time.txt \
+            python scripts/generate_gp_alpha_search_benchmark_data.py \
+            2>&1 | tee /tmp/gp-alpha-search-report/data_generation.log
+          status=${PIPESTATUS[0]}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          if [[ -f /tmp/gp-alpha-search-data/manifest.json ]]; then
+            cp /tmp/gp-alpha-search-data/manifest.json \
+              /tmp/gp-alpha-search-report/data_manifest.json
+          fi
+          exit 0
+
+      - name: Smoke-test formula generation and execution
+        id: smoke
+        if: steps.data.outputs.status == '0'
+        env:
+          GP_INPUT_GLOB: "/tmp/gp-alpha-search-data/*.npy"
+          GP_OUTPUT_DIR: /tmp/gp-alpha-search-smoke
+          GP_ROWS: "2000"
+          GP_N_INSTRUMENTS: "9"
+          GP_POPULATION_SIZE: "8"
+          GP_GENERATIONS: "1"
+          GP_ELITE_COUNT: "2"
+          GP_IMMIGRANTS: "2"
+          GP_POOL_SIZE: "4"
+          GP_POOL_CANDIDATES_PER_GENERATION: "4"
+          GP_FITNESS_SHARDS: "2"
+          GP_THREADS: "1"
+          GP_PARALLEL_DIAGNOSTIC: "0"
+          GP_SHOW_PLOT: "0"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/gp-alpha-search-report/smoke_time.txt \
+            python scripts/run_gp_alpha_search.py \
+            2>&1 | tee /tmp/gp-alpha-search-report/smoke.log
+          status=${PIPESTATUS[0]}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Benchmark full 5,000,000 x 9 search
+        id: full
+        if: steps.data.outputs.status == '0' && steps.smoke.outputs.status == '0'
+        env:
+          GP_INPUT_GLOB: "/tmp/gp-alpha-search-data/*.npy"
+          GP_OUTPUT_DIR: /tmp/gp-alpha-search-full
+          GP_ROWS: "5000000"
+          GP_N_INSTRUMENTS: "9"
+          GP_POPULATION_SIZE: "64"
+          GP_GENERATIONS: "50"
+          GP_PROJECTED_GENERATIONS: "50"
+          GP_STOP_IF_PROJECTED_OVER_SECONDS: "3600"
+          GP_MIN_GENERATIONS_BEFORE_STOP: "2"
+          GP_MAX_SEARCH_WALL_SECONDS: "3300"
+          GP_DEPTH_GROW_EVERY: "5"
+          GP_ELITE_COUNT: "8"
+          GP_IMMIGRANTS: "8"
+          GP_POOL_SIZE: "16"
+          GP_POOL_CANDIDATES_PER_GENERATION: "8"
+          GP_FITNESS_SHARDS: "4"
+          GP_THREADS: "1"
+          GP_PARALLEL_DIAGNOSTIC: "1"
+          GP_DIAGNOSTIC_CANDIDATES: "8"
+          GP_SHOW_PLOT: "0"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/gp-alpha-search-report/full_time.txt \
+            python scripts/run_gp_alpha_search.py \
+            2>&1 | tee /tmp/gp-alpha-search-report/full.log
+          status=${PIPESTATUS[0]}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run 50-generation convergence proxy
+        id: proxy
+        if: steps.data.outputs.status == '0' && steps.smoke.outputs.status == '0' && steps.full.outputs.status == '0'
+        env:
+          GP_INPUT_GLOB: "/tmp/gp-alpha-search-data/*.npy"
+          GP_OUTPUT_DIR: /tmp/gp-alpha-search-proxy
+          GP_ROWS: "10000"
+          GP_N_INSTRUMENTS: "9"
+          GP_POPULATION_SIZE: "32"
+          GP_GENERATIONS: "50"
+          GP_PROJECTED_GENERATIONS: "50"
+          GP_MAX_SEARCH_WALL_SECONDS: "1800"
+          GP_DEPTH_GROW_EVERY: "5"
+          GP_ELITE_COUNT: "8"
+          GP_IMMIGRANTS: "8"
+          GP_POOL_SIZE: "16"
+          GP_POOL_CANDIDATES_PER_GENERATION: "8"
+          GP_FITNESS_SHARDS: "4"
+          GP_THREADS: "1"
+          GP_PARALLEL_DIAGNOSTIC: "0"
+          GP_SHOW_PLOT: "0"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/gp-alpha-search-report/proxy_time.txt \
+            python scripts/run_gp_alpha_search.py \
+            2>&1 | tee /tmp/gp-alpha-search-report/proxy.log
+          status=${PIPESTATUS[0]}
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Assemble benchmark artifact
+        if: always()
+        env:
+          DATA_STATUS: ${{ steps.data.outputs.status }}
+          SMOKE_STATUS: ${{ steps.smoke.outputs.status }}
+          FULL_STATUS: ${{ steps.full.outputs.status }}
+          PROXY_STATUS: ${{ steps.proxy.outputs.status }}
+        shell: bash
+        run: |
+          report=/tmp/gp-alpha-search-report
+          mkdir -p "$report/full_5m" "$report/convergence_proxy"
+
+          for file in \
+            gp_search_history.csv \
+            gp_search_history.png \
+            gp_search_summary.json
+          do
+            cp "/tmp/gp-alpha-search-full/$file" \
+              "$report/full_5m/" 2>/dev/null || true
+            cp "/tmp/gp-alpha-search-proxy/$file" \
+              "$report/convergence_proxy/" 2>/dev/null || true
+          done
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_dir = Path("/tmp/gp-alpha-search-report")
+          combined = {
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "statuses": {
+                  "data": os.environ.get("DATA_STATUS", ""),
+                  "smoke": os.environ.get("SMOKE_STATUS", ""),
+                  "full_5m": os.environ.get("FULL_STATUS", ""),
+                  "convergence_proxy": os.environ.get("PROXY_STATUS", ""),
+              },
+          }
+          for label, path in {
+              "data_manifest": report_dir / "data_manifest.json",
+              "full_5m": report_dir / "full_5m" / "gp_search_summary.json",
+              "convergence_proxy": report_dir / "convergence_proxy" / "gp_search_summary.json",
+          }.items():
+              if path.exists():
+                  combined[label] = json.loads(path.read_text())
+
+          output = report_dir / "combined_benchmark_report.json"
+          output.write_text(
+              json.dumps(combined, indent=2, sort_keys=True),
+              encoding="utf-8",
+          )
+          print(output.read_text())
+          PY
+
+      - name: Upload benchmark outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gp-ridge-search-benchmark-${{ github.sha }}
+          path: /tmp/gp-alpha-search-report
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail after preserving diagnostics
+        if: always()
+        shell: bash
+        run: |
+          data="${{ steps.data.outputs.status }}"
+          smoke="${{ steps.smoke.outputs.status }}"
+          full="${{ steps.full.outputs.status }}"
+          proxy="${{ steps.proxy.outputs.status }}"
+          [[ "$data" == "0" ]] || { echo "data generation failed: $data"; exit 1; }
+          [[ "$smoke" == "0" ]] || { echo "smoke test failed: $smoke"; exit 1; }
+          [[ "$full" == "0" ]] || { echo "full benchmark failed: $full"; exit 1; }
+          [[ "$proxy" == "0" ]] || { echo "proxy benchmark failed: $proxy"; exit 1; }
