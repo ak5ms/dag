@@ -44,9 +44,13 @@ jobs:
             | base64 -d > /tmp/gp-walltime-update.tar.gz
           echo "5c9507b2da3fd9e44e293f1dac21ef6d15aeaa9756dc09a6842f72fe0f4a2b0e  /tmp/gp-walltime-update.tar.gz" | sha256sum -c -
           tar -xzf /tmp/gp-walltime-update.tar.gz
+
+          # The Actions token can push ordinary source but GitHub blocks it from
+          # changing workflow files. Restore those files here; the connector
+          # installs the validated workflow updates after this source commit.
+          git restore --source=HEAD --staged --worktree .github/workflows
           rm -rf .gp-update
-          rm -f .github/workflows/apply-gp-walltime-optimization.yml
-          rm -f .github/workflows/export-deap-runtime.yml
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
