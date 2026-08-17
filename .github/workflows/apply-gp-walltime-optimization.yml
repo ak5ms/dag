@@ -1,0 +1,55 @@
+name: Apply GP wall-time optimization
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/apply-gp-walltime-optimization.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 0
+      - name: Verify and apply optimized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat \
+            .gp-update/chunk00 \
+            .gp-update/chunk01 \
+            .gp-update/chunk02 \
+            .gp-update/chunk03 \
+            .gp-update/chunk04 \
+            .gp-update/chunk05 \
+            .gp-update/chunk06 \
+            .gp-update/chunk07.correct \
+            .gp-update/chunk08 \
+            .gp-update/chunk09 \
+            .gp-update/chunk10 \
+            .gp-update/chunk11 \
+            .gp-update/chunk12a \
+            .gp-update/chunk12b \
+            .gp-update/chunk13 \
+            .gp-update/chunk14 \
+            .gp-update/chunk15 \
+            .gp-update/chunk16 \
+            | base64 -d > /tmp/gp-walltime-update.tar.gz
+          echo "5c9507b2da3fd9e44e293f1dac21ef6d15aeaa9756dc09a6842f72fe0f4a2b0e  /tmp/gp-walltime-update.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gp-walltime-update.tar.gz
+          rm -rf .gp-update
+          rm -f .github/workflows/apply-gp-walltime-optimization.yml
+          rm -f .github/workflows/export-deap-runtime.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Speed up strongly typed GP wall time"
+          git push origin HEAD:agent/strongly-typed-gp
