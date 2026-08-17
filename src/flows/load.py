@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from trading_dsl_engine.jax_flat.engine import compile_formula
 
 _DATA_CACHE: dict[tuple[str, int | None], dict[str, np.ndarray]] = {}
 
@@ -26,7 +25,6 @@ class InputData:
     def __post_init__(self):
         if self.nrows:
             self.nrows = int(self.nrows)
-
 
     def _load_memmap(self, fps: list[str]) -> dict[str, np.ndarray]:
         cache_key = (self.fp, self.nrows)
@@ -59,7 +57,12 @@ class InputData:
         return self.data
 
     def run(self, formula, cpp=True, runtimes=None) -> pd.DataFrame | np.ndarray:
-        # TODO: attach cached values to call objects directly (careful about tracking memory)?
+        # Keep the JAX backend lazy: loading mmap inputs for cpp_stream/GP should
+        # not import JAX, Astropy, and the metadata stack.
+        from trading_dsl_engine.jax_flat.engine import compile_formula
+
+        # TODO: attach cached values to call objects directly while preserving
+        # explicit memory ownership.
         if self.data is None:
             self.get_data()
         start = time.perf_counter()
