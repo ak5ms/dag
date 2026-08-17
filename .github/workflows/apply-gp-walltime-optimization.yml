@@ -45,9 +45,9 @@ jobs:
           echo "5c9507b2da3fd9e44e293f1dac21ef6d15aeaa9756dc09a6842f72fe0f4a2b0e  /tmp/gp-walltime-update.tar.gz" | sha256sum -c -
           tar -xzf /tmp/gp-walltime-update.tar.gz
 
-          # The Actions token can push ordinary source but GitHub blocks it from
-          # changing workflow files. Restore those files here; the connector
-          # installs the validated workflow updates after this source commit.
+          # Actions may push source but not workflow mutations. Remove newly
+          # unpacked workflow files and restore all tracked workflow files.
+          git clean -fd .github/workflows
           git restore --source=HEAD --staged --worktree .github/workflows
           rm -rf .gp-update
 
