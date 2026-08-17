@@ -42,8 +42,10 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install project
+      - name: Install project and linker
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lld
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m py_compile \
@@ -69,7 +71,7 @@ jobs:
             df -h
             clang++ --version
             g++ --version
-            ld.lld --version
+            (ld.lld --version || true)
             python --version
           } | tee "$report/machine.txt"
 
