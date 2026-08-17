@@ -1,0 +1,264 @@
+name: GP wall-time optimization benchmark
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/gp-walltime-benchmark.yml"
+      - "scripts/run_gp_alpha_search.py"
+      - "scripts/benchmark_gp_toolchain.py"
+      - "src/flows/load.py"
+      - "src/trading_dsl_engine/cpp_stream/python/compile.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gp-walltime-agent-strongly-typed-gp
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      PYTHONPATH: src
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m py_compile \
+            scripts/run_gp_alpha_search.py \
+            scripts/benchmark_gp_toolchain.py \
+            scripts/generate_gp_alpha_search_benchmark_data.py
+
+      - name: Record machine and source
+        shell: bash
+        run: |
+          report=/tmp/gp-walltime-report
+          mkdir -p "$report"
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "optimized_sha=$GITHUB_SHA"
+            echo "baseline_sha=b7f456c830ab180d926eda0c1a0d34eb7120f344"
+            echo "nproc=$(nproc)"
+            echo "affinity=$(taskset -pc $$ 2>/dev/null || true)"
+            echo "cpu.max=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || true)"
+            echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+            lscpu
+            free -h
+            df -h
+            clang++ --version
+            g++ --version
+            ld.lld --version
+            python --version
+          } | tee "$report/machine.txt"
+
+      - name: Generate deterministic 5,000,000 x 9 inputs
+        env:
+          GP_SYNTHETIC_ROWS: "5000000"
+          GP_SYNTHETIC_INSTRUMENTS: "9"
+          GP_SYNTHETIC_CHUNK_ROWS: "100000"
+          GP_SYNTHETIC_SEED: "42"
+          GP_SYNTHETIC_OUTPUT_DIR: /tmp/gp-alpha-search-data
+        shell: bash
+        run: |
+          /usr/bin/time -v \
+            -o /tmp/gp-walltime-report/data_time.txt \
+            python scripts/generate_gp_alpha_search_benchmark_data.py \
+            2>&1 | tee /tmp/gp-walltime-report/data.log
+          cp /tmp/gp-alpha-search-data/manifest.json \
+            /tmp/gp-walltime-report/data_manifest.json
+
+      - name: Run pre-optimization baseline on 5M x 9
+        id: baseline
+        shell: bash
+        run: |
+          set +e
+          git worktree add --detach /tmp/dag-gp-baseline \
+            b7f456c830ab180d926eda0c1a0d34eb7120f344
+          env \
+            PYTHONPATH=/tmp/dag-gp-baseline/src \
+            MPLBACKEND=Agg \
+            CXX=g++ \
+            TRADING_DSL_ENGINE_CPP_LTO=0 \
+            TRADING_DSL_ENGINE_CPP_NATIVE=1 \
+            TRADING_DSL_ENGINE_CPP_PCH=0 \
+            TRADING_DSL_ENGINE_CPP_STREAM_CACHE=/tmp/gp-cache-baseline \
+            GP_INPUT_GLOB='/tmp/gp-alpha-search-data/*.npy' \
+            GP_OUTPUT_DIR=/tmp/gp-alpha-search-baseline \
+            GP_ROWS=5000000 \
+            GP_N_INSTRUMENTS=9 \
+            GP_POPULATION_SIZE=64 \
+            GP_GENERATIONS=2 \
+            GP_PROJECTED_GENERATIONS=50 \
+            GP_MAX_SEARCH_WALL_SECONDS=3300 \
+            GP_DEPTH_GROW_EVERY=5 \
+            GP_ELITE_COUNT=8 \
+            GP_IMMIGRANTS=8 \
+            GP_POOL_SIZE=16 \
+            GP_POOL_CANDIDATES_PER_GENERATION=8 \
+            GP_FITNESS_SHARDS=1 \
+            GP_THREADS=1 \
+            GP_PARALLEL_DIAGNOSTIC=0 \
+            GP_SHOW_PLOT=0 \
+            /usr/bin/time -v \
+              -o /tmp/gp-walltime-report/baseline_time.txt \
+              python /tmp/dag-gp-baseline/scripts/run_gp_alpha_search.py \
+              2>&1 | tee /tmp/gp-walltime-report/baseline.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/gp-walltime-report/baseline
+          cp /tmp/gp-alpha-search-baseline/gp_search_* \
+            /tmp/gp-walltime-report/baseline/ 2>/dev/null || true
+          exit 0
+
+      - name: Run optimized search on 5M x 9
+        id: optimized
+        shell: bash
+        run: |
+          set +e
+          unset CXX TRADING_DSL_ENGINE_CPP_LTO \
+            TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS \
+            TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS
+          env \
+            GP_CXX=clang++ \
+            TRADING_DSL_ENGINE_CPP_NATIVE=1 \
+            TRADING_DSL_ENGINE_CPP_PCH=1 \
+            TRADING_DSL_ENGINE_CPP_STREAM_CACHE=/tmp/gp-cache-optimized \
+            GP_INPUT_GLOB='/tmp/gp-alpha-search-data/*.npy' \
+            GP_OUTPUT_DIR=/tmp/gp-alpha-search-optimized \
+            GP_ROWS=5000000 \
+            GP_N_INSTRUMENTS=9 \
+            GP_POPULATION_SIZE=64 \
+            GP_GENERATIONS=50 \
+            GP_PROJECTED_GENERATIONS=50 \
+            GP_STOP_IF_PROJECTED_OVER_SECONDS=3600 \
+            GP_MIN_GENERATIONS_BEFORE_STOP=3 \
+            GP_MAX_SEARCH_WALL_SECONDS=3300 \
+            GP_DEPTH_GROW_EVERY=5 \
+            GP_ELITE_COUNT=8 \
+            GP_IMMIGRANTS=8 \
+            GP_POOL_SIZE=16 \
+            GP_POOL_CANDIDATES_PER_GENERATION=8 \
+            GP_THREADS=1 \
+            GP_PARALLEL_DIAGNOSTIC=0 \
+            GP_SHOW_PLOT=0 \
+            /usr/bin/time -v \
+              -o /tmp/gp-walltime-report/optimized_time.txt \
+              python scripts/run_gp_alpha_search.py \
+              2>&1 | tee /tmp/gp-walltime-report/optimized.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/gp-walltime-report/optimized
+          cp /tmp/gp-alpha-search-optimized/gp_search_* \
+            /tmp/gp-walltime-report/optimized/ 2>/dev/null || true
+          exit 0
+
+      - name: Compare toolchains on the same 5M formula
+        id: toolchain
+        if: steps.optimized.outputs.status == '0'
+        env:
+          GP_TOOLCHAIN_INPUT_GLOB: "/tmp/gp-alpha-search-data/*.npy"
+          GP_TOOLCHAIN_DERIVED_DIR: /tmp/gp-alpha-search-optimized/derived
+          GP_TOOLCHAIN_OUTPUT_DIR: /tmp/gp-toolchain-benchmark
+          GP_TOOLCHAIN_ROWS: "5000000"
+          GP_TOOLCHAIN_INSTRUMENTS: "9"
+          GP_TOOLCHAIN_RUNS: "3"
+          GP_TOOLCHAIN_WARMUPS: "1"
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v \
+            -o /tmp/gp-walltime-report/toolchain_time.txt \
+            python scripts/benchmark_gp_toolchain.py \
+            2>&1 | tee /tmp/gp-walltime-report/toolchain.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cp /tmp/gp-toolchain-benchmark/toolchain_benchmark.json \
+            /tmp/gp-walltime-report/ 2>/dev/null || true
+          exit 0
+
+      - name: Assemble comparison
+        if: always()
+        env:
+          BASELINE_STATUS: ${{ steps.baseline.outputs.status }}
+          OPTIMIZED_STATUS: ${{ steps.optimized.outputs.status }}
+          TOOLCHAIN_STATUS: ${{ steps.toolchain.outputs.status }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path('/tmp/gp-walltime-report')
+          payload = {
+              'statuses': {
+                  'baseline': os.environ.get('BASELINE_STATUS', ''),
+                  'optimized': os.environ.get('OPTIMIZED_STATUS', ''),
+                  'toolchain': os.environ.get('TOOLCHAIN_STATUS', ''),
+              }
+          }
+          for name in ('baseline', 'optimized'):
+              path = report / name / 'gp_search_summary.json'
+              if path.exists():
+                  payload[name] = json.loads(path.read_text())
+          toolchain = report / 'toolchain_benchmark.json'
+          if toolchain.exists():
+              payload['toolchain'] = json.loads(toolchain.read_text())
+
+          baseline = payload.get('baseline', {}).get('history', [])
+          optimized = payload.get('optimized', {}).get('history', [])
+          if baseline and optimized:
+              b = baseline[-1]
+              o = optimized[-1]
+              b_wall = float(b.get('generation_steady_state_seconds', b['generation_wall_seconds']))
+              o_wall = float(o.get('generation_steady_state_seconds', o['generation_wall_seconds']))
+              payload['steady_generation_comparison'] = {
+                  'baseline_seconds': b_wall,
+                  'optimized_seconds': o_wall,
+                  'speedup': b_wall / o_wall if o_wall else None,
+                  'baseline_generation': int(b['generation']),
+                  'optimized_generation': int(o['generation']),
+              }
+
+          (report / 'comparison.json').write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + '\n'
+          )
+          print((report / 'comparison.json').read_text())
+          PY
+
+      - name: Upload benchmark outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gp-walltime-5m-${{ github.sha }}
+          path: /tmp/gp-walltime-report
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail after preserving diagnostics
+        if: always()
+        run: |
+          [[ "${{ steps.optimized.outputs.status }}" == "0" ]] || exit 1
+          [[ "${{ steps.toolchain.outputs.status }}" == "0" ]] || exit 1
