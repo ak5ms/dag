@@ -79,6 +79,22 @@ The returned artifact includes `stats` (`expanded_nodes`, `cache_hits`, `compile
 
 The module includes compositional fitness helpers for the initial Sharpe-style objective (`alpha / ewm_var(roll_rets, HL)` with shifted, tradability-masked PnL) and a pool-aware ridge objective helper that combines the existing alpha pool with a candidate via `Ridge(...)`/`get_beta(...)`. `trading_dsl_engine.base.terminals` provides field terminal helpers: `futures_field_metadata()` expands the common futures field schema (types/ranges for prices, quantities, calendars, tradability flags, spreads, and cross-trade fields), and `feature_names_with_tags(...)` selects feature terminals by tags. Candidate filters are ordinary callables; `dimensionless_filter(...)` uses compile-time metadata so searches can restrict alphas by units or other static metadata without changing runtime hot paths.
 
+`scripts/run_gp_alpha_search.py` is the timed cpp_stream example. It materializes
+dataset-only transforms such as cleaned returns, return volatility, and Ridge
+weights once; evaluates unique formulas in cost-balanced, bounded native
+microbatches; and probes a short prefix before allowing an unexpectedly costly
+formula to monopolize a generation. The persistent pool uses a bounded-rank
+cross-sectional residual screen followed by an independent `K=1` temporal
+nonnegative Ridge for each proposal. Because a nine-instrument cross-section has
+rank at most nine, pool-screen complexity does not grow into a 100-by-100
+temporal solve merely because the archive contains 100 formulas.
+
+The cpp_stream compiler caches complete generated programs as before, and also
+reuses a toolchain-specific precompiled header for the formula-independent C++
+runtime. Supplying `n_instruments` avoids a redundant neutral-IR rebuild. These
+compile-latency optimizations retain the same `-O3` formula translation unit and
+do not insert an interpreter or callback into the native row loop.
+
 ## Data contract
 
 - Inputs are aligned 2D arrays with shape `(time, n_instruments)`.
