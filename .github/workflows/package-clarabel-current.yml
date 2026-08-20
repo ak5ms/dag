@@ -14,9 +14,12 @@ on:
 jobs:
   vendor-clarabel-rust:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Vendor Clarabel 0.11.1 and dependencies
         run: |
           mkdir -p clarabel-current/src
@@ -33,10 +36,23 @@ jobs:
           mkdir -p clarabel-current/vendor
           cargo vendor --manifest-path clarabel-current/Cargo.toml clarabel-current/vendor > clarabel-current/config.toml
           tar -czf clarabel-current-vendor.tar.gz clarabel-current
+      - name: Download complete Python 3.11 dependency wheel set
+        run: >-
+          python -m pip download --dest py311-wheels
+          numpy pandas numba scipy jax equinox pytest pytest-xdist
+          pybind11 includeigen Jinja2 unxt deap pydot graphviz matplotlib
+          moreau==0.3.3 cvxpy==1.9.1 cvxpygen==1.0.0 clarabel==0.11.1
       - name: Upload vendored current Clarabel crate
         uses: actions/upload-artifact@v4
         with:
           name: clarabel-current-vendor
           path: clarabel-current-vendor.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload Python dependency wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-stream-cvxpy-py311-wheels
+          path: py311-wheels
           if-no-files-found: error
           retention-days: 1
