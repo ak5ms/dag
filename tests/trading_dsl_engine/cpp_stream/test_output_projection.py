@@ -103,7 +103,7 @@ def test_parent_before_lazy_subgraph_reorders_only_execution(
     assert [stage.kind for stage in runtime.plan.stages] == ["copy_bundle"]
 
 
-def test_emit_before_lazy_row_output_reuses_requested_row_storage(
+def test_final_parent_before_lazy_row_output_reuses_row_storage(
     tmp_path: Path,
 ) -> None:
     rows, cols = 32, 4
@@ -112,15 +112,20 @@ def test_emit_before_lazy_row_output_reuses_requested_row_storage(
     y = rng.normal(size=(rows, cols)).astype(np.float64)
 
     runtime = compile_formula(
-        [f"emit({LAZY_SUBGRAPH})", LAZY_SUBGRAPH],
+        [f"emit({LAZY_PARENT})", LAZY_SUBGRAPH],
         {"x": x, "y": y},
         n_instruments=cols,
     )
     final, row_values = runtime.run(
-        out_path=tmp_path / "emit-before-lazy-row.npy"
+        out_path=tmp_path / "final-parent-before-lazy-row.npy"
     ).load(mmap_mode=None)
 
-    np.testing.assert_allclose(final, row_values[-1], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        final,
+        np.sqrt(np.abs(row_values[-1])),
+        rtol=1e-12,
+        atol=1e-12,
+    )
     terminal = runtime.plan.stages[-2:]
     assert [stage.kind for stage in terminal] == ["copy", "emit_last"]
     assert _source_has_kind(terminal[1].inputs[0], "packed_output")
