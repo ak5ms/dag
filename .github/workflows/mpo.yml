@@ -1,0 +1,48 @@
+name: mpo
+
+on:
+  push:
+    branches: [mpo]
+    paths:
+      - "src/flows/mpo.py"
+      - "src/flows/riskmodel.py"
+      - "tests/flows/test_mpo.py"
+      - "scripts/benchmark_mpo.py"
+      - "pyproject.toml"
+      - ".github/workflows/mpo.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/flows/mpo.py"
+      - "src/flows/riskmodel.py"
+      - "tests/flows/test_mpo.py"
+      - "scripts/benchmark_mpo.py"
+      - "pyproject.toml"
+      - ".github/workflows/mpo.yml"
+  workflow_dispatch:
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install project and solver dependencies
+        run: >-
+          python -m pip install
+          numpy pandas numba scipy jax equinox pytest pytest-xdist
+          pybind11 includeigen Jinja2 unxt deap pydot graphviz matplotlib
+          moreau==0.3.3
+      - name: Test MPO and risk-model integration
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: python -m pytest -q -o addopts="" tests/flows/test_mpo.py
+      - name: Run synthetic risk-model/MPO benchmark
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: python scripts/benchmark_mpo.py
