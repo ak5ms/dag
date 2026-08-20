@@ -36,6 +36,24 @@ jobs:
           numpy pandas numba scipy jax equinox pytest pytest-xdist
           pybind11 includeigen Jinja2 unxt deap pydot graphviz matplotlib
           moreau==0.3.3
+      - name: Package source and portable dependency wheels
+        run: |
+          mkdir -p mpo-local-bundle/wheels
+          tar --exclude=.git -czf mpo-local-bundle/dag-mpo-source.tar.gz \
+            pyproject.toml setup.py src scripts/benchmark_mpo.py tests/flows/test_mpo.py
+          python -m pip download --no-deps --dest mpo-local-bundle/wheels \
+            moreau==0.3.3 moreau-cpu==0.3.3 \
+            equinox==0.13.8 jaxtyping==0.3.11 wadler-lindig==0.1.7 \
+            pybind11==3.1.0 includeigen==0.1 \
+            astropy==8.0.1 pyerfa==2.0.1.5 astropy-iers-data \
+            graphviz==0.21
+      - name: Upload local benchmark bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpo-local-bundle
+          path: mpo-local-bundle
+          if-no-files-found: error
+          retention-days: 1
       - name: Test MPO and risk-model integration
         env:
           PYTHONPATH: src
