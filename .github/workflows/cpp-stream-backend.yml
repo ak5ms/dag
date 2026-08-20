@@ -17,6 +17,28 @@ on:
   workflow_dispatch:
 
 jobs:
+  subgraph-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install benchmark dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba jinja2 jax equinox astropy includeigen scipy
+      - name: Benchmark returned shared subgraph
+        env:
+          PYTHONPATH: src
+          CPP_STREAM_MULTI_ROWS: "5000000"
+          CPP_STREAM_MULTI_INSTRUMENTS: "9"
+          CPP_STREAM_MULTI_RUNS: "10"
+          CPP_STREAM_MULTI_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_multi_output_subgraph.py
+
   focused-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -41,6 +63,8 @@ jobs:
           tests/trading_dsl_engine/cpp_stream/test_sources.py
           tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
           tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+          tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+          tests/trading_dsl_engine/cpp_stream/test_output_projection.py
           tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
           tests/trading_dsl_engine/cpp_stream/test_minute_groupby.py
           tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py

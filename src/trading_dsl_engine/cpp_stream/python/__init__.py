@@ -4,8 +4,8 @@ from collections import Counter
 from collections.abc import Mapping
 
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
-from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.compile import (
+    FormulaInput,
     compile_formula as _compile_formula,
 )
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime, RunResult
@@ -27,13 +27,7 @@ from trading_dsl_engine.cpp_stream.python.utils import __all__ as _utils_all
 
 
 def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
-    """Infer the instrument extent from source row shapes.
-
-    Every non-scalar row shape contributes its leading extent. The most frequent
-    extent wins, which handles ordinary market-data mappings containing many
-    ``(rows, instruments)`` arrays plus a smaller number of fixed feature arrays.
-    A tie is intentionally rejected rather than guessing.
-    """
+    """Infer the instrument extent from source row shapes."""
     counts = Counter(
         int(info.input_type.row_shape[0])
         for info in infos.values()
@@ -56,7 +50,7 @@ def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
 
 
 def compile_formula(
-    formula: str | Expr,
+    formula: FormulaInput,
     data: Mapping[str, SourceValue] | None = None,
     *,
     n_instruments: int | None = None,
@@ -67,7 +61,7 @@ def compile_formula(
     prefetch_rows: int = 16,
     input_types: Mapping[str, InputTypeSpec] | None = None,
 ) -> CppStreamRuntime:
-    """Compile a formula, inferring ``n_instruments`` when source shapes allow."""
+    """Compile one or many formulas, inferring N from supplied sources."""
     resolved_n = n_instruments
     if data is not None and resolved_n is None:
         resolved_n = infer_n_instruments(

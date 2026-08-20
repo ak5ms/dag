@@ -16,6 +16,25 @@
 namespace {
 thread_local std::string g_last_error;
 
+using PublicOutputs = stackdsl::OutputLayout<
+{% for output in outputs %}
+    stackdsl::OutputSpec<
+        {{ output.offset }},
+        {{ output.size }},
+        {{ "true" if output.mode == "final" else "false" }},
+        {{ "true" if output.lane_partitionable else "false" }}
+    >{% if not loop.last %},{% endif %}
+{% endfor %}
+>;
+
+{# Lowering compacts scalar scratch independently per native dtype and carries the
+   exact counts on the int-compatible scratch_slots plan value. #}
+{% set scalar_counts = scratch_slots.counts %}
+using ScalarScratch = stackdsl::ScalarScratchLayout<
+    {{ scalar_counts[0] }}, {{ scalar_counts[1] }}, {{ scalar_counts[2] }},
+    {{ scalar_counts[3] }}, {{ scalar_counts[4] }}, {{ scalar_counts[5] }}
+>;
+
 {% for inner in inners %}
 template <std::size_t N, std::size_t Capacity, std::size_t PartitionCount>
 struct {{ inner.name }} {
@@ -24,7 +43,8 @@ struct {{ inner.name }} {
         {{ inner.input_count }},
         {{ inner.scratch_slots }},
         {{ inner.matrix_scratch_slots }},
-        {{ inner.matrix_scratch_width }}
+        {{ inner.matrix_scratch_width }},
+        {{ inner.matrix_scratch_layout }}
     > ctx{};
 {% for stage in inner.stages %}
     {{ stage.cpp_type }} s{{ stage.index }}{};
@@ -58,14 +78,17 @@ struct {{ inner.name }} {
 
 struct CppStreamPlanRunner {
     static constexpr std::size_t N = {{ n }};
-    static constexpr std::size_t output_row_width = {{ output_row_width }};
+    static constexpr std::size_t row_output_width = PublicOutputs::row_width;
+    static constexpr std::size_t final_output_width = PublicOutputs::final_width;
 
     stackdsl::RowContext<
         N,
         {{ input_count }},
         {{ scratch_slots }},
         {{ matrix_scratch_slots }},
-        {{ matrix_scratch_width }}
+        {{ matrix_scratch_width }},
+        {{ matrix_scratch_layout }},
+        ScalarScratch
     > ctx{};
 {% for stage in stages %}
     {{ stage.cpp_type }} s{{ stage.index }}{};
@@ -81,7 +104,7 @@ struct CppStreamPlanRunner {
         const std::array<const void*, {{ input_count }}>& input_data,
         std::size_t row_begin,
         std::size_t row_end,
-        double* STACKDSL_RESTRICT out,
+        double* STACKDSL_RESTRICT row_out,
         std::size_t lane_begin,
         std::size_t lane_end) noexcept {
         ctx.lane_begin = lane_begin;
@@ -103,11 +126,13 @@ struct CppStreamPlanRunner {
                 static_cast<const {{ input.cpp_type }}*>(input_data[{{ input.index }}])
                     + t * {{ input.row_width }};
 {% endfor %}
-{% if output_mode == 'final' %}
-            ctx.output = nullptr;
-{% else %}
-            ctx.output = out + t * output_row_width;
-{% endif %}
+            if constexpr (row_output_width > 0) {
+                ctx.row_output = row_out + t * row_output_width;
+                ctx.output = ctx.row_output;
+            } else {
+                ctx.row_output = nullptr;
+                ctx.output = nullptr;
+            }
 {% for stage in stages %}
 {% if not stage.final_on_data %}
 {% if stage.checked %}
@@ -121,9 +146,11 @@ struct CppStreamPlanRunner {
         return 0;
     }
 
-{% if output_mode == 'final' %}
-    int finalize(double* STACKDSL_RESTRICT out) noexcept {
-        ctx.output = out;
+{% if has_final_output %}
+    int finalize(double* STACKDSL_RESTRICT final_out) noexcept {
+        // Keep ctx.row_output on the last processed row so final-only descendants
+        // may consume a public row subgraph without re-materializing it.
+        ctx.output = final_out;
 {% for stage in stages %}
 {% if stage.final_on_data %}
 {% if stage.checked %}
@@ -156,10 +183,11 @@ int run_bound_inputs(
     std::size_t* threads_out,
     std::size_t* available_cpus_out) {
     constexpr std::size_t N = {{ n }};
-    constexpr std::size_t output_row_width = {{ output_row_width }};
-    constexpr std::size_t output_row_bytes = output_row_width * sizeof(double);
-    const std::size_t output_rows = {% if output_mode == 'final' %}1{% else %}rows{% endif %};
-    const std::size_t output_payload_bytes = output_rows * output_row_bytes;
+    constexpr std::size_t row_output_width = PublicOutputs::row_width;
+    constexpr std::size_t final_output_width = PublicOutputs::final_width;
+    const std::size_t row_output_values = rows * row_output_width;
+    const std::size_t output_payload_values = row_output_values + final_output_width;
+    const std::size_t output_payload_bytes = output_payload_values * sizeof(double);
     if (output_offset_bytes % alignof(double) != 0) return 6;
     stackdsl::MMapFile output(
         output_path,
@@ -170,19 +198,21 @@ int run_bound_inputs(
     auto* STACKDSL_RESTRICT out = reinterpret_cast<double*>(
         static_cast<std::byte*>(output.data()) + output_offset_bytes
     );
+    double* STACKDSL_RESTRICT row_out = out;
+    double* STACKDSL_RESTRICT final_out = out + row_output_values;
 
     const std::size_t available_cpus = stackdsl::available_cpu_count();
     if (available_cpus_out) *available_cpus_out = available_cpus;
 
     std::size_t threads = 1;
-{% if output_mode != 'final' %}
+{% if not has_final_output %}
     if (parallel_mode == 1) {
         threads = stackdsl::resolved_thread_count(requested_threads, rows);
     } else if (parallel_mode == 2) {
-        threads = stackdsl::resolved_thread_count(requested_threads, N);
-        if constexpr (output_row_width % N != 0) {
+        if constexpr (!PublicOutputs::row_lane_partitionable) {
             return 5;
         }
+        threads = stackdsl::resolved_thread_count(requested_threads, N);
     }
 {% endif %}
     if (threads_out) *threads_out = threads;
@@ -200,9 +230,9 @@ int run_bound_inputs(
     const auto started = std::chrono::steady_clock::now();
 
     if (threads == 1) {
-        int code = runners[0]->run(input_data, 0, rows, out, 0, N);
-{% if output_mode == 'final' %}
-        if (code == 0) code = runners[0]->finalize(out);
+        int code = runners[0]->run(input_data, 0, rows, row_out, 0, N);
+{% if has_final_output %}
+        if (code == 0) code = runners[0]->finalize(final_out);
 {% endif %}
         if (code != 0) error.store(code, std::memory_order_relaxed);
     } else {
@@ -215,11 +245,15 @@ int run_bound_inputs(
                 if (parallel_mode == 1) {
                     const std::size_t begin = rows * worker / threads;
                     const std::size_t end = rows * (worker + 1) / threads;
-                    code = runners[worker]->run(input_data, begin, end, out, 0, N);
+                    code = runners[worker]->run(
+                        input_data, begin, end, row_out, 0, N
+                    );
                 } else {
                     const std::size_t begin = N * worker / threads;
                     const std::size_t end = N * (worker + 1) / threads;
-                    code = runners[worker]->run(input_data, 0, rows, out, begin, end);
+                    code = runners[worker]->run(
+                        input_data, 0, rows, row_out, begin, end
+                    );
                 }
                 if (code != 0) {
                     int expected = 0;

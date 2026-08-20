@@ -79,30 +79,33 @@ def _depends_on_temporal_reduction(nodes: list[Node]) -> tuple[bool, ...]:
     result: list[bool] = []
     for node in nodes:
         result.append(
-            (
-                isinstance(node.op, ReductionOp)
-                and node.op.temporal
-            )
+            (isinstance(node.op, ReductionOp) and node.op.temporal)
             or any(result[child_id] for child_id in node.child_ids)
         )
     return tuple(result)
 
 
 def compile_ir(
-    formula: str | Expr,
+    formula: str | Expr | list[str | Expr] | tuple[str | Expr, ...],
     *,
     dsl_registry: DSLFunctionRegistry | None = None,
     column_names: list[str] | tuple[str, ...] | None = None,
     input_value_types: Mapping[str, ValueType] | None = None,
 ) -> Program:
-    """Compile cpp_stream IR with tensor broadcasting and composable reductions.
+    """Build one neutral DAG and CSE table for one or many cpp_stream roots."""
 
-    A temporal reduction accumulates in the row loop but projects its result only
-    during finalization. The complete downstream suffix is evaluated once from
-    that final value and is implicitly wrapped in ``emit('last')``.
-    """
+    formulas = tuple(formula) if isinstance(formula, (list, tuple)) else (formula,)
+    if not formulas:
+        raise neutral_frontend.FormulaIRCompileError(
+            "compile_ir requires at least one formula"
+        )
+    expressions = tuple(
+        parse_formula(item) if isinstance(item, str) else item for item in formulas
+    )
 
-    expression = parse_formula(formula) if isinstance(formula, str) else formula
+    # cpp_stream currently extends the neutral frontend's tensor broadcasting and
+    # shape-preserving temporal semantics. Keep that compatibility shim confined to
+    # IR construction; lowering/codegen are imported explicitly by compile.py.
     with _COMPILE_LOCK:
         original_nary = neutral_frontend._nary_result_type
         original_lane_state = neutral_frontend._lane_state_result_type
@@ -114,48 +117,48 @@ def compile_ir(
                 {name: index for index, name in enumerate(column_names or ())},
                 input_value_types or {},
             )
-            root = builder.build(expression)
+            roots = tuple(builder.build(expression) for expression in expressions)
         finally:
             neutral_frontend._nary_result_type = original_nary
             neutral_frontend._lane_state_result_type = original_lane_state
 
     temporal = _depends_on_temporal_reduction(builder.nodes)
-    if temporal[root] and not (
-        isinstance(builder.nodes[root].op, EmitOp)
-        or (
-            isinstance(builder.nodes[root].op, ReductionOp)
-            and builder.nodes[root].op.temporal
-        )
-    ):
-        root = builder._append(
-            EmitOp("last"),
-            (root,),
-            builder.nodes[root].value_type,
-        )
+    resolved_roots: list[int] = []
+    for root in roots:
+        if temporal[root] and not (
+            isinstance(builder.nodes[root].op, EmitOp)
+            or (
+                isinstance(builder.nodes[root].op, ReductionOp)
+                and builder.nodes[root].op.temporal
+            )
+        ):
+            root = builder._append(
+                EmitOp("last"),
+                (root,),
+                builder.nodes[root].value_type,
+            )
+        resolved_roots.append(root)
 
+    root_set = frozenset(resolved_roots)
+    child_ids = frozenset(
+        child_id for node in builder.nodes for child_id in node.child_ids
+    )
     for node_id, node in enumerate(builder.nodes):
-        if isinstance(node.op, EmitOp) and node_id != root:
+        if isinstance(node.op, EmitOp) and (
+            node_id not in root_set or node_id in child_ids
+        ):
             raise neutral_frontend.FormulaIRCompileError(
-                "emit('last') must be the terminal output"
+                "emit('last') must be a terminal output"
             )
 
-    return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
+    return Program(
+        tuple(builder.nodes),
+        tuple(resolved_roots),
+        tuple(builder.inputs),
+    )
 
 
 FormulaIRCompileError = neutral_frontend.FormulaIRCompileError
-
-# compile.py imports codegen first, then this module, then lower_program. Patch
-# the already-loaded modules before those imported callables are used.
-from trading_dsl_engine.cpp_stream.python import lowering as _lowering  # noqa: E402
-from trading_dsl_engine.cpp_stream.python.codegen_full import (  # noqa: E402
-    install as _install_full_codegen,
-)
-from trading_dsl_engine.cpp_stream.python.lowering_full import (  # noqa: E402
-    lower_program as _full_lower_program,
-)
-
-_install_full_codegen()
-_lowering.lower_program = _full_lower_program
 
 
 __all__ = ["FormulaIRCompileError", "compile_ir"]

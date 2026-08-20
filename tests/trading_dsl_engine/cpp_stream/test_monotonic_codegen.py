@@ -6,15 +6,24 @@ from trading_dsl_engine.base.dsl import cumsum, groupby, self_, var
 from trading_dsl_engine.base.keys import Key
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
-from trading_dsl_engine.cpp_stream.python.lowering import (
-    CppStreamLoweringError,
-    lower_program,
-)
+from trading_dsl_engine.cpp_stream.python.lowering import CppStreamLoweringError
+from trading_dsl_engine.cpp_stream.python.lowering_multi import lower_program
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
+from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
 
 
 def _group(plan):
     return next(stage.group for stage in plan.stages if stage.group is not None)
+
+
+def _render(program, plan, *, n: int, input_types) -> str:
+    return render_translation_unit(
+        plan,
+        n_instruments=n,
+        prefetch_rows=16,
+        input_types=input_types,
+        output_layout=build_output_layout(program, n),
+    ).text
 
 
 def test_monotonic_only_key_uses_capacity_one_reset_resolver() -> None:
@@ -43,12 +52,7 @@ def test_monotonic_only_key_uses_capacity_one_reset_resolver() -> None:
     group = _group(plan)
     assert group.capacity == 1
     assert group.dense is False
-    source = render_translation_unit(
-        plan,
-        n_instruments=9,
-        prefetch_rows=16,
-        input_types=input_types,
-    ).text
+    source = _render(program, plan, n=9, input_types=input_types)
     assert "stackdsl::MonotonicGroupResolver<" in source
     assert "stackdsl::NoKeyResolver<9>" in source
 
@@ -81,12 +85,7 @@ def test_monotonic_epoch_can_wrap_retained_dense_keys() -> None:
     group = _group(plan)
     assert group.capacity == 5
     assert group.dense is True
-    source = render_translation_unit(
-        plan,
-        n_instruments=5,
-        prefetch_rows=16,
-        input_types=input_types,
-    ).text
+    source = _render(program, plan, n=5, input_types=input_types)
     assert "stackdsl::MonotonicGroupResolver<" in source
     assert "stackdsl::DenseTupleGroupResolver<5" in source
 

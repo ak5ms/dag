@@ -19,6 +19,7 @@
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/ops/dense_tensor.hpp"
 #include "stackdsl/ops/tensor_ops.hpp"
+#include "stackdsl/ops/output.hpp"
 #include "stackdsl/ops/custom.hpp"
 #include "stackdsl/ops/ridge.hpp"
 #include "stackdsl/ops/groupby.hpp"

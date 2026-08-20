@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from trading_dsl_engine.cpp_stream import compile_formula
+
+
+EXPENSIVE = (
+    "sqrt(abs(sin(x * 1.000001 + y * 0.999999))) "
+    "+ tanh((x - y) * (x + y)) "
+    "+ exp(abs(x - y) * -1.0)"
+)
+
+
+def _public_stages(runtime):
+    return [
+        stage
+        for stage in runtime.plan.stages
+        if stage.out.slot is not None and stage.out.slot < 0
+    ]
+
+
+def test_duplicate_lazy_roots_reuse_first_packed_output(tmp_path: Path) -> None:
+    rows, cols = 48, 4
+    rng = np.random.default_rng(20260820)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [EXPENSIVE, EXPENSIVE],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    first, second = runtime.run(
+        out_path=tmp_path / "duplicate-lazy.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(first, second, rtol=0.0, atol=0.0)
+    public = _public_stages(runtime)
+    assert [stage.kind for stage in public] == ["copy", "copy"]
+    assert public[0].inputs[0].kind != "packed_output"
+    assert public[1].inputs[0].kind == "packed_output"
+    assert runtime.plan.scratch_slots == 0
+
+
+def test_duplicate_cat_roots_copy_first_packed_tensor(tmp_path: Path) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260821)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        ["cat(x, y)", "cat(x, y)"],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    first, second = runtime.run(
+        out_path=tmp_path / "duplicate-cat.npy"
+    ).load(mmap_mode=None)
+
+    expected = np.stack((x, y), axis=-1)
+    np.testing.assert_allclose(first, expected, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(second, expected, rtol=0.0, atol=0.0)
+    public = _public_stages(runtime)
+    assert [stage.kind for stage in public] == ["cat", "tensor_copy"]
+    assert public[1].inputs[0].kind == "packed_output"
+    assert runtime.plan.scratch_slots == 0
+
+
+def test_single_ewm_fanout_uses_direct_output_not_singleton_bundle(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 40, 4
+    rng = np.random.default_rng(20260822)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        ["ewm(x, 3)", "cat(ewm(x, 3), ewm(x, 3))"],
+        {"x": x},
+        n_instruments=cols,
+    )
+    first, pair = runtime.run(
+        out_path=tmp_path / "single-ewm-fanout.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(pair[..., 0], first, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(pair[..., 1], first, rtol=0.0, atol=0.0)
+    assert runtime.plan.scratch_slots == 0
+    assert not any(
+        stage.kind == "ewm_bundle" and len(stage.members) == 1
+        for stage in runtime.plan.stages
+    )
+    assert "stackdsl::PackedOutputSrc<" in runtime.generated_cpp.read_text()
+
+
+def test_projection_rewrite_recompacts_released_scratch_slots(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260823)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [
+            "ewm(x, 3)",
+            "cat(ewm(x, 3), ewm(x, 3))",
+            "xs_rank(y)",
+            "xs_rank(y) + 1",
+        ],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    ewm_value, pair, rank, shifted = runtime.run(
+        out_path=tmp_path / "recompact-public-scratch.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(pair[..., 0], ewm_value, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(pair[..., 1], ewm_value, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(shifted, rank + 1.0, rtol=0.0, atol=0.0)
+    positive_scalar_slots = {
+        int(candidate.out.slot)
+        for stage in runtime.plan.stages
+        for candidate in (stage, *stage.members, *stage.epilogues)
+        if candidate.out.slot is not None
+        and candidate.out.slot >= 0
+        and not candidate.out.matrix
+        and not candidate.out.tensor
+    }
+    assert positive_scalar_slots == {0}
+    assert runtime.plan.scratch_slots == 1
+
+
+def test_ewm_component_labels_do_not_allocate_physical_scratch(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260824)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+    z = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [
+            "cat(ewm(x, 3), ewm(y, 3))",
+            "xs_rank(z)",
+            "xs_rank(z) + 1",
+        ],
+        {"x": x, "y": y, "z": z},
+        n_instruments=cols,
+    )
+    pair, rank, shifted = runtime.run(
+        out_path=tmp_path / "ewm-labels-not-scratch.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(shifted, rank + 1.0, rtol=0.0, atol=0.0)
+    assert pair.shape == (rows, cols, 2)
+    bundle = next(stage for stage in runtime.plan.stages if stage.kind == "ewm_bundle")
+    rank_stage = next(stage for stage in runtime.plan.stages if stage.kind == "xs_rank")
+    assert bundle.epilogues
+    assert rank_stage.out.slot == 0
+    assert runtime.plan.scratch_slots == 1
+    assert runtime.plan.scratch_slots.counts == (1, 0, 0, 0, 0, 0)
+
+
+def test_integral_descendant_does_not_round_trip_through_float_output(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 8, 4
+    base = 1 << 60
+    x = (
+        base + np.arange(1, rows * cols + 1, dtype=np.int64)
+    ).reshape(rows, cols)
+
+    runtime = compile_formula(
+        ["x", "x % 7"],
+        {"x": x},
+        n_instruments=cols,
+    )
+    public_x, remainder = runtime.run(
+        out_path=tmp_path / "integral-public-descendant.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(public_x, x.astype(np.float64), rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        remainder,
+        (x % 7).astype(np.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    # The first public output is float64 storage, but modulo must still consume
+    # the original int64 input so values above 2**53 retain their low bits.
+    assert "stackdsl::PackedOutputSrc<" not in runtime.generated_cpp.read_text()
