@@ -5,6 +5,10 @@ on:
     branches: [agent/cvxpygen-cargo-cache]
     paths:
       - ".github/workflows/package-optimizer-python-wheels.yml"
+  pull_request:
+    branches: [mpo]
+    paths:
+      - ".github/workflows/package-optimizer-python-wheels.yml"
   workflow_dispatch:
 
 jobs:
