@@ -25,7 +25,13 @@ def parse_size(value: str) -> tuple[int, int]:
 
 
 def build_problem(n_assets: int, n_horizons: int):
-    """Build the DPP CVXPY version of the multi-period optimizer."""
+    """Build a DPP CVXPY formulation of the multi-period optimizer.
+
+    The absolute turnover cost is represented with an auxiliary nonnegative
+    variable. Besides matching the Moreau conic formulation exactly, this avoids
+    multiplying a parameter by a nonlinear expression that itself contains the
+    current-weight parameter, which would violate CVXPY's DPP rules.
+    """
     expected_returns = cp.Parameter((n_horizons, n_assets), name="expected_returns")
     half_spread = cp.Parameter((n_horizons, n_assets), nonneg=True, name="half_spread")
     current_weights = cp.Parameter(n_assets, name="current_weights")
@@ -33,22 +39,25 @@ def build_problem(n_assets: int, n_horizons: int):
     risk_radius = cp.Parameter(n_horizons, nonneg=True, name="risk_radius")
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
+    turnover = cp.Variable((n_horizons, n_assets), nonneg=True, name="turnover")
     previous = cp.vstack(
         [cp.reshape(current_weights, (1, n_assets), order="C"), weights[:-1, :]]
     )
-    turnover = cp.abs(weights - previous)
+    delta = weights - previous
+
     objective = cp.Maximize(
         cp.sum(cp.multiply(expected_returns, weights))
         - cp.sum(cp.multiply(half_spread, turnover))
     )
-    constraints = [
+    constraints = [turnover >= delta, turnover >= -delta]
+    constraints.extend(
         cp.norm(
             risk_factor[t * n_assets : (t + 1) * n_assets, :] @ weights[t, :],
             2,
         )
         <= risk_radius[t]
         for t in range(n_horizons)
-    ]
+    )
     problem = cp.Problem(objective, constraints)
     if not problem.is_dcp(dpp=True):
         raise RuntimeError("MPO formulation is not DPP-compatible")
@@ -59,6 +68,7 @@ def build_problem(n_assets: int, n_horizons: int):
         "risk_factor": risk_factor,
         "risk_radius": risk_radius,
         "weights": weights,
+        "turnover": turnover,
     }
 
 
@@ -105,12 +115,16 @@ def smoke_test(code_dir: Path, problem, symbols, parameters: dict[str, np.ndarra
     value = problem.solve(method="CPG", updated_params=list(parameters))
     elapsed = time.perf_counter() - t0
     weights = np.asarray(symbols["weights"].value)
+    turnover = np.asarray(symbols["turnover"].value)
     if weights.shape != symbols["weights"].shape or not np.all(np.isfinite(weights)):
         raise RuntimeError("generated solver returned invalid weights")
+    if turnover.shape != symbols["turnover"].shape or not np.all(np.isfinite(turnover)):
+        raise RuntimeError("generated solver returned invalid turnover")
     return {
         "objective": float(value),
         "elapsed_seconds": elapsed,
         "weight_norm": float(np.linalg.norm(weights)),
+        "turnover_sum": float(np.sum(turnover)),
         "status": str(problem.status),
     }
 
