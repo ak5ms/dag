@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -130,18 +131,28 @@ def smoke_test(code_dir: Path, problem, symbols, parameters: dict[str, np.ndarra
 
 
 def generate_one(output_root: Path, n_assets: int, n_horizons: int) -> dict[str, object]:
+    output_root = output_root.resolve()
     name = f"mpo_n{n_assets}_h{n_horizons}"
     code_dir = output_root / name
     problem, symbols = build_problem(n_assets, n_horizons)
+
+    # CVXPYgen registers the generated wrapper using importlib and therefore expects
+    # code_dir itself to be a valid Python package name, not an arbitrary path.
+    original_cwd = Path.cwd()
     t0 = time.perf_counter()
-    cpg.generate_code(
-        problem,
-        code_dir=str(code_dir),
-        solver="CLARABEL",
-        wrapper=True,
-        prefix=f"n{n_assets}_h{n_horizons}_",
-    )
+    try:
+        os.chdir(output_root)
+        cpg.generate_code(
+            problem,
+            code_dir=name,
+            solver="CLARABEL",
+            wrapper=True,
+            prefix=f"n{n_assets}_h{n_horizons}_",
+        )
+    finally:
+        os.chdir(original_cwd)
     generation_seconds = time.perf_counter() - t0
+
     parameters = deterministic_parameters(n_assets, n_horizons)
     np.savez(output_root / f"{name}_parameters.npz", **parameters)
     smoke = smoke_test(code_dir, problem, symbols, parameters)
