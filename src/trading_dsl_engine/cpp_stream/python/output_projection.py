@@ -74,15 +74,7 @@ def _replace_slot_source(
 
 
 def _split_singleton_ewm_bundle(stage: Stage) -> tuple[Stage, ...]:
-    """Remove the invalid one-member bundle introduced by output epilogues.
-
-    A normal EWM bundle has at least two independent state machines. When one EWM
-    feeds several public projections, the first plain Copy projection can instead
-    become the EWM destination and later projections can read that packed output.
-    This keeps one EWM evaluation, removes scratch, and avoids teaching the native
-    multi-state bundle about a degenerate one-member case. If there is no plain
-    public Copy anchor, restore the ordinary EWM plus its projection stages.
-    """
+    """Remove a one-member EWM bundle introduced only by output epilogues."""
 
     if stage.kind != "ewm_bundle" or len(stage.members) != 1:
         return (stage,)
@@ -167,9 +159,8 @@ def _schedule_terminal_projections(stages: list[Stage]) -> list[Stage]:
 
     Output offsets encode API order independently of execution order. A stable
     topological ordering of the terminal projection suffix can therefore execute
-    `[parent, subgraph]` as `subgraph -> parent`, allowing the parent projection to
-    read the requested packed subgraph instead of evaluating the same pure graph a
-    second time. Stateful physical stages are outside this suffix and never move.
+    ``[parent, subgraph]`` as ``subgraph -> parent``. Stateful stages are outside
+    this suffix and never move.
     """
 
     start = _terminal_projection_suffix_start(stages)
@@ -201,14 +192,14 @@ def _schedule_terminal_projections(stages: list[Stage]) -> list[Stage]:
     order: list[int] = []
     while remaining:
         ready = next(
-            (index for index in range(len(suffix))
-             if index in remaining and indegree[index] == 0),
+            (
+                index
+                for index in range(len(suffix))
+                if index in remaining and indegree[index] == 0
+            ),
             None,
         )
         if ready is None:
-            # Structural source containment should be acyclic. Preserve the
-            # original schedule rather than guessing if a future source kind
-            # violates that invariant.
             return stages
         remaining.remove(ready)
         order.append(ready)
@@ -236,19 +227,10 @@ def _rewrite_anchored_source(
 
 
 def _reuse_public_row_storage(stages: list[Stage]) -> list[Stage]:
-    """Reuse an earlier public row result instead of recomputing the same source.
+    """Reuse an earlier float64 public row result instead of recomputing it.
 
-    Neutral-IR CSE can leave a pure expression lazy. Two separate Copy stages would
-    then place that same expression in two different C++ loops, outside the
-    compiler's local CSE region. The first requested row output is a natural
-    materialization point: later equal roots, emits, and descendant expressions
-    read its packed row slice. The incremental cost is therefore an ordinary copy,
-    matching the memory traffic of returning the extra result rather than repeating
-    expensive arithmetic.
-
-    Native outputs are float64. Reusing that storage as an internal source is
-    therefore restricted to float64 values; integral scratch remains typed so large
-    integers and integer operators cannot be changed by a float64 round trip.
+    Public storage is float64, so integral values remain on their original typed
+    source path and never round-trip through a potentially inexact output value.
     """
 
     source_anchors: dict[Source, Source] = {}
@@ -318,6 +300,58 @@ def _reuse_public_row_storage(stages: list[Stage]) -> list[Stage]:
 
         result.append(stage)
 
+    return result
+
+
+def _copy_bundle_candidate(stage: Stage) -> bool:
+    return bool(
+        stage.kind == "copy"
+        and _public_offset(stage) is not None
+        and not stage.final_only
+        and len(stage.inputs) == 1
+        and stage.inputs[0].width == 1
+        and not stage.out.matrix
+        and not stage.out.tensor
+    )
+
+
+def _bundle_terminal_copies(stages: list[Stage]) -> list[Stage]:
+    """Fuse adjacent public vector copies into one CSE-visible lane loop."""
+
+    result: list[Stage] = []
+    cursor = 0
+    while cursor < len(stages):
+        first = stages[cursor]
+        if not _copy_bundle_candidate(first):
+            result.append(first)
+            cursor += 1
+            continue
+
+        members = [first]
+        following = cursor + 1
+        while following < len(stages):
+            candidate = stages[following]
+            if not (
+                _copy_bundle_candidate(candidate)
+                and candidate.lane_count == first.lane_count
+            ):
+                break
+            members.append(candidate)
+            following += 1
+
+        if len(members) == 1:
+            result.append(first)
+        else:
+            result.append(
+                replace(
+                    first,
+                    kind="copy_bundle",
+                    inputs=tuple(member.inputs[0] for member in members),
+                    members=tuple(members),
+                    epilogues=(),
+                )
+            )
+        cursor = following
     return result
 
 
@@ -438,8 +472,9 @@ def optimize_public_projections(plan: Plan) -> Plan:
     for stage in plan.stages:
         expanded.extend(_split_singleton_ewm_bundle(stage))
     scheduled = _schedule_terminal_projections(expanded)
-    optimized = _reuse_public_row_storage(scheduled)
-    compact = _recompact_physical_scalar_slots(optimized)
+    reused = _reuse_public_row_storage(scheduled)
+    bundled = _bundle_terminal_copies(reused)
+    compact = _recompact_physical_scalar_slots(bundled)
     return replace(
         plan,
         stages=tuple(compact),
