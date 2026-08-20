@@ -1,0 +1,156 @@
+state=tests_failed
+target_branch=agent/strongly-typed-gp
+original_sha=ecc72b1205714be3b2ada2d0dc60c478bc821004
+rebased_sha=ef706769f74240f734183770f2614b2a8c856027
+main_sha=0c956aa1304448f24abf92811ded693bcd7b02ed
+details:
+                id(node.fn),
+                node.lookback,
+                node.min_periods,
+                node.output_kind,
+                node.output_width,
+                node.name,
+                tuple(_expr_key(a) for a in node.args),
+            )
+        if isinstance(node, StatelessJaxCall):
+            return (
+                "jax_stateless",
+                id(node.fn),
+                node.output_kind,
+                node.output_width,
+                node.name,
+                node.cpp_name,
+                tuple(_expr_key(a) for a in node.args),
+            )
+        if isinstance(node, KeyTuple):
+            return ("tuple", tuple(_expr_key(item) for item in node.items))
+        if isinstance(node, Universe):
+            return ("univ", node.groups)
+>       raise ValueError(f"Unsupported expression: {node}")
+E       ValueError: Unsupported expression: Key(expr=Identifier(name='session_start0'), num_keys=None, offset=0, row_scalar=True, dtype='float64', monotonic=True)
+
+src/trading_dsl_engine/jax_flat/compile.py:213: ValueError
+----------------------------- Captured stdout call -----------------------------
+running build_ext
+building 'trading_dsl_engine.jax_flat._cpp_flat' extension
+creating build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat
+clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Isrc -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/includeigen/include/eigen -I/usr/include/eigen3 -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/pybind11/include -I/opt/hostedtoolcache/Python/3.11.16/x64/include/python3.11 -c src/trading_dsl_engine/jax_flat/engine.cpp -o build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat/engine.o -fvisibility=hidden -g0 -std=c++23 -O3 -DNDEBUG -DEIGEN_NO_DEBUG -fvisibility=hidden -fno-math-errno -funroll-loops -march=native -mtune=native -flto
+creating build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat
+clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -shared build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat/engine.o -L/opt/hostedtoolcache/Python/3.11.16/x64/lib -o build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat/_cpp_flat.cpython-311-x86_64-linux-gnu.so -Wl,-O3 -flto
+building 'trading_dsl_engine.jax_ffi.nnqp._eigen_nnqp' extension
+creating build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp
+clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Isrc -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/includeigen/include/eigen -I/usr/include/eigen3 -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/pybind11/include -I/opt/hostedtoolcache/Python/3.11.16/x64/include/python3.11 -c src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc -o build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.o -fvisibility=hidden -g0 -std=c++17 -O3 -DNDEBUG -DEIGEN_NO_DEBUG -fvisibility=hidden -fno-math-errno -funroll-loops -march=native -mtune=native -flto -DEIGEN_MPL2_ONLY
+creating build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp
+clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -shared build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.o -L/opt/hostedtoolcache/Python/3.11.16/x64/lib -o build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp/_eigen_nnqp.cpython-311-x86_64-linux-gnu.so -Wl,-O3 -flto
+copying build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat/_cpp_flat.cpython-311-x86_64-linux-gnu.so -> src/trading_dsl_engine/jax_flat
+copying build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp/_eigen_nnqp.cpython-311-x86_64-linux-gnu.so -> src/trading_dsl_engine/jax_ffi/nnqp
+----------------------------- Captured stderr call -----------------------------
+In file included from src/trading_dsl_engine/jax_flat/engine.cpp:1:
+src/trading_dsl_engine/jax_flat/ops.cpp:583:33: warning: braces around scalar initializer [-Wbraced-scalar-init]
+  583 |         py::array_t<double> out({static_cast<int64_t>(output_size(state))});
+      |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+src/trading_dsl_engine/jax_flat/ops.cpp:1033:21: warning: enumeration value 'Count' not handled in switch [-Wswitch]
+ 1033 |             switch (spec.opcode) {
+      |                     ^~~~~~~~~~~
+src/trading_dsl_engine/jax_flat/ops.cpp:648:9: warning: private field 'n_states_' is not used [-Wunused-private-field]
+  648 |     int n_states_;
+      |         ^
+3 warnings generated.
+In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:461:67: warning: comparison of integers of different signs: '__int_type' (aka 'long') and 'size_t' (aka 'unsigned long') [-Wsign-compare]
+  461 |         state_->count.fetch_sub(count, std::memory_order_acq_rel) == count;
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^  ~~~~~
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:893:35: warning: comparison of integers of different signs: 'size_t' (aka 'unsigned long') and 'const int64_t' (aka 'const long') [-Wsign-compare]
+  893 |     if (XLA_FFI_PREDICT_FALSE(idx >= args()->size)) {
+      |                               ~~~ ^  ~~~~~~~~~~~~
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:87:62: note: expanded from macro 'XLA_FFI_PREDICT_FALSE'
+   87 | #define XLA_FFI_PREDICT_FALSE(x) (__builtin_expect(false || (x), false))
+      |                                                              ^
+In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:981:35: warning: comparison of integers of different signs: 'size_t' (aka 'unsigned long') and 'const int64_t' (aka 'const long') [-Wsign-compare]
+  981 |     if (XLA_FFI_PREDICT_FALSE(idx >= rets()->size)) {
+      |                               ~~~ ^  ~~~~~~~~~~~~
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:87:62: note: expanded from macro 'XLA_FFI_PREDICT_FALSE'
+   87 | #define XLA_FFI_PREDICT_FALSE(x) (__builtin_expect(false || (x), false))
+      |                                                              ^
+src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:33:27: warning: braces around scalar initializer [-Wbraced-scalar-init]
+   33 |   py::array_t<double> out({p});
+      |                           ^~~
+In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
+In file included from /opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:49:
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1810:12: note: in instantiation of function template specialization 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call<0UL, 1UL, 2UL>' requested here
+ 1810 |     return Call(call_frame, Is{});
+      |            ^
+src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:110:1: note: in instantiation of member function 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call' requested here
+  110 | XLA_FFI_DEFINE_HANDLER_SYMBOL(
+      | ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2292:5: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_SYMBOL'
+ 2292 |     XLA_FFI_DEFINE_HANDLER(handler, impl, ##__VA_ARGS__);                      \
+      |     ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2256:7: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER'
+ 2256 |       XLA_FFI_DEFINE_HANDLER_EXPLICIT(fn, impl, ##__VA_ARGS__),             \
+      |       ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2235:21: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_EXPLICIT'
+ 2235 |     return handler->Call(call_frame);                                         \
+      |                     ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1810:12: note: in instantiation of function template specialization 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call<0UL, 1UL, 2UL, 3UL, 4UL, 5UL>' requested here
+ 1810 |     return Call(call_frame, Is{});
+      |            ^
+src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:118:1: note: in instantiation of member function 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call' requested here
+  118 | XLA_FFI_DEFINE_HANDLER_SYMBOL(
+      | ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2292:5: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_SYMBOL'
+ 2292 |     XLA_FFI_DEFINE_HANDLER(handler, impl, ##__VA_ARGS__);                      \
+      |     ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2256:7: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER'
+ 2256 |       XLA_FFI_DEFINE_HANDLER_EXPLICIT(fn, impl, ##__VA_ARGS__),             \
+      |       ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2235:21: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_EXPLICIT'
+ 2235 |     return handler->Call(call_frame);                                         \
+      |                     ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
+ 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
+      |                                                            &&
+/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
+11 warnings generated.
+=========================== short test summary info ============================
+FAILED tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py::test_known_instrument_count_uses_one_ir_build - AssertionError: assert 2 == 1
+ +  where 2 = len([<trading_dsl_engine.cpp_stream.python.compiler_support.ReferencedSourceTypes object at 0x7f1ebdf92fd0>, {'x': ValueType(kind='vector', width=1, dtype='float64', shape=(None,))}])
+FAILED tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py::test_header_digest_cache_invalidates_after_header_edit - AttributeError: module 'trading_dsl_engine.cpp_stream.python.compile' has no attribute '_header_digest'
+FAILED tests/trading_dsl_engine/cpp_stream/test_roll_rets.py::test_roll_rets_native_matches_jax_flat - ValueError: Unsupported expression: Key(expr=Identifier(name='session_start0'), num_keys=None, offset=0, row_scalar=True, dtype='float64', monotonic=True)
+3 failed, 89 passed in 448.51s (0:07:28)
