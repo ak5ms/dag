@@ -43,6 +43,25 @@ def _public_offset(stage: Stage) -> int | None:
     return None if slot is None or slot >= 0 else -int(slot) - 1
 
 
+def _collect_source_slots(source: Source, result: set[SlotKey]) -> None:
+    key = _source_slot_key(source)
+    if key is not None:
+        result.add(key)
+    for part in source.parts:
+        _collect_source_slots(part, result)
+
+
+def _stage_input_slots(stage: Stage) -> frozenset[SlotKey]:
+    result: set[SlotKey] = set()
+    for candidate in (stage, *stage.members, *stage.epilogues):
+        for source in candidate.inputs:
+            _collect_source_slots(source, result)
+    if stage.group is not None:
+        for source in (*stage.group.key_sources, *stage.group.feed_sources):
+            _collect_source_slots(source, result)
+    return frozenset(result)
+
+
 def _packed_source(source: Source, offset: int) -> Source:
     if source.dtype != "float64":
         raise TypeError("packed public-output reuse requires a float64 source")
@@ -71,6 +90,99 @@ def _replace_slot_source(
         for part in source.parts
     )
     return source if parts == source.parts else replace(source, parts=parts)
+
+
+def _is_public_ewm_projection(
+    stage: Stage,
+    member_outputs: frozenset[SlotKey],
+    final_only: bool,
+) -> bool:
+    public_dest = _public_offset(stage) is not None
+    scalar_projection = (
+        stage.kind == "copy"
+        and len(stage.inputs) == 1
+        and stage.inputs[0].width == 1
+    ) or (
+        stage.kind == "cat"
+        and stage.inputs
+        and all(source.width == 1 for source in stage.inputs)
+    )
+    dependencies = _stage_input_slots(stage)
+    return bool(
+        public_dest
+        and scalar_projection
+        and dependencies
+        and dependencies <= member_outputs
+        and stage.final_only == final_only
+    )
+
+
+def _fuse_nonadjacent_ewm_epilogues(stages: list[Stage]) -> list[Stage]:
+    """Attach output-only EWM consumers even across independent stages.
+
+    The original lowering pass only saw an immediately following Copy/Cat. Public
+    projections are terminal and their packed offsets encode API order, so an
+    unrelated physical stage between an EWM producer and its projection must not
+    force the EWM values into RowContext scratch. We scan all later direct users:
+    fusion is allowed only when every use of every member output is an eligible
+    public projection. A real downstream consumer keeps the ordinary scratch path.
+    """
+
+    removed: set[int] = set()
+    result: list[Stage] = []
+
+    for cursor, stage in enumerate(stages):
+        if cursor in removed:
+            continue
+        if stage.kind not in {"ewm", "ewm_bundle"} or stage.epilogues:
+            result.append(stage)
+            continue
+
+        members = stage.members if stage.members else (stage,)
+        member_outputs = frozenset(
+            key
+            for member in members
+            if (key := _dest_slot_key(member)) is not None
+        )
+        if not member_outputs:
+            result.append(stage)
+            continue
+
+        epilogue_indices: list[int] = []
+        blocked = False
+        for following in range(cursor + 1, len(stages)):
+            candidate = stages[following]
+            dependencies = _stage_input_slots(candidate)
+            if not (dependencies & member_outputs):
+                continue
+            if _is_public_ewm_projection(
+                candidate,
+                member_outputs,
+                stage.final_only,
+            ):
+                epilogue_indices.append(following)
+            else:
+                blocked = True
+                break
+
+        if blocked or not epilogue_indices:
+            result.append(stage)
+            continue
+
+        bundle = (
+            stage
+            if stage.kind == "ewm_bundle"
+            else replace(stage, kind="ewm_bundle", members=members)
+        )
+        result.append(
+            replace(
+                bundle,
+                epilogues=tuple(stages[index] for index in epilogue_indices),
+            )
+        )
+        removed.update(epilogue_indices)
+
+    return result
 
 
 def _split_singleton_ewm_bundle(stage: Stage) -> tuple[Stage, ...]:
@@ -308,7 +420,9 @@ def _copy_bundle_candidate(stage: Stage) -> bool:
         stage.kind == "copy"
         and _public_offset(stage) is not None
         and not stage.final_only
+        and stage.dtype == "float64"
         and len(stage.inputs) == 1
+        and stage.inputs[0].dtype == "float64"
         and stage.inputs[0].width == 1
         and not stage.out.matrix
         and not stage.out.tensor
@@ -316,7 +430,7 @@ def _copy_bundle_candidate(stage: Stage) -> bool:
 
 
 def _bundle_terminal_copies(stages: list[Stage]) -> list[Stage]:
-    """Fuse adjacent public vector copies into one CSE-visible lane loop."""
+    """Fuse adjacent public float64 vector copies into one cached lane loop."""
 
     result: list[Stage] = []
     cursor = 0
@@ -468,8 +582,9 @@ def _recompact_physical_scalar_slots(stages: list[Stage]) -> list[Stage]:
 def optimize_public_projections(plan: Plan) -> Plan:
     """Optimize terminal fan-out and recompact any released scalar slots."""
 
+    fused = _fuse_nonadjacent_ewm_epilogues(list(plan.stages))
     expanded: list[Stage] = []
-    for stage in plan.stages:
+    for stage in fused:
         expanded.extend(_split_singleton_ewm_bundle(stage))
     scheduled = _schedule_terminal_projections(expanded)
     reused = _reuse_public_row_storage(scheduled)
