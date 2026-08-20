@@ -1,0 +1,33 @@
+name: agent typed literal PR patch
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'agent/multi-formula-cpp-stream'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/multi-formula-cpp-stream
+          fetch-depth: 0
+      - name: Apply typed literal patch
+        run: python scripts/agent_patch_typed_literals.py
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            src/trading_dsl_engine/base/parser.py \
+            src/trading_dsl_engine/base/dsl.py \
+            src/trading_dsl_engine/ir/frontend.py \
+            src/trading_dsl_engine/cpp_stream/python/frontend.py \
+            tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+          git rm scripts/agent_patch_typed_literals.py
+          git commit -m "cpp_stream: preserve integer and float literal types"
+          git push origin HEAD:agent/multi-formula-cpp-stream
