@@ -5,10 +5,6 @@ on:
     branches: [agent/cvxpygen-cargo-cache]
     paths:
       - ".github/workflows/package-clarabel-cargo-cache.yml"
-  pull_request:
-    branches: [mpo]
-    paths:
-      - ".github/workflows/package-clarabel-cargo-cache.yml"
   workflow_dispatch:
 
 jobs:
@@ -17,24 +13,26 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install CVXPYgen
-        run: python -m pip install cvxpygen==1.0.0
-      - name: Vendor Clarabel Rust dependencies
+      - name: Vendor Clarabel 0.11.1 and dependencies
         run: |
-          site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"
-          manifest="$site_dir/cvxpygen/solvers/Clarabel.cpp/rust_wrapper/Cargo.toml"
-          mkdir -p clarabel-cargo-vendor
-          cargo vendor --manifest-path "$manifest" clarabel-cargo-vendor/vendor > clarabel-cargo-vendor/config.toml
-          cp "$manifest" clarabel-cargo-vendor/Cargo.toml
-          cp "$site_dir/cvxpygen/solvers/Clarabel.cpp/Clarabel.rs/Cargo.toml" clarabel-cargo-vendor/Clarabel.Cargo.toml
-          tar -czf clarabel-cargo-vendor.tar.gz clarabel-cargo-vendor
-      - name: Upload vendored dependencies
+          mkdir -p clarabel-current/src
+          cat > clarabel-current/Cargo.toml <<'EOF'
+          [package]
+          name = "clarabel_current_vendor"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          clarabel = "=0.11.1"
+          EOF
+          echo 'fn main() {}' > clarabel-current/src/main.rs
+          mkdir -p clarabel-current/vendor
+          cargo vendor --manifest-path clarabel-current/Cargo.toml clarabel-current/vendor > clarabel-current/config.toml
+          tar -czf clarabel-current-vendor.tar.gz clarabel-current
+      - name: Upload vendored current Clarabel crate
         uses: actions/upload-artifact@v4
         with:
-          name: clarabel-cargo-vendor-tar
-          path: clarabel-cargo-vendor.tar.gz
+          name: clarabel-current-vendor
+          path: clarabel-current-vendor.tar.gz
           if-no-files-found: error
           retention-days: 1
