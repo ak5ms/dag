@@ -7,6 +7,7 @@ from trading_dsl_engine.base.parser import Expr
 from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
 from trading_dsl_engine.cpp_stream.python.compiler_support import (
     ReferencedSourceTypes,
+    _header_digest,
     apply_input_key_hints,
     build_shared,
     infer_n,
@@ -123,6 +124,9 @@ def compile_formula(
             input_types,
             n_instruments,
         )
+        # The discovery pass inspects metadata only for names reached by the IR.
+        # When N is supplied, ReferencedSourceTypes already returns exact logical
+        # extents, so the same IR does not need to be built a second time.
         program = compile_ir(
             formula,
             dsl_registry=dsl_registry,
@@ -135,18 +139,19 @@ def compile_formula(
             details = {name: info.rows for name, info in infos.items()}
             raise ValueError(f"cpp_stream sources have different row counts: {details}")
         n = infer_n(infos, n_instruments)
-        # Rebuild with exact N so all tensor and public-output extents become
-        # compile-time constants before lowering and Jinja rendering.
-        program = compile_ir(
-            formula,
-            dsl_registry=dsl_registry,
-            column_names=column_names,
-            input_value_types={
-                name: input_value_type(info.input_type, n)
-                for name, info in infos.items()
-            },
-        )
-        validate_names(program, data, what="source")
+        if n_instruments is None:
+            # If N was inferred, rebuild once with exact extents before lowering
+            # so tensor/public-output geometry remains compile-time constant.
+            program = compile_ir(
+                formula,
+                dsl_registry=dsl_registry,
+                column_names=column_names,
+                input_value_types={
+                    name: input_value_type(info.input_type, n)
+                    for name, info in infos.items()
+                },
+            )
+            validate_names(program, data, what="source")
         ordered = tuple(infos[name].input_type for name in program.input_names)
         bound_sources: Mapping[str, SourceValue] | None = {
             name: data[name] for name in program.input_names
