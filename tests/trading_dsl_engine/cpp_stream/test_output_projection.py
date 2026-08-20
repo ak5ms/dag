@@ -15,6 +15,8 @@ EXPENSIVE = (
     "+ tanh((x - y) * (x + y)) "
     "+ exp(abs(x - y) * -1.0)"
 )
+LAZY_SUBGRAPH = "sin(x * 1.000001 + y * 0.999999) + tanh(x - y)"
+LAZY_PARENT = f"sqrt(abs({LAZY_SUBGRAPH}))"
 
 
 def _public_stages(runtime):
@@ -25,6 +27,12 @@ def _public_stages(runtime):
     ]
 
 
+def _source_has_kind(source, kind: str) -> bool:
+    return source.kind == kind or any(
+        _source_has_kind(part, kind) for part in source.parts
+    )
+
+
 def test_fixed_extent_equal_to_n_is_not_lane_partitionable() -> None:
     program = compile_ir("x", input_value_types={"x": fixed(4)})
     layout = build_output_layout(program, 4)
@@ -33,6 +41,59 @@ def test_fixed_extent_equal_to_n_is_not_lane_partitionable() -> None:
     assert layout.outputs[0].size == 4
     assert layout.outputs[0].lane_partitionable is False
     assert layout.row_lane_partitionable is False
+
+
+def test_parent_before_lazy_subgraph_reorders_only_execution(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260825)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [LAZY_PARENT, LAZY_SUBGRAPH],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    parent, subgraph = runtime.run(
+        out_path=tmp_path / "parent-before-lazy-subgraph.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(
+        parent,
+        np.sqrt(np.abs(subgraph)),
+        rtol=1e-15,
+        atol=1e-15,
+    )
+    public = _public_stages(runtime)
+    # API order remains parent then subgraph in RunResult.load(), but execution
+    # writes the subgraph's later packed offset first so the parent can reuse it.
+    assert [stage.out.slot for stage in public] == [-(cols + 1), -1]
+    assert _source_has_kind(public[1].inputs[0], "packed_output")
+
+
+def test_emit_before_lazy_row_output_reuses_requested_row_storage(
+    tmp_path: Path,
+) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260826)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [f"emit({LAZY_SUBGRAPH})", LAZY_SUBGRAPH],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    final, row_values = runtime.run(
+        out_path=tmp_path / "emit-before-lazy-row.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(final, row_values[-1], rtol=0.0, atol=0.0)
+    terminal = runtime.plan.stages[-2:]
+    assert [stage.kind for stage in terminal] == ["copy", "emit_last"]
+    assert _source_has_kind(terminal[1].inputs[0], "packed_output")
 
 
 def test_duplicate_lazy_roots_reuse_first_packed_output(tmp_path: Path) -> None:
