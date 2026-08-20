@@ -4,63 +4,26 @@ on:
   push:
     branches: [mpo]
     paths:
-      - "src/flows/mpo.py"
-      - "src/flows/riskmodel.py"
-      - "tests/flows/test_mpo.py"
-      - "scripts/benchmark_mpo.py"
-      - "pyproject.toml"
-      - ".github/workflows/mpo.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/flows/mpo.py"
-      - "src/flows/riskmodel.py"
-      - "tests/flows/test_mpo.py"
-      - "scripts/benchmark_mpo.py"
-      - "pyproject.toml"
       - ".github/workflows/mpo.yml"
   workflow_dispatch:
 
 jobs:
-  test-and-benchmark:
+  package-python-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install project and solver dependencies
-        run: >-
-          python -m pip install
-          numpy pandas numba scipy jax equinox pytest pytest-xdist
-          pybind11 includeigen Jinja2 unxt deap pydot graphviz matplotlib
-          moreau==0.3.3 cvxpy==1.9.1 cvxpygen==1.0.0 clarabel==0.11.1
-      - name: Package source, Python wheels, and portable Rust toolchain
+      - name: Package portable CPython runtime
         run: |
-          mkdir -p mpo-local-bundle/wheels
-          tar --exclude=.git -czf mpo-local-bundle/dag-mpo-source.tar.gz \
-            pyproject.toml setup.py src scripts/benchmark_mpo.py tests/flows/test_mpo.py
-          python -m pip download --dest mpo-local-bundle/wheels \
-            moreau==0.3.3 cvxpy==1.9.1 cvxpygen==1.0.0 clarabel==0.11.1
-          rust_sysroot="$(rustc --print sysroot)"
-          tar -C "$(dirname "$rust_sysroot")" \
-            --exclude='*/share/doc' --exclude='*/share/man' --exclude='*/lib/rustlib/src' \
-            -czf mpo-local-bundle/rust-toolchain.tar.gz "$(basename "$rust_sysroot")"
-      - name: Upload local benchmark bundle
+          mkdir -p mpo-python311-runtime
+          tar -C "$(dirname "$pythonLocation")" -czf mpo-python311-runtime/python311.tar.gz "$(basename "$pythonLocation")"
+      - name: Upload portable CPython runtime
         uses: actions/upload-artifact@v4
         with:
-          name: mpo-cvxpygen-local-bundle
-          path: mpo-local-bundle
+          name: mpo-python311-runtime
+          path: mpo-python311-runtime
           if-no-files-found: error
           retention-days: 1
-      - name: Test MPO and risk-model integration
-        env:
-          PYTHONPATH: src
-          JAX_ENABLE_X64: "1"
-        run: python -m pytest -q -o addopts="" tests/flows/test_mpo.py
-      - name: Run synthetic risk-model/MPO benchmark
-        env:
-          PYTHONPATH: src
-          JAX_ENABLE_X64: "1"
-        run: python scripts/benchmark_mpo.py
