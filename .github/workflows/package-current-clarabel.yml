@@ -1,0 +1,33 @@
+name: package-current-clarabel
+
+on:
+  push:
+    branches: [agent/cvxpygen-cargo-cache]
+    paths:
+      - ".github/workflows/package-current-clarabel.yml"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone current Clarabel C/C++ wrapper
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/oxfordcontrol/Clarabel.cpp.git current-clarabel/Clarabel.cpp
+      - name: Vendor Rust dependencies
+        run: |
+          cd current-clarabel/Clarabel.cpp
+          mkdir -p .cargo vendor
+          cargo vendor --manifest-path rust_wrapper/Cargo.toml vendor > .cargo/config.toml
+          cd ../..
+          tar -czf current-clarabel.tar.gz current-clarabel
+      - name: Upload source and vendor tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-clarabel-source-vendor
+          path: current-clarabel.tar.gz
+          if-no-files-found: error
+          retention-days: 1
