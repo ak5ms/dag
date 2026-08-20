@@ -67,7 +67,9 @@ def build_output_layout(program: Program, n_instruments: int) -> OutputLayout:
     final_offset = 0
     outputs: list[FormulaOutput] = []
     for root_id in program.outputs:
-        shape = resolve_shape(program.nodes[root_id].value_type, n_instruments)
+        value_type = program.nodes[root_id].value_type
+        logical_shape = value_type.logical_shape
+        shape = resolve_shape(value_type, n_instruments)
         size = shape_size(shape)
         mode = _output_mode(program, root_id)
         if mode == "rows":
@@ -84,7 +86,9 @@ def build_output_layout(program: Program, n_instruments: int) -> OutputLayout:
                 mode,
                 offset,
                 bool(
-                    shape
+                    logical_shape
+                    and logical_shape[0] is None
+                    and shape
                     and shape[0] == n_instruments
                     and size % n_instruments == 0
                 ),
