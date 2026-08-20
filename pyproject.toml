@@ -23,6 +23,7 @@ dependencies = [
     "deap",
     "pydot",
     "matplotlib",
+    "moreau>=0.3.3",
 ]
 
 [tool.pytest.ini_options]
