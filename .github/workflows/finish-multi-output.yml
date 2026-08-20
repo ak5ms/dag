@@ -1,0 +1,368 @@
+name: Finish multi-output fanout fusion
+
+on:
+  push:
+    branches:
+      - agent/multi-formula-cpp-stream
+    paths:
+      - .github/workflows/finish-multi-output.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/multi-formula-cpp-stream
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Apply generic duplicate-root fanout fusion
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text()
+              if new in text:
+                  return
+              if old not in text:
+                  raise RuntimeError(f"marker not found in {path}: {old[:100]!r}")
+              path.write_text(text.replace(old, new, 1))
+
+          nary = root / 'src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/naryop.hpp'
+          nary_text = nary.read_text()
+          if 'struct CopyBundleNode {' not in nary_text:
+              marker = '\nstruct RankItem {\n'
+              insertion = r'''
+
+template <
+    std::size_t N,
+    class In,
+    class Execution,
+    class... Outs
+>
+struct CopyBundleNode {
+    static_assert(sizeof...(Outs) > 1);
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            const auto value = ctx.template read_native<In>(lane);
+            ((ctx.template write_ptr<Outs>()[lane] = value), ...);
+        }
+    }
+};
+'''
+              if marker not in nary_text:
+                  raise RuntimeError('CopyNode insertion marker not found')
+              nary.write_text(nary_text.replace(marker, insertion + marker, 1))
+
+          tensor_ops = root / 'src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/tensor_ops.hpp'
+          tensor_text = tensor_ops.read_text()
+          if 'struct TensorCopyBundleNode {' not in tensor_text:
+              marker = 'template <class Input, class Out, std::size_t Index, class Execution>\nstruct TensorColumnNode {'
+              insertion = r'''
+template <class Input, class Execution, class... Outs>
+struct TensorCopyBundleNode {
+    static_assert(sizeof...(Outs) > 1);
+    using Shape = typename Input::shape;
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        const auto [begin, end] =
+            execution_output_range<Shape::size, Execution>(ctx);
+        for (std::size_t index = begin; index < end; ++index) {
+            const double value = Input::read_flat(ctx, index);
+            ((ctx.template write_ptr<Outs>()[index] = value), ...);
+        }
+    }
+};
+
+'''
+              if marker not in tensor_text:
+                  raise RuntimeError('TensorCopyNode insertion marker not found')
+              tensor_ops.write_text(tensor_text.replace(marker, insertion + marker, 1))
+
+          lowering = root / 'src/trading_dsl_engine/cpp_stream/python/lowering_multi.py'
+          lowering_text = lowering.read_text()
+          if 'def _fuse_duplicate_output_copies(' not in lowering_text:
+              marker = '\ndef _plan_output_shape('
+              insertion = r'''
+
+def _fuse_duplicate_output_copies(stages: list[Stage]) -> list[Stage]:
+    """Evaluate identical public Copy projections once and fan out the value.
+
+    Formula-list roots are appended as ordinary output projections. When two or
+    more projections have the same lowered source, mode, dtype, and geometry,
+    combine them into one physical loop with multiple compile-time destinations.
+    This is generic copy fusion: it applies equally to inputs, lazy expressions,
+    scratch-backed final values, and arbitrary-rank tensor sources.
+    """
+
+    result: list[Stage] = []
+    consumed: set[int] = set()
+
+    def eligible(stage: Stage) -> bool:
+        return bool(
+            stage.kind in {"copy", "tensor_copy"}
+            and len(stage.inputs) == 1
+            and stage.out.slot is not None
+            and stage.out.slot < 0
+        )
+
+    def equivalent(left: Stage, right: Stage) -> bool:
+        return bool(
+            left.kind == right.kind
+            and left.inputs == right.inputs
+            and left.lane_count == right.lane_count
+            and left.dtype == right.dtype
+            and left.final_only == right.final_only
+            and left.out.shape == right.out.shape
+            and left.out.size == right.out.size
+            and left.out.matrix == right.out.matrix
+            and left.out.tensor == right.out.tensor
+        )
+
+    for index, stage in enumerate(stages):
+        if index in consumed:
+            continue
+        if not eligible(stage):
+            result.append(stage)
+            continue
+
+        matches = [
+            other
+            for other in range(index + 1, len(stages))
+            if other not in consumed
+            and eligible(stages[other])
+            and equivalent(stage, stages[other])
+        ]
+        if not matches:
+            result.append(stage)
+            continue
+
+        indexes = (index, *matches)
+        members = tuple(stages[item] for item in indexes)
+        consumed.update(matches)
+        result.append(
+            replace(
+                stage,
+                kind=(
+                    "tensor_copy_bundle"
+                    if stage.kind == "tensor_copy"
+                    else "copy_bundle"
+                ),
+                members=members,
+            )
+        )
+    return result
+'''
+              if marker not in lowering_text:
+                  raise RuntimeError('lowering fusion insertion marker not found')
+              lowering_text = lowering_text.replace(marker, insertion + marker, 1)
+              lowering.write_text(lowering_text)
+
+          lowering_text = lowering.read_text()
+          old = '    rewritten = _fuse_public_ewm_epilogues(rewritten)\n    rewritten, _, matrix_slots, matrix_width = _compact_scratch(rewritten)\n'
+          new = '    rewritten = _fuse_public_ewm_epilogues(rewritten)\n    rewritten = _fuse_duplicate_output_copies(rewritten)\n    rewritten, _, matrix_slots, matrix_width = _compact_scratch(rewritten)\n'
+          if new not in lowering_text:
+              if old not in lowering_text:
+                  raise RuntimeError('lowering fusion call marker not found')
+              lowering.write_text(lowering_text.replace(old, new, 1))
+
+          codegen = root / 'src/trading_dsl_engine/cpp_stream/python/codegen.py'
+          codegen_text = codegen.read_text()
+          if 'stage.kind == "copy_bundle"' not in codegen_text:
+              old = '''def _stage_type(
+    stage: Stage,
+    n: CppType,
+    execution: CppType,
+    *,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
+    tensor = _tensor_stage_type(
+        stage, n, execution, input_types=input_types
+    )
+    if tensor is not None:
+        return tensor
+
+    stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
+    out = _dest_type(stage)
+'''
+              new = '''def _stage_type(
+    stage: Stage,
+    n: CppType,
+    execution: CppType,
+    *,
+    input_types: tuple[InputTypeSpec, ...] | None,
+) -> CppType:
+    stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
+    if stage.kind == "copy_bundle":
+        if len(stage.members) <= 1 or len(stage.inputs) != 1:
+            raise ValueError("copy bundle requires one source and multiple members")
+        return tmpl(
+            "stackdsl::CopyBundleNode",
+            stage_n,
+            _source_type(stage.inputs[0], n=n, input_types=input_types),
+            execution,
+            *(_dest_type(member) for member in stage.members),
+        )
+    if stage.kind == "tensor_copy_bundle":
+        if len(stage.members) <= 1 or len(stage.inputs) != 1:
+            raise ValueError(
+                "tensor copy bundle requires one source and multiple members"
+            )
+        return tmpl(
+            "stackdsl::TensorCopyBundleNode",
+            _tensor_source_type(
+                stage.inputs[0], n=n, input_types=input_types
+            ),
+            execution,
+            *(_dest_type(member) for member in stage.members),
+        )
+
+    tensor = _tensor_stage_type(
+        stage, n, execution, input_types=input_types
+    )
+    if tensor is not None:
+        return tensor
+
+    out = _dest_type(stage)
+'''
+              if old not in codegen_text:
+                  raise RuntimeError('codegen stage dispatcher marker not found')
+              codegen.write_text(codegen_text.replace(old, new, 1))
+
+          parallel = root / 'src/trading_dsl_engine/cpp_stream/python/parallel.py'
+          parallel_text = parallel.read_text()
+          parallel_text = parallel_text.replace(
+              '    "copy", "unary", "binary",',
+              '    "copy", "copy_bundle", "unary", "binary",',
+              1,
+          )
+          parallel_text = parallel_text.replace(
+              '    "tensor_copy", "tensor_unary",',
+              '    "tensor_copy", "tensor_copy_bundle", "tensor_unary",',
+              1,
+          )
+          parallel_text = parallel_text.replace(
+              '    "copy": 1, "unary": 1,',
+              '    "copy": 1, "copy_bundle": 1, "unary": 1,',
+              1,
+          )
+          parallel_text = parallel_text.replace(
+              '    "tensor_copy": 1, "tensor_unary": 1,',
+              '    "tensor_copy": 1, "tensor_copy_bundle": 1, "tensor_unary": 1,',
+              1,
+          )
+          parallel.write_text(parallel_text)
+
+          tests = root / 'tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py'
+          tests_text = tests.read_text()
+          if 'def test_duplicate_lazy_roots_use_one_copy_bundle' not in tests_text:
+              tests_text += r'''
+
+
+def test_duplicate_lazy_roots_use_one_copy_bundle(tmp_path: Path):
+    rows, cols = 96, 4
+    rng = np.random.default_rng(20260822)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+    expression = (
+        "sqrt(abs(sin(x * 1.000001 + y * 0.999999))) + "
+        "tanh((x - y) * (x + y)) + exp(abs(x - y) * -1.0)"
+    )
+
+    runtime = compile_formula(
+        [expression, expression],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    first, second = runtime.run(
+        out_path=tmp_path / "duplicate-lazy.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(first, second, rtol=0.0, atol=0.0)
+    assert [stage.kind for stage in runtime.plan.stages] == ["copy_bundle"]
+    generated = runtime.generated_cpp.read_text()
+    assert generated.count("stackdsl::CopyBundleNode<") == 1
+    assert generated.count("stackdsl::NaryExpressionSrc<") > 0
+
+
+def test_duplicate_tensor_roots_use_one_tensor_copy_bundle(tmp_path: Path):
+    rows, cols, features = 32, 4, 3
+    rng = np.random.default_rng(20260823)
+    x = rng.normal(size=(rows, cols, features)).astype(np.float64)
+
+    runtime = compile_formula(
+        ["x + 1", "x + 1"],
+        {"x": x},
+        n_instruments=cols,
+    )
+    first, second = runtime.run(
+        out_path=tmp_path / "duplicate-tensor.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(first, x + 1.0, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(second, first, rtol=0.0, atol=0.0)
+    assert [stage.kind for stage in runtime.plan.stages] == [
+        "tensor_copy_bundle"
+    ]
+    assert "stackdsl::TensorCopyBundleNode<" in runtime.generated_cpp.read_text()
+'''
+              tests.write_text(tests_text)
+
+          benchmark = root / 'scripts/benchmark_cpp_stream_multi_output_subgraph.py'
+          benchmark_text = benchmark.read_text()
+          marker = '    print(f"duplicate_expr_cat_stages={[stage.kind for stage in expr_cat_runtime.plan.stages]}")\n'
+          addition = marker + '''    assert [stage.kind for stage in input_list_runtime.plan.stages] == ["copy_bundle"]\n    assert [stage.kind for stage in expr_list_runtime.plan.stages] == ["copy_bundle"]\n    assert "stackdsl::CopyBundleNode<" in expr_list_runtime.generated_cpp.read_text()\n'''
+          if marker in benchmark_text and addition not in benchmark_text:
+              benchmark.write_text(benchmark_text.replace(marker, addition, 1))
+
+          workflow = root / '.github/workflows/finish-multi-output.yml'
+          workflow.unlink()
+          PY
+      - name: Install focused dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy numba pytest jinja2 jax equinox astropy includeigen
+          pybind11 matplotlib graphviz scipy
+      - name: Run focused cpp_stream suite
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/ir/test_einsum_ir.py
+          tests/trading_dsl_engine/cpp_stream/test_codegen.py
+          tests/trading_dsl_engine/cpp_stream/test_sources.py
+          tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
+          tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+          tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+          tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
+          tests/trading_dsl_engine/cpp_stream/test_minute_groupby.py
+          tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
+          tests/trading_dsl_engine/cpp_stream/test_einsum.py
+          tests/trading_dsl_engine/cpp_stream/test_reductions.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+      - name: Commit validated implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "cpp_stream: fuse duplicate output projections"
+          git push origin HEAD:agent/multi-formula-cpp-stream
