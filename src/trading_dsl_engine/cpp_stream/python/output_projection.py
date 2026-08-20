@@ -15,6 +15,9 @@ from trading_dsl_engine.cpp_stream.python.lowering import (
 
 SlotKey = tuple[str, int]
 ScalarSlotKey = tuple[str, int]
+_TERMINAL_PROJECTION_KINDS = frozenset(
+    {"copy", "tensor_copy", "cat", "emit_last"}
+)
 
 
 def _source_slot_key(source: Source) -> SlotKey | None:
@@ -126,6 +129,95 @@ def _split_singleton_ewm_bundle(stage: Stage) -> tuple[Stage, ...]:
             epilogue if inputs == epilogue.inputs else replace(epilogue, inputs=inputs)
         )
     return (producer, *projections)
+
+
+def _source_contains(container: Source, candidate: Source) -> bool:
+    if container == candidate:
+        return True
+    return any(_source_contains(part, candidate) for part in container.parts)
+
+
+def _row_anchor_source(stage: Stage) -> Source | None:
+    if (
+        _public_offset(stage) is None
+        or stage.final_only
+        or stage.kind not in {"copy", "tensor_copy"}
+        or len(stage.inputs) != 1
+        or stage.inputs[0].dtype != "float64"
+    ):
+        return None
+    return stage.inputs[0]
+
+
+def _terminal_projection_suffix_start(stages: list[Stage]) -> int:
+    start = len(stages)
+    while start > 0:
+        stage = stages[start - 1]
+        if (
+            _public_offset(stage) is None
+            or stage.kind not in _TERMINAL_PROJECTION_KINDS
+        ):
+            break
+        start -= 1
+    return start
+
+
+def _schedule_terminal_projections(stages: list[Stage]) -> list[Stage]:
+    """Materialize requested lazy subgraphs before their public descendants.
+
+    Output offsets encode API order independently of execution order. A stable
+    topological ordering of the terminal projection suffix can therefore execute
+    `[parent, subgraph]` as `subgraph -> parent`, allowing the parent projection to
+    read the requested packed subgraph instead of evaluating the same pure graph a
+    second time. Stateful physical stages are outside this suffix and never move.
+    """
+
+    start = _terminal_projection_suffix_start(stages)
+    suffix = stages[start:]
+    if len(suffix) < 2:
+        return stages
+
+    anchors = tuple(_row_anchor_source(stage) for stage in suffix)
+    edges: list[set[int]] = [set() for _ in suffix]
+    indegree = [0] * len(suffix)
+    for producer, source in enumerate(anchors):
+        if source is None:
+            continue
+        for consumer, stage in enumerate(suffix):
+            if producer == consumer:
+                continue
+            # Equal roots are already handled in stable API order. Only strict
+            # containment requires reordering.
+            depends = any(
+                input_source != source
+                and _source_contains(input_source, source)
+                for input_source in stage.inputs
+            )
+            if depends and consumer not in edges[producer]:
+                edges[producer].add(consumer)
+                indegree[consumer] += 1
+
+    remaining = set(range(len(suffix)))
+    order: list[int] = []
+    while remaining:
+        ready = next(
+            (index for index in range(len(suffix))
+             if index in remaining and indegree[index] == 0),
+            None,
+        )
+        if ready is None:
+            # Structural source containment should be acyclic. Preserve the
+            # original schedule rather than guessing if a future source kind
+            # violates that invariant.
+            return stages
+        remaining.remove(ready)
+        order.append(ready)
+        for consumer in edges[ready]:
+            indegree[consumer] -= 1
+
+    if order == list(range(len(suffix))):
+        return stages
+    return [*stages[:start], *(suffix[index] for index in order)]
 
 
 def _rewrite_anchored_source(
@@ -345,7 +437,8 @@ def optimize_public_projections(plan: Plan) -> Plan:
     expanded: list[Stage] = []
     for stage in plan.stages:
         expanded.extend(_split_singleton_ewm_bundle(stage))
-    optimized = _reuse_public_row_storage(expanded)
+    scheduled = _schedule_terminal_projections(expanded)
+    optimized = _reuse_public_row_storage(scheduled)
     compact = _recompact_physical_scalar_slots(optimized)
     return replace(
         plan,
