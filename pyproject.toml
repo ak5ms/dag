@@ -22,6 +22,7 @@ dependencies = [
     "unxt>=1.11",
     "deap",
     "pydot",
+    "graphviz",
     "matplotlib",
     "moreau>=0.3.3",
 ]
