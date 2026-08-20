@@ -55,7 +55,7 @@ def test_sibling_lazy_outputs_share_one_projection_loop(tmp_path: Path) -> None:
     y = rng.normal(size=(rows, cols)).astype(np.float64)
 
     runtime = compile_formula(
-        [f"{SHARED_SIBLING} + 1", f"{SHARED_SIBLING} * 2"],
+        [f"({SHARED_SIBLING}) + 1", f"({SHARED_SIBLING}) * 2"],
         {"x": x, "y": y},
         n_instruments=cols,
     )
