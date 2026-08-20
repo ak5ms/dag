@@ -30,10 +30,11 @@ jobs:
           cargo vendor --manifest-path "$manifest" clarabel-cargo-vendor/vendor > clarabel-cargo-vendor/config.toml
           cp "$manifest" clarabel-cargo-vendor/Cargo.toml
           cp "$site_dir/cvxpygen/solvers/Clarabel.cpp/Clarabel.rs/Cargo.toml" clarabel-cargo-vendor/Clarabel.Cargo.toml
+          tar -czf clarabel-cargo-vendor.tar.gz clarabel-cargo-vendor
       - name: Upload vendored dependencies
         uses: actions/upload-artifact@v4
         with:
-          name: clarabel-cargo-vendor
-          path: clarabel-cargo-vendor
+          name: clarabel-cargo-vendor-tar
+          path: clarabel-cargo-vendor.tar.gz
           if-no-files-found: error
           retention-days: 1
