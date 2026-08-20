@@ -5,6 +5,9 @@ from pathlib import Path
 import numpy as np
 
 from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
+from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
+from trading_dsl_engine.ir.types import fixed
 
 
 EXPENSIVE = (
@@ -20,6 +23,16 @@ def _public_stages(runtime):
         for stage in runtime.plan.stages
         if stage.out.slot is not None and stage.out.slot < 0
     ]
+
+
+def test_fixed_extent_equal_to_n_is_not_lane_partitionable() -> None:
+    program = compile_ir("x", input_value_types={"x": fixed(4)})
+    layout = build_output_layout(program, 4)
+
+    assert layout.outputs[0].shape == (4,)
+    assert layout.outputs[0].size == 4
+    assert layout.outputs[0].lane_partitionable is False
+    assert layout.row_lane_partitionable is False
 
 
 def test_duplicate_lazy_roots_reuse_first_packed_output(tmp_path: Path) -> None:
