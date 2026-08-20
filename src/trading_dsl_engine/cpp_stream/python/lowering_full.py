@@ -69,7 +69,19 @@ def _build_plan(
     row_scalar_nodes: frozenset[int],
     input_dtypes: tuple[str, ...],
     node_dtypes: tuple[str, ...],
+    materialize_root: bool = True,
+    exposed_node_ids: frozenset[int] = frozenset(),
+    exposed_sources: dict[int, Source] | None = None,
 ) -> Plan:
+    """Lower one DAG.
+
+    ``materialize_root`` preserves the established grouped/single-plan behavior.
+    The public multi-output layer sets it to ``False`` and asks for the lowered
+    Sources of its roots instead, so there is no synthetic root or output anchor.
+    ``exposed_node_ids`` also protects externally consumed scratch values from
+    epilogue fusion that would otherwise discard them.
+    """
+
     root = program.output_id
     sources: dict[int, Source] = {}
     stages: list[Stage] = []
@@ -224,7 +236,10 @@ def _build_plan(
         materialized_sources[source] = materialized
         return materialized
 
-    def bundle_physical_stages(items: list[Stage]) -> list[Stage]:
+    def bundle_physical_stages(
+        items: list[Stage],
+        preserve_slots: frozenset[tuple[str, int]],
+    ) -> list[Stage]:
         """Bundle compatible sibling state machines without reordering stages."""
 
         bundled: list[Stage] = []
@@ -305,6 +320,7 @@ def _build_plan(
                     )
                 )
             cursor = following
+
         fused: list[Stage] = []
         cursor = 0
         while cursor < len(bundled):
@@ -348,6 +364,7 @@ def _build_plan(
                 and epilogue_dependencies
                 and epilogue_dependencies <= member_outputs
                 and not (member_outputs & future_dependencies)
+                and not (member_outputs & preserve_slots)
                 and epilogue.final_only == stage.final_only
             ):
                 fused.append(replace(stage, epilogues=(epilogue,)))
@@ -387,7 +404,7 @@ def _build_plan(
 
         children = tuple(sources[child] for child in node.child_ids)
         final_only = any(child.final_only for child in children)
-        is_root = node_id == root
+        is_root = materialize_root and node_id == root
 
         if isinstance(op, RbfBasisOp):
             source = Source(
@@ -997,7 +1014,7 @@ def _build_plan(
 
     root_type = program.nodes[root].value_type
     root_shape = resolve_shape(root_type, n_instruments)
-    if isinstance(program.nodes[root].op, (InputOp, LiteralOp)):
+    if materialize_root and isinstance(program.nodes[root].op, (InputOp, LiteralOp)):
         source = sources[root]
         tensor_copy = not scalar_width_shape(root_shape)
         out = value_dest(True, root_shape)
@@ -1014,8 +1031,18 @@ def _build_plan(
             )
         )
 
+    if exposed_sources is not None:
+        exposed_sources.update(sources)
+
+    preserve_slots = frozenset().union(
+        *(
+            source_slot_dependencies(sources[node_id])
+            for node_id in exposed_node_ids
+            if node_id in sources
+        )
+    )
     return Plan(
-        tuple(bundle_physical_stages(stages)),
+        tuple(bundle_physical_stages(stages, preserve_slots)),
         next_slot,
         next_matrix_slot,
         max_matrix_width,
@@ -1034,6 +1061,23 @@ def _build_plan(
     )
 
 
+def _validate_lowering_args(
+    program: Program,
+    n_instruments: int,
+    default_group_capacity: int,
+    input_dtypes: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if n_instruments <= 0 or default_group_capacity <= 0:
+        raise CppStreamLoweringError(
+            "n_instruments and group capacity must be > 0"
+        )
+    return (
+        ("float64",) * len(program.input_names)
+        if input_dtypes is None
+        else input_dtypes
+    )
+
+
 def lower_program(
     program: Program,
     *,
@@ -1043,12 +1087,9 @@ def lower_program(
     row_scalar_nodes: frozenset[int] | None = None,
     input_dtypes: tuple[str, ...] | None = None,
 ) -> Plan:
-    if n_instruments <= 0 or default_group_capacity <= 0:
-        raise CppStreamLoweringError(
-            "n_instruments and group capacity must be > 0"
-        )
-    if input_dtypes is None:
-        input_dtypes = ("float64",) * len(program.input_names)
+    input_dtypes = _validate_lowering_args(
+        program, n_instruments, default_group_capacity, input_dtypes
+    )
     return _build_plan(
         program,
         n_instruments=n_instruments,
@@ -1061,4 +1102,42 @@ def lower_program(
     )
 
 
-__all__ = ["lower_program"]
+def lower_graph(
+    program: Program,
+    *,
+    exposed_node_ids: tuple[int, ...],
+    n_instruments: int,
+    default_group_capacity: int = 64,
+    key_cardinalities: Mapping[str, int] | None = None,
+    row_scalar_nodes: frozenset[int] | None = None,
+    input_dtypes: tuple[str, ...] | None = None,
+) -> tuple[Plan, tuple[Source, ...]]:
+    """Lower one complete DAG and expose selected lowered values as Sources."""
+
+    input_dtypes = _validate_lowering_args(
+        program, n_instruments, default_group_capacity, input_dtypes
+    )
+    table: dict[int, Source] = {}
+    plan = _build_plan(
+        program,
+        n_instruments=n_instruments,
+        default_group_capacity=default_group_capacity,
+        key_cardinalities=key_cardinalities,
+        grouped=False,
+        row_scalar_nodes=row_scalar_nodes or frozenset(),
+        input_dtypes=input_dtypes,
+        node_dtypes=infer_node_dtypes(program, input_dtypes),
+        materialize_root=False,
+        exposed_node_ids=frozenset(exposed_node_ids),
+        exposed_sources=table,
+    )
+    try:
+        values = tuple(table[node_id] for node_id in exposed_node_ids)
+    except KeyError as exc:
+        raise CppStreamLoweringError(
+            f"requested lowered source {exc.args[0]} was not produced"
+        ) from exc
+    return plan, values
+
+
+__all__ = ["lower_graph", "lower_program"]

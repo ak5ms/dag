@@ -9,10 +9,8 @@ import tempfile
 
 import includeigen
 
-from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
-from trading_dsl_engine.cpp_stream.python.lowering import lower_program
+from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.ir import compile_ir
 
 
 FORMULA = os.environ.get(
@@ -126,26 +124,21 @@ def main() -> None:
     if compiler is None:
         raise RuntimeError("stateless codegen audit requires a C++ compiler")
 
-    program = compile_ir(FORMULA)
-    if program.input_names != ("x", "y"):
-        raise AssertionError(
-            f"audit formula must consume x then y, got {program.input_names!r}"
-        )
-    input_types = (
-        InputTypeSpec("float64", N_INSTRUMENTS),
-        InputTypeSpec("float64", N_INSTRUMENTS),
-    )
-    plan = lower_program(
-        program,
+    input_types = {
+        "x": InputTypeSpec("float64", N_INSTRUMENTS),
+        "y": InputTypeSpec("float64", N_INSTRUMENTS),
+    }
+    runtime = compile_formula(
+        FORMULA,
         n_instruments=N_INSTRUMENTS,
-        input_dtypes=tuple(spec.dtype for spec in input_types),
-    )
-    generated = render_translation_unit(
-        plan,
-        n_instruments=N_INSTRUMENTS,
-        prefetch_rows=16,
         input_types=input_types,
-    ).text
+    )
+    if runtime.input_names != ("x", "y"):
+        raise AssertionError(
+            f"audit formula must consume x then y, got {runtime.input_names!r}"
+        )
+    plan = runtime.plan
+    generated = runtime.generated_cpp.read_text()
     stages = _stage_types(generated)
     if len(stages) != 1:
         raise AssertionError(
@@ -156,6 +149,7 @@ def main() -> None:
         "stackdsl::XsRankNode<",
         "stackdsl::NaryExpressionSrc<double, stackdsl::AddOp",
         "stackdsl::NaryExpressionSrc<double, stackdsl::MulOp",
+        "stackdsl::OutputSliceDst<0>",
     )
     missing_type_fragments = [
         fragment
