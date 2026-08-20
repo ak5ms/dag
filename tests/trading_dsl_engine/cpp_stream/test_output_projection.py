@@ -4,10 +4,12 @@ from pathlib import Path
 
 import numpy as np
 
+from trading_dsl_engine.base.dsl import var
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
 from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
-from trading_dsl_engine.ir.types import fixed
+from trading_dsl_engine.ir.ops import LiteralOp
+from trading_dsl_engine.ir.types import fixed, tensor
 
 
 EXPENSIVE = (
@@ -46,6 +48,70 @@ def test_fixed_extent_equal_to_n_is_not_lane_partitionable() -> None:
     assert layout.outputs[0].size == 4
     assert layout.outputs[0].lane_partitionable is False
     assert layout.row_lane_partitionable is False
+
+
+def test_integer_and_float_literals_remain_distinct_in_ir() -> None:
+    program = compile_ir(
+        ["x % 7", "x % 7.0", "x + 1", "x + 1.0"],
+        input_value_types={"x": tensor((None,), dtype="int64")},
+    )
+    literals = [
+        node for node in program.nodes if isinstance(node.op, LiteralOp)
+    ]
+    assert any(type(node.op.value) is int and node.op.value == 7 for node in literals)
+    assert any(
+        type(node.op.value) is float and node.op.value == 7.0
+        for node in literals
+    )
+    assert any(type(node.op.value) is int and node.op.value == 1 for node in literals)
+    assert any(
+        type(node.op.value) is float and node.op.value == 1.0
+        for node in literals
+    )
+    assert len(set(program.outputs)) == 4
+
+
+def test_integer_and_float_literals_keep_native_semantics(
+    tmp_path: Path,
+) -> None:
+    maximum = np.iinfo(np.int64).max
+    x = np.array(
+        [
+            [maximum, maximum - 1, (1 << 60) + 1, (1 << 60) + 2],
+            [(1 << 60) + 3, (1 << 60) + 4, (1 << 60) + 5, (1 << 60) + 6],
+        ],
+        dtype=np.int64,
+    )
+
+    runtime = compile_formula(
+        [var("x") % 7, "x % 7.0", var("x") + 1.0],
+        {"x": x},
+        n_instruments=x.shape[1],
+    )
+    integer_mod, float_mod, float_add = runtime.run(
+        out_path=tmp_path / "typed-literals.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(
+        integer_mod,
+        (x % 7).astype(np.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        float_mod,
+        np.fmod(x.astype(np.float64), 7.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        float_add,
+        x.astype(np.float64) + 1.0,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert integer_mod[0, 0] >= 0.0
+    assert float_add[0, 0] > 0.0
 
 
 def test_sibling_lazy_outputs_share_one_projection_loop(tmp_path: Path) -> None:

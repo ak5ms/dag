@@ -192,7 +192,7 @@ class Identifier(Expr):
 
 @dataclass(frozen=True, eq=False)
 class Number(Expr):
-    value: float
+    value: int | float
 
 
 @dataclass(frozen=True, eq=False)
@@ -261,8 +261,11 @@ class _AstParser:
     def _expr(self, node: ast.AST) -> Expr:
         if isinstance(node, ast.Name):
             return Identifier(node.id)
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return Number(float(node.value))
+        if isinstance(node, ast.Constant) and isinstance(
+            node.value, (int, float)
+        ):
+            value = node.value
+            return Number(float(value) if isinstance(value, bool) else value)
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return String(node.value)
         if isinstance(node, ast.UnaryOp):
@@ -270,7 +273,9 @@ class _AstParser:
                 if isinstance(node.operand, ast.Constant):
                     v = node.operand.value
                     if isinstance(v, (int, float)):
-                        return Number(-float(v))
+                        return Number(
+                            -float(v) if isinstance(v, bool) else -v
+                        )
                 return Call("sub", (Number(0.0), self._expr(node.operand)))
             if isinstance(node.op, ast.UAdd):
                 return self._expr(node.operand)
