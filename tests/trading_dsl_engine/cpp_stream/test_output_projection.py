@@ -17,14 +17,19 @@ EXPENSIVE = (
 )
 LAZY_SUBGRAPH = "sin(x * 1.000001 + y * 0.999999) + tanh(x - y)"
 LAZY_PARENT = f"sqrt(abs({LAZY_SUBGRAPH}))"
+SHARED_SIBLING = "sin(x * 1.000001 + y * 0.999999)"
 
 
 def _public_stages(runtime):
-    return [
-        stage
-        for stage in runtime.plan.stages
-        if stage.out.slot is not None and stage.out.slot < 0
-    ]
+    result = []
+    for stage in runtime.plan.stages:
+        candidates = stage.members if stage.kind == "copy_bundle" else (stage,)
+        result.extend(
+            candidate
+            for candidate in candidates
+            if candidate.out.slot is not None and candidate.out.slot < 0
+        )
+    return result
 
 
 def _source_has_kind(source, kind: str) -> bool:
@@ -41,6 +46,32 @@ def test_fixed_extent_equal_to_n_is_not_lane_partitionable() -> None:
     assert layout.outputs[0].size == 4
     assert layout.outputs[0].lane_partitionable is False
     assert layout.row_lane_partitionable is False
+
+
+def test_sibling_lazy_outputs_share_one_projection_loop(tmp_path: Path) -> None:
+    rows, cols = 32, 4
+    rng = np.random.default_rng(20260827)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+
+    runtime = compile_formula(
+        [f"{SHARED_SIBLING} + 1", f"{SHARED_SIBLING} * 2"],
+        {"x": x, "y": y},
+        n_instruments=cols,
+    )
+    first, second = runtime.run(
+        out_path=tmp_path / "shared-sibling-projections.npy"
+    ).load(mmap_mode=None)
+
+    shared = np.sin(x * 1.000001 + y * 0.999999)
+    np.testing.assert_allclose(first, shared + 1.0, rtol=1e-15, atol=1e-15)
+    np.testing.assert_allclose(second, shared * 2.0, rtol=1e-15, atol=1e-15)
+    assert [stage.kind for stage in runtime.plan.stages] == ["copy_bundle"]
+    bundle = runtime.plan.stages[0]
+    assert len(bundle.members) == 2
+    generated = runtime.generated_cpp.read_text()
+    assert "stackdsl::OutputProjectionBundleNode<" in generated
+    assert "stackdsl::ExpressionCacheContext<" in generated
 
 
 def test_parent_before_lazy_subgraph_reorders_only_execution(
@@ -71,6 +102,7 @@ def test_parent_before_lazy_subgraph_reorders_only_execution(
     # writes the subgraph's later packed offset first so the parent can reuse it.
     assert [stage.out.slot for stage in public] == [-(cols + 1), -1]
     assert _source_has_kind(public[1].inputs[0], "packed_output")
+    assert [stage.kind for stage in runtime.plan.stages] == ["copy_bundle"]
 
 
 def test_emit_before_lazy_row_output_reuses_requested_row_storage(
@@ -116,6 +148,7 @@ def test_duplicate_lazy_roots_reuse_first_packed_output(tmp_path: Path) -> None:
     assert [stage.kind for stage in public] == ["copy", "copy"]
     assert public[0].inputs[0].kind != "packed_output"
     assert public[1].inputs[0].kind == "packed_output"
+    assert [stage.kind for stage in runtime.plan.stages] == ["copy_bundle"]
     assert runtime.plan.scratch_slots == 0
 
 
