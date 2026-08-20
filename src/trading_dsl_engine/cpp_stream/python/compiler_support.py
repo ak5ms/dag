@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -9,7 +10,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Mapping
+import warnings
 
 import includeigen
 
@@ -34,6 +37,12 @@ from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 
 _LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp, RollingOp)
+_PCH_BUILD_LOCK = threading.Lock()
+_HEADER_DIGEST_LOCK = threading.Lock()
+_HEADER_DIGEST_CACHE: dict[
+    tuple[str, str],
+    tuple[tuple[tuple[str, int, int], ...], str],
+] = {}
 
 
 def _cpp_root() -> Path:
@@ -108,40 +117,203 @@ def _flags() -> tuple[list[str], list[str]]:
     return compile_flags, link_flags
 
 
-def build_shared(source: str) -> tuple[Path, Path]:
-    compiler = _compiler()
-    compile_flags, link_flags = _flags()
-    digest = hashlib.sha256(source.encode())
-    for header in sorted(_cpp_root().rglob("*.hpp")):
-        digest.update(header.relative_to(_cpp_root()).as_posix().encode())
-        digest.update(header.read_bytes())
-    eigen_include = _eigen_include()
-    digest.update(str(eigen_include).encode())
-    eigen_macros = eigen_include / "Eigen" / "src" / "Core" / "util" / "Macros.h"
-    if eigen_macros.is_file():
-        digest.update(eigen_macros.read_bytes())
+def _env_enabled(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+@lru_cache(maxsize=16)
+def _compiler_version(compiler: str) -> str:
     version = subprocess.run(
         [compiler, "--version"], capture_output=True, text=True, check=False
     )
-    digest.update((version.stdout or version.stderr).encode())
+    return version.stdout or version.stderr
+
+
+def _header_digest(cpp_root: str, eigen_include: str) -> str:
+    """Hash native headers once per unchanged filesystem fingerprint.
+
+    GP compilation can launch many independent translation units. Re-reading all
+    C++ headers and querying the compiler version for every formula serializes
+    avoidable Python/filesystem work. The stat fingerprint keeps editable-source
+    invalidation semantics: modifying any header changes the digest in-process.
+    """
+
+    root = Path(cpp_root)
+    eigen_root = Path(eigen_include)
+    headers = sorted(root.rglob("*.hpp"))
+    eigen_macros = eigen_root / "Eigen" / "src" / "Core" / "util" / "Macros.h"
+    fingerprint_items = [
+        (
+            header.relative_to(root).as_posix(),
+            header.stat().st_mtime_ns,
+            header.stat().st_size,
+        )
+        for header in headers
+    ]
+    if eigen_macros.is_file():
+        stat = eigen_macros.stat()
+        fingerprint_items.append(
+            (f"Eigen::{eigen_macros}", stat.st_mtime_ns, stat.st_size)
+        )
+    fingerprint = tuple(fingerprint_items)
+    cache_key = (cpp_root, eigen_include)
+    with _HEADER_DIGEST_LOCK:
+        cached = _HEADER_DIGEST_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+
+    digest = hashlib.sha256()
+    for header in headers:
+        digest.update(header.relative_to(root).as_posix().encode())
+        digest.update(header.read_bytes())
+    digest.update(str(eigen_root).encode())
+    if eigen_macros.is_file():
+        digest.update(eigen_macros.read_bytes())
+    result = digest.hexdigest()
+    with _HEADER_DIGEST_LOCK:
+        _HEADER_DIGEST_CACHE[cache_key] = (fingerprint, result)
+    return result
+
+
+def _toolchain_digest(
+    compiler: str,
+    compile_flags: list[str],
+    link_flags: list[str],
+) -> str:
+    cpp_root = _cpp_root()
+    eigen_include = _eigen_include()
+    digest = hashlib.sha256()
+    digest.update(_header_digest(str(cpp_root), str(eigen_include)).encode())
+    digest.update(_compiler_version(compiler).encode())
     digest.update("\0".join((*compile_flags, *link_flags)).encode())
     digest.update(
-        f"{platform.platform()}|{platform.machine()}|{sys.implementation.cache_tag}".encode()
+        (
+            f"{platform.platform()}|{platform.machine()}|"
+            f"{sys.implementation.cache_tag}"
+        ).encode()
     )
+    return digest.hexdigest()
+
+
+def _pch_header_text() -> str:
+    # Keep this aligned with the formula-independent includes in runner.cpp.j2.
+    # Formula-specific stage/output types remain in formula.cpp and still receive
+    # the normal -O3/LTO/native optimization passes.
+    return """#pragma once
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <exception>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+#include \"stackdsl/runtime.hpp\"
+"""
+
+
+def _pch_compile_args(
+    compiler: str,
+    compile_flags: list[str],
+    toolchain_digest: str,
+) -> tuple[str, ...]:
+    """Build/reuse a native PCH, falling back harmlessly on failure."""
+
+    if not _env_enabled("TRADING_DSL_ENGINE_CPP_PCH", True):
+        return ()
+    basename = Path(compiler).name.lower()
+    is_clang = "clang" in basename
+    is_gcc = (
+        any(token in basename for token in ("g++", "gcc", "c++"))
+        and not is_clang
+    )
+    if not (is_gcc or is_clang):
+        return ()
+
+    pch_dir = _cache_root() / "_pch" / toolchain_digest
+    header = pch_dir / "cpp_stream_pch.hpp"
+    artifact = pch_dir / (
+        "cpp_stream_pch.pch" if is_clang else "cpp_stream_pch.hpp.gch"
+    )
+
+    def arguments() -> tuple[str, ...]:
+        return (
+            ("-include-pch", str(artifact))
+            if is_clang
+            else ("-include", str(header), "-Winvalid-pch")
+        )
+
+    if artifact.is_file():
+        return arguments()
+
+    with _PCH_BUILD_LOCK:
+        if artifact.is_file():
+            return arguments()
+        pch_dir.mkdir(parents=True, exist_ok=True)
+        header.write_text(_pch_header_text())
+        unique = f"{os.getpid()}.{threading.get_ident()}"
+        temporary = artifact.with_name(f"{artifact.name}.{unique}.tmp")
+        pch_flags = [flag for flag in compile_flags if flag != "-shared"]
+        command = [
+            compiler,
+            *pch_flags,
+            f"-I{_cpp_root()}",
+            f"-I{_eigen_include()}",
+            "-x",
+            "c++-header",
+            str(header),
+            "-o",
+            str(temporary),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            temporary.unlink(missing_ok=True)
+            failure = pch_dir / "pch-build-failure.txt"
+            failure.write_text(
+                " ".join(command) + "\n" + result.stdout + result.stderr
+            )
+            warnings.warn(
+                "cpp_stream PCH build failed; falling back to ordinary native "
+                f"compilation. See {failure}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return ()
+        temporary.replace(artifact)
+    return arguments()
+
+
+def build_shared(source: str) -> tuple[Path, Path]:
+    compiler = _compiler()
+    compile_flags, link_flags = _flags()
+    toolchain_digest = _toolchain_digest(compiler, compile_flags, link_flags)
+    digest = hashlib.sha256(source.encode())
+    digest.update(toolchain_digest.encode())
     build_dir = _cache_root() / digest.hexdigest()
     cpp_path = build_dir / "formula.cpp"
     so_path = build_dir / "formula.so"
     if so_path.is_file():
         return so_path, cpp_path
+
+    pch_args = _pch_compile_args(compiler, compile_flags, toolchain_digest)
     build_dir.mkdir(parents=True, exist_ok=True)
-    temporary_cpp = build_dir / f"formula.{os.getpid()}.cpp"
-    temporary_so = build_dir / f"formula.{os.getpid()}.so"
+    unique = f"{os.getpid()}.{threading.get_ident()}"
+    temporary_cpp = build_dir / f"formula.{unique}.cpp"
+    temporary_so = build_dir / f"formula.{unique}.so"
     temporary_cpp.write_text(source)
     command = [
         compiler,
         *compile_flags,
+        "-pipe",
         f"-I{_cpp_root()}",
         f"-I{_eigen_include()}",
+        *pch_args,
         str(temporary_cpp),
         *link_flags,
         "-o",
@@ -149,6 +321,8 @@ def build_shared(source: str) -> tuple[Path, Path]:
     ]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
+        temporary_cpp.unlink(missing_ok=True)
+        temporary_so.unlink(missing_ok=True)
         raise RuntimeError(
             "cpp_stream native compilation failed\n"
             + " ".join(command)
