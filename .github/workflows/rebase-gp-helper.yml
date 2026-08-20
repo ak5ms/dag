@@ -25,27 +25,70 @@ jobs:
       - name: Rebase GP branch and validate
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          target_branch="agent/strongly-typed-gp"
+          status_branch="agent/strongly-typed-gp-rebased-check-final"
           original_sha="$(git rev-parse HEAD)"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          write_status() {
+            state="$1"
+            rebased_sha="$2"
+            details_file="$3"
+            git rebase --abort >/dev/null 2>&1 || true
+            git fetch origin "$status_branch"
+            git switch -C rebase-status "origin/$status_branch"
+            {
+              echo "state=$state"
+              echo "target_branch=$target_branch"
+              echo "original_sha=$original_sha"
+              echo "rebased_sha=$rebased_sha"
+              echo "main_sha=$(git rev-parse origin/main 2>/dev/null || true)"
+              echo "details:"
+              cat "$details_file" 2>/dev/null || true
+            } > .github/rebase-gp-status.txt
+            git add .github/rebase-gp-status.txt
+            git commit -m "chore: record GP rebase $state"
+            git push origin HEAD:"$status_branch"
+          }
+
           git fetch origin main
+          : > /tmp/rebase-details.txt
 
           # In a rebase, "ours" is the updated upstream. Preserve the newly
           # merged main implementation for overlapping hunks while replaying all
           # non-conflicting GP changes normally.
           if ! git rebase -X ours origin/main; then
-            echo "Unresolved rebase conflicts:"
-            git diff --name-only --diff-filter=U || true
-            git status --short || true
+            echo "Unresolved rebase conflicts:" | tee /tmp/rebase-details.txt
+            git diff --name-only --diff-filter=U | tee -a /tmp/rebase-details.txt || true
+            git status --short | tee -a /tmp/rebase-details.txt || true
+            write_status "rebase_failed" "" /tmp/rebase-details.txt
             exit 1
           fi
 
+          rebased_sha="$(git rev-parse HEAD)"
           python -m pip install --upgrade pip >/dev/null
-          python -m pip install -e . pytest >/dev/null
-          python -m pytest -q -o addopts="" \
-            tests/flows/gp \
-            tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py \
-            tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+          if ! python -m pip install -e . pytest >/tmp/pip.log 2>&1; then
+            tail -100 /tmp/pip.log > /tmp/rebase-details.txt
+            write_status "install_failed" "$rebased_sha" /tmp/rebase-details.txt
+            exit 1
+          fi
 
-          git push --force-with-lease=refs/heads/agent/strongly-typed-gp:"$original_sha" origin HEAD:agent/strongly-typed-gp
+          if ! python -m pytest -q -o addopts="" \
+              tests/flows/gp \
+              tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py \
+              tests/trading_dsl_engine/cpp_stream/test_roll_rets.py \
+              >/tmp/pytest.log 2>&1; then
+            tail -150 /tmp/pytest.log > /tmp/rebase-details.txt
+            write_status "tests_failed" "$rebased_sha" /tmp/rebase-details.txt
+            exit 1
+          fi
+
+          tail -30 /tmp/pytest.log > /tmp/rebase-details.txt
+          if ! git push --force-with-lease=refs/heads/$target_branch:"$original_sha" origin HEAD:"$target_branch"; then
+            echo "Target push failed because the remote branch moved." >> /tmp/rebase-details.txt
+            write_status "push_failed" "$rebased_sha" /tmp/rebase-details.txt
+            exit 1
+          fi
+          write_status "success" "$rebased_sha" /tmp/rebase-details.txt
