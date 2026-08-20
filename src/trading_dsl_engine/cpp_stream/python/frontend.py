@@ -6,12 +6,74 @@ from threading import RLock
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr, parse_formula
 from trading_dsl_engine.ir import frontend as neutral_frontend
-from trading_dsl_engine.ir.ops import EmitOp, LiteralOp, ReductionOp
+from trading_dsl_engine.ir.ops import EmitOp, ReductionOp
 from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import ValueType, tensor
 
 
 _COMPILE_LOCK = RLock()
+
+
+def _broadcast_shapes(
+    shapes: tuple[tuple[int | None, ...], ...],
+) -> tuple[int | None, ...]:
+    rank = max((len(shape) for shape in shapes), default=0)
+    result: list[int | None] = []
+    for output_axis in range(rank):
+        aligned: list[int | None] = []
+        for shape in shapes:
+            input_axis = output_axis - (rank - len(shape))
+            aligned.append(1 if input_axis < 0 else shape[input_axis])
+        chosen: int | None = 1
+        for extent in aligned:
+            if extent == 1:
+                continue
+            if chosen == 1:
+                chosen = extent
+                continue
+            if extent != chosen:
+                raise neutral_frontend.FormulaIRCompileError(
+                    f"operands could not be broadcast together: {shapes!r}"
+                )
+        result.append(chosen)
+    return tuple(result)
+
+
+def _nary_result_type(name: str, children: list[Node]) -> ValueType:
+    del name
+    if any(child.value_type.kind == "object" for child in children):
+        raise neutral_frontend.FormulaIRCompileError(
+            "elementwise operators cannot consume object values"
+        )
+    try:
+        shape = _broadcast_shapes(
+            tuple(child.value_type.logical_shape for child in children)
+        )
+    except ValueError as exc:
+        raise neutral_frontend.FormulaIRCompileError(
+            "elementwise operators require numeric tensor values"
+        ) from exc
+    dtype = (
+        "float64"
+        if len({child.value_type.dtype for child in children}) > 1
+        else children[0].value_type.dtype
+    )
+    return tensor(shape, dtype=dtype)
+
+
+def _lane_state_result_type(name: str, child: Node) -> ValueType:
+    if child.value_type.kind == "object":
+        raise neutral_frontend.FormulaIRCompileError(
+            f"{name} cannot consume object values"
+        )
+    try:
+        child.value_type.logical_shape
+    except ValueError as exc:
+        raise neutral_frontend.FormulaIRCompileError(
+            f"{name} requires a numeric tensor input"
+        ) from exc
+    return child.value_type
+
 
 def _depends_on_temporal_reduction(nodes: list[Node]) -> tuple[bool, ...]:
     result: list[bool] = []
