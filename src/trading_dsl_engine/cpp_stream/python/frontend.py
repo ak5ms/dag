@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
+import math
 from threading import RLock
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr, parse_formula
 from trading_dsl_engine.ir import frontend as neutral_frontend
-from trading_dsl_engine.ir.ops import EmitOp, ReductionOp
+from trading_dsl_engine.ir.ops import EmitOp, LiteralOp, ReductionOp
 from trading_dsl_engine.ir.program import Node, Program
 from trading_dsl_engine.ir.types import ValueType, tensor
 
 
 _COMPILE_LOCK = RLock()
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
 
 
 def _broadcast_shapes(
@@ -75,6 +79,37 @@ def _lane_state_result_type(name: str, child: Node) -> ValueType:
     return child.value_type
 
 
+def _native_literal_value(value: int | float) -> int | float:
+    """Recover integer literals lost by the parser's float-valued Number node.
+
+    The base parser intentionally stores every numeric token as a float. cpp_stream
+    has typed integer inputs and operators, so leaving an exact token such as ``7``
+    as double would make ``int64_x % 7`` convert values above 2**53 to double before
+    applying modulo. Preserve nonintegral values, infinities, NaNs, and negative
+    zero; convert only exactly representable signed-64-bit integer literals.
+    """
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return value
+    if numeric == 0.0 and math.copysign(1.0, numeric) < 0.0:
+        return value
+    integer = int(numeric)
+    return integer if _INT64_MIN <= integer <= _INT64_MAX else value
+
+
+def _restore_native_literals(nodes: list[Node]) -> None:
+    for index, node in enumerate(nodes):
+        if not isinstance(node.op, LiteralOp):
+            continue
+        value = _native_literal_value(node.op.value)
+        if type(value) is type(node.op.value) and value == node.op.value:
+            continue
+        nodes[index] = replace(node, op=LiteralOp(value))
+
+
 def _depends_on_temporal_reduction(nodes: list[Node]) -> tuple[bool, ...]:
     result: list[bool] = []
     for node in nodes:
@@ -122,6 +157,7 @@ def compile_ir(
             neutral_frontend._nary_result_type = original_nary
             neutral_frontend._lane_state_result_type = original_lane_state
 
+    _restore_native_literals(builder.nodes)
     temporal = _depends_on_temporal_reduction(builder.nodes)
     resolved_roots: list[int] = []
     for root in roots:
