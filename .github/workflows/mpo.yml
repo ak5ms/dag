@@ -24,7 +24,7 @@ on:
 jobs:
   test-and-benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,22 +35,22 @@ jobs:
           python -m pip install
           numpy pandas numba scipy jax equinox pytest pytest-xdist
           pybind11 includeigen Jinja2 unxt deap pydot graphviz matplotlib
-          moreau==0.3.3
-      - name: Package source and portable dependency wheels
+          moreau==0.3.3 cvxpy==1.9.1 cvxpygen==1.0.0 clarabel==0.11.1
+      - name: Package source, Python wheels, and portable Rust toolchain
         run: |
           mkdir -p mpo-local-bundle/wheels
           tar --exclude=.git -czf mpo-local-bundle/dag-mpo-source.tar.gz \
             pyproject.toml setup.py src scripts/benchmark_mpo.py tests/flows/test_mpo.py
-          python -m pip download --no-deps --dest mpo-local-bundle/wheels \
-            moreau==0.3.3 moreau-cpu==0.3.3 \
-            equinox==0.13.8 jaxtyping==0.3.11 wadler-lindig==0.1.7 \
-            pybind11==3.1.0 includeigen==0.1 \
-            astropy==8.0.1 pyerfa==2.0.1.5 astropy-iers-data \
-            graphviz==0.21
+          python -m pip download --dest mpo-local-bundle/wheels \
+            moreau==0.3.3 cvxpy==1.9.1 cvxpygen==1.0.0 clarabel==0.11.1
+          rust_sysroot="$(rustc --print sysroot)"
+          tar -C "$(dirname "$rust_sysroot")" \
+            --exclude='*/share/doc' --exclude='*/share/man' --exclude='*/lib/rustlib/src' \
+            -czf mpo-local-bundle/rust-toolchain.tar.gz "$(basename "$rust_sysroot")"
       - name: Upload local benchmark bundle
         uses: actions/upload-artifact@v4
         with:
-          name: mpo-local-bundle
+          name: mpo-cvxpygen-local-bundle
           path: mpo-local-bundle
           if-no-files-found: error
           retention-days: 1
