@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 
+#include "stackdsl/engine.hpp"
 #include "stackdsl/utils.hpp"
 
 namespace stackdsl {
@@ -123,6 +124,55 @@ struct PackedOutputTensorSource {
     ) noexcept {
         for (std::size_t index = 0; index < count; ++index) {
             out[index] = read_flat(ctx, base + index);
+        }
+    }
+};
+
+// One terminal projection binding. Several bindings may have unrelated public
+// offsets while sharing arbitrary nested scalar expressions.
+template <class Source, class Destination>
+struct OutputProjectionBinding {
+    using source_type = Source;
+    using destination_type = Destination;
+};
+
+// Fuse compatible scalar/vector public projections into one lane loop. The typed
+// expression cache spans every binding for the current lane, so neutral-IR CSE is
+// retained even when the requested formulas are separate public roots.
+template <
+    std::size_t N,
+    class Execution,
+    class... Bindings
+>
+struct OutputProjectionBundleNode {
+    static_assert(sizeof...(Bindings) > 1);
+    using ExpressionSources = typename expression_sources_for<
+        typename Bindings::source_type...
+    >::type;
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Binding, class Cached, class Context>
+    STACKDSL_HOT static void emit(
+        Cached& cached,
+        Context& ctx,
+        std::size_t lane
+    ) noexcept {
+        double* STACKDSL_RESTRICT output = ctx.template write_ptr<
+            typename Binding::destination_type
+        >();
+        output[lane] = static_cast<double>(cached.template read<
+            typename Binding::source_type
+        >(lane));
+    }
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        const std::size_t begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = begin; lane < end; ++lane) {
+            ExpressionCacheContext<Context, ExpressionSources> cached(ctx);
+            (emit<Bindings>(cached, ctx, lane), ...);
         }
     }
 };
