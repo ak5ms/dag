@@ -1,0 +1,32 @@
+name: package-optimizer-python-wheels
+
+on:
+  push:
+    branches: [agent/cvxpygen-cargo-cache]
+    paths:
+      - ".github/workflows/package-optimizer-python-wheels.yml"
+  workflow_dispatch:
+
+jobs:
+  package-wheels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download exact development wheels
+        run: |
+          mkdir -p optimizer-python-wheels
+          python -m pip download --dest optimizer-python-wheels \
+            numpy==2.4.6 pandas==3.0.5 numba==0.67.0 \
+            jax==0.10.2 jaxlib==0.10.2 equinox==0.13.8 \
+            pytest==9.1.1 pytest-xdist==3.8.0
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimizer-python-wheels
+          path: optimizer-python-wheels
+          if-no-files-found: error
+          retention-days: 1
