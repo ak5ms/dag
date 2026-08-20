@@ -47,6 +47,7 @@ _TEMPORAL_KINDS = {
 
 _LANE_LOCAL_KINDS = {
     "copy",
+    "copy_bundle",
     "unary",
     "binary",
     "ternary",
@@ -85,6 +86,7 @@ _LANE_AUTO_MULTICORE_MIN_SCORE = 16
 
 _EXPERIMENTAL_STAGE_WORK = {
     "copy": 1,
+    "copy_bundle": 1,
     "unary": 1,
     "binary": 1,
     "ternary": 1,
