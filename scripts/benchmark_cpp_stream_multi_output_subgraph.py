@@ -46,14 +46,16 @@ FUSED_Y = "ewm(y, span=32)"
 FUSED_TOP = f"cat({FUSED_X}, {FUSED_Y})"
 FUSED_EQUIVALENT_CAT = f"cat({FUSED_X}, {FUSED_TOP})"
 
-# Exact duplicate lazy roots share one IR node but currently materialize through
-# independent public projection stages. Raw-input duplication measures the extra
-# read/write traffic; a materially larger increment for this expensive stateless
-# expression would prove that arithmetic is being recomputed too.
+# Exact duplicate roots exercise packed-output reuse; distinct sibling roots
+# exercise the generic projection bundle's cross-root expression cache.
 DUP_EXPR = (
     "sqrt(abs(sin(x * 1.000001 + y * 0.999999))) "
     "+ tanh((x - y) * (x + y)) + exp(abs(x - y) * -1.0)"
 )
+SIBLING_SHARED = "sin(x * 1.000001 + y * 0.999999) + tanh(x - y)"
+SIBLING_LEFT = f"sqrt(abs({SIBLING_SHARED}))"
+SIBLING_RIGHT = f"({SIBLING_SHARED}) * 2 + 1"
+SIBLING_CAT = f"cat({SIBLING_LEFT}, {SIBLING_RIGHT})"
 
 
 def _benchmark(
@@ -196,12 +198,12 @@ def _benchmark_bundle_fusion() -> None:
     assert multi_runtime.plan.scratch_slots == 0
 
 
-def _benchmark_duplicate_lazy_roots() -> None:
+def _benchmark_lazy_projection_cse() -> None:
     rng = np.random.default_rng(20260822)
     x = rng.normal(size=(DUP_ROWS, INSTRUMENTS)).astype(np.float64)
     y = rng.normal(size=(DUP_ROWS, INSTRUMENTS)).astype(np.float64)
     data = {"x": x, "y": y}
-    bench_path = OUTPUT_DIR / "cpp_stream_multi_duplicate_lazy_bench.bin"
+    bench_path = OUTPUT_DIR / "cpp_stream_multi_lazy_projection_bench.bin"
 
     input_single, _ = _benchmark(
         "duplicate_control_input_single", "x", data, bench_path, rows=DUP_ROWS
@@ -222,6 +224,20 @@ def _benchmark_duplicate_lazy_roots() -> None:
         bench_path,
         rows=DUP_ROWS,
     )
+    sibling_list, sibling_runtime = _benchmark(
+        "sibling_lazy_expr_list",
+        [SIBLING_LEFT, SIBLING_RIGHT],
+        data,
+        bench_path,
+        rows=DUP_ROWS,
+    )
+    sibling_cat, sibling_cat_runtime = _benchmark(
+        "sibling_lazy_expr_cat",
+        SIBLING_CAT,
+        data,
+        bench_path,
+        rows=DUP_ROWS,
+    )
 
     input_increment = input_double - input_single
     expr_increment = expr_double - expr_single
@@ -229,11 +245,16 @@ def _benchmark_duplicate_lazy_roots() -> None:
     print(f"duplicate_expr_increment_seconds={expr_increment:.9f}")
     print(f"duplicate_expr_increment_over_input={expr_increment / input_increment:.6f}x")
     print(f"duplicate_expr_list_over_cat={expr_double / expr_cat - 1.0:.6%}")
+    print(f"sibling_expr_list_over_cat={sibling_list / sibling_cat - 1.0:.6%}")
     print(f"duplicate_input_list_stages={[stage.kind for stage in input_double_runtime.plan.stages]}")
     print(f"duplicate_expr_list_stages={[stage.kind for stage in expr_double_runtime.plan.stages]}")
     print(f"duplicate_expr_cat_stages={[stage.kind for stage in expr_cat_runtime.plan.stages]}")
+    print(f"sibling_expr_list_stages={[stage.kind for stage in sibling_runtime.plan.stages]}")
+    print(f"sibling_expr_cat_stages={[stage.kind for stage in sibling_cat_runtime.plan.stages]}")
     assert len(set(expr_double_runtime.program.outputs)) == 1
     assert expr_double_runtime.output_layout.row_width == expr_cat_runtime.output_layout.row_width
+    assert [stage.kind for stage in sibling_runtime.plan.stages] == ["copy_bundle"]
+    assert sibling_runtime.output_layout.row_width == sibling_cat_runtime.output_layout.row_width
 
 
 def main() -> None:
@@ -254,7 +275,7 @@ def main() -> None:
     _benchmark_equal_width({"x": x})
     _benchmark_heterogeneous_width()
     _benchmark_bundle_fusion()
-    _benchmark_duplicate_lazy_roots()
+    _benchmark_lazy_projection_cse()
 
 
 if __name__ == "__main__":
