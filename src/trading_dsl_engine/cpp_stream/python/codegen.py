@@ -670,6 +670,24 @@ def _stage_type(
 
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
+    if stage.kind == "copy_bundle":
+        assert len(stage.members) > 1
+        bindings = tuple(
+            tmpl(
+                "stackdsl::OutputProjectionBinding",
+                _source_type(
+                    member.inputs[0], n=n, input_types=input_types
+                ),
+                _dest_type(member),
+            )
+            for member in stage.members
+        )
+        return tmpl(
+            "stackdsl::OutputProjectionBundleNode",
+            stage_n,
+            execution,
+            *bindings,
+        )
     if stage.kind == "reduce":
         assert isinstance(stage.op, ReductionOp)
         tensor_source = _tensor_source_type(
