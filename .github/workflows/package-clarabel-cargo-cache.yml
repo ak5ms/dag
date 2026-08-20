@@ -1,0 +1,35 @@
+name: package-clarabel-cargo-cache
+
+on:
+  push:
+    branches: [agent/cvxpygen-cargo-cache]
+    paths:
+      - ".github/workflows/package-clarabel-cargo-cache.yml"
+  workflow_dispatch:
+
+jobs:
+  vendor-clarabel-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CVXPYgen
+        run: python -m pip install cvxpygen==1.0.0
+      - name: Vendor Clarabel Rust dependencies
+        run: |
+          site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"
+          manifest="$site_dir/cvxpygen/solvers/Clarabel.cpp/rust_wrapper/Cargo.toml"
+          mkdir -p clarabel-cargo-vendor
+          cargo vendor --manifest-path "$manifest" clarabel-cargo-vendor/vendor > clarabel-cargo-vendor/config.toml
+          cp "$manifest" clarabel-cargo-vendor/Cargo.toml
+          cp "$site_dir/cvxpygen/solvers/Clarabel.cpp/Clarabel.rs/Cargo.toml" clarabel-cargo-vendor/Clarabel.Cargo.toml
+      - name: Upload vendored dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: clarabel-cargo-vendor
+          path: clarabel-cargo-vendor
+          if-no-files-found: error
+          retention-days: 1
