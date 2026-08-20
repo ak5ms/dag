@@ -1,0 +1,51 @@
+name: Rebase GP target onto main
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-rebased-check-final
+    paths:
+      - .github/workflows/rebase-gp-helper.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Rebase GP branch and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          original_sha="$(git rev-parse HEAD)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+
+          # In a rebase, "ours" is the updated upstream. Preserve the newly
+          # merged main implementation for overlapping hunks while replaying all
+          # non-conflicting GP changes normally.
+          if ! git rebase -X ours origin/main; then
+            echo "Unresolved rebase conflicts:"
+            git diff --name-only --diff-filter=U || true
+            git status --short || true
+            exit 1
+          fi
+
+          python -m pip install --upgrade pip >/dev/null
+          python -m pip install -e . pytest >/dev/null
+          python -m pytest -q -o addopts="" \
+            tests/flows/gp \
+            tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py \
+            tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+
+          git push --force-with-lease=refs/heads/agent/strongly-typed-gp:"$original_sha" origin HEAD:agent/strongly-typed-gp
