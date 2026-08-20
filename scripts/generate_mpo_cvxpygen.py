@@ -27,10 +27,10 @@ def parse_size(value: str) -> tuple[int, int]:
 def build_problem(n_assets: int, n_horizons: int):
     """Build a DPP CVXPY formulation of the multi-period optimizer.
 
-    The absolute turnover cost is represented with an auxiliary nonnegative
-    variable. Besides matching the Moreau conic formulation exactly, this avoids
-    multiplying a parameter by a nonlinear expression that itself contains the
-    current-weight parameter, which would violate CVXPY's DPP rules.
+    The absolute turnover cost uses the same two-inequality epigraph as the
+    hand-written Moreau conic problem. This avoids multiplying a parameter by a
+    nonlinear expression containing another parameter and does not add a redundant
+    explicit nonnegativity cone for turnover.
     """
     expected_returns = cp.Parameter((n_horizons, n_assets), name="expected_returns")
     half_spread = cp.Parameter((n_horizons, n_assets), nonneg=True, name="half_spread")
@@ -39,7 +39,7 @@ def build_problem(n_assets: int, n_horizons: int):
     risk_radius = cp.Parameter(n_horizons, nonneg=True, name="risk_radius")
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
-    turnover = cp.Variable((n_horizons, n_assets), nonneg=True, name="turnover")
+    turnover = cp.Variable((n_horizons, n_assets), name="turnover")
     previous = cp.vstack(
         [cp.reshape(current_weights, (1, n_assets), order="C"), weights[:-1, :]]
     )
