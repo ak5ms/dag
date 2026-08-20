@@ -26,12 +26,12 @@ def parse_size(value: str) -> tuple[int, int]:
 
 
 def build_problem(n_assets: int, n_horizons: int):
-    """Build a DPP CVXPY formulation of the multi-period optimizer.
+    """Build the DPP CVXPY formulation of the multi-period optimizer.
 
-    The absolute turnover cost uses the same two-inequality epigraph as the
-    hand-written Moreau conic problem. This avoids multiplying a parameter by a
-    nonlinear expression containing another parameter and does not add a redundant
-    explicit nonnegativity cone for turnover.
+    Turnover uses the same two-inequality epigraph as the hand-written Moreau
+    conic problem. Risk uses ``cp.SOC`` directly; spelling the constraint as
+    ``cp.norm(...) <= radius`` adds one epigraph variable and inequality per
+    horizon and materially slows Clarabel for this problem family.
     """
     expected_returns = cp.Parameter((n_horizons, n_assets), name="expected_returns")
     half_spread = cp.Parameter((n_horizons, n_assets), nonneg=True, name="half_spread")
@@ -52,11 +52,10 @@ def build_problem(n_assets: int, n_horizons: int):
     )
     constraints = [turnover >= delta, turnover >= -delta]
     constraints.extend(
-        cp.norm(
+        cp.SOC(
+            risk_radius[t],
             risk_factor[t * n_assets : (t + 1) * n_assets, :] @ weights[t, :],
-            2,
         )
-        <= risk_radius[t]
         for t in range(n_horizons)
     )
     problem = cp.Problem(objective, constraints)
