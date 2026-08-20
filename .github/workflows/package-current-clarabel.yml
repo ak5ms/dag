@@ -5,6 +5,10 @@ on:
     branches: [agent/cvxpygen-cargo-cache]
     paths:
       - ".github/workflows/package-current-clarabel.yml"
+  pull_request:
+    branches: [mpo]
+    paths:
+      - ".github/workflows/package-current-clarabel.yml"
   workflow_dispatch:
 
 jobs:
