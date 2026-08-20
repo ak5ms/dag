@@ -30,9 +30,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install focused dependencies
+      - name: Install project and solver dependencies
         run: >-
-          python -m pip install numpy pandas scipy jax equinox pytest
+          python -m pip install
+          numpy pandas numba scipy jax equinox pytest pytest-xdist
+          pybind11 includeigen Jinja2 unxt deap pydot matplotlib
           moreau==0.3.3
       - name: Test MPO and risk-model integration
         env:
