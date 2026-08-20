@@ -138,6 +138,9 @@ def generate_one(output_root: Path, n_assets: int, n_horizons: int) -> dict[str,
 
     # CVXPYgen registers the generated wrapper using importlib and therefore expects
     # code_dir itself to be a valid Python package name, not an arbitrary path.
+    output_parent = str(output_root)
+    if output_parent not in sys.path:
+        sys.path.insert(0, output_parent)
     original_cwd = Path.cwd()
     t0 = time.perf_counter()
     try:
