@@ -49,15 +49,17 @@ jobs:
       - name: Generate and benchmark Clarabel solver
         run: |
           set -o pipefail
-          python scripts/benchmark_mpo_cvxpygen.py \
+          mkdir -p benchmark_artifacts
+          cd benchmark_artifacts
+          python ../scripts/benchmark_mpo_cvxpygen.py \
             --assets 24 \
             --horizons 8 \
             --runs 30 \
             --cvxpy-runs 10 \
             --warmups 2 \
-            --code-dir benchmark_artifacts/mpo_cvxpygen_code \
-            --json-out benchmark_artifacts/mpo_cvxpygen_results.json \
-            2>&1 | tee benchmark_artifacts/benchmark.log
+            --code-dir mpo_cvxpygen_code \
+            --json-out mpo_cvxpygen_results.json \
+            2>&1 | tee benchmark.log
       - name: Inspect generated native interface
         if: always()
         run: |
