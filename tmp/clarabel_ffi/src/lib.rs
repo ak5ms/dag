@@ -65,6 +65,35 @@ struct SolverHandle {
     a_nnz: usize,
 }
 
+/// Sized borrowed wrappers avoid allocating temporary Vecs for Clarabel's
+/// generic data-update API, whose slice implementations are otherwise unsized.
+struct BorrowedMatrixUpdate<'a>(&'a [f64]);
+struct BorrowedVectorUpdate<'a>(&'a [f64]);
+
+impl MatrixProblemDataUpdate<f64> for BorrowedMatrixUpdate<'_> {
+    fn update_matrix(
+        &self,
+        matrix: &mut CscMatrix<f64>,
+        left_scale: &[f64],
+        right_scale: &[f64],
+        constant_scale: Option<f64>,
+    ) -> Result<(), SparseFormatError> {
+        self.0
+            .update_matrix(matrix, left_scale, right_scale, constant_scale)
+    }
+}
+
+impl VectorProblemDataUpdate<f64> for BorrowedVectorUpdate<'_> {
+    fn update_vector(
+        &self,
+        vector: &mut [f64],
+        scale: &[f64],
+        constant_scale: Option<f64>,
+    ) -> Result<(), SparseFormatError> {
+        self.0.update_vector(vector, scale, constant_scale)
+    }
+}
+
 fn cone(kind: u32, dim: usize) -> Result<SupportedConeT<f64>, String> {
     match kind {
         0 => Ok(ZeroConeT(dim)),
@@ -199,7 +228,12 @@ pub unsafe extern "C" fn cpp_stream_clarabel_update(
             let b = required_slice(b, handle.m, "b")?;
             handle
                 .solver
-                .update_data(&[] as &[f64], q, a_values, b)
+                .update_data(
+                    &[] as &[f64; 0],
+                    &BorrowedVectorUpdate(q),
+                    &BorrowedMatrixUpdate(a_values),
+                    &BorrowedVectorUpdate(b),
+                )
                 .map_err(|error| error.to_string())?;
             Ok(())
         })
