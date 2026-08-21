@@ -24,6 +24,7 @@ from trading_dsl_engine.cpp_stream.python.sources import (
 )
 from trading_dsl_engine.cpp_stream.python.utils import *  # noqa: F403
 from trading_dsl_engine.cpp_stream.python.utils import __all__ as _utils_all
+from trading_dsl_engine.cpp_stream.python.xs_gauss import xs_gauss
 
 
 def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
@@ -95,5 +96,6 @@ __all__ = [
     "open_source",
     "register_source_adapter",
     "source",
+    "xs_gauss",
     *_utils_all,
 ]
