@@ -7,7 +7,6 @@
 #include "stackdsl/ops/literal.hpp"
 #include "stackdsl/ops/naryop.hpp"
 #include "stackdsl/ops/cross_sectional.hpp"
-#include "stackdsl/ops/xs_gauss.hpp"
 #include "stackdsl/ops/cat.hpp"
 #include "stackdsl/ops/cumsum.hpp"
 #include "stackdsl/ops/reduction.hpp"
