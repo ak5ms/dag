@@ -52,6 +52,20 @@ def test_cost_balanced_batches_are_bounded_and_cover_every_candidate(monkeypatch
     assert [len(batch) for batch in serial_batches] == [3, 3]
 
 
+def test_high_core_count_does_not_create_one_compile_unit_per_candidate(monkeypatch):
+    search = _search_module()
+    monkeypatch.setattr(search, "FITNESS_BATCH_SIZE", 8)
+    monkeypatch.setattr(search, "FITNESS_TASKS_PER_WORKER", 1)
+    items = [
+        search._CandidateSpec(str(index), object(), float(index + 1))
+        for index in range(64)
+    ]
+
+    batches = search._make_microbatches(items, workers=64)
+    assert len(batches) == 8
+    assert all(len(batch) == 8 for batch in batches)
+
+
 def test_interval_union_counts_overlapping_compile_wall_once():
     search = _search_module()
     stages = [
@@ -229,6 +243,7 @@ def test_search_hot_loop_has_no_python_worker_pool_or_duplicate_source_load():
     assert "sources_all" not in source
     assert "run_many(" in source
     assert "compile_formula(\n        formulas," in source
+    assert "train_end=(folds[-1].train_end if folds else None)" in source
 
 
 def test_inputdata_import_does_not_eagerly_import_jax_backend():
