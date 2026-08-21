@@ -23,6 +23,7 @@ import operator
 import os
 from pathlib import Path
 import random
+import shutil
 from statistics import NormalDist
 import time
 from typing import Any
@@ -94,6 +95,43 @@ def _available_cpus() -> int:
         return os.cpu_count() or 1
 
 
+def _configure_gp_toolchain() -> str:
+    """Select the low-overhead GP compiler path unless explicitly overridden."""
+
+    explicit = os.environ.get("GP_CXX")
+    if explicit and explicit.strip().lower() != "auto":
+        selected = explicit.strip()
+        os.environ["CXX"] = selected
+    elif "CXX" in os.environ:
+        selected = os.environ["CXX"]
+    else:
+        selected = "clang++" if shutil.which("clang++") else "g++"
+        os.environ["CXX"] = selected
+
+    os.environ.setdefault("TRADING_DSL_ENGINE_CPP_PCH", "1")
+    if (
+        "clang" in Path(selected).name.lower()
+        and shutil.which("ld.lld") is not None
+    ):
+        # Full LTO is disproportionately expensive for the many bounded GP
+        # translation units. ThinLTO plus lld retains cross-TU optimization
+        # while allowing the reusable PCH and a much faster link.
+        if "TRADING_DSL_ENGINE_CPP_LTO" not in os.environ:
+            os.environ["TRADING_DSL_ENGINE_CPP_LTO"] = "0"
+            os.environ.setdefault(
+                "TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS",
+                "-flto=thin",
+            )
+        os.environ.setdefault(
+            "TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS",
+            "-fuse-ld=lld",
+        )
+    return selected
+
+
+GP_COMPILER = _configure_gp_toolchain()
+
+
 # Search controls.
 N_INSTRUMENTS = int(os.environ.get("GP_N_INSTRUMENTS", "9"))
 ROWS = int(os.environ.get("GP_ROWS", "1000000"))
@@ -121,7 +159,7 @@ NATIVE_WORKERS = int(
 )
 FITNESS_BATCH_SIZE = int(os.environ.get("GP_FITNESS_BATCH_SIZE", "8"))
 FITNESS_TASKS_PER_WORKER = int(
-    os.environ.get("GP_FITNESS_TASKS_PER_WORKER", "2")
+    os.environ.get("GP_FITNESS_TASKS_PER_WORKER", "1")
 )
 PIN_NATIVE_WORKERS = _env_bool("GP_PIN_NATIVE_WORKERS", False)
 PARALLEL_DIAGNOSTIC = _env_bool("GP_PARALLEL_DIAGNOSTIC", False)
@@ -134,7 +172,7 @@ OUTPUT_DIR = Path(os.environ.get("GP_OUTPUT_DIR", "/tmp/gp-alpha-search"))
 FIELD_NAMES = _env_names("GP_FIELD_NAMES")
 DISABLE_TENSORS = _env_bool("GP_DISABLE_TENSORS", False)
 
-# Anchored walk-forward controls.  FOLDS=0 preserves full-sample search.
+# Anchored walk-forward controls. FOLDS=0 preserves full-sample search.
 WALK_FORWARD_FOLDS = int(os.environ.get("GP_WALK_FORWARD_FOLDS", "0"))
 WALK_FORWARD_VALIDATION_FRACTION = float(
     _env_first(
@@ -168,7 +206,7 @@ WALK_FORWARD_FITNESS = os.environ.get(
     "median_is",
 ).strip().lower()
 
-# Plotting.  All per-generation PnL outputs share one multi-output DAG/run.
+# Plotting. All per-generation PnL outputs share one multi-output DAG/run.
 SHOW_PLOT = _env_bool("GP_SHOW_PLOT", False)
 PLOT_EVERY = int(os.environ.get("GP_PLOT_EVERY", "5"))
 PLOT_FINAL_GENERATION = _env_bool("GP_PLOT_FINAL_GENERATION", True)
@@ -759,7 +797,18 @@ def _make_microbatches(
     worker_count = max(1, int(workers))
     minimum_batches = math.ceil(len(items) / FITNESS_BATCH_SIZE)
     requested_batches = worker_count * FITNESS_TASKS_PER_WORKER
-    batch_count = min(len(items), max(minimum_batches, requested_batches))
+    # Never degenerate into one translation unit per candidate merely because
+    # the host exposes many CPUs. At the default of one task per worker this
+    # emits the minimum number of bounded, CSE-friendly formula-list batches.
+    # Raising GP_FITNESS_TASKS_PER_WORKER permits at most that multiple of the
+    # minimum, retaining a direct and bounded compile/runtime trade-off.
+    batch_count = min(
+        len(items),
+        max(
+            minimum_batches,
+            min(requested_batches, minimum_batches * FITNESS_TASKS_PER_WORKER),
+        ),
+    )
 
     batches: list[list[_CandidateSpec]] = [[] for _ in range(batch_count)]
     loads = [0.0] * batch_count
@@ -944,7 +993,7 @@ def _execute_compiled_fitness_batches(
         workers = batch_result.workers
         effective_concurrency = batch_result.effective_concurrency
     except Exception as exc:
-        # Runtime failures are rare after successful compilation.  Serial replay
+        # Runtime failures are rare after successful compilation. Serial replay
         # isolates the bad batch while retaining a useful search result.
         fallback_serial = True
         print(
@@ -1150,11 +1199,16 @@ def _pool_ridge_expr(
     scaled_alphas: list[Expr],
     clean_rets: Expr,
     lag: int = 0,
+    train_end: int | None = None,
 ) -> Expr:
     hs = var("vw_halfspread_out0")
     ridge_weights = purify(
         var("volume_out0") * var("vwap_mp_out0") / (hs * hs)
     )
+    if train_end is not None:
+        in_sample = var("gp_row_index") < int(train_end)
+        clean_rets = where(in_sample, clean_rets, float("nan"))
+        ridge_weights = where(in_sample, ridge_weights, 0.0)
     return Ridge(
         *(shift(alpha, 1 + lag) for alpha in scaled_alphas),
         y=clean_rets,
@@ -1237,14 +1291,27 @@ def ridge_contributions(
     generation: int,
     *,
     capture_beta: bool,
+    train_end: int | None,
 ) -> tuple[np.ndarray, dict[str, Any], Path | None]:
     """Compute contribution and optional beta history from one Ridge state/run."""
 
     scaled = _pool_scaled_alphas(individuals, pset)
-    regression = _pool_ridge_expr(scaled, var("clean_rets"))
-    formulas = [abs(get_beta(regression)).mean(axis=0)]
+    regression = _pool_ridge_expr(
+        scaled,
+        var("clean_rets"),
+        train_end=train_end,
+    )
+    beta = get_beta(regression)
+    contribution = abs(beta)
+    if train_end is not None:
+        contribution = where(
+            var("gp_row_index") < int(train_end),
+            contribution,
+            float("nan"),
+        )
+    formulas = [contribution.mean(axis=0)]
     if capture_beta:
-        formulas.append(get_beta(regression))
+        formulas.append(beta)
 
     compile_started = time.perf_counter()
     runtime = compile_formula(
@@ -1278,6 +1345,7 @@ def ridge_contributions(
     )
     metrics["candidate_count"] = len(individuals)
     metrics["multi_output_beta"] = bool(capture_beta)
+    metrics["train_end"] = train_end
     return (
         np.nan_to_num(contribution, nan=0.0, posinf=0.0, neginf=0.0),
         metrics,
@@ -1300,6 +1368,7 @@ def _empty_ridge_metrics(*, reason: str = "no candidates") -> dict[str, Any]:
         "parallel_plan_reason": reason,
         "work_score": 0,
         "multi_output_beta": False,
+        "train_end": None,
     }
 
 
@@ -1319,6 +1388,7 @@ def update_pool(
     generation: int,
     *,
     capture_beta: bool,
+    train_end: int | None,
 ):
     """Merge strong candidates and rank once with one multi-output Ridge run."""
 
@@ -1347,6 +1417,7 @@ def update_pool(
         source,
         generation,
         capture_beta=capture_beta,
+        train_end=train_end,
     )
     order = np.argsort(contribution)[::-1]
     previous = set(pool)
@@ -1575,6 +1646,7 @@ def vary(population, pset, toolbox, next_depth: int):
 def _settings(folds: tuple[WalkForwardFold, ...]) -> dict[str, Any]:
     return {
         "n_instruments": N_INSTRUMENTS,
+        "gp_compiler": GP_COMPILER,
         "rows_requested": ROWS,
         "population_size": POPULATION_SIZE,
         "generations_requested": GENERATIONS,
@@ -1617,6 +1689,9 @@ def _settings(folds: tuple[WalkForwardFold, ...]) -> dict[str, Any]:
         "pool_ridge_lambda": POOL_RIDGE_LAMBDA,
         "pool_ridge_recompute_every": POOL_RIDGE_RECOMPUTE_EVERY,
         "pool_ridge_nonnegative": True,
+        "pool_training_end": (
+            folds[-1].train_end if folds else None
+        ),
         "enable_pool": ENABLE_POOL,
         "pool_row_threshold": POOL_ROW_THRESHOLD,
         "plot_every": PLOT_EVERY,
@@ -1772,6 +1847,7 @@ def main() -> None:
             toolbox,
             generation,
             capture_beta=(plotting and PLOT_RIDGE_BETA),
+            train_end=(folds[-1].train_end if folds else None),
         )
         core_generation_wall = time.perf_counter() - generation_started
         steady_state_cumulative += core_generation_wall
@@ -1878,12 +1954,16 @@ def main() -> None:
         row["plot_wall_seconds"] = plot_metrics["wall_seconds"]
         history.append(row)
 
+        oos_pass_text = (
+            f"{row['validation_pass_rate']:.1%}"
+            if folds
+            else "n/a"
+        )
         print(
             f"generation={generation:3d} depth={depth:2d} "
             f"best={row['best_sharpe']:9.5f} "
             f"mean={row['mean_sharpe']:9.5f} "
-            f"oos_pass="
-            f"{row['validation_pass_rate']:.1%} "
+            f"oos_pass={oos_pass_text} "
             f"pool={len(pool):2d} "
             f"fitness={row['fitness_wall_seconds']:.2f}s "
             f"native_workers={row['fitness_native_workers']} "
