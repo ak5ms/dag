@@ -1,5 +1,4 @@
 import re
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import jax.numpy as jnp
@@ -98,17 +97,18 @@ def pov(n_basis: int = 6, h: int = 1440, f: SimpleNamespace = PovFields):
 
 RollRetsFields = SimpleNamespace(
     wdte=var("wdte_out0"),
-    px0=var("mp_out0.close"),
-    px1 = var("mp_out1.close"),
+    px0=var("vwap_mp_out0"),
+    px1 = var("vwap_mp_out1"),
     is_tradable_out0 = var("is_tradable_out0"),
     is_tradable_out1 = var("is_tradable_out1"),
 )
 
-
+from typing import Any
+from dataclasses import dataclass, field
 
 @dataclass
 class RollRets:
-    fields = RollRetsFields
+    fields: Any = field(default_factory=lambda: RollRetsFields)
 
     def roll_rets(self, days_roll: int = 2,  **kwargs):
         f = self.fields

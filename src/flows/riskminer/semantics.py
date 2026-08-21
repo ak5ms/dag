@@ -723,6 +723,34 @@ def inputdata_alpha_terminal_metadata() -> dict[str, SemanticInfo]:
     return {name: values[name] for name in INPUTDATA_ALPHA_KEYS}
 
 
+def gp_derived_alpha_terminal_metadata() -> dict[str, SemanticInfo]:
+    """Derived row fields materialized at runtime but not stored in InputData."""
+
+    row = SearchShape.ROW
+    return {
+        "roll_rets": SemanticInfo(
+            frozenset(
+                {
+                    "numeric",
+                    "dimensionless",
+                    "return",
+                    "roll_return",
+                    "returns",
+                }
+            ),
+            row,
+        ),
+    }
+
+
+def gp_alpha_search_terminal_metadata() -> dict[str, SemanticInfo]:
+    """InputData alpha terminals plus GP-searchable derived fields."""
+
+    metadata = dict(inputdata_alpha_terminal_metadata())
+    metadata.update(gp_derived_alpha_terminal_metadata())
+    return metadata
+
+
 def inputdata_alpha_keys() -> tuple[str, ...]:
     return INPUTDATA_ALPHA_KEYS
 
@@ -760,6 +788,8 @@ __all__ = [
     "division_output",
     "inputdata_alpha_keys",
     "inputdata_alpha_terminal_metadata",
+    "gp_alpha_search_terminal_metadata",
+    "gp_derived_alpha_terminal_metadata",
     "literal_semantics",
     "metadata_as_dict",
     "multiplication_output",

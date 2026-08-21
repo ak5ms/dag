@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,14 +71,31 @@ class StaticValue:
 
 
 @dataclass(frozen=True)
-class PositiveNumber(StaticValue):
-    """Positive compile-time numeric literal usable in scalar-broadcast slots."""
+class ScalarNumber(StaticValue):
+    """Finite compile-time scalar usable in row/tensor broadcast slots."""
+
+    value: float
+
+    def __post_init__(self) -> None:
+        number = float(self.value)
+        if not math.isfinite(number):
+            raise ValueError("ScalarNumber must be finite")
+        object.__setattr__(self, "value", number)
+
+
+@dataclass(frozen=True)
+class PositiveNumber(ScalarNumber):
+    """Positive compile-time numeric literal usable in span/window slots."""
 
     value: int | float
 
     def __post_init__(self) -> None:
-        if float(self.value) <= 0.0:
+        number = float(self.value)
+        if not math.isfinite(number):
+            raise ValueError("PositiveNumber must be finite")
+        if number <= 0.0:
             raise ValueError("PositiveNumber must be > 0")
+        object.__setattr__(self, "value", number)
 
 
 @dataclass(frozen=True)
@@ -245,6 +263,7 @@ __all__ = [
     "QuantileParam",
     "QuantityRow",
     "RegressionReturnSpec",
+    "ScalarNumber",
     "StaticValue",
     "TimestampRow",
     "TradingDayHorizonRow",

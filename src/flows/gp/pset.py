@@ -40,6 +40,7 @@ from flows.gp.types import (
     PriceRow,
     QuantileParam,
     QuantityRow,
+    ScalarNumber,
     TimestampRow,
     TradingDayHorizonRow,
     VALUE_TYPES,
@@ -118,6 +119,7 @@ class GPConfig:
     grammar: GrammarPolicy = GrammarPolicy()
     positive_ints: tuple[int, ...] = (1, 2, 3, 5, 10, 20, 60, 120, 240, 1440)
     positive_floats: tuple[float, ...] = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0)
+    negative_floats: tuple[float, ...] = (-1.0, -0.5, -0.25, -0.1)
     quantiles: tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9)
     bools: tuple[bool, ...] = (False, True)
     axes: tuple[int | tuple[int, ...], ...] = (1,)
@@ -142,6 +144,10 @@ class GPConfig:
             raise ValueError("positive_ints must contain only positive integers")
         if not self.positive_floats or any(float(v) <= 0.0 for v in self.positive_floats):
             raise ValueError("positive_floats must contain only positive floats")
+        if any(not math.isfinite(float(v)) for v in self.negative_floats):
+            raise ValueError("negative_floats must contain only finite values")
+        if any(float(v) >= 0.0 for v in self.negative_floats):
+            raise ValueError("negative_floats must contain only negative values")
         if not self.quantiles:
             raise ValueError("quantiles cannot be empty")
         for value in self.quantiles:
@@ -447,8 +453,12 @@ def _public(reg: _Registrar, family: str, args: Sequence[type], ret: type, varia
     reg.add(family, partial(_public_call, family, ret), args, ret, variant=variant)
 
 
-def _add_terminal(pset, value, ret_type: type, name: str) -> None:
-    pset.addTerminal(value, ret_type, name=_safe_name(name))
+def _add_terminal(pset, value, ret_type: type, name: str, *, literal: bool = False) -> None:
+    pset.addTerminal(
+        value,
+        ret_type,
+        name=name if literal else _safe_name(name),
+    )
 
 
 def _add_terminals(pset: gp.PrimitiveSetTyped, config: GPConfig) -> dict[str, str]:
@@ -499,6 +509,13 @@ def _add_terminals(pset: gp.PrimitiveSetTyped, config: GPConfig) -> dict[str, st
             PositiveFloat,
             f"positive_float_{_safe_name(f'{value:g}')}",
         )
+    for value in sorted({float(v) for v in config.negative_floats}):
+        terminal = ScalarNumber(value)
+        literal = f"{value:g}"
+        _add_terminal(pset, terminal, ScalarNumber, literal, literal=True)
+        alias = f"negative_float_{_safe_name(f'{value:g}')}"
+        if alias != literal:
+            _add_terminal(pset, terminal, ScalarNumber, alias)
     for value in sorted({float(v) for v in config.quantiles}):
         _add_terminal(
             pset,
@@ -542,30 +559,30 @@ def _scalar_broadcast_ops(reg: _Registrar) -> None:
     for row_type in VALUE_TYPES:
         tag = _type_tag(row_type)
         if row_type is not TimestampRow:
-            _core(reg, "add", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
-            _core(reg, "add", (PositiveNumber, row_type), row_type, f"scalar_{tag}")
-            _core(reg, "sub", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
+            _core(reg, "add", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
+            _core(reg, "add", (ScalarNumber, row_type), row_type, f"scalar_{tag}")
+            _core(reg, "sub", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
         for name in ("minimum", "maximum"):
-            _core(reg, name, (row_type, PositiveNumber), row_type, f"{tag}_scalar")
-            _core(reg, name, (PositiveNumber, row_type), row_type, f"scalar_{tag}")
-        _core(reg, "fillna", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
-        reg.add("clip", partial(_clip_call, row_type), (row_type, PositiveNumber, PositiveNumber), row_type, variant=f"{tag}_scalar_bounds")
+            _core(reg, name, (row_type, ScalarNumber), row_type, f"{tag}_scalar")
+            _core(reg, name, (ScalarNumber, row_type), row_type, f"scalar_{tag}")
+        _core(reg, "fillna", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
+        reg.add("clip", partial(_clip_call, row_type), (row_type, ScalarNumber, ScalarNumber), row_type, variant=f"{tag}_scalar_bounds")
         for name in ("eq", "ne", "lt", "gt", "le", "ge"):
-            _core(reg, name, (row_type, PositiveNumber), BoolRow, f"{tag}_scalar")
-            _core(reg, name, (PositiveNumber, row_type), BoolRow, f"scalar_{tag}")
-        _core(reg, "where", (BoolRow, row_type, PositiveNumber), row_type, f"{tag}_scalar_false")
-        _core(reg, "where", (BoolRow, PositiveNumber, row_type), row_type, f"scalar_true_{tag}")
-        _core(reg, "mul", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
-        _core(reg, "mul", (PositiveNumber, row_type), row_type, f"scalar_{tag}")
-        _core(reg, "div", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
+            _core(reg, name, (row_type, ScalarNumber), BoolRow, f"{tag}_scalar")
+            _core(reg, name, (ScalarNumber, row_type), BoolRow, f"scalar_{tag}")
+        _core(reg, "where", (BoolRow, row_type, ScalarNumber), row_type, f"{tag}_scalar_false")
+        _core(reg, "where", (BoolRow, ScalarNumber, row_type), row_type, f"scalar_true_{tag}")
+        _core(reg, "mul", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
+        _core(reg, "mul", (ScalarNumber, row_type), row_type, f"scalar_{tag}")
+        _core(reg, "div", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
         inv_ret = DimensionlessRow if issubclass(row_type, DimensionlessRow) else DerivedNumericRow
-        _core(reg, "div", (PositiveNumber, row_type), inv_ret, f"scalar_{tag}")
-        reg.add("floordiv", partial(_floordiv_call, row_type), (row_type, PositiveNumber), row_type, variant=f"{tag}_scalar")
-        reg.add("floordiv", partial(_floordiv_call, inv_ret), (PositiveNumber, row_type), inv_ret, variant=f"scalar_{tag}")
-        _core(reg, "mod", (row_type, PositiveNumber), row_type, f"{tag}_scalar")
-        _core(reg, "mod", (PositiveNumber, row_type), DerivedNumericRow, f"scalar_{tag}")
+        _core(reg, "div", (ScalarNumber, row_type), inv_ret, f"scalar_{tag}")
+        reg.add("floordiv", partial(_floordiv_call, row_type), (row_type, ScalarNumber), row_type, variant=f"{tag}_scalar")
+        reg.add("floordiv", partial(_floordiv_call, inv_ret), (ScalarNumber, row_type), inv_ret, variant=f"scalar_{tag}")
+        _core(reg, "mod", (row_type, ScalarNumber), row_type, f"{tag}_scalar")
+        _core(reg, "mod", (ScalarNumber, row_type), DerivedNumericRow, f"scalar_{tag}")
         pow_ret = DimensionlessRow if issubclass(row_type, DimensionlessRow) else DerivedNumericRow
-        _core(reg, "pow", (row_type, PositiveNumber), pow_ret, f"{tag}_scalar")
+        _core(reg, "pow", (row_type, ScalarNumber), pow_ret, f"{tag}_scalar")
     for family in ("and", "and_", "or", "or_", "xor"):
         op = {"and": "and_", "or": "or_"}.get(family, family)
         _core(reg, family, (BoolRow, BoolParam), BoolRow, "row_scalar", op=op)

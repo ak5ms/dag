@@ -26,6 +26,7 @@ from flows.gp.types import (
     PriceRow,
     QuantileParam,
     QuantityRow,
+    ScalarNumber,
     TimestampRow,
     TradingDayHorizonRow,
 )
@@ -53,6 +54,7 @@ _STATIC_SAMPLES = {
     PeriodAtLeastTwo: PeriodAtLeastTwo(20),
     PositiveFloat: PositiveFloat(0.5),
     PositiveNumber: PositiveInt(2),
+    ScalarNumber: ScalarNumber(-1.0),
     QuantileParam: QuantileParam(0.5),
     BoolParam: BoolParam(True),
     KthIgnoreSpec: KthIgnoreSpec("NAN 0"),

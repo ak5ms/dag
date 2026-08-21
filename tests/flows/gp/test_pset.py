@@ -166,3 +166,25 @@ def test_gp_package_uses_only_absolute_imports():
             node for node in ast.walk(module)
             if isinstance(node, ast.ImportFrom) and node.level
         ], path
+
+
+def test_negative_scalar_float_terminals_support_from_string():
+    from flows.gp import GrammarPolicy, individual_to_expr
+    from flows.gp.generation import make_toolbox
+    from flows.riskminer.semantics import gp_alpha_search_terminal_metadata
+
+    pset = make_pset(
+        GPConfig(
+            fields=gp_alpha_search_terminal_metadata(),
+            grammar=GrammarPolicy(exclude_sections=("utils.group",)),
+        )
+    )
+    make_toolbox(pset, min_depth=1, max_depth=2)
+    assert "-1" in pset.mapping
+    tree = gp.PrimitiveTree.from_string(
+        "mul_scalar_dimensionless(-1, xs_rank_numeric(field_roll_rets))",
+        pset,
+    )
+    expr = individual_to_expr(tree, pset)
+    assert "xs_rank" in str(expr)
+    assert "mul" in str(expr)

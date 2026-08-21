@@ -70,6 +70,7 @@ from flows.gp.types import (
     QuantileParam,
     QuantityRow,
     RegressionReturnSpec,
+    ScalarNumber,
     StaticValue,
     TimestampRow,
     TradingDayHorizonRow,
