@@ -82,3 +82,21 @@ def test_native_batch_validates_output_path_count(tmp_path: Path, monkeypatch):
     runtime = compile_formula(var("x") + 1.0, data, n_instruments=2)
     with pytest.raises(ValueError, match="out_paths length"):
         run_many((runtime,), out_paths=())
+
+
+def test_native_batch_rejects_duplicate_output_paths(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv(
+        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE",
+        str(tmp_path / "cache"),
+    )
+    monkeypatch.setenv("TRADING_DSL_ENGINE_CPP_PCH", "0")
+    monkeypatch.setenv("TRADING_DSL_ENGINE_CPP_LTO", "0")
+    data = {"x": np.arange(16, dtype=np.float64).reshape(8, 2)}
+    runtime = compile_formula(var("x") + 1.0, data, n_instruments=2)
+    shared = tmp_path / "shared.npy"
+    with pytest.raises(ValueError, match="out_paths must be distinct"):
+        run_many(
+            (runtime, runtime),
+            out_paths=(shared, shared),
+            workers=2,
+        )
