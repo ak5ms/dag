@@ -1,0 +1,121 @@
+name: mpo-cvxpygen
+
+on:
+  push:
+    branches: [mpo]
+    paths:
+      - "scripts/benchmark_mpo_cvxpygen.py"
+      - "scripts/benchmark_mpo_cvxpygen_native.c"
+      - ".github/workflows/mpo-cvxpygen.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/benchmark_mpo_cvxpygen.py"
+      - "scripts/benchmark_mpo_cvxpygen_native.c"
+      - ".github/workflows/mpo-cvxpygen.yml"
+  workflow_dispatch:
+
+jobs:
+  codegen-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Eigen and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev ninja-build
+      - name: Install CVXPYgen and Clarabel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cvxpygen==1.0.0
+      - name: Record environment
+        run: |
+          mkdir -p benchmark_artifacts
+          {
+            python --version
+            python -m pip show cvxpygen cvxpy clarabel numpy scipy
+            rustc --version
+            cargo --version
+            cmake --version
+            c++ --version
+            lscpu
+          } | tee benchmark_artifacts/environment.txt
+      - name: Generate and benchmark Clarabel solver
+        run: |
+          set -o pipefail
+          # u >= delta and u >= -delta already imply u >= 0. Remove the redundant
+          # 192-row nonnegative block so the generated cone program matches Moreau.
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/benchmark_mpo_cvxpygen.py")
+          text = path.read_text()
+          old = "constraints: list[cp.Constraint] = [turnover_aux >= 0]"
+          new = "constraints: list[cp.Constraint] = []"
+          if old not in text:
+              raise SystemExit("expected turnover constraint line not found")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          mkdir -p benchmark_artifacts
+          cd benchmark_artifacts
+          python ../scripts/benchmark_mpo_cvxpygen.py \
+            --assets 24 \
+            --horizons 8 \
+            --runs 30 \
+            --cvxpy-runs 10 \
+            --warmups 2 \
+            --code-dir mpo_cvxpygen_code \
+            --json-out mpo_cvxpygen_results.json \
+            2>&1 | tee benchmark.log
+      - name: Benchmark generated C entry point
+        run: |
+          set -o pipefail
+          cd benchmark_artifacts/mpo_cvxpygen_code
+          cc -O3 -DNDEBUG -std=c11 \
+            -Ic/include -Ic/solver_code/include \
+            c/src/cpg_workspace.c \
+            c/src/cpg_solve.c \
+            ../../scripts/benchmark_mpo_cvxpygen_native.c \
+            c/solver_code/rust_wrapper/target/release/libclarabel_c.a \
+            -lm -ldl -lpthread \
+            -o cpg_mpo_native_benchmark
+          {
+            ./cpg_mpo_native_benchmark 30 same 1
+            ./cpg_mpo_native_benchmark 30 q 1
+            ./cpg_mpo_native_benchmark 30 A 1
+            # Demonstrate the current generated backend's missing solver free.
+            ./cpg_mpo_native_benchmark 30 same 0
+          } | tee ../native_benchmark.txt
+      - name: Inspect generated native interface
+        if: always()
+        run: |
+          {
+            echo "Generated files:"
+            find benchmark_artifacts/mpo_cvxpygen_code -maxdepth 4 -type f -printf '%p %s bytes\n' 2>/dev/null | sort
+            echo
+            echo "Shared objects and static archives:"
+            find benchmark_artifacts/mpo_cvxpygen_code -type f \( -name '*.so' -o -name '*.a' \) -print 2>/dev/null
+            echo
+            echo "Generated solve lifecycle:"
+            grep -nE 'DefaultSolver_(new|solve|free)' benchmark_artifacts/mpo_cvxpygen_code/c/src/cpg_solve.c || true
+            echo
+            for f in $(find benchmark_artifacts/mpo_cvxpygen_code -type f -name '*.so' 2>/dev/null); do
+              echo "=== nm -D $f ==="
+              nm -D --defined-only "$f" | head -200 || true
+            done
+          } | tee benchmark_artifacts/native_interface.txt
+      - name: Upload generated solver and benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpo-cvxpygen-clarabel
+          path: benchmark_artifacts
+          if-no-files-found: error
+          retention-days: 3

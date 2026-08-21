@@ -1,0 +1,42 @@
+name: package-optimizer-dev-artifacts
+
+on:
+  pull_request:
+    branches: [mpo]
+    paths:
+      - ".github/workflows/package-optimizer-dev-artifacts.yml"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Package exact Python wheels
+        run: |
+          mkdir -p optimizer-dev-artifacts/wheels
+          python -m pip download --dest optimizer-dev-artifacts/wheels \
+            numpy==2.4.6 pandas==3.0.5 numba==0.67.0 \
+            jax==0.10.2 jaxlib==0.10.2 equinox==0.13.8 \
+            pytest==9.1.1 pytest-xdist==3.8.0
+      - name: Package current Clarabel C++ source with vendored crates
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/oxfordcontrol/Clarabel.cpp.git optimizer-dev-artifacts/current-clarabel/Clarabel.cpp
+          cd optimizer-dev-artifacts/current-clarabel/Clarabel.cpp
+          mkdir -p .cargo vendor
+          cargo vendor --manifest-path rust_wrapper/Cargo.toml vendor > .cargo/config.toml
+          cd ../../..
+          tar -C optimizer-dev-artifacts -czf optimizer-dev-artifacts/current-clarabel.tar.gz current-clarabel
+          rm -rf optimizer-dev-artifacts/current-clarabel
+      - name: Upload development artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimizer-dev-artifacts
+          path: optimizer-dev-artifacts
+          if-no-files-found: error
+          retention-days: 1
