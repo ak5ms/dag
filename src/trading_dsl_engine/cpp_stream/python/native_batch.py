@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import ctypes
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 import time
 
@@ -233,6 +234,7 @@ class _PreparedTask:
         )
 
 
+@lru_cache(maxsize=1)
 def _load_dispatcher() -> ctypes.CDLL:
     library_path, _ = build_shared(_DISPATCH_SOURCE)
     library = ctypes.CDLL(str(library_path))
