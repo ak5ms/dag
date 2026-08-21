@@ -1,0 +1,173 @@
+name: GP multi-output walk-forward PR
+
+on:
+  pull_request:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - "scripts/run_gp_alpha_search.py"
+      - "src/trading_dsl_engine/cpp_stream/python/**"
+      - "tests/flows/gp/test_search_runtime_optimizations.py"
+      - "tests/trading_dsl_engine/cpp_stream/test_native_batch.py"
+      - ".github/workflows/gp-multi-output-pr.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  focused-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONPATH: src
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TRADING_DSL_ENGINE_CPP_NATIVE: "0"
+      TRADING_DSL_ENGINE_CPP_LTO: "0"
+      TRADING_DSL_ENGINE_CPP_PCH: "0"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-multi-output-walk-forward
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Apply idempotent performance patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/run_gp_alpha_search.py")
+          source = path.read_text()
+          replacements = [
+              (
+                  "import random\nfrom statistics import NormalDist\n",
+                  "import random\nimport shutil\nfrom statistics import NormalDist\n",
+              ),
+              (
+                  '''def _available_cpus() -> int:\n    try:\n        return len(os.sched_getaffinity(0))\n    except AttributeError:\n        return os.cpu_count() or 1\n\n\n# Search controls.\n''',
+                  '''def _available_cpus() -> int:\n    try:\n        return len(os.sched_getaffinity(0))\n    except AttributeError:\n        return os.cpu_count() or 1\n\n\ndef _configure_gp_toolchain() -> str:\n    """Select the low-overhead GP compiler path unless explicitly overridden."""\n\n    explicit = os.environ.get("GP_CXX")\n    if explicit and explicit.strip().lower() != "auto":\n        selected = explicit.strip()\n        os.environ["CXX"] = selected\n    elif "CXX" in os.environ:\n        selected = os.environ["CXX"]\n    else:\n        selected = "clang++" if shutil.which("clang++") else "g++"\n        os.environ["CXX"] = selected\n\n    os.environ.setdefault("TRADING_DSL_ENGINE_CPP_PCH", "1")\n    if (\n        "clang" in Path(selected).name.lower()\n        and shutil.which("ld.lld") is not None\n    ):\n        if "TRADING_DSL_ENGINE_CPP_LTO" not in os.environ:\n            os.environ["TRADING_DSL_ENGINE_CPP_LTO"] = "0"\n            os.environ.setdefault(\n                "TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS",\n                "-flto=thin",\n            )\n        os.environ.setdefault(\n            "TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS",\n            "-fuse-ld=lld",\n        )\n    return selected\n\n\nGP_COMPILER = _configure_gp_toolchain()\n\n\n# Search controls.\n''',
+              ),
+              (
+                  '''FITNESS_TASKS_PER_WORKER = int(\n    os.environ.get("GP_FITNESS_TASKS_PER_WORKER", "2")\n)\n''',
+                  '''FITNESS_TASKS_PER_WORKER = int(\n    os.environ.get("GP_FITNESS_TASKS_PER_WORKER", "1")\n)\n''',
+              ),
+              (
+                  '''    worker_count = max(1, int(workers))\n    minimum_batches = math.ceil(len(items) / FITNESS_BATCH_SIZE)\n    requested_batches = worker_count * FITNESS_TASKS_PER_WORKER\n    batch_count = min(len(items), max(minimum_batches, requested_batches))\n''',
+                  '''    worker_count = max(1, int(workers))\n    minimum_batches = math.ceil(len(items) / FITNESS_BATCH_SIZE)\n    requested_batches = worker_count * FITNESS_TASKS_PER_WORKER\n    # Never degenerate into one translation unit per candidate merely because\n    # the host exposes many CPUs. The default emits the minimum number of\n    # bounded, CSE-friendly formula-list batches. Raising tasks-per-worker\n    # permits at most that multiple of the minimum.\n    batch_count = min(\n        len(items),\n        max(\n            minimum_batches,\n            min(requested_batches, minimum_batches * FITNESS_TASKS_PER_WORKER),\n        ),\n    )\n''',
+              ),
+              (
+                  '''        "n_instruments": N_INSTRUMENTS,\n''',
+                  '''        "n_instruments": N_INSTRUMENTS,\n        "gp_compiler": GP_COMPILER,\n''',
+              ),
+              (
+                  '''        print(\n            f"generation={generation:3d} depth={depth:2d} "\n            f"best={row['best_sharpe']:9.5f} "\n            f"mean={row['mean_sharpe']:9.5f} "\n            f"oos_pass="\n            f"{row['validation_pass_rate']:.1%} "\n''',
+                  '''        oos_pass_text = (\n            f"{row['validation_pass_rate']:.1%}"\n            if folds\n            else "n/a"\n        )\n        print(\n            f"generation={generation:3d} depth={depth:2d} "\n            f"best={row['best_sharpe']:9.5f} "\n            f"mean={row['mean_sharpe']:9.5f} "\n            f"oos_pass={oos_pass_text} "\n''',
+              ),
+          ]
+          for old, new in replacements:
+              old_count = source.count(old)
+              new_count = source.count(new)
+              if old_count == 1 and new_count == 0:
+                  source = source.replace(old, new)
+              elif old_count == 0 and new_count == 1:
+                  continue
+              else:
+                  raise RuntimeError(
+                      f"ambiguous patch state old={old_count} new={new_count}: {old[:80]!r}"
+                  )
+          path.write_text(source)
+          PY
+          python -m py_compile \
+            scripts/run_gp_alpha_search.py \
+            src/trading_dsl_engine/cpp_stream/python/native_batch.py \
+            tests/flows/gp/test_search_runtime_optimizations.py \
+            tests/trading_dsl_engine/cpp_stream/test_native_batch.py
+
+      - name: Install project
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lld
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Run focused tests
+        env:
+          JAX_ENABLE_X64: "1"
+          TRADING_DSL_ENGINE_CPP_STREAM_CACHE: /tmp/cpp-stream-test-cache
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/flows/gp/test_search_runtime_optimizations.py
+          tests/trading_dsl_engine/cpp_stream/test_native_batch.py
+          tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+          tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+
+      - name: Generate smoke inputs
+        env:
+          GP_SYNTHETIC_ROWS: "20000"
+          GP_SYNTHETIC_INSTRUMENTS: "9"
+          GP_SYNTHETIC_CHUNK_ROWS: "5000"
+          GP_SYNTHETIC_OUTPUT_DIR: /tmp/gp-walk-forward-data
+        run: python scripts/generate_gp_alpha_search_benchmark_data.py
+
+      - name: Run complete anchored walk-forward smoke search
+        env:
+          GP_CXX: g++
+          GP_INPUT_GLOB: "/tmp/gp-walk-forward-data/*.npy"
+          GP_OUTPUT_DIR: /tmp/gp-walk-forward-smoke
+          GP_ROWS: "20000"
+          GP_N_INSTRUMENTS: "9"
+          GP_POPULATION_SIZE: "8"
+          GP_GENERATIONS: "1"
+          GP_ELITE_COUNT: "2"
+          GP_IMMIGRANTS: "2"
+          GP_NATIVE_WORKERS: "2"
+          GP_FITNESS_BATCH_SIZE: "2"
+          GP_WALK_FORWARD_FOLDS: "2"
+          GP_WALK_FORWARD_VALIDATION_FRACTION: "0.20"
+          GP_OOS_FILTER_FITNESS: "0"
+          GP_ENABLE_POOL: "0"
+          GP_DISABLE_TENSORS: "1"
+          GP_PLOT_EVERY: "0"
+          GP_PLOT_FINAL_GENERATION: "0"
+          GP_SHOW_PLOT: "0"
+          TRADING_DSL_ENGINE_CPP_STREAM_CACHE: /tmp/gp-walk-forward-cache
+        run: |
+          python scripts/run_gp_alpha_search.py
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summary = json.loads(Path(
+              "/tmp/gp-walk-forward-smoke/gp_search_summary.json"
+          ).read_text())
+          assert summary["completed_generations"] == 1
+          folds = summary["settings"]["walk_forward_folds"]
+          assert len(folds) == 2
+          assert folds[-1]["validation_end"] == 20000
+          assert summary["history"][0]["fitness_native_workers"] >= 1
+          print(json.dumps({
+              "folds": folds,
+              "history": summary["history"][0],
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Commit tested performance patch
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/run_gp_alpha_search.py
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m "GP: bound native batches and restore fast toolchain"
+            git push origin HEAD:agent/gp-multi-output-walk-forward
+          fi
