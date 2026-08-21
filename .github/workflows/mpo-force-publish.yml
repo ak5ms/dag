@@ -1,0 +1,25 @@
+name: mpo-force-publish
+on:
+  push:
+    branches: [agent/mpo-force-publish]
+permissions:
+  contents: write
+concurrency:
+  group: mpo-force-publish
+  cancel-in-progress: true
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Force publish first-class MPO
+        run: |
+          cp .github/mpo-first-class.patch.gz /tmp/mpo-first-class.patch.gz
+          git fetch origin main
+          git checkout -B mpo origin/main
+          gzip -dc /tmp/mpo-first-class.patch.gz | git apply --index
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Add first-class cpp_stream MPO operator'
+          git push origin HEAD:mpo --force
