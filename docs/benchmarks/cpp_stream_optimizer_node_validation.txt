@@ -1,0 +1,78 @@
+.F..F                                                                    [100%]
+=================================== FAILURES ===================================
+____________ test_parallel_batch_preserves_order_and_matches_serial ____________
+
+    def test_parallel_batch_preserves_order_and_matches_serial():
+        node = _make_node()
+        cases = [_data(seed) for seed in range(8)]
+        inputs = {
+            name: np.stack([case[name] for case in cases]) for name in cases[0]
+        }
+        serial = node.compile(workers=1).solve_batch(inputs, workers=1)
+        parallel = node.compile(workers=4).solve_batch(inputs, workers=4)
+        assert serial.keys() == parallel.keys()
+        for name in serial:
+            if serial[name].dtype.kind in "USO":
+                assert serial[name].tolist() == parallel[name].tolist()
+            else:
+>               np.testing.assert_allclose(
+                    serial[name], parallel[name], rtol=4e-6, atol=4e-7
+                )
+E               AssertionError: 
+E               Not equal to tolerance rtol=4e-06, atol=4e-07
+E               
+E               Mismatched elements: 14 / 48 (29.2%)
+E               First 5 mismatches are at indices:
+E                [3, 0, 0]: 0.05799631593164712 (ACTUAL), 0.05799754266047436 (DESIRED)
+E                [3, 0, 1]: -0.00013959478390152542 (ACTUAL), -0.00012344411584480042 (DESIRED)
+E                [3, 0, 2]: 0.029881750370838834 (ACTUAL), 0.02990236695204292 (DESIRED)
+E                [6, 0, 0]: 0.06112185808609662 (ACTUAL), 0.06112117720535709 (DESIRED)
+E                [6, 0, 1]: 0.11994136904237847 (ACTUAL), 0.11994598016637852 (DESIRED)
+E               Max absolute difference among violations: 5.73584281e-05
+E               Max relative difference among violations: 0.13083384
+E                ACTUAL: array([[[-1.576049e-01, -4.412185e-02, -2.355543e-02],
+E                       [-1.705890e-01,  1.314036e-02, -3.957999e-02]],
+E               ...
+E                DESIRED: array([[[-1.576049e-01, -4.412185e-02, -2.355543e-02],
+E                       [-1.705890e-01,  1.314036e-02, -3.957999e-02]],
+E               ...
+
+tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py:144: AssertionError
+_____ test_risk_covariance_cpp_stream_matrix_path_handles_nans_and_changes _____
+
+    def test_risk_covariance_cpp_stream_matrix_path_handles_nans_and_changes():
+        rng = np.random.default_rng(42)
+        returns = rng.normal(scale=0.01, size=(80, 4))
+        returns[rng.random(returns.shape) < 0.12] = np.nan
+        returns[rng.random(returns.shape) < 0.05] = 0.0
+        expression = risk_covariance(var("returns"), span=7)
+        try:
+            runtime = compile_formula(expression, n_instruments=returns.shape[1])
+        except TypeError:
+            runtime = compile_formula(expression)
+>       actual = np.asarray(_unwrap_run(runtime.run_batch({"returns": returns})))
+                                        ^^^^^^^^^^^^^^^^^
+E       AttributeError: 'CppStreamRuntime' object has no attribute 'run_batch'
+
+tests/trading_dsl_engine/cpp_stream/test_riskmodel_optimizer_inputs.py:27: AttributeError
+=========================== short test summary info ============================
+FAILED tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py::test_parallel_batch_preserves_order_and_matches_serial - AssertionError: 
+Not equal to tolerance rtol=4e-06, atol=4e-07
+
+Mismatched elements: 14 / 48 (29.2%)
+First 5 mismatches are at indices:
+ [3, 0, 0]: 0.05799631593164712 (ACTUAL), 0.05799754266047436 (DESIRED)
+ [3, 0, 1]: -0.00013959478390152542 (ACTUAL), -0.00012344411584480042 (DESIRED)
+ [3, 0, 2]: 0.029881750370838834 (ACTUAL), 0.02990236695204292 (DESIRED)
+ [6, 0, 0]: 0.06112185808609662 (ACTUAL), 0.06112117720535709 (DESIRED)
+ [6, 0, 1]: 0.11994136904237847 (ACTUAL), 0.11994598016637852 (DESIRED)
+Max absolute difference among violations: 5.73584281e-05
+Max relative difference among violations: 0.13083384
+ ACTUAL: array([[[-1.576049e-01, -4.412185e-02, -2.355543e-02],
+        [-1.705890e-01,  1.314036e-02, -3.957999e-02]],
+...
+ DESIRED: array([[[-1.576049e-01, -4.412185e-02, -2.355543e-02],
+        [-1.705890e-01,  1.314036e-02, -3.957999e-02]],
+...
+FAILED tests/trading_dsl_engine/cpp_stream/test_riskmodel_optimizer_inputs.py::test_risk_covariance_cpp_stream_matrix_path_handles_nans_and_changes - AttributeError: 'CppStreamRuntime' object has no attribute 'run_batch'
+2 failed, 3 passed in 13.07s

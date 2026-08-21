@@ -14,9 +14,7 @@ from trading_dsl_engine.cpp_stream.python.lowering import (
     double_bits,
 )
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.cpp_stream.python.outputs import OutputLayout
 from trading_dsl_engine.ir.ops import (
-    ColumnOp,
     EmitOp,
     EwmOp,
     FFillOp,
@@ -177,15 +175,6 @@ def _source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
-    if source.kind == "packed_output":
-        if source.value is None:
-            raise ValueError("packed output source is missing its offset")
-        return tmpl(
-            "stackdsl::PackedOutputSrc",
-            SignedValueArg(int(source.value)),
-            IntArg(source.width),
-            BoolArg(source.row_scalar),
-        )
     if source.kind == "input":
         index = int(source.value)
         if input_types is None:
@@ -343,14 +332,6 @@ def _tensor_source_type(
     n: int | CppType,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
-    if source.kind == "packed_output":
-        if source.value is None:
-            raise ValueError("packed tensor source is missing its offset")
-        return tmpl(
-            "stackdsl::PackedOutputTensorSource",
-            SignedValueArg(int(source.value)),
-            _tensor_shape(source.shape),
-        )
     if source.kind == "expression":
         op_name = getattr(source.op, "name", None)
         arity = getattr(source.op, "arity", None)
@@ -417,24 +398,23 @@ def _tensor_source_type(
 
 
 def _dest_type(stage: Stage) -> CppType:
-    slot = stage.out.slot
-    if slot is not None and slot < 0:
-        return tmpl("stackdsl::OutputSliceDst", IntArg(-int(slot) - 1))
-    if slot is None:
+    if stage.out.slot is None:
         return Name("stackdsl::OutputDst")
     if stage.out.tensor:
         return tmpl(
             "stackdsl::TensorSlotDst",
-            IntArg(slot),
+            IntArg(stage.out.slot),
             IntArg(stage.out.size),
         )
     if stage.out.matrix:
         return tmpl(
             "stackdsl::MatrixSlotDst",
-            IntArg(slot),
+            IntArg(stage.out.slot),
             IntArg(stage.out.width),
         )
-    return tmpl("stackdsl::SlotDst", IntArg(slot), _cpp_type(stage.dtype))
+    return tmpl(
+        "stackdsl::SlotDst", IntArg(stage.out.slot), _cpp_type(stage.dtype)
+    )
 
 
 _BINARY_POLICIES = {
@@ -525,134 +505,24 @@ def _ridge_projection_type(stage: Stage) -> CppType:
     component = stage.projection_component
     if stage.projection in {"coefficient", "standard_error", "tstat"}:
         assert component is not None
-        return tmpl(
-            {
-                "coefficient": "stackdsl::RidgeCoefficientProjection",
-                "standard_error": "stackdsl::RidgeStandardErrorProjection",
-                "tstat": "stackdsl::RidgeTStatProjection",
-            }[stage.projection],
-            IntArg(component),
-        )
-    return Name(
-        {
-            "beta": "stackdsl::RidgeBetaProjection",
-            "preds": "stackdsl::RidgePredsProjection",
-            "residuals": "stackdsl::RidgeResidualsProjection",
-            "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
-            "tstats": "stackdsl::RidgeTStatsProjection",
-            "sse": "stackdsl::RidgeSseProjection",
-            "sst": "stackdsl::RidgeSstProjection",
-            "r2": "stackdsl::RidgeR2Projection",
-            "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
-            "effective_df": "stackdsl::RidgeEffectiveDfProjection",
-            "effective_n": "stackdsl::RidgeEffectiveNProjection",
-        }[stage.projection]
-    )
-
-
-def _tensor_stage_type(
-    stage: Stage,
-    n: CppType,
-    execution: CppType,
-    *,
-    input_types: tuple[InputTypeSpec, ...] | None,
-) -> CppType | None:
-    if stage.kind not in {
-        "tensor_copy",
-        "tensor_unary",
-        "tensor_binary",
-        "tensor_ternary",
-        "tensor_cumsum",
-        "tensor_ffill",
-        "tensor_shift",
-        "tensor_ewm",
-        "tensor_column",
-    }:
-        return None
-
-    tensors = tuple(
-        _tensor_source_type(source, n=n, input_types=input_types)
-        for source in stage.inputs
-    )
-    out = _dest_type(stage)
-    shape = _tensor_shape(stage.out.shape)
-    if stage.kind == "tensor_copy":
-        return tmpl("stackdsl::TensorCopyNode", tensors[0], out, execution)
-    if stage.kind == "tensor_unary":
-        return tmpl(
-            "stackdsl::TensorUnaryNode",
-            tensors[0],
-            out,
-            shape,
-            _cpp_type(stage.dtype),
-            Name(_UNARY_POLICIES[stage.op_name or ""]),
-            execution,
-        )
-    if stage.kind == "tensor_binary":
-        return tmpl(
-            "stackdsl::TensorBinaryNode",
-            tensors[0],
-            tensors[1],
-            out,
-            shape,
-            _cpp_type(stage.dtype),
-            Name(_BINARY_POLICIES[stage.op_name or ""]),
-            execution,
-        )
-    if stage.kind == "tensor_ternary":
-        return tmpl(
-            "stackdsl::TensorTernaryNode",
-            tensors[0],
-            tensors[1],
-            tensors[2],
-            out,
-            shape,
-            _cpp_type(stage.dtype),
-            Name(_TERNARY_POLICIES[stage.op_name or ""]),
-            execution,
-        )
-    if stage.kind == "tensor_cumsum":
-        return tmpl("stackdsl::TensorCumsumNode", tensors[0], out, execution)
-    if stage.kind == "tensor_ffill":
-        assert isinstance(stage.op, FFillOp)
-        limit = -1 if stage.op.limit is None else stage.op.limit
-        return tmpl(
-            "stackdsl::TensorFFillNode",
-            tensors[0],
-            out,
-            SignedValueArg(limit),
-            execution,
-        )
-    if stage.kind == "tensor_shift":
-        assert isinstance(stage.op, ShiftOp)
-        return tmpl(
-            "stackdsl::TensorShiftNode",
-            tensors[0],
-            out,
-            IntArg(stage.op.lag),
-            IntArg(stage.op.max_lag),
-            execution,
-        )
-    if stage.kind == "tensor_ewm":
-        assert isinstance(stage.op, EwmOp)
-        return tmpl(
-            "stackdsl::TensorEwmNode",
-            tensors[0],
-            out,
-            UInt64Arg(double_bits(stage.op.span)),
-            IntArg(stage.op.min_periods),
-            BoolArg(stage.op.ignore_na),
-            BoolArg(stage.op.adjust),
-            execution,
-        )
-    assert stage.kind == "tensor_column" and isinstance(stage.op, ColumnOp)
-    return tmpl(
-        "stackdsl::TensorColumnNode",
-        tensors[0],
-        out,
-        IntArg(stage.op.index),
-        execution,
-    )
+        return tmpl({
+            "coefficient": "stackdsl::RidgeCoefficientProjection",
+            "standard_error": "stackdsl::RidgeStandardErrorProjection",
+            "tstat": "stackdsl::RidgeTStatProjection",
+        }[stage.projection], IntArg(component))
+    return Name({
+        "beta": "stackdsl::RidgeBetaProjection",
+        "preds": "stackdsl::RidgePredsProjection",
+        "residuals": "stackdsl::RidgeResidualsProjection",
+        "standard_errors": "stackdsl::RidgeStandardErrorsProjection",
+        "tstats": "stackdsl::RidgeTStatsProjection",
+        "sse": "stackdsl::RidgeSseProjection",
+        "sst": "stackdsl::RidgeSstProjection",
+        "r2": "stackdsl::RidgeR2Projection",
+        "residual_variance": "stackdsl::RidgeResidualVarianceProjection",
+        "effective_df": "stackdsl::RidgeEffectiveDfProjection",
+        "effective_n": "stackdsl::RidgeEffectiveNProjection",
+    }[stage.projection])
 
 
 def _stage_type(
@@ -662,32 +532,8 @@ def _stage_type(
     *,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType:
-    tensor = _tensor_stage_type(
-        stage, n, execution, input_types=input_types
-    )
-    if tensor is not None:
-        return tensor
-
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
-    if stage.kind == "copy_bundle":
-        assert len(stage.members) > 1
-        bindings = tuple(
-            tmpl(
-                "stackdsl::OutputProjectionBinding",
-                _source_type(
-                    member.inputs[0], n=n, input_types=input_types
-                ),
-                _dest_type(member),
-            )
-            for member in stage.members
-        )
-        return tmpl(
-            "stackdsl::OutputProjectionBundleNode",
-            stage_n,
-            execution,
-            *bindings,
-        )
     if stage.kind == "reduce":
         assert isinstance(stage.op, ReductionOp)
         tensor_source = _tensor_source_type(
@@ -890,7 +736,7 @@ def _stage_type(
         component_slots = {
             int(member.out.slot): index
             for index, member in enumerate(stage.members)
-            if member.out.slot is not None and member.out.slot >= 0
+            if member.out.slot is not None
         }
         bindings = tuple(
             tmpl(
@@ -1038,17 +884,15 @@ def _stage_type(
         return tmpl("stackdsl::XsPctRankNode", stage_n, inputs[0], out, execution)
     if stage.kind == "xs_aggregate":
         assert isinstance(stage.op, XsAggregateOp)
-        policy = Name(
-            {
-                "count": "stackdsl::XsCountProjection",
-                "sum": "stackdsl::XsSumProjection",
-                "mean": "stackdsl::XsMeanProjection",
-                "std": "stackdsl::XsStdProjection",
-                "min": "stackdsl::XsMinProjection",
-                "max": "stackdsl::XsMaxProjection",
-                "quantile": "stackdsl::XsQuantileProjection",
-            }[stage.op.kind]
-        )
+        policy = Name({
+            "count": "stackdsl::XsCountProjection",
+            "sum": "stackdsl::XsSumProjection",
+            "mean": "stackdsl::XsMeanProjection",
+            "std": "stackdsl::XsStdProjection",
+            "min": "stackdsl::XsMinProjection",
+            "max": "stackdsl::XsMaxProjection",
+            "quantile": "stackdsl::XsQuantileProjection",
+        }[stage.op.kind])
         return tmpl(
             "stackdsl::XsAggregateNode",
             stage_n,
@@ -1101,13 +945,11 @@ def _stage_type(
     if stage.kind == "rolling":
         assert isinstance(stage.op, RollingOp)
         if stage.op.kind in {"sum", "mean", "std"}:
-            projection = Name(
-                {
-                    "sum": "stackdsl::RollingSumProjection",
-                    "mean": "stackdsl::RollingMeanProjection",
-                    "std": "stackdsl::RollingStdProjection",
-                }[stage.op.kind]
-            )
+            projection = Name({
+                "sum": "stackdsl::RollingSumProjection",
+                "mean": "stackdsl::RollingMeanProjection",
+                "std": "stackdsl::RollingStdProjection",
+            }[stage.op.kind])
             return tmpl(
                 "stackdsl::RollingMomentsNode",
                 stage_n,
@@ -1299,7 +1141,6 @@ class InnerView:
     scratch_slots: int
     matrix_scratch_slots: int
     matrix_scratch_width: int
-    matrix_scratch_layout: str
     stages: tuple[StageView, ...]
 
 
@@ -1308,33 +1149,6 @@ class InputView:
     index: int
     cpp_type: str
     row_width: int
-
-
-def _matrix_scratch_sizes(plan: Plan) -> tuple[int, ...]:
-    """Return exact element counts for every live matrix/tensor scratch slot."""
-
-    sizes = [0] * int(plan.matrix_scratch_slots)
-    for stage in plan.stages:
-        for candidate in (stage, *stage.members, *stage.epilogues):
-            slot = candidate.out.slot
-            if (
-                slot is None
-                or slot < 0
-                or not (candidate.out.matrix or candidate.out.tensor)
-            ):
-                continue
-            sizes[int(slot)] = max(sizes[int(slot)], int(candidate.out.size))
-    missing = [index for index, size in enumerate(sizes) if size <= 0]
-    if missing:
-        raise ValueError(f"matrix scratch slot(s) have no exact extent: {missing}")
-    return tuple(sizes)
-
-
-def _scratch_layout_type(plan: Plan) -> str:
-    return tmpl(
-        "stackdsl::ScratchLayout",
-        *(IntArg(size) for size in _matrix_scratch_sizes(plan)),
-    ).render()
 
 
 def _inner_view(name: str, group: GroupStage) -> InnerView:
@@ -1361,7 +1175,6 @@ def _inner_view(name: str, group: GroupStage) -> InnerView:
         group.inner.scratch_slots,
         group.inner.matrix_scratch_slots,
         group.inner.matrix_scratch_width,
-        _scratch_layout_type(group.inner),
         tuple(stages),
     )
 
@@ -1439,10 +1252,7 @@ def render_translation_unit(
     n_instruments: int,
     prefetch_rows: int,
     input_types: tuple[InputTypeSpec, ...] | None = None,
-    output_layout: OutputLayout,
 ) -> GeneratedSource:
-    """Render one runner with exact public-output and scratch geometry."""
-
     if input_types is None:
         input_types = tuple(
             InputTypeSpec("float64", n_instruments)
@@ -1491,7 +1301,7 @@ def render_translation_unit(
                     finalizer=stage.kind in {
                         "reduce", "reduction_bundle", "emit_last"
                     }
-                    and output_layout.final_width > 0,
+                    and plan.output_mode == "final",
                 )
             )
     if plan.input_count == 0:
@@ -1504,9 +1314,8 @@ def render_translation_unit(
             scratch_slots=plan.scratch_slots,
             matrix_scratch_slots=plan.matrix_scratch_slots,
             matrix_scratch_width=plan.matrix_scratch_width,
-            matrix_scratch_layout=_scratch_layout_type(plan),
-            outputs=output_layout.outputs,
-            has_final_output=output_layout.final_width > 0,
+            output_row_width=plan.output_row_width,
+            output_mode=plan.output_mode,
             prefetch_rows=prefetch_rows,
             inputs=tuple(
                 InputView(index, spec.cpp_type, spec.row_width)

@@ -11,9 +11,11 @@ import numpy as np
 
 from trading_dsl_engine.cpp_stream.python.lowering import Plan
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.cpp_stream.python.outputs import FormulaOutput, OutputLayout
 from trading_dsl_engine.cpp_stream.python.parallel import ParallelPlan
-from trading_dsl_engine.cpp_stream.python.sources import SourceValue, open_source_mapping
+from trading_dsl_engine.cpp_stream.python.sources import (
+    SourceValue,
+    open_source_mapping,
+)
 from trading_dsl_engine.ir.program import Program
 
 
@@ -38,10 +40,6 @@ class RunResult:
     threads: int
     available_cpus: int
     parallel_mode: str
-    formula_outputs: tuple[FormulaOutput, ...]
-    row_output_width: int
-    final_output_width: int
-    return_multiple: bool
     output_dtype: str = "float64"
     data_offset: int = 0
 
@@ -53,11 +51,13 @@ class RunResult:
     def average_busy_cores(self) -> float:
         return 0.0 if self.seconds == 0.0 else self.cpu_seconds / self.seconds
 
-    @property
-    def logical_output_shapes(self) -> tuple[tuple[int, ...], ...]:
-        return tuple(output.shape for output in self.formula_outputs)
+    def load(self, *, mmap_mode: str | None = "r") -> np.ndarray:
+        """Open the result with its inferred dtype and complete logical shape.
 
-    def _load_storage(self, mmap_mode: str | None) -> np.ndarray:
+        ``.npy`` outputs use NumPy's public loader and therefore need no manually
+        supplied shape. Raw outputs remain available for compatibility and are
+        mapped using the shape recorded in this result.
+        """
         if self.output_path.suffix.lower() == ".npy":
             return np.load(
                 self.output_path,
@@ -76,40 +76,8 @@ class RunResult:
             order="C",
         )
 
-    def load(
-        self, *, mmap_mode: str | None = "r"
-    ) -> np.ndarray | tuple[np.ndarray, ...]:
-        """Return one ndarray or ordered zero-copy views for a formula list."""
-
-        storage = self._load_storage(mmap_mode)
-        if not self.return_multiple:
-            return storage
-
-        flat = storage.reshape(-1)
-        row_values = self.rows * self.row_output_width
-        row_region = (
-            flat[:row_values].reshape(self.rows, self.row_output_width)
-            if self.row_output_width
-            else None
-        )
-        final_region = flat[row_values:]
-        values: list[np.ndarray] = []
-        for output in self.formula_outputs:
-            if output.mode == "rows":
-                assert row_region is not None
-                value = row_region[:, output.offset : output.offset + output.size]
-                value = value.reshape((self.rows,) + output.shape)
-            else:
-                value = final_region[
-                    output.offset : output.offset + output.size
-                ].reshape(output.shape or ())
-            values.append(value)
-        return tuple(values)
-
 
 class CppStreamRuntime:
-    """One runtime for one or many public roots backed by one native runner."""
-
     def __init__(
         self,
         *,
@@ -120,8 +88,6 @@ class CppStreamRuntime:
         n_instruments: int,
         input_types: tuple[InputTypeSpec, ...],
         parallel_plan: ParallelPlan,
-        output_layout: OutputLayout,
-        return_multiple: bool,
         bound_sources: Mapping[str, SourceValue] | None = None,
     ) -> None:
         self.program = program
@@ -131,8 +97,6 @@ class CppStreamRuntime:
         self.n_instruments = int(n_instruments)
         self.input_types = tuple(input_types)
         self.parallel_plan = parallel_plan
-        self.output_layout = output_layout
-        self.return_multiple = bool(return_multiple)
         self.bound_sources = (
             None if bound_sources is None else dict(bound_sources)
         )
@@ -150,6 +114,7 @@ class CppStreamRuntime:
         rankdir: str = "LR",
         figsize: tuple[float, float] | None = None,
     ):
+        """Plot the compiled neutral IR retained by this runtime."""
         return self.program.plot(
             backend=backend,
             show=show,
@@ -219,7 +184,7 @@ class CppStreamRuntime:
             2: "input row width validation failed",
             3: "input sources have different row counts",
             4: "group capacity exceeded or dense key fell outside its declared domain",
-            5: "lane-parallel public outputs are not partitionable by instrument",
+            5: "lane-parallel output shape is not partitionable by instrument",
             6: "output payload offset is not aligned for float64",
         }
         base = meanings.get(code, f"native runtime returned error code {code}")
@@ -236,9 +201,14 @@ class CppStreamRuntime:
         return path
 
     @staticmethod
-    def _prepare_output(output: Path, logical_shape: tuple[int, ...]) -> int:
+    def _prepare_output(
+        output: Path,
+        logical_shape: tuple[int, ...],
+    ) -> int:
+        """Prepare a reusable output and return its native payload offset."""
         if output.suffix.lower() != ".npy":
             return 0
+
         if output.exists():
             try:
                 existing = np.lib.format.open_memmap(output, mode="r+")
@@ -253,6 +223,7 @@ class CppStreamRuntime:
                     _close_memmap(existing)
             except (OSError, ValueError, TypeError):
                 pass
+
         created = np.lib.format.open_memmap(
             output,
             mode="w+",
@@ -274,6 +245,18 @@ class CppStreamRuntime:
         threads: int = 1,
         pin_threads: bool = False,
     ) -> RunResult:
+        """Execute compatible heterogeneous sources through one native call.
+
+        When ``out_path`` is omitted, a valid temporary ``.npy`` file is created.
+        A supplied ``.npy`` path is also written directly: the native mmap points
+        at the array payload after NumPy's header, so no post-run conversion or
+        full-output copy occurs. Supplying another extension retains raw output.
+
+        Execution is serial by default. Positive ``threads`` requests the compiler-
+        proven row or lane strategy. ``threads=0`` opts into the profitability
+        heuristic. Terminal reductions and ``emit('last')`` are always single-owner
+        final-output plans, irrespective of the requested thread count.
+        """
         selected = self.bound_sources if data is None else data
         if selected is None:
             raise ValueError(
@@ -299,28 +282,18 @@ class CppStreamRuntime:
                     f"cpp_stream sources have different row counts: {details}"
                 )
             processed_input_rows = next(iter(row_counts))
-
-            # Preserve the traditional logical .npy shape for a single public root.
-            # Multi-root storage is one flat packed payload surfaced as shaped views.
-            if len(self.output_layout.outputs) == 1:
-                public = self.output_layout.outputs[0]
-                logical_shape = (
-                    public.shape
-                    if public.mode == "final"
-                    else (processed_input_rows,) + public.shape
-                )
-            else:
-                logical_shape = (
-                    self.output_layout.storage_size(processed_input_rows),
-                )
-
-            output_path = (
+            logical_shape = (
+                self.plan.output_shape
+                if self.plan.output_mode == "final"
+                else (processed_input_rows,) + self.plan.output_shape
+            )
+            output = (
                 self._default_output_path()
                 if out_path is None
                 else Path(out_path)
             )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_offset = self._prepare_output(output_path, logical_shape)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output_offset = self._prepare_output(output, logical_shape)
 
             pointers = (ctypes.c_void_p * len(prepared))(
                 *(ctypes.c_void_p(item.data_pointer) for item in prepared)
@@ -342,7 +315,7 @@ class CppStreamRuntime:
                 input_rows,
                 input_widths,
                 len(prepared),
-                str(output_path).encode(),
+                str(output).encode(),
                 output_offset,
                 writeback,
                 requested_threads,
@@ -357,22 +330,18 @@ class CppStreamRuntime:
             self._raise_native(code, lib)
             processed_rows = int(rows.value)
             return RunResult(
-                output_path=output_path,
+                output_path=output,
                 rows=processed_rows,
                 seconds=float(seconds.value),
                 output_rows=(
-                    1 if self.output_layout.mode == "final" else processed_rows
+                    1 if self.plan.output_mode == "final" else processed_rows
                 ),
                 output_shape=logical_shape,
-                output_mode=self.output_layout.mode,
+                output_mode=self.plan.output_mode,
                 cpu_seconds=float(cpu_seconds.value),
                 threads=int(actual_threads.value),
                 available_cpus=int(available_cpus.value),
                 parallel_mode=self.parallel_plan.mode,
-                formula_outputs=self.output_layout.outputs,
-                row_output_width=self.output_layout.row_width,
-                final_output_width=self.output_layout.final_width,
-                return_multiple=self.return_multiple,
                 output_dtype="float64",
                 data_offset=output_offset,
             )
@@ -381,10 +350,6 @@ class CppStreamRuntime:
                 item.close()
 
     def explain(self) -> str:
-        outputs = ", ".join(
-            f"{index}:{output.mode}{output.shape}@{output.offset}+{output.size}"
-            for index, output in enumerate(self.output_layout.outputs)
-        )
         lines = [
             f"cpp_stream N={self.n_instruments}",
             f"inputs={self.input_names}",
@@ -395,22 +360,15 @@ class CppStreamRuntime:
             f"parallel_auto_multicore={self.parallel_plan.auto_multicore}",
             f"parallel_work_score={self.parallel_plan.work_score}",
             f"scratch_slots={self.plan.scratch_slots}",
-            f"matrix_scratch_slots={self.plan.matrix_scratch_slots}",
-            f"public_outputs=({outputs})",
-            f"packed_row_width={self.output_layout.row_width}",
-            f"packed_final_width={self.output_layout.final_width}",
+            f"output_mode={self.plan.output_mode}",
+            f"output_shape={self.plan.output_shape}",
             "default_output=.npy (direct payload mmap; no conversion copy)",
         ]
-        for index, stage in enumerate(self.plan.stages):
-            slot = stage.out.slot
-            destination = (
-                f"output[{(-slot - 1)}:]"
-                if slot is not None and slot < 0
-                else "output"
-                if slot is None
-                else f"slot {slot}"
+        for i, stage in enumerate(self.plan.stages):
+            lines.append(
+                f"{i}: {stage.kind} -> "
+                f"{'output' if stage.out.slot is None else f'slot {stage.out.slot}'}"
             )
-            lines.append(f"{index}: {stage.kind} -> {destination}")
         return "\n".join(lines)
 
 

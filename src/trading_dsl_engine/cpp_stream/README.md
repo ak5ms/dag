@@ -32,62 +32,6 @@ runtime = compile_formula(
 runtime.run(out_path="/data/alpha.bin")
 ```
 
-`compile_formula` also accepts a list or tuple of formulas. All roots are built into
-one neutral IR DAG, so CSE and physical fusion are shared across formulas and the
-backend still emits one C++ translation unit and invokes one native runner. The
-formulas do not need compatible output shapes:
-
-```python
-runtime = compile_formula(
-    [
-        ewm(close, 21),
-        cat(ewm(close, 21), ewm(close, 63)),
-    ],
-    {"close": close},
-    n_instruments=9,
-)
-result = runtime.run(out_path="/data/alphas.npy")
-fast, features = result.load()
-
-assert fast.shape == (rows, 9)
-assert features.shape == (rows, 9, 2)
-```
-
-For a formula list, `RunResult.load()` returns an ordered tuple of shaped views in
-the same order as the input formulas. The native writer packs those logical outputs
-into one backing mmap; callers should use `load()` rather than manually interpreting
-the packed file. Row-emitting and final-only formulas may coexist in the same list;
-a plan containing any final-only root stays single-owner during finalization. Passing
-a single formula retains the existing ndarray result behavior, while a one-element
-list returns a one-element tuple.
-
-Public-output storage is chosen without changing the hot compute path. A leaf
-materialized public root may write directly to its packed output slice. When that
-same value is still consumed by another public root, it remains in the same
-scratch-local producer/consumer path as the corresponding top-only formula, and an
-ordinary `CopyNode` or `CatNode` persists the requested extra result. The subgraph is
-never recomputed. Public projections also re-enter normal physical fusion: for
-example, compatible EWM outputs are folded into `EwmBundleNode` epilogues instead of
-forcing a second row traversal or dead scratch writes.
-
-The packed output descriptor retains each formula's exact logical size, offset,
-row/final mode, and lane-partitionability as compile-time C++ metadata. Scratch is
-also exact: matrix/tensor slots use their individual extents rather than a global
-maximum width, and scalar slots are compacted independently by native dtype.
-
-A representative GitHub-hosted single-thread run for 5M x 9 with
-`subgraph = ewm(x + 1, span=32)` and `top = xs_rank(subgraph)` measured about
-0.4060 s median for `top`, 0.4971 s for `[subgraph, top]`, and 0.5419 s for
-`cat(subgraph, top)`. The list form therefore returned the same 720 MB of values as
-the Cat baseline about 8.3% faster while preserving the top-only `ewm -> xs_rank`
-locality; its roughly 22% delta versus top-only is the cost of persisting the extra
-360 MB result. A heterogeneous `(N,) + (N,8)` case with equal total output bytes was
-within about 1% of the equivalent Cat baseline on the same class of hosted runner.
-A same-span EWM-bundle case compiled both the Cat and formula-list forms to one
-`ewm_bundle` stage and measured within about 0.2%, showing that public-output
-projection does not block the existing EWM epilogue fusion. Full reproducible runs
-live in `scripts/benchmark_cpp_stream_multi_output_subgraph.py`.
-
 There is no `.npy`-specific compiler or runner. Every input independently selects a
 source adapter from its object type, URI scheme, file extension, or explicit adapter
 name. A single formula may therefore mix formats:

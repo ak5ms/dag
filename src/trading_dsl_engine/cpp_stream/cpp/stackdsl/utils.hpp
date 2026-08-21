@@ -200,9 +200,9 @@ struct type_list_merge<Accumulator, Head, Tail...> {
     >::type;
 };
 
-// Stateless source headers specialize this trait. Keeping the default here lets
-// every physical operator ask for a recursively unique expression list without
-// knowing which scalar operators are present.
+// Stateless source headers specialize this trait.  Keeping the default here
+// lets every physical operator ask for a recursively unique expression list
+// without knowing which scalar operators are present.
 template <class Source>
 struct expression_source_traits {
     using type = TypeList<>;
@@ -262,152 +262,19 @@ private:
     const Context& context_;
 };
 
-// Scalar slots are compacted independently per native dtype. Keeping the six
-// counts in the generated type removes unused parallel arrays while leaving slot
-// selection a compile-time operation.
-template <
-    std::size_t F64,
-    std::size_t F32,
-    std::size_t I64,
-    std::size_t U64,
-    std::size_t I32,
-    std::size_t U32
->
-struct ScalarScratchLayout {
-    static constexpr std::size_t total_slots = F64 + F32 + I64 + U64 + I32 + U32;
-
-    template <class T>
-    static consteval std::size_t count() {
-        if constexpr (std::is_same_v<T, double>) return F64;
-        else if constexpr (std::is_same_v<T, float>) return F32;
-        else if constexpr (std::is_same_v<T, std::int64_t>) return I64;
-        else if constexpr (std::is_same_v<T, std::uint64_t>) return U64;
-        else if constexpr (std::is_same_v<T, std::int32_t>) return I32;
-        else if constexpr (std::is_same_v<T, std::uint32_t>) return U32;
-        else static_assert(
-            always_false_v<T>,
-            "unsupported cpp_stream scalar scratch type"
-        );
-    }
-};
-
-template <std::size_t Slots>
-using UniformScalarScratchLayout = ScalarScratchLayout<
-    Slots, Slots, Slots, Slots, Slots, Slots
->;
-
-// Matrix/tensor slots have heterogeneous compile-time extents. Store them in one
-// flat array using prefix offsets instead of reserving every slot at max width.
-template <std::size_t... Sizes>
-struct ScratchLayout {
-    static constexpr std::size_t count = sizeof...(Sizes);
-    static constexpr std::array<std::size_t, count> sizes{Sizes...};
-    static constexpr std::size_t total_size = (Sizes + ... + std::size_t{0});
-    static constexpr std::array<std::size_t, count> offsets = []() consteval {
-        std::array<std::size_t, count> result{};
-        std::size_t running = 0;
-        for (std::size_t index = 0; index < count; ++index) {
-            result[index] = running;
-            running += sizes[index];
-        }
-        return result;
-    }();
-
-    static constexpr std::size_t offset(std::size_t index) noexcept {
-        return offsets[index];
-    }
-};
-
-template <std::size_t Slots, std::size_t SlotSize>
-struct UniformScratchLayout {
-    static constexpr std::size_t count = Slots;
-    static constexpr std::size_t total_size = Slots * SlotSize;
-
-    static constexpr std::size_t offset(std::size_t index) noexcept {
-        return index * SlotSize;
-    }
-};
-
-template <class Layout>
-struct PackedScratchStorage {
-    struct SlotView {
-        double* data;
-
-        STACKDSL_HOT double& operator[](std::size_t index) noexcept {
-            return data[index];
-        }
-    };
-
-    struct ConstSlotView {
-        const double* data;
-
-        STACKDSL_HOT const double& operator[](std::size_t index) const noexcept {
-            return data[index];
-        }
-    };
-
-    std::array<double, Layout::total_size> values{};
-
-    STACKDSL_HOT SlotView operator[](std::size_t slot) noexcept {
-        return {values.data() + Layout::offset(slot)};
-    }
-
-    STACKDSL_HOT ConstSlotView operator[](std::size_t slot) const noexcept {
-        return {values.data() + Layout::offset(slot)};
-    }
-
-    STACKDSL_HOT double* data() noexcept { return values.data(); }
-    STACKDSL_HOT const double* data() const noexcept { return values.data(); }
-};
-
-template <
-    std::size_t N,
-    std::size_t Inputs,
-    std::size_t ScratchSlots,
-    std::size_t MatrixScratchSlots = 0,
-    std::size_t MatrixScratchWidth = 1,
-    class MatrixLayout = UniformScratchLayout<
-        MatrixScratchSlots,
-        N * MatrixScratchWidth
-    >,
-    class ScalarLayout = UniformScalarScratchLayout<ScratchSlots>
->
+template <std::size_t N, std::size_t Inputs, std::size_t ScratchSlots, std::size_t MatrixScratchSlots = 0, std::size_t MatrixScratchWidth = 1>
 struct alignas(64) RowContext {
-    static_assert(MatrixLayout::count == MatrixScratchSlots);
-
     std::array<const void*, Inputs> inputs{};
-    alignas(64) std::array<
-        std::array<double, N>,
-        ScalarLayout::template count<double>()
-    > scratch_f64{};
-    alignas(64) std::array<
-        std::array<float, N>,
-        ScalarLayout::template count<float>()
-    > scratch_f32{};
-    alignas(64) std::array<
-        std::array<std::int64_t, N>,
-        ScalarLayout::template count<std::int64_t>()
-    > scratch_i64{};
-    alignas(64) std::array<
-        std::array<std::uint64_t, N>,
-        ScalarLayout::template count<std::uint64_t>()
-    > scratch_u64{};
-    alignas(64) std::array<
-        std::array<std::int32_t, N>,
-        ScalarLayout::template count<std::int32_t>()
-    > scratch_i32{};
-    alignas(64) std::array<
-        std::array<std::uint32_t, N>,
-        ScalarLayout::template count<std::uint32_t>()
-    > scratch_u32{};
-    alignas(64) PackedScratchStorage<MatrixLayout> scratch_matrix_f64{};
-
-    // output is the destination for the currently scheduled phase. row_output
-    // remains on the current/last row while finalization points output elsewhere.
-    double* output = nullptr;
-    double* row_output = nullptr;
-    std::size_t lane_begin = 0;
-    std::size_t lane_end = N;
+    alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch_f64{};
+    alignas(64) std::array<std::array<float, N>, ScratchSlots> scratch_f32{};
+    alignas(64) std::array<std::array<std::int64_t, N>, ScratchSlots> scratch_i64{};
+    alignas(64) std::array<std::array<std::uint64_t, N>, ScratchSlots> scratch_u64{};
+    alignas(64) std::array<std::array<std::int32_t, N>, ScratchSlots> scratch_i32{};
+    alignas(64) std::array<std::array<std::uint32_t, N>, ScratchSlots> scratch_u32{};
+    alignas(64) std::array<std::array<double, N * MatrixScratchWidth>, MatrixScratchSlots> scratch_matrix_f64{};
+    double* output=nullptr;
+    std::size_t lane_begin=0;
+    std::size_t lane_end=N;
 
     template <class T>
     STACKDSL_HOT auto& scratch_storage() noexcept {
@@ -435,14 +302,10 @@ struct alignas(64) RowContext {
     STACKDSL_HOT source_value_t<Src> read_native(std::size_t lane) const noexcept {
         static_assert(source_width_v<Src> == 1, "scalar read of matrix/tensor source");
         if constexpr (requires { Src::input_index; }) {
-            const auto* values = static_cast<const source_value_t<Src>*>(
-                inputs[Src::input_index]
-            );
+            const auto* values = static_cast<const source_value_t<Src>*>(inputs[Src::input_index]);
             return values[Src::row_width == 1 ? 0 : lane];
         } else if constexpr (requires { Src::slot_index; }) {
-            return scratch_storage<source_value_t<Src>>()[Src::slot_index][
-                Src::row_scalar ? 0 : lane
-            ];
+            return scratch_storage<source_value_t<Src>>()[Src::slot_index][Src::row_scalar ? 0 : lane];
         } else if constexpr (requires { Src::read(*this, lane); }) {
             return Src::read(*this, lane);
         } else {
@@ -451,23 +314,12 @@ struct alignas(64) RowContext {
     }
 
     template <class Src>
-    STACKDSL_HOT double read(std::size_t lane) const noexcept {
-        return static_cast<double>(read_native<Src>(lane));
-    }
+    STACKDSL_HOT double read(std::size_t lane) const noexcept { return static_cast<double>(read_native<Src>(lane)); }
 
     template <class Src>
-    STACKDSL_HOT double read_feature(
-        std::size_t lane,
-        std::size_t feature
-    ) const noexcept {
-        if constexpr (requires { Src::matrix_slot_index; }) {
-            return scratch_matrix_f64[Src::matrix_slot_index][
-                lane * Src::feature_width + feature
-            ];
-        } else {
-            (void)feature;
-            return read<Src>(lane);
-        }
+    STACKDSL_HOT double read_feature(std::size_t lane, std::size_t feature) const noexcept {
+        if constexpr (requires { Src::matrix_slot_index; }) return scratch_matrix_f64[Src::matrix_slot_index][lane * Src::feature_width + feature];
+        else { (void)feature; return read<Src>(lane); }
     }
 
     template <class Src>
@@ -478,8 +330,6 @@ struct alignas(64) RowContext {
         if constexpr (requires { Src::input_index; }) {
             static_assert(Src::row_width == 0 || Src::row_width == N);
             return static_cast<const double*>(inputs[Src::input_index]);
-        } else if constexpr (requires { Src::read_ptr(*this); }) {
-            return Src::read_ptr(*this);
         } else {
             static_assert(!Src::row_scalar);
             return scratch_f64[Src::slot_index].data();
@@ -488,17 +338,9 @@ struct alignas(64) RowContext {
 
     template <class Dst>
     STACKDSL_HOT auto* write_ptr() noexcept {
-        if constexpr (requires { Dst::output_offset; }) {
-            return output + Dst::output_offset;
-        } else if constexpr (std::is_same_v<Dst, OutputDst>) {
-            return output;
-        } else if constexpr (requires { Dst::matrix_slot_index; }) {
-            return scratch_matrix_f64.data()
-                + MatrixLayout::offset(Dst::matrix_slot_index);
-        } else {
-            return scratch_storage<destination_value_t<Dst>>()
-                [Dst::slot_index].data();
-        }
+        if constexpr (std::is_same_v<Dst, OutputDst>) return output;
+        else if constexpr (requires { Dst::matrix_slot_index; }) return scratch_matrix_f64[Dst::matrix_slot_index].data();
+        else return scratch_storage<destination_value_t<Dst>>()[Dst::slot_index].data();
     }
 };
 
