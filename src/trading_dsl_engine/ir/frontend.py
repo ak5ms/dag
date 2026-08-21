@@ -139,15 +139,14 @@ _DERIVED_TERMINALS: dict[str, Expr] = {
 }
 
 
-def _number_key(value: int | float) -> tuple:
-    """Return a stable, type-preserving key for a numeric literal.
+def _number_key(value: float) -> tuple:
+    """Return a stable semantic key for a parsed numeric literal.
 
-    Integer and floating literals are semantically distinct. Float values retain
-    their IEEE encoding so NaNs share one key while signed zero remains distinct.
+    All NaNs are equivalent in the DSL.  Other values use their IEEE encoding so
+    signed zero remains distinct for order-sensitive operations such as minimum
+    and maximum.
     """
 
-    if isinstance(value, int) and not isinstance(value, bool):
-        return ("int", value)
     numeric = float(value)
     if math.isnan(numeric):
         return ("nan",)
@@ -705,13 +704,7 @@ class _BaseBuilder:
         if isinstance(node, Key):
             return self.build(node.expr)
         if isinstance(node, Number):
-            value_type = (
-                tensor((), dtype="int64")
-                if isinstance(node.value, int)
-                and not isinstance(node.value, bool)
-                else SCALAR
-            )
-            return self._append(LiteralOp(node.value), (), value_type)
+            return self._append(LiteralOp(node.value), (), SCALAR)
         if isinstance(node, StatelessCall):
             children = tuple(self.build(arg) for arg in node.args)
             name = node.cpp_name or node.name

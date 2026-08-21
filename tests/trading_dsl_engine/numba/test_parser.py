@@ -1,12 +1,6 @@
 import pytest
 
-from trading_dsl_engine.base.parser import (
-    Call,
-    FormulaParseError,
-    Identifier,
-    Number,
-    parse_formula,
-)
+from trading_dsl_engine.base.parser import parse_formula, Call, Identifier, Number, FormulaParseError
 
 
 def test_parse_nested_call():
@@ -25,32 +19,11 @@ def test_parse_number_and_identifier():
     assert isinstance(expr.args[1], Number)
 
 
-def test_parse_preserves_integer_and_float_literal_types():
-    integer = parse_formula("7")
-    floating = parse_formula("7.0")
-    negative_integer = parse_formula("-7")
-    negative_floating = parse_formula("-7.0")
-
-    assert isinstance(integer, Number)
-    assert isinstance(floating, Number)
-    assert isinstance(negative_integer, Number)
-    assert isinstance(negative_floating, Number)
-    assert type(integer.value) is int
-    assert type(floating.value) is float
-    assert type(negative_integer.value) is int
-    assert type(negative_floating.value) is float
-
-
 def test_parse_keyword_args():
     expr = parse_formula("groupby((key,), x, cumsum(self_), capacity=21)")
     assert isinstance(expr, Call)
     assert expr.fn == "groupby"
-    assert len(expr.kwargs) == 1
-    name, value = expr.kwargs[0]
-    assert name == "capacity"
-    assert isinstance(value, Number)
-    assert type(value.value) is int
-    assert value.value == 21
+    assert expr.kwargs == (("capacity", Number(21.0)),)
 
 
 def test_parse_multiline_formula():

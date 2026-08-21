@@ -95,12 +95,8 @@ def ensure_expr(value) -> Expr:
         if len(value) == 0:
             raise TypeError("Key tuples cannot be empty")
         return KeyTuple(tuple(ensure_expr(item) for item in value))
-    if isinstance(value, bool):
+    if isinstance(value, (int, float)):
         return Number(float(value))
-    if isinstance(value, int):
-        return Number(value)
-    if isinstance(value, float):
-        return Number(value)
     if isinstance(value, str):
         return String(value)
     raise TypeError(f"Expected Expr|int|float, got {type(value).__name__}")
@@ -139,12 +135,8 @@ def call(name: str, *args, **kwargs) -> Expr:
 def _axis_expr(axis) -> Expr:
     if isinstance(axis, Expr):
         return axis
-    if isinstance(axis, bool):
+    if isinstance(axis, (int, float)):
         return Number(float(axis))
-    if isinstance(axis, int):
-        return Number(axis)
-    if isinstance(axis, float):
-        return Number(axis)
     if isinstance(axis, (tuple, list)):
         if not axis:
             raise ValueError("axis cannot be empty")

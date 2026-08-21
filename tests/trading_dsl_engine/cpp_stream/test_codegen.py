@@ -3,17 +3,10 @@ import re
 
 from trading_dsl_engine.base.dsl import cumsum, ewm, groupby, self_, univ, var
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.cpp_stream.python.codegen import (
-    _matrix_scratch_sizes,
-    _scratch_layout_type,
-    render_translation_unit,
-)
 from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
-from trading_dsl_engine.cpp_stream.python.lowering import Dest, Plan, Stage
-from trading_dsl_engine.cpp_stream.python.lowering_multi import lower_program
+from trading_dsl_engine.cpp_stream.python.codegen import render_translation_unit
+from trading_dsl_engine.cpp_stream.python.lowering import lower_program
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
-from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
-from trading_dsl_engine.ir.types import fixed
 
 
 _ROW_LOOP_HEADERS = (
@@ -22,33 +15,10 @@ _ROW_LOOP_HEADERS = (
 )
 
 
-def _lower(program, *, n: int, input_types=None, **kwargs):
-    return lower_program(
-        program,
-        n_instruments=n,
-        input_dtypes=(
-            None
-            if input_types is None
-            else tuple(spec.dtype for spec in input_types)
-        ),
-        **kwargs,
-    )
-
-
-def _render_plan(program, plan, *, n: int, input_types=None) -> str:
-    return render_translation_unit(
-        plan,
-        n_instruments=n,
-        prefetch_rows=16,
-        input_types=input_types,
-        output_layout=build_output_layout(program, n),
-    ).text
-
-
 def _render(formula, *, n: int = 5) -> str:
     program = compile_ir(formula)
-    plan = _lower(program, n=n)
-    return _render_plan(program, plan, n=n)
+    plan = lower_program(program, n_instruments=n)
+    return render_translation_unit(plan, n_instruments=n, prefetch_rows=16).text
 
 
 def _generated_row_loop_header(source: str) -> str:
@@ -65,70 +35,8 @@ def test_cpp_stream_codegen_uses_packaged_jinja_template():
     assert "stackdsl::EwmNode<" in source
     assert "stackdsl::XsRankNode<" in source
     assert "stackdsl::DirectExecution<5>" in source
-    assert "stackdsl::OutputLayout<" in source
-    assert "stackdsl::OutputSpec<" in source
-    assert "stackdsl::OutputSliceDst<0>" in source
     assert "{%" not in source
     assert "{{" not in source
-
-
-def test_codegen_embeds_each_heterogeneous_output_size_in_cpp_type():
-    program = compile_ir(["x", "cat(x, x)"])
-    plan = _lower(program, n=5)
-    source = _render_plan(program, plan, n=5)
-    assert "stackdsl::OutputSpec<\n        0,\n        5," in source
-    assert "stackdsl::OutputSpec<\n        5,\n        10," in source
-    assert "PublicOutputs::row_width" in source
-    assert "PublicOutputs::row_lane_partitionable" in source
-
-
-def test_aggregate_output_width_cannot_fake_lane_partitionability():
-    # Total row width is exactly N=5, which would pass the old aggregate modulo
-    # test. Neither fixed output actually has the instrument axis, so lane
-    # sharding must remain forbidden per output.
-    program = compile_ir(
-        ["left", "right"],
-        input_value_types={"left": fixed(2), "right": fixed(3)},
-    )
-    layout = build_output_layout(program, 5)
-    assert layout.row_width == 5
-    assert [output.size for output in layout.outputs] == [2, 3]
-    assert not any(output.lane_partitionable for output in layout.outputs)
-    assert layout.row_lane_partitionable is False
-
-
-def test_tensor_scratch_layout_uses_sum_of_exact_slot_extents():
-    # A wide scratch tensor must not inflate every other slot to its width.
-    plan = Plan(
-        stages=(
-            Stage(
-                "tensor_copy",
-                (),
-                Dest(0, tensor=True, width=2, size=10, shape=(5, 2)),
-                5,
-            ),
-            Stage(
-                "tensor_copy",
-                (),
-                Dest(1, tensor=True, width=8, size=40, shape=(5, 8)),
-                5,
-            ),
-        ),
-        scratch_slots=0,
-        matrix_scratch_slots=2,
-        matrix_scratch_width=8,
-        input_count=1,
-        output_kind="vector",
-        output_width=1,
-        output_row_width=5,
-        output_shape=(5,),
-        output_mode="rows",
-    )
-    sizes = _matrix_scratch_sizes(plan)
-    assert sizes == (10, 40)
-    assert sum(sizes) == 50
-    assert sum(sizes) < plan.matrix_scratch_slots * 5 * plan.matrix_scratch_width
-    assert _scratch_layout_type(plan) == "stackdsl::ScratchLayout<10, 40>"
 
 
 def test_grouped_codegen_changes_only_execution_scope():
@@ -178,10 +86,17 @@ def test_key_descriptor_selects_dense_row_scalar_resolver():
         InputTypeSpec("int64", 1),
         InputTypeSpec("float64", 9),
     )
-    plan = _lower(program, n=9, input_types=input_types)
-    source = _render_plan(
-        program, plan, n=9, input_types=input_types
+    plan = lower_program(
+        program,
+        n_instruments=9,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
     )
+    source = render_translation_unit(
+        plan,
+        n_instruments=9,
+        prefetch_rows=16,
+        input_types=input_types,
+    ).text
     assert "stackdsl::FloorOp" in source
     assert "stackdsl::ModOp" in source
     assert "stackdsl::DenseTupleGroupResolver<" in source
@@ -210,13 +125,20 @@ def test_tuple_of_key_descriptors_uses_mixed_radix_dense_capacity():
         InputTypeSpec("uint32", 1),
         InputTypeSpec("float64", 5),
     )
-    plan = _lower(program, n=5, input_types=input_types)
+    plan = lower_program(
+        program,
+        n_instruments=5,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
+    )
     group = next(stage.group for stage in plan.stages if stage.group is not None)
     assert group.dense is True
     assert group.capacity == (3 + 1) * (4 + 1)
-    source = _render_plan(
-        program, plan, n=5, input_types=input_types
-    )
+    source = render_translation_unit(
+        plan,
+        n_instruments=5,
+        prefetch_rows=16,
+        input_types=input_types,
+    ).text
     assert "stackdsl::DenseTupleGroupResolver<" in source
     assert source.count("stackdsl::KeySpec<") >= 2
     assert "stackdsl::InputSrc<0, std::int32_t, 5>" in source
@@ -231,10 +153,17 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
         InputTypeSpec("float64", 9),
         InputTypeSpec("int64", 1),
     )
-    plan = _lower(program, n=9, input_types=input_types)
-    source = _render_plan(
-        program, plan, n=9, input_types=input_types
+    plan = lower_program(
+        program,
+        n_instruments=9,
+        input_dtypes=tuple(spec.dtype for spec in input_types),
     )
+    source = render_translation_unit(
+        plan,
+        n_instruments=9,
+        prefetch_rows=16,
+        input_types=input_types,
+    ).text
     assert "stackdsl::InputSrc<0, double, 9>" in source
     assert "stackdsl::InputSrc<1, std::int64_t, 1>" in source
     assert "stackdsl::CopyNode<9," in source
@@ -243,20 +172,24 @@ def test_codegen_embeds_typed_row_widths_and_promotes_only_at_operation():
         "stackdsl::InputSrc<0, double, 9>, "
         "stackdsl::InputSrc<1, std::int64_t, 1>>"
     ) in source
-    assert "stackdsl::OutputSliceDst<0>" in source
+    assert "stackdsl::OutputDst" in source
     assert "cpp_stream_run_arrays" in source
 
 
 def test_generated_runtime_has_one_row_pass_and_cse_for_repeated_cat_branches():
-    program = compile_ir("cat(close + 1, close + 1, close + 2)")
-    plan = _lower(program, n=5)
+    plan = lower_program(
+        compile_ir("cat(close + 1, close + 1, close + 2)"),
+        n_instruments=5,
+    )
     assert len(plan.stages) == 1
     cat_stage = plan.stages[0]
     assert cat_stage.kind == "cat"
     assert cat_stage.inputs[0] == cat_stage.inputs[1]
     assert cat_stage.inputs[0] != cat_stage.inputs[2]
 
-    source = _render_plan(program, plan, n=5)
+    source = render_translation_unit(
+        plan, n_instruments=5, prefetch_rows=16
+    ).text
     header = _generated_row_loop_header(source)
     assert sum(source.count(candidate) for candidate in _ROW_LOOP_HEADERS) == 1
     assert source.count(header) == 1
@@ -339,8 +272,8 @@ def test_temporal_reduction_suffix_runs_once_during_finalization():
     loop_end = source.index("        return 0;\n    }", loop_start)
     row_loop = source[loop_start:loop_end]
 
-    # The reduction accumulates in the row loop; no downstream public projection
-    # occurs per row.
+    # s0 accumulates the temporal reduction. Its result consumers are omitted
+    # from the row loop rather than projecting the cumulative result every row.
     assert re.findall(
         r"^\s+s(\d+)\.on_data\(ctx\);$", row_loop, re.MULTILINE
     ) == ["0"]
@@ -351,7 +284,7 @@ def test_temporal_reduction_suffix_runs_once_during_finalization():
     calls = (
         "s0.finalize(ctx);",
         "s1.on_data(ctx);",
+        "s1.finalize(ctx);",
     )
     positions = [final_phase.index(call) for call in calls]
     assert positions == sorted(positions)
-    assert "s1.finalize(ctx);" not in final_phase

@@ -324,26 +324,17 @@ struct MonotonicGroupResolver<
     }
 };
 
-// One grouped context type is used for both uniform legacy scratch and exact
-// heterogeneous matrix/tensor scratch. The MatrixLayout argument is entirely
-// compile-time and adds no runtime dispatch.
 template <
     std::size_t N,
     std::size_t Inputs,
     std::size_t ScratchSlots,
     std::size_t MatrixScratchSlots = 0,
-    std::size_t MatrixScratchWidth = 1,
-    class MatrixLayout = UniformScratchLayout<
-        MatrixScratchSlots,
-        N * MatrixScratchWidth
-    >
+    std::size_t MatrixScratchWidth = 1
 >
 struct alignas(64) GroupRowContext {
-    static_assert(MatrixLayout::count == MatrixScratchSlots);
-
     std::array<const double*, Inputs> inputs{};
     alignas(64) std::array<std::array<double, N>, ScratchSlots> scratch{};
-    alignas(64) PackedScratchStorage<MatrixLayout> scratch_matrix{};
+    alignas(64) std::array<std::array<double, N * MatrixScratchWidth>, MatrixScratchSlots> scratch_matrix{};
     double* output = nullptr;
     const std::array<std::uint16_t, N>* group_slots = nullptr;
     const std::array<std::uint16_t, N>* partitions = nullptr;
@@ -353,59 +344,28 @@ struct alignas(64) GroupRowContext {
     template <class Src>
     STACKDSL_HOT double read_native(std::size_t lane) const noexcept {
         static_assert(source_width_v<Src> == 1);
-        if constexpr (requires { Src::input_index; }) {
-            return inputs[Src::input_index][lane];
-        } else if constexpr (requires { Src::slot_index; }) {
-            return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
-        } else if constexpr (requires { Src::read(*this, lane); }) {
-            return Src::read(*this, lane);
-        } else {
-            return Src::value;
-        }
+        if constexpr (requires { Src::input_index; }) return inputs[Src::input_index][lane];
+        else if constexpr (requires { Src::slot_index; }) return scratch[Src::slot_index][Src::row_scalar ? 0 : lane];
+        else if constexpr (requires { Src::read(*this, lane); }) return Src::read(*this, lane);
+        else return Src::value;
     }
-
+    template <class Src> STACKDSL_HOT double read(std::size_t lane) const noexcept { return read_native<Src>(lane); }
     template <class Src>
-    STACKDSL_HOT double read(std::size_t lane) const noexcept {
-        return read_native<Src>(lane);
+    STACKDSL_HOT double read_feature(std::size_t lane, std::size_t feature) const noexcept {
+        if constexpr (requires { Src::matrix_slot_index; }) return scratch_matrix[Src::matrix_slot_index][lane * MatrixScratchWidth + feature];
+        else { (void)feature; return read<Src>(lane); }
     }
-
-    template <class Src>
-    STACKDSL_HOT double read_feature(
-        std::size_t lane,
-        std::size_t feature
-    ) const noexcept {
-        if constexpr (requires { Src::matrix_slot_index; }) {
-            return scratch_matrix[Src::matrix_slot_index][
-                lane * Src::feature_width + feature
-            ];
-        } else {
-            (void)feature;
-            return read<Src>(lane);
-        }
-    }
-
     template <class Src>
     STACKDSL_HOT const double* read_ptr() const noexcept {
         static_assert(source_width_v<Src> == 1 && !is_literal_source_v<Src>);
-        if constexpr (requires { Src::input_index; }) {
-            return inputs[Src::input_index];
-        } else {
-            return scratch[Src::slot_index].data();
-        }
+        if constexpr (requires { Src::input_index; }) return inputs[Src::input_index];
+        else return scratch[Src::slot_index].data();
     }
-
     template <class Dst>
     STACKDSL_HOT double* write_ptr() noexcept {
-        if constexpr (requires { Dst::output_offset; }) {
-            return output + Dst::output_offset;
-        } else if constexpr (std::is_same_v<Dst, OutputDst>) {
-            return output;
-        } else if constexpr (requires { Dst::matrix_slot_index; }) {
-            return scratch_matrix.data()
-                + MatrixLayout::offset(Dst::matrix_slot_index);
-        } else {
-            return scratch[Dst::slot_index].data();
-        }
+        if constexpr (std::is_same_v<Dst, OutputDst>) return output;
+        else if constexpr (requires { Dst::matrix_slot_index; }) return scratch_matrix[Dst::matrix_slot_index].data();
+        else return scratch[Dst::slot_index].data();
     }
 };
 
