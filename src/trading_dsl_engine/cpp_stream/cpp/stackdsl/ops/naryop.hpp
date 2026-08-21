@@ -568,11 +568,260 @@ struct CopyNode {
     }
 };
 
+// Keep records compact: both rank sorting and xs_gauss move these repeatedly.
 struct RankItem {
-    std::uint32_t group;
     double value;
+    std::uint32_t group;
     std::uint32_t lane;
 };
+static_assert(sizeof(RankItem) == 16);
+
+namespace nary_detail {
+
+template <std::size_t N, class Less>
+STACKDSL_HOT void sort_rank_items(
+    std::array<RankItem, N>& items,
+    std::size_t count,
+    Less less
+) noexcept {
+    // The common futures cross section is small.  Avoid introsort setup and let
+    // the compiler specialize a compact insertion sort for those fixed widths.
+    if constexpr (N <= 16) {
+        for (std::size_t index = 1; index < count; ++index) {
+            const RankItem item = items[index];
+            std::size_t position = index;
+            while (position != 0 && less(item, items[position - 1])) {
+                items[position] = items[position - 1];
+                --position;
+            }
+            items[position] = item;
+        }
+    } else {
+        std::sort(
+            items.begin(),
+            items.begin() + static_cast<std::ptrdiff_t>(count),
+            less
+        );
+    }
+}
+
+struct MagnitudeLess {
+    STACKDSL_HOT bool operator()(
+        const RankItem& left, const RankItem& right
+    ) const noexcept {
+        if (left.group != right.group) return left.group < right.group;
+        const double left_abs = std::abs(left.value);
+        const double right_abs = std::abs(right.value);
+        if (left_abs != right_abs) return left_abs < right_abs;
+        return left.lane < right.lane;
+    }
+};
+
+struct ValueLess {
+    STACKDSL_HOT bool operator()(
+        const RankItem& left, const RankItem& right
+    ) const noexcept {
+        if (left.group != right.group) return left.group < right.group;
+        if (left.value != right.value) return left.value < right.value;
+        return left.lane < right.lane;
+    }
+};
+
+}  // namespace nary_detail
+
+// The primary template is defined in cross_sectional.hpp.  A declaration here
+// lets the -0.0 compile-time tag select the native xs_gauss node without a
+// separate header or a runtime branch.
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    std::uint64_t PowerBits,
+    class Execution
+>
+struct XsGeneralizedRankNode;
+
+inline constexpr std::uint64_t kXsGaussPowerTag = 0x8000000000000000ULL;
+
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution = DirectExecution<N>
+>
+struct XsGaussNode {
+    static constexpr std::size_t Groups = Execution::cross_state_size;
+    static constexpr double MaxProbability = 0x1.fffffffffffffp-1;
+
+    STACKDSL_HOT void setup() noexcept {}
+
+    template <class Context>
+    STACKDSL_HOT void on_data(Context& ctx) noexcept {
+        double* STACKDSL_RESTRICT out = ctx.template write_ptr<Out>();
+        const std::size_t write_begin = execution_lane_begin<N, Execution>(ctx);
+        const std::size_t write_end = execution_lane_end<N, Execution>(ctx);
+        for (std::size_t lane = write_begin; lane < write_end; ++lane) {
+            out[lane] = kNaN;
+        }
+
+        std::array<RankItem, N> items{};
+        std::array<double, N> levels{};
+        std::size_t item_count = 0;
+        for (std::size_t lane = 0; lane < N; ++lane) {
+            const double value = ctx.template read<In>(lane);
+            if (!finite(value)) continue;
+            items[item_count++] = {
+                value,
+                static_cast<std::uint32_t>(Execution::cross_group(ctx, lane)),
+                static_cast<std::uint32_t>(lane),
+            };
+        }
+        if (item_count == 0) return;
+
+        // q's spacing is the cumulative sum of sorted absolute magnitudes.
+        nary_detail::sort_rank_items(
+            items, item_count, nary_detail::MagnitudeLess{}
+        );
+        std::size_t group_begin = 0;
+        while (group_begin < item_count) {
+            std::size_t group_end = group_begin + 1;
+            while (
+                group_end < item_count
+                && items[group_end].group == items[group_begin].group
+            ) {
+                ++group_end;
+            }
+
+            const double min_abs = std::abs(items[group_begin].value);
+            const double max_abs = std::abs(items[group_end - 1].value);
+            if (!(max_abs > 0.0)) {
+                for (std::size_t position = group_begin; position < group_end; ++position) {
+                    levels[position] = 0.5;
+                }
+                group_begin = group_end;
+                continue;
+            }
+
+            double total = 0.0;
+            for (std::size_t position = group_begin; position < group_end; ++position) {
+                total += std::abs(items[position].value);
+            }
+            double denominator = total + 0.5 * (min_abs + max_abs);
+            double multiplier = 1.0;
+            if (!finite(denominator)) {
+                // Rare overflow fallback; common rows avoid the extra divisions.
+                multiplier = 1.0 / max_abs;
+                total = 0.0;
+                for (std::size_t position = group_begin; position < group_end; ++position) {
+                    total += std::abs(items[position].value) * multiplier;
+                }
+                denominator = total + 0.5 * (min_abs * multiplier + 1.0);
+            }
+
+            double cumulative = 0.0;
+            for (std::size_t position = group_begin; position < group_end; ++position) {
+                cumulative += std::abs(items[position].value) * multiplier;
+                levels[position] = cumulative / denominator;
+            }
+
+            // Zero magnitudes otherwise create q=0 and norm_inv(q)=-inf.
+            std::size_t first_positive = group_begin;
+            while (
+                first_positive < group_end
+                && std::abs(items[first_positive].value) == 0.0
+            ) {
+                ++first_positive;
+            }
+            if (first_positive != group_begin && first_positive < group_end) {
+                const double first_level = levels[first_positive];
+                const std::size_t zero_count = first_positive - group_begin;
+                const double spacing = first_level / static_cast<double>(zero_count + 1);
+                for (std::size_t index = 0; index < zero_count; ++index) {
+                    levels[group_begin + index] = spacing * static_cast<double>(index + 1);
+                }
+            }
+            group_begin = group_end;
+        }
+
+        // Assign the magnitude-derived grid by ascending x rank.  The two sorts
+        // are intrinsic: magnitude order and signed-value order are independent.
+        nary_detail::sort_rank_items(
+            items, item_count, nary_detail::ValueLess{}
+        );
+        std::array<double, Groups> mean{};
+        std::array<double, Groups> m2{};
+        std::array<std::uint32_t, Groups> count{};
+
+        group_begin = 0;
+        while (group_begin < item_count) {
+            std::size_t group_end = group_begin + 1;
+            while (
+                group_end < item_count
+                && items[group_end].group == items[group_begin].group
+            ) {
+                ++group_end;
+            }
+            std::size_t tie_begin = group_begin;
+            while (tie_begin < group_end) {
+                std::size_t tie_end = tie_begin + 1;
+                while (
+                    tie_end < group_end
+                    && items[tie_end].value == items[tie_begin].value
+                ) {
+                    ++tie_end;
+                }
+                double probability = levels[tie_end - 1];
+                probability = std::max(
+                    std::numeric_limits<double>::min(),
+                    std::min(probability, MaxProbability)
+                );
+                const double score = norm_inv(probability);
+                const std::size_t group = items[tie_begin].group;
+                for (std::size_t position = tie_begin; position < tie_end; ++position) {
+                    // Reuse the value field for the raw score; this removes an
+                    // additional N-double scratch array and another input read.
+                    items[position].value = score;
+                    const std::uint32_t next_count = count[group] + 1;
+                    const double delta = score - mean[group];
+                    mean[group] += delta / static_cast<double>(next_count);
+                    m2[group] = std::fma(
+                        delta, score - mean[group], m2[group]
+                    );
+                    count[group] = next_count;
+                }
+                tie_begin = tie_end;
+            }
+            group_begin = group_end;
+        }
+
+        std::array<double, Groups> scale{};
+        for (std::size_t group = 0; group < Groups; ++group) {
+            if (count[group] != 0) {
+                scale[group] = std::sqrt(
+                    std::max(0.0, m2[group]) / static_cast<double>(count[group])
+                );
+            }
+        }
+        for (std::size_t position = 0; position < item_count; ++position) {
+            const std::size_t lane = items[position].lane;
+            if (lane < write_begin || lane >= write_end) continue;
+            const double stddev = scale[items[position].group];
+            out[lane] = stddev > 0.0 && finite(stddev)
+                ? items[position].value / stddev
+                : 0.0;
+        }
+    }
+};
+
+template <
+    std::size_t N,
+    class In,
+    class Out,
+    class Execution
+>
+struct XsGeneralizedRankNode<
+    N, In, Out, kXsGaussPowerTag, Execution
+> : XsGaussNode<N, In, Out, Execution> {};
 
 template <
     std::size_t N,
@@ -632,21 +881,16 @@ private:
             const double value = ctx.template read<In>(lane);
             if (finite(value)) {
                 items[count++] = {
-                    Execution::rank_group(ctx, lane),
                     value,
+                    Execution::rank_group(ctx, lane),
                     static_cast<std::uint32_t>(lane),
                 };
             } else {
                 out[lane] = kNaN;
             }
         }
-        std::sort(
-            items.begin(),
-            items.begin() + static_cast<std::ptrdiff_t>(count),
-            [](const RankItem& a, const RankItem& b) {
-                return a.group < b.group ||
-                    (a.group == b.group && a.value < b.value);
-            }
+        nary_detail::sort_rank_items(
+            items, count, nary_detail::ValueLess{}
         );
         std::size_t start = 0;
         while (start < count) {
