@@ -4,10 +4,11 @@ from pathlib import Path
 import re
 
 import numpy as np
+import pytest
 
 from trading_dsl_engine.base.dsl import cumsum, groupby, self_, var
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream import compile_formula, run_many
 
 
 def test_promoted_row_output_remains_readable_by_final_projection(tmp_path: Path):
@@ -207,3 +208,59 @@ def test_grouped_ewm_epilogue_uses_no_inner_scalar_scratch(tmp_path: Path):
     generated = runtime.generated_cpp.read_text()
     assert "stackdsl::EwmDiscardDst" in generated
     assert "stackdsl::EwmEpilogueBinding" in generated
+
+
+def test_native_batch_matches_serial_mixed_output_runtimes(tmp_path: Path):
+    rows, cols = 512, 5
+    rng = np.random.default_rng(42)
+    data = {"x": rng.normal(size=(rows, cols))}
+    x = var("x")
+    runtimes = (
+        compile_formula(
+            [x + 1.0, (x + 1.0).mean(axis=0)],
+            data,
+            n_instruments=cols,
+        ),
+        compile_formula(
+            [x * 2.0, (x * 2.0).std(axis=0)],
+            data,
+            n_instruments=cols,
+        ),
+    )
+    serial = tuple(
+        runtime.run(out_path=tmp_path / f"serial-{index}.npy", threads=1)
+        for index, runtime in enumerate(runtimes)
+    )
+    native = run_many(
+        runtimes,
+        out_paths=(tmp_path / "native-0.npy", tmp_path / "native-1.npy"),
+        workers=2,
+        threads_per_runtime=1,
+    )
+
+    assert 1 <= native.workers <= 2
+    for expected_result, actual_result in zip(serial, native.results):
+        expected = expected_result.load(mmap_mode=None)
+        actual = actual_result.load(mmap_mode=None)
+        assert isinstance(expected, tuple)
+        assert isinstance(actual, tuple)
+        for expected_value, actual_value in zip(expected, actual):
+            np.testing.assert_allclose(
+                actual_value,
+                expected_value,
+                rtol=1e-13,
+                atol=1e-13,
+                equal_nan=True,
+            )
+
+
+def test_native_batch_rejects_duplicate_output_paths(tmp_path: Path):
+    data = {"x": np.arange(16, dtype=np.float64).reshape(8, 2)}
+    runtime = compile_formula(var("x") + 1.0, data, n_instruments=2)
+    shared = tmp_path / "shared.npy"
+    with pytest.raises(ValueError, match="out_paths must be distinct"):
+        run_many(
+            (runtime, runtime),
+            out_paths=(shared, shared),
+            workers=2,
+        )
