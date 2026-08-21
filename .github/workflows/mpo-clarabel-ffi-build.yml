@@ -20,7 +20,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build current Clarabel FFI
-        run: cargo build --release --manifest-path tmp/clarabel_ffi/Cargo.toml
+        run: |
+          sed -i 's/use clarabel::{algebra::CscMatrix, solver::\*};/use clarabel::{algebra::{CscMatrix, SparseFormatError}, solver::*};/' tmp/clarabel_ffi/src/lib.rs
+          cargo build --release --manifest-path tmp/clarabel_ffi/Cargo.toml
       - name: Inspect exported ABI
         run: |
           nm -D --defined-only tmp/clarabel_ffi/target/release/libcpp_stream_clarabel.so | sort
