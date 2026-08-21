@@ -25,6 +25,7 @@ _DISPATCH_SOURCE = r'''// Generic native task scheduler for independent cpp_stre
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <exception>
 #include <string>
 #include <thread>
@@ -91,6 +92,33 @@ void run_task(NativeTask& task) noexcept {
         &task.threads_out,
         &task.available_cpus_out);
 }
+
+void attribute_batch_cpu(
+    NativeTask* tasks,
+    std::size_t task_count,
+    double batch_cpu_seconds) noexcept {
+    // Each generated runner measures process CPU time. Those clocks overlap
+    // when runners execute concurrently, so summing them would double count.
+    // Preserve an additive per-task field by attributing the one aggregate
+    // process measurement in proportion to each task's native wall time.
+    double weight_sum = 0.0;
+    for (std::size_t index = 0; index < task_count; ++index) {
+        if (tasks[index].seconds_out > 0.0) {
+            weight_sum += tasks[index].seconds_out;
+        }
+    }
+    if (weight_sum > 0.0) {
+        for (std::size_t index = 0; index < task_count; ++index) {
+            const double weight = std::max(0.0, tasks[index].seconds_out);
+            tasks[index].cpu_seconds_out =
+                batch_cpu_seconds * weight / weight_sum;
+        }
+        return;
+    }
+    for (std::size_t index = 0; index < task_count; ++index) {
+        tasks[index].cpu_seconds_out = index == 0 ? batch_cpu_seconds : 0.0;
+    }
+}
 }  // namespace
 
 extern "C" const char* cpp_stream_batch_last_error() noexcept {
@@ -115,28 +143,32 @@ extern "C" int cpp_stream_run_many(
             std::min(task_count, std::min(requested, available)));
         if (workers_out != nullptr) *workers_out = workers;
 
+        const std::clock_t batch_cpu_started = std::clock();
         if (workers == 1) {
             for (std::size_t index = 0; index < task_count; ++index) {
                 run_task(tasks[index]);
             }
-            return 0;
+        } else {
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> pool;
+            pool.reserve(workers);
+            for (std::size_t worker = 0; worker < workers; ++worker) {
+                pool.emplace_back([&, worker] {
+                    if (pin_workers) stackdsl::pin_current_thread(worker);
+                    while (true) {
+                        const std::size_t index = next.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (index >= task_count) break;
+                        run_task(tasks[index]);
+                    }
+                });
+            }
+            for (auto& thread : pool) thread.join();
         }
-
-        std::atomic<std::size_t> next{0};
-        std::vector<std::thread> pool;
-        pool.reserve(workers);
-        for (std::size_t worker = 0; worker < workers; ++worker) {
-            pool.emplace_back([&, worker] {
-                if (pin_workers) stackdsl::pin_current_thread(worker);
-                while (true) {
-                    const std::size_t index = next.fetch_add(
-                        1, std::memory_order_relaxed);
-                    if (index >= task_count) break;
-                    run_task(tasks[index]);
-                }
-            });
-        }
-        for (auto& thread : pool) thread.join();
+        const std::clock_t batch_cpu_finished = std::clock();
+        const double batch_cpu_seconds = static_cast<double>(
+            batch_cpu_finished - batch_cpu_started) / CLOCKS_PER_SEC;
+        attribute_batch_cpu(tasks, task_count, batch_cpu_seconds);
         return 0;
     } catch (const std::exception& exc) {
         g_last_error = exc.what();
