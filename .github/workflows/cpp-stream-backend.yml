@@ -67,6 +67,7 @@ jobs:
           tests/trading_dsl_engine/cpp_stream/test_sources.py
           tests/trading_dsl_engine/cpp_stream/test_npy_inputs.py
           tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+          tests/trading_dsl_engine/cpp_stream/test_xs_gauss.py
           tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
           tests/trading_dsl_engine/cpp_stream/test_output_projection.py
           tests/trading_dsl_engine/cpp_stream/test_jax_flat_nan_compat.py
