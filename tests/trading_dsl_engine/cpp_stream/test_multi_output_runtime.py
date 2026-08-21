@@ -361,3 +361,91 @@ def test_gp_search_pure_walk_forward_and_batching_contracts():
         assert all(len(batch) == 8 for batch in batches)
     finally:
         sys.modules.pop(module_name, None)
+
+
+def test_gp_fitness_path_uses_native_cpp_batches_and_anchored_folds(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import importlib.util
+    import sys
+
+    from deap import base as deap_base
+
+    script = Path(__file__).resolve().parents[3] / "scripts" / "run_gp_alpha_search.py"
+    module_name = "_gp_search_native_path"
+    spec = importlib.util.spec_from_file_location(module_name, script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(module, "N_INSTRUMENTS", 3)
+        monkeypatch.setattr(module, "NATIVE_WORKERS", 2)
+        monkeypatch.setattr(module, "FITNESS_BATCH_SIZE", 2)
+        monkeypatch.setattr(module, "FITNESS_TASKS_PER_WORKER", 1)
+        monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(module, "OOS_FILTER_FITNESS", False)
+        monkeypatch.setattr(module, "OOS_REQUIRE_POSITIVE", False)
+        monkeypatch.setattr(
+            module,
+            "alpha_expr",
+            lambda individual, _pset: var(str(individual)),
+        )
+
+        class Fitness(deap_base.Fitness):
+            weights = (1.0,)
+
+        class Individual(list):
+            def __init__(self, name: str):
+                super().__init__([name])
+                self.name = name
+                self.fitness = Fitness()
+
+            def __str__(self) -> str:
+                return self.name
+
+        rows, cols = 4096, 3
+        rng = np.random.default_rng(20260821)
+        source = {
+            "clean_rets": rng.normal(0.0, 5.0e-4, size=(rows, cols)),
+            "volatility": np.full((rows, cols), 0.01, dtype=np.float64),
+            "is_tradable_out0": np.ones((rows, cols), dtype=np.float64),
+            "gp_row_index": np.arange(rows, dtype=np.int64),
+        }
+        individuals = [Individual(f"alpha_{index}") for index in range(4)]
+        for index, individual in enumerate(individuals):
+            source[str(individual)] = rng.normal(
+                loc=0.01 * index,
+                scale=1.0,
+                size=(rows, cols),
+            )
+
+        folds = module.build_anchored_walk_forward(
+            rows,
+            folds=2,
+            validation_fraction=0.20,
+        )
+        assessments = {}
+        metrics = module.evaluate_individuals(
+            individuals,
+            None,
+            source,
+            folds,
+            1,
+            assessments,
+        )
+
+        assert metrics["unique_evaluated"] == 4
+        assert metrics["microbatches"] == 2
+        assert metrics["native_workers"] >= 1
+        if module._available_cpus() >= 2:
+            assert metrics["native_workers"] == 2
+        assert metrics["fallback_serial"] is False
+        assert metrics["native_seconds_sum"] >= metrics["run_wall_seconds_sum"]
+        assert metrics["cpu_seconds_sum"] >= 0.0
+        assert all(individual.fitness.valid for individual in individuals)
+        assert set(assessments) == {str(individual) for individual in individuals}
+        assert folds[-1].validation_end == rows
+    finally:
+        sys.modules.pop(module_name, None)
