@@ -5,8 +5,9 @@ from trading_dsl_engine.base.parser import Expr
 
 
 # cpp_stream transports xs_gauss through XsGeneralizedRankOp using the otherwise
-# equivalent signed-zero spelling of power=0.  The generated C++ specializes on
-# the -0.0 bit pattern, so ordinary xs_generalized_rank(..., 0) is unchanged.
+# equivalent signed-zero spelling of power=0.  naryop.hpp specializes that exact
+# compile-time bit pattern to XsGaussNode, with no runtime tag check and no change
+# to ordinary xs_generalized_rank(..., 0).
 _XS_GAUSS_POWER_TAG = -0.0
 
 

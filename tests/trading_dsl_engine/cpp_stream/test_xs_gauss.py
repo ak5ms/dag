@@ -54,6 +54,24 @@ def _reference(row: np.ndarray) -> np.ndarray:
     return result
 
 
+def _run(tmp_path: Path, x: np.ndarray, name: str) -> np.ndarray:
+    runtime = compile_formula("xs_gauss(x)", {"x": x}, n_instruments=x.shape[1])
+    run = runtime.run(out_path=tmp_path / name)
+    return np.fromfile(run.output_path, dtype=np.float64).reshape(run.output_shape)
+
+
+def _assert_reference_and_unit_std(actual: np.ndarray, expected: np.ndarray) -> None:
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True
+    )
+    for row in actual:
+        finite = row[np.isfinite(row)]
+        if finite.size and np.std(finite, ddof=0) > 0.0:
+            np.testing.assert_allclose(
+                np.std(finite, ddof=0), 1.0, rtol=2e-12, atol=2e-12
+            )
+
+
 def test_xs_gauss_matches_reference(tmp_path: Path) -> None:
     assert DEFAULT_DSL_REGISTRY.get("xs_gauss") is not None
     assert hasattr(cpp_stream, "xs_gauss")
@@ -67,13 +85,25 @@ def test_xs_gauss_matches_reference(tmp_path: Path) -> None:
         ],
         dtype=np.float64,
     )
-    runtime = compile_formula("xs_gauss(x)", {"x": x}, n_instruments=x.shape[1])
-    run = runtime.run(out_path=tmp_path / "xs_gauss.bin")
-    actual = np.fromfile(run.output_path, dtype=np.float64).reshape(run.output_shape)
+    actual = _run(tmp_path, x, "xs_gauss.bin")
     expected = np.vstack([_reference(row) for row in x])
 
-    np.testing.assert_allclose(actual, expected, rtol=2e-12, atol=2e-12, equal_nan=True)
-    for row in actual[:-1]:
-        finite = row[np.isfinite(row)]
-        np.testing.assert_allclose(np.std(finite, ddof=0), 1.0, rtol=2e-12, atol=2e-12)
+    _assert_reference_and_unit_std(actual, expected)
     np.testing.assert_array_equal(actual[-1], np.zeros(x.shape[1]))
+
+
+def test_xs_gauss_large_sort_path(tmp_path: Path) -> None:
+    rng = np.random.default_rng(12345)
+    x = np.vstack(
+        (
+            rng.standard_t(df=2.0, size=17),
+            rng.normal(size=17),
+        )
+    )
+    x[0, [1, 6]] = 0.0
+    x[1, 3] = np.nan
+    x[1, 7:9] = 1.25
+
+    actual = _run(tmp_path, x, "xs_gauss_wide.bin")
+    expected = np.vstack([_reference(row) for row in x])
+    _assert_reference_and_unit_std(actual, expected)
