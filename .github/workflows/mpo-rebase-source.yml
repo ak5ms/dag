@@ -5,10 +5,14 @@ on:
     branches: [agent/mpo-rebase-work]
     paths:
       - ".github/workflows/mpo-rebase-source.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/mpo-rebase-source.yml"
   workflow_dispatch:
 
 concurrency:
-  group: package-mpo-rebase-source
+  group: package-mpo-rebase-source-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
