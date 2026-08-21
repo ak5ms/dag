@@ -1,32 +1,145 @@
-name: mpo-agent-export
+name: mpo-rebase-and-validate
 
 on:
   push:
     branches: [mpo-agent-export]
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/mpo-agent-export.yml
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
+  rebuild:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Fetch every branch and create git bundle
+      - name: Rebase MPO onto current main and validate
+        shell: bash
         run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
-          git bundle create /tmp/dag.bundle --all
-          git bundle verify /tmp/dag.bundle
+
+          original_mpo=$(git rev-parse origin/mpo)
+          main_head=$(git rev-parse origin/main)
+          work_root="$RUNNER_TEMP/mpo-rebase"
+          rm -rf "$work_root"
+          mkdir -p "$work_root"
+
+          # Rebase candidates differ only in automatic conflict preference. Each
+          # candidate is tested independently; nothing is pushed unless the full
+          # first-class operator and current-main regression suite passes.
+          selected=""
+          for strategy in theirs ours; do
+            candidate="$work_root/$strategy"
+            git clone --no-local "$GITHUB_WORKSPACE" "$candidate"
+            cd "$candidate"
+            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+            git checkout -B mpo-rebased "$original_mpo"
+            if ! GIT_EDITOR=true git rebase "$main_head" -X "$strategy"; then
+              git rebase --abort || true
+              continue
+            fi
+
+            # These are current-main facilities, not MPO implementation files.
+            # A first-class MPO must compose with them rather than replacing them.
+            required_main_files=(
+              benchmarks/cpp_stream_multi_output_audit.md
+              scripts/benchmark_cpp_stream_multi_output_subgraph.py
+              src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/output.hpp
+              src/trading_dsl_engine/cpp_stream/python/compiler_support.py
+              src/trading_dsl_engine/cpp_stream/python/lowering_multi.py
+              src/trading_dsl_engine/cpp_stream/python/output_projection.py
+              src/trading_dsl_engine/cpp_stream/python/outputs.py
+              tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+              tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+            )
+            for path in "${required_main_files[@]}"; do
+              if [[ ! -e "$path" ]]; then
+                git checkout "$main_head" -- "$path"
+              fi
+            done
+
+            # Remove historical post-batch/CVXPYgen benchmark output. Keep only
+            # source and focused tests needed by the regular cpp_stream operator.
+            rm -f \
+              docs/benchmarks/cpp_stream_optimizer_node.json \
+              docs/benchmarks/cpp_stream_optimizer_node_benchmark.txt \
+              docs/benchmarks/cpp_stream_optimizer_node_validation.txt \
+              docs/benchmarks/mpo_optimizer_final_status.md \
+              docs/benchmarks/mpo_optimizer_full_validation.txt \
+              scripts/benchmark_cpp_stream_optimizer_node.py \
+              scripts/benchmark_mpo_cvxpygen.py \
+              scripts/benchmark_mpo_cvxpygen_native.c
+
+            if ! git diff --quiet; then
+              git add -A
+              git commit -m "Rebase first-class MPO onto current main"
+            fi
+
+            python -m pip install --upgrade pip
+            python -m pip install -e '.[test]' || python -m pip install -e .
+            python -m pip install pytest numpy scipy cvxpy clarabel includeigen pybind11 jinja2
+
+            export PYTHONPATH=src
+            export JAX_ENABLE_X64=1
+
+            # Static rejection of the old post-batch execution architecture.
+            python - <<'PY'
+          from pathlib import Path
+
+          root = Path('src/trading_dsl_engine/cpp_stream')
+          combined = '\n'.join(
+              p.read_text(errors='ignore')
+              for p in root.rglob('*.py')
+              if p.is_file()
+          )
+          bad = []
+          for token in ('OptimizerPipeline(', 'optimizer_pipeline('):
+              if token in combined:
+                  bad.append(token)
+          if bad:
+              raise SystemExit(f'post-batch optimizer pipeline remains reachable: {bad}')
+          PY
+
+            test_paths=(
+              tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+              tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+              tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
+              tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+            )
+            [[ -e tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py ]] && test_paths+=(tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py)
+            [[ -e tests/flows/test_mpo.py ]] && test_paths+=(tests/flows/test_mpo.py)
+            [[ -e tests/flows/test_mpo_cvxpy_node.py ]] && test_paths+=(tests/flows/test_mpo_cvxpy_node.py)
+
+            if python -m pytest -q -o addopts="" "${test_paths[@]}"; then
+              selected="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$selected" ]]; then
+            echo "No conflict-resolution candidate preserved both MPO and current main" >&2
+            exit 1
+          fi
+
+          cd "$selected"
+          # Verify ancestry and reject accidental merge commits: the rebuilt head
+          # must be a linear descendant of the exact current main head.
+          git merge-base --is-ancestor "$main_head" HEAD
+          test "$(git rev-list --merges "$main_head"..HEAD --count)" -eq 0
+          git push --force-with-lease=refs/heads/mpo:"$original_mpo" origin HEAD:refs/heads/mpo
+          git rev-parse HEAD | tee "$RUNNER_TEMP/mpo-final-sha.txt"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: dag-git-bundle
-          path: /tmp/dag.bundle
-          if-no-files-found: error
-          retention-days: 1
+          name: mpo-rebase-validation
+          path: |
+            ${{ runner.temp }}/mpo-final-sha.txt
+          if-no-files-found: ignore
+          retention-days: 2
