@@ -50,9 +50,9 @@ class SemanticSearchConfig:
     require_known_types: bool = False
 
 
-def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:
+def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float, lag: int = 0) -> Expr:
     w = alpha / ewm_std(roll_rets, span=hl)
-    return shift(ffill(where(is_tradable, w, float("nan")))) * roll_rets
+    return shift(ffill(where(is_tradable, shift(w, lag), float("nan")))) * roll_rets
 
 
 def default_sharpe_objective(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:

@@ -67,8 +67,14 @@ def _build_inputs(root: Path) -> dict[str, Path]:
         arrays["is_tradable_out0"][start:stop] = tradable
         arrays["is_tradable_out1"][start:stop] = tradable
         arrays["wdte_out0"][start:stop] = wdte
-        arrays["mp_out0.close"][start:stop] = close0
-        arrays["mp_out1.close"][start:stop] = close1
+        # Keep this validation-only generator compatible with both the current
+        # VWAP roll-rets inputs and the older close-field aliases.
+        for name in ("vwap_mp_out0", "mp_out0.close"):
+            if name in arrays:
+                arrays[name][start:stop] = close0
+        for name in ("vwap_mp_out1", "mp_out1.close"):
+            if name in arrays:
+                arrays[name][start:stop] = close1
 
     for array in arrays.values():
         array.flush()

@@ -8,6 +8,10 @@ from trading_dsl_engine.cpp_stream.python.compile import (
     FormulaInput,
     compile_formula as _compile_formula,
 )
+from trading_dsl_engine.cpp_stream.python.native_batch import (
+    NativeBatchResult,
+    run_many,
+)
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime, RunResult
 from trading_dsl_engine.cpp_stream.python.source_types import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.sources import (
@@ -86,6 +90,8 @@ __all__ = [
     "infer_n_instruments",
     "CppStreamRuntime",
     "RunResult",
+    "NativeBatchResult",
+    "run_many",
     "InputTypeSpec",
     "InputSource",
     "PreparedSource",
