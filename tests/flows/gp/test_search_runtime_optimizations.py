@@ -48,13 +48,11 @@ def test_cost_balanced_batches_are_bounded_and_cover_every_candidate(monkeypatch
     loads = [sum(item.estimated_cost for item in batch) for batch in batches]
     assert max(loads) - min(loads) <= 20.0
 
-    # A single effective CPU still uses bounded fusion. This prevents one
-    # pathological formula from holding an entire 64-candidate generation.
     serial_batches = search._make_microbatches(items, workers=1)
     assert [len(batch) for batch in serial_batches] == [3, 3]
 
 
-def test_interval_union_counts_parallel_compile_wall_once():
+def test_interval_union_counts_overlapping_compile_wall_once():
     search = _search_module()
     stages = [
         {"start": 1.0, "end": 4.0},
@@ -62,6 +60,62 @@ def test_interval_union_counts_parallel_compile_wall_once():
         {"start": 7.0, "end": 8.5},
     ]
     assert search._interval_union_seconds(stages, "start", "end") == 5.5
+
+
+def test_anchored_walk_forward_ends_at_last_row_and_expands_training():
+    search = _search_module()
+    folds = search.build_anchored_walk_forward(
+        1_000,
+        folds=3,
+        validation_fraction=0.10,
+    )
+    assert [
+        (fold.train_end, fold.validation_start, fold.validation_end)
+        for fold in folds
+    ] == [
+        (700, 700, 800),
+        (800, 800, 900),
+        (900, 900, 1_000),
+    ]
+    assert all(fold.train_start == 0 for fold in folds)
+
+
+def test_anchored_walk_forward_rejects_insufficient_training_rows():
+    search = _search_module()
+    with pytest.raises(ValueError, match="does not fit"):
+        search.build_anchored_walk_forward(
+            100,
+            folds=4,
+            validation_fraction=0.25,
+            min_train_rows=20,
+        )
+
+
+def test_two_sharpe_noninferiority_test_accepts_comparable_and_rejects_decay():
+    search = _search_module()
+    comparable = search.compare_sharpes(
+        1.0,
+        0.8,
+        in_sample_rows=1_000,
+        out_of_sample_rows=1_000,
+        min_ratio=0.5,
+        alpha=0.05,
+        require_positive=True,
+    )
+    decayed = search.compare_sharpes(
+        1.0,
+        0.3,
+        in_sample_rows=1_000,
+        out_of_sample_rows=1_000,
+        min_ratio=0.5,
+        alpha=0.05,
+        require_positive=True,
+    )
+    assert comparable.passed
+    assert comparable.noninferiority_p >= 0.95
+    assert not decayed.passed
+    assert decayed.noninferiority_p < 0.95
+    assert 0.0 <= comparable.equality_two_sided_p <= 1.0
 
 
 def test_pool_batch_loader_removes_only_verified_lane_broadcast():
@@ -92,6 +146,7 @@ def test_materialized_fitness_invariants_preserve_alpha_pnl(tmp_path, monkeypatc
     monkeypatch.setenv("TRADING_DSL_ENGINE_CPP_STREAM_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("TRADING_DSL_ENGINE_CPP_PCH", "0")
     monkeypatch.setenv("TRADING_DSL_ENGINE_CPP_LTO", "0")
+    monkeypatch.setattr(search, "LAG", 1)
 
     rows, instruments = 256, 9
     rng = np.random.default_rng(42)
@@ -108,47 +163,38 @@ def test_materialized_fitness_invariants_preserve_alpha_pnl(tmp_path, monkeypatc
 
     clean = search.clean_returns_expr()
     volatility = ewm_std(clean, span=21)
-    alpha = search.l1_norm(var("alpha"))
+    position = var("alpha") / volatility
+    position = shift(position, search.LAG)
     original = (
         shift(
             ffill(
                 where(
                     var("is_tradable_out0"),
-                    alpha / volatility,
+                    position,
                     float("nan"),
                 )
-            ),
-            1,
-            1,
+            )
         )
         * clean
     )
-
     original_result = compile_formula(
         original,
         data,
         n_instruments=instruments,
     ).run(out_path=tmp_path / "original.npy")
 
-    clean_result = compile_formula(
-        clean,
+    derived_result = compile_formula(
+        [clean, volatility],
         data,
         n_instruments=instruments,
-    ).run(out_path=tmp_path / "clean.npy")
+    ).run(out_path=tmp_path / "derived.npy")
+    clean_values, volatility_values = derived_result.load(mmap_mode=None)
     materialized = data | {
-        "clean_rets": clean_result.load(),
+        "clean_rets": np.ascontiguousarray(clean_values),
+        "volatility": np.ascontiguousarray(volatility_values),
     }
-    volatility_result = compile_formula(
-        ewm_std(var("clean_rets"), span=21),
-        materialized,
-        n_instruments=instruments,
-    ).run(out_path=tmp_path / "volatility.npy")
-    materialized = materialized | {
-        "volatility": volatility_result.load(),
-    }
-
     optimized_result = compile_formula(
-        search.precomputed_alpha_pnl(alpha),
+        search.precomputed_alpha_pnl(var("alpha")),
         materialized,
         n_instruments=instruments,
     ).run(out_path=tmp_path / "optimized.npy")
@@ -160,6 +206,29 @@ def test_materialized_fitness_invariants_preserve_alpha_pnl(tmp_path, monkeypatc
         atol=1e-14,
         equal_nan=True,
     )
+
+
+def test_numpy_downsampling_matches_block_sum_and_cumsum():
+    search = _search_module()
+    values = np.arange(22, dtype=np.float64).reshape(11, 2)
+    values[3, 1] = np.nan
+    actual = search._portfolio_cumulative(values, 4)
+    expected = np.array(
+        [
+            np.nansum(values[0:4], axis=0),
+            np.nansum(values[0:8], axis=0),
+            np.nansum(values[0:11], axis=0),
+        ]
+    )
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_search_hot_loop_has_no_python_worker_pool_or_duplicate_source_load():
+    source = _SCRIPT_PATH.read_text()
+    assert "ThreadPoolExecutor" not in source
+    assert "sources_all" not in source
+    assert "run_many(" in source
+    assert "compile_formula(\n        formulas," in source
 
 
 def test_inputdata_import_does_not_eagerly_import_jax_backend():
