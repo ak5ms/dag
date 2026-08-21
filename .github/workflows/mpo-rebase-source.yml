@@ -1,0 +1,29 @@
+name: package-mpo-rebase-source
+
+on:
+  push:
+    branches: [agent/mpo-rebase-work]
+    paths:
+      - ".github/workflows/mpo-rebase-source.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: package-mpo-rebase-source
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: |
+          mkdir -p source-artifact
+          tar --exclude=.git --exclude=source-artifact -czf source-artifact/dag-main-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-main-source
+          path: source-artifact/dag-main-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
