@@ -393,6 +393,15 @@ def run_many(
                 "out_paths length must match runtimes: "
                 f"{len(resolved_paths)} != {len(runtimes)}"
             )
+        explicit_paths = [
+            Path(path).expanduser().resolve()
+            for path in resolved_paths
+            if path is not None
+        ]
+        if len(set(explicit_paths)) != len(explicit_paths):
+            raise ValueError(
+                "out_paths must be distinct when runtimes may execute concurrently"
+            )
 
     # Avoid nested oversubscription.  A caller may still request a multithreaded
     # child DAG when there is only one outer task.
