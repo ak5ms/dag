@@ -25,6 +25,12 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.optional-dependencies]
+optimizer = [
+    "cvxpy>=1.9.1,<2",
+    "cvxpygen==1.0.0",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --durations=0 -n 12 --import-mode=importlib"

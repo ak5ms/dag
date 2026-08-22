@@ -90,6 +90,26 @@ This backend must remain independent of `jax_flat`.
   active-set-aware inference implementation is added; do not silently report
   unconstrained OLS uncertainty.
 
+## Generated convex optimizer programs
+
+- CVXPY and CVXPYgen are compile-time tools only. Native per-row execution must
+  not invoke Python, pybind, CVXPY, or the CVXPYgen Python wrapper.
+- Preserve CVXPYgen as the owner of DPP validation, parameter-to-canonical maps,
+  cone layout, dirty-block tracking, and primal/dual result mappings. Do not
+  duplicate those maps in cpp_stream.
+- Generated Clarabel programs use one persistent solver per generated object.
+  The first solve constructs it; later solves update dirty fixed-sparsity
+  `P/A/q/b` blocks; destruction must call `clarabel_DefaultSolver_free`.
+- Mutable generated parameter, canonical, result, and solver state is
+  instance-owned. Read-only sparse maps, CSC indices, and cone descriptors may
+  be shared. Never restore one generated global mutable workspace.
+- Independent optimizer rows may run in parallel only through separate generated
+  objects owned by separate native workers. Do not serialize workers around one
+  solver lock or permit nested solver thread pools.
+- Native build-cache fingerprints must include generated public headers,
+  manifests, and the linked solver archive. A changed CVXPY ABI or Clarabel
+  binary must invalidate the compiled formula.
+
 ## Streaming statistics
 
 - Public lookbacks are named `periods` and count input rows. Use `ewm_*` names for

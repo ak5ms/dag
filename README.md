@@ -23,7 +23,9 @@ Current development targets the `trading_dsl_engine.jax_flat` runtime plus share
 - `src/trading_dsl_engine/jax_flat/`
   - Active JAX-flat runtime that lowers supported DSL expressions to a flat operator DAG and executes live ticks/batch scans through JIT-compiled JAX functions.
 - `src/trading_dsl_engine/cpp_stream/`
-  - Formula-specialized C++20 streaming backend with typed source adapters, generated native row loops, and fixed-size streaming reductions.
+  - Formula-specialized C++20 streaming backend with typed source adapters,
+    generated native row loops, fixed-size streaming reductions, and persistent
+    CVXPYgen/Clarabel native-program support.
 - `tests/numba/`
   - Deprecated Numba runtime tests; do not run or update unless explicitly requested.
 - `tests/jax/`
@@ -51,6 +53,11 @@ out2d_ram = run_batch_from_mapping(engine, {"open": open_2d, "close": close_2d},
 Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.memmap` by default to avoid materializing full results in RAM. Pass `out_path=None` to allocate in memory, or provide `out=` to write into a preallocated array.
 
 Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
+
+For generated convex programs, CVXPY is used at compile time and CVXPYgen's
+native parameter/result maps execute inside the C++ runtime. Generated instances
+own persistent Clarabel state and can be allocated once per independent native
+worker. See [`docs/cvxpygen_cpp_stream.md`](docs/cvxpygen_cpp_stream.md).
 
 ## DSL composition
 

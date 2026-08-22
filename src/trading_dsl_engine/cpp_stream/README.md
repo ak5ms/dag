@@ -294,6 +294,23 @@ half-life in rows, and `rettype` accepts descriptive values such as `"residual"`
 `"prediction"`, `"intercept"`, `"beta"`, `"r2"`, `"beta_stderr"`, and
 `"beta_tstat"`; numeric selectors are rejected.
 
+## Generated convex programs
+
+`cpp_stream.optimizer.generate_clarabel_program(...)` compiles a static-shape,
+DPP-compliant CVXPY problem through CVXPYgen and emits an instance-owned C++
+class. CVXPYgen retains responsibility for parameter-to-`P/A/q/b` maps, cone
+layout, and result mapping. The generated class retains one Clarabel solver,
+updates dirty fixed-sparsity blocks on subsequent solves, and frees the solver
+in its destructor.
+
+Every independent native worker must own a separate generated instance. Mutable
+parameter/canonical/result buffers are per instance; immutable generated maps
+and cone descriptors are shared. `GeneratedCvxpygenProgram.build_shared_kwargs()`
+connects the generated headers and pinned Clarabel archive to cpp_stream's
+normal translation-unit cache and build path. See
+[`docs/cvxpygen_cpp_stream.md`](../../../docs/cvxpygen_cpp_stream.md) for the
+compile-time and C++ interfaces.
+
 ## Execution model
 
 Every operator has one native implementation and receives its execution scope as

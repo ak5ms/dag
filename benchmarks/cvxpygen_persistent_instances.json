@@ -1,0 +1,562 @@
+{
+  "environment": {
+    "cpu_count": 5,
+    "clarabel_version": "0.11.1",
+    "cxx": "g++"
+  },
+  "configuration": {
+    "horizons": 8,
+    "runs": 15,
+    "warmups": 3,
+    "repetitions": 3,
+    "workers": [
+      2,
+      4
+    ]
+  },
+  "cases": [
+    {
+      "assets": 9,
+      "horizons": 8,
+      "codegen_seconds": 0.0969166810000388,
+      "compile_seconds": 1.276608890000034,
+      "generated_header_bytes": 238550,
+      "binary_bytes": 2627888,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 1.25127,
+        "mean_ms": 1.2800866666666668,
+        "min_ms": 1.213324,
+        "max_ms": 1.375666,
+        "rss_delta_kb_median": 128.0
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 0.621701033,
+          "median_problems_per_second": 1608.490168721,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 18.608077,
+              "ms_per_problem": 0.620269233,
+              "problems_per_second": 1612.203130915,
+              "checksum": 1.3286717937475072
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 19.232646,
+              "ms_per_problem": 0.6410882,
+              "problems_per_second": 1559.847771329,
+              "checksum": 1.3286717937475072
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 18.651031,
+              "ms_per_problem": 0.621701033,
+              "problems_per_second": 1608.490168721,
+              "checksum": 1.3286717937475072
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 0.35277085,
+          "median_problems_per_second": 2834.701336567,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 19.465762,
+              "ms_per_problem": 0.324429367,
+              "problems_per_second": 3082.335024956,
+              "checksum": 2.8185897049622968
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 21.166251,
+              "ms_per_problem": 0.35277085,
+              "problems_per_second": 2834.701336567,
+              "checksum": 2.8185897049622968
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 22.912327,
+              "ms_per_problem": 0.381872117,
+              "problems_per_second": 2618.677710028,
+              "checksum": 2.8185897049622968
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 1.2833054,
+            "median_ms": 1.25127,
+            "min_ms": 1.10988,
+            "max_ms": 1.58053,
+            "rss_delta_kb": 128,
+            "checksum": 0.546191858673041
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 18.608077,
+            "ms_per_problem": 0.620269233,
+            "problems_per_second": 1612.203130915,
+            "checksum": 1.3286717937475072
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 19.465762,
+            "ms_per_problem": 0.324429367,
+            "problems_per_second": 3082.335024956,
+            "checksum": 2.8185897049622968
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 1.2719078,
+            "median_ms": 1.213324,
+            "min_ms": 1.064753,
+            "max_ms": 1.568643,
+            "rss_delta_kb": 128,
+            "checksum": 0.546191858673041
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 19.232646,
+            "ms_per_problem": 0.6410882,
+            "problems_per_second": 1559.847771329,
+            "checksum": 1.3286717937475072
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 21.166251,
+            "ms_per_problem": 0.35277085,
+            "problems_per_second": 2834.701336567,
+            "checksum": 2.8185897049622968
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 1.413900267,
+            "median_ms": 1.375666,
+            "min_ms": 1.194236,
+            "max_ms": 2.069517,
+            "rss_delta_kb": 128,
+            "checksum": 0.546191858673041
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 18.651031,
+            "ms_per_problem": 0.621701033,
+            "problems_per_second": 1608.490168721,
+            "checksum": 1.3286717937475072
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 22.912327,
+            "ms_per_problem": 0.381872117,
+            "problems_per_second": 2618.677710028,
+            "checksum": 2.8185897049622968
+          }
+        ]
+      ]
+    },
+    {
+      "assets": 24,
+      "horizons": 8,
+      "codegen_seconds": 0.41420135099997424,
+      "compile_seconds": 1.3453086370000165,
+      "generated_header_bytes": 981629,
+      "binary_bytes": 2880056,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 7.540362,
+        "mean_ms": 7.46405,
+        "min_ms": 7.139826,
+        "max_ms": 7.711962,
+        "rss_delta_kb_median": 128.0
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 3.780459333,
+          "median_problems_per_second": 264.518121167,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 113.41378,
+              "ms_per_problem": 3.780459333,
+              "problems_per_second": 264.518121167,
+              "checksum": 0.7465255258995545
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 113.94536,
+              "ms_per_problem": 3.798178667,
+              "problems_per_second": 263.284086338,
+              "checksum": 0.7465255258995545
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 112.001925,
+              "ms_per_problem": 3.7333975,
+              "problems_per_second": 267.852539141,
+              "checksum": 0.7465255258995545
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 1.9398284,
+          "median_problems_per_second": 515.509516203,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 136.867963,
+              "ms_per_problem": 2.281132717,
+              "problems_per_second": 438.378702253,
+              "checksum": 1.5615408985210206
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 115.585178,
+              "ms_per_problem": 1.926419633,
+              "problems_per_second": 519.097699534,
+              "checksum": 1.5615408985210206
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 116.389704,
+              "ms_per_problem": 1.9398284,
+              "problems_per_second": 515.509516203,
+              "checksum": 1.5615408985210206
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 7.679957333,
+            "median_ms": 7.540362,
+            "min_ms": 7.346388,
+            "max_ms": 8.804241,
+            "rss_delta_kb": 128,
+            "checksum": 0.30723801785329474
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 113.41378,
+            "ms_per_problem": 3.780459333,
+            "problems_per_second": 264.518121167,
+            "checksum": 0.7465255258995545
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 136.867963,
+            "ms_per_problem": 2.281132717,
+            "problems_per_second": 438.378702253,
+            "checksum": 1.5615408985210206
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 7.235912733,
+            "median_ms": 7.139826,
+            "min_ms": 7.109161,
+            "max_ms": 7.747239,
+            "rss_delta_kb": 128,
+            "checksum": 0.30723801785329474
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 113.94536,
+            "ms_per_problem": 3.798178667,
+            "problems_per_second": 263.284086338,
+            "checksum": 0.7465255258995545
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 115.585178,
+            "ms_per_problem": 1.926419633,
+            "problems_per_second": 519.097699534,
+            "checksum": 1.5615408985210206
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 8.518113533,
+            "median_ms": 7.711962,
+            "min_ms": 7.131133,
+            "max_ms": 18.745662,
+            "rss_delta_kb": 128,
+            "checksum": 0.30723801785329474
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 112.001925,
+            "ms_per_problem": 3.7333975,
+            "problems_per_second": 267.852539141,
+            "checksum": 0.7465255258995545
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 116.389704,
+            "ms_per_problem": 1.9398284,
+            "problems_per_second": 515.509516203,
+            "checksum": 1.5615408985210206
+          }
+        ]
+      ]
+    },
+    {
+      "assets": 50,
+      "horizons": 8,
+      "codegen_seconds": 3.309949283999913,
+      "compile_seconds": 2.30199393099997,
+      "generated_header_bytes": 3460740,
+      "binary_bytes": 3742168,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 39.43175,
+        "mean_ms": 39.10042333333333,
+        "min_ms": 38.36979,
+        "max_ms": 39.49973,
+        "rss_delta_kb_median": 128.0
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 21.665041733,
+          "median_problems_per_second": 46.15730781,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 705.744683,
+              "ms_per_problem": 23.524822767,
+              "problems_per_second": 42.508290495,
+              "checksum": 0.5365786985164391
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 649.951252,
+              "ms_per_problem": 21.665041733,
+              "problems_per_second": 46.15730781,
+              "checksum": 0.5365786985164391
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 30,
+              "wall_ms": 591.192446,
+              "ms_per_problem": 19.706414867,
+              "problems_per_second": 50.744897373,
+              "checksum": 0.5365786985164391
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 10.4862612,
+          "median_problems_per_second": 95.362873471,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 746.86597,
+              "ms_per_problem": 12.447766167,
+              "problems_per_second": 80.335699322,
+              "checksum": 1.0984237005753172
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 629.175672,
+              "ms_per_problem": 10.4862612,
+              "problems_per_second": 95.362873471,
+              "checksum": 1.0984237005753172
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 60,
+              "wall_ms": 621.182131,
+              "ms_per_problem": 10.353035517,
+              "problems_per_second": 96.590028923,
+              "checksum": 1.0984237005753172
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 39.298879733,
+            "median_ms": 39.43175,
+            "min_ms": 37.697601,
+            "max_ms": 40.607687,
+            "rss_delta_kb": 128,
+            "checksum": 0.2228100849547179
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 705.744683,
+            "ms_per_problem": 23.524822767,
+            "problems_per_second": 42.508290495,
+            "checksum": 0.5365786985164391
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 746.86597,
+            "ms_per_problem": 12.447766167,
+            "problems_per_second": 80.335699322,
+            "checksum": 1.0984237005753172
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 39.933623533,
+            "median_ms": 39.49973,
+            "min_ms": 38.327527,
+            "max_ms": 42.426311,
+            "rss_delta_kb": 128,
+            "checksum": 0.2228100849547179
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 649.951252,
+            "ms_per_problem": 21.665041733,
+            "problems_per_second": 46.15730781,
+            "checksum": 0.5365786985164391
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 629.175672,
+            "ms_per_problem": 10.4862612,
+            "problems_per_second": 95.362873471,
+            "checksum": 1.0984237005753172
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "workers": 1,
+            "problems": 15,
+            "mean_ms": 39.262354067,
+            "median_ms": 38.36979,
+            "min_ms": 37.695237,
+            "max_ms": 42.817854,
+            "rss_delta_kb": 152,
+            "checksum": 0.2228100849547179
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 30,
+            "wall_ms": 591.192446,
+            "ms_per_problem": 19.706414867,
+            "problems_per_second": 50.744897373,
+            "checksum": 0.5365786985164391
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 60,
+            "wall_ms": 621.182131,
+            "ms_per_problem": 10.353035517,
+            "problems_per_second": 96.590028923,
+            "checksum": 1.0984237005753172
+          }
+        ]
+      ]
+    }
+  ]
+}

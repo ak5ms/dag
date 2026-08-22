@@ -108,7 +108,20 @@ def _flags() -> tuple[list[str], list[str]]:
     return compile_flags, link_flags
 
 
-def build_shared(source: str) -> tuple[Path, Path]:
+def build_shared(
+    source: str,
+    *,
+    extra_include_dirs: tuple[Path, ...] = (),
+    extra_link_files: tuple[Path, ...] = (),
+    extra_fingerprint_files: tuple[Path, ...] = (),
+) -> tuple[Path, Path]:
+    """Compile one generated translation unit and cache all native dependencies.
+
+    Optimizer nodes use this hook to include CVXPYgen's generated instance class
+    and link a pinned Clarabel static library without introducing a second build
+    system. Existing formulas pass no extras and retain the previous behavior.
+    """
+
     compiler = _compiler()
     compile_flags, link_flags = _flags()
     digest = hashlib.sha256(source.encode())
@@ -117,6 +130,20 @@ def build_shared(source: str) -> tuple[Path, Path]:
         digest.update(header.read_bytes())
     eigen_include = _eigen_include()
     digest.update(str(eigen_include).encode())
+    normalized_include_dirs = tuple(Path(path).resolve() for path in extra_include_dirs)
+    normalized_link_files = tuple(Path(path).resolve() for path in extra_link_files)
+    normalized_fingerprint_files = tuple(
+        Path(path).resolve() for path in extra_fingerprint_files
+    )
+    for path in (*normalized_link_files, *normalized_fingerprint_files):
+        if not path.is_file():
+            raise FileNotFoundError(f"native build dependency not found: {path}")
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes())
+    for directory in normalized_include_dirs:
+        if not directory.is_dir():
+            raise FileNotFoundError(f"native include directory not found: {directory}")
+        digest.update(str(directory).encode())
     eigen_macros = eigen_include / "Eigen" / "src" / "Core" / "util" / "Macros.h"
     if eigen_macros.is_file():
         digest.update(eigen_macros.read_bytes())
@@ -142,7 +169,9 @@ def build_shared(source: str) -> tuple[Path, Path]:
         *compile_flags,
         f"-I{_cpp_root()}",
         f"-I{_eigen_include()}",
+        *(f"-I{directory}" for directory in normalized_include_dirs),
         str(temporary_cpp),
+        *(str(path) for path in normalized_link_files),
         *link_flags,
         "-o",
         str(temporary_so),
