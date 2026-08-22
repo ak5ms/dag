@@ -1,101 +1,495 @@
 {
   "environment": {
-    "cpu_count": 5,
+    "cpu_count": 9,
+    "cpu_affinity": 9,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
     "clarabel_version": "0.11.1",
-    "cxx": "g++"
+    "cxx": "g++",
+    "cxx_version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
   },
   "configuration": {
     "horizons": 8,
-    "runs": 15,
-    "warmups": 3,
+    "runs": 10,
+    "warmups": 1,
     "repetitions": 3,
     "workers": [
       2,
-      4
+      4,
+      8
     ]
   },
   "cases": [
     {
       "assets": 9,
       "horizons": 8,
-      "codegen_seconds": 0.0969166810000388,
-      "compile_seconds": 1.276608890000034,
-      "generated_header_bytes": 238550,
-      "binary_bytes": 2627888,
+      "codegen_seconds": 0.10375048300011258,
+      "codegen_reused": false,
+      "compile_seconds": 1.1721856550002485,
+      "generated_header_bytes": 267946,
+      "binary_bytes": 2632312,
       "serial": {
         "repetitions": 3,
-        "median_ms": 1.25127,
-        "mean_ms": 1.2800866666666668,
-        "min_ms": 1.213324,
-        "max_ms": 1.375666,
-        "rss_delta_kb_median": 128.0
+        "median_ms": 1.294004,
+        "mean_ms": 1.25553,
+        "min_ms": 1.1606705,
+        "max_ms": 1.3119155,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 72,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 1.1616297,
+            "median_ms": 1.1606705,
+            "min_ms": 1.058068,
+            "max_ms": 1.282122001,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              1.282122001,
+              1.094762,
+              1.210715001,
+              1.22085,
+              1.20789,
+              1.165447999,
+              1.085067001,
+              1.058068,
+              1.155893,
+              1.135482
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 1.4199168,
+            "median_ms": 1.3119155,
+            "min_ms": 1.137755999,
+            "max_ms": 2.218277,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              2.218277,
+              1.779122,
+              1.347249,
+              1.302471001,
+              1.169474,
+              1.32136,
+              1.137755999,
+              1.399276,
+              1.299126,
+              1.225057
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 1.3186999,
+            "median_ms": 1.294004,
+            "min_ms": 1.126458999,
+            "max_ms": 1.586625,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              1.260088,
+              1.32792,
+              1.167621001,
+              1.352406,
+              1.586625,
+              1.242142,
+              1.126458999,
+              1.36147,
+              1.208692,
+              1.553575999
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 1.294004,
+          "mean_ms": 1.25553,
+          "min_ms": 1.1606705,
+          "max_ms": 1.3119155,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 72,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 1.1616297,
+              "median_ms": 1.1606705,
+              "min_ms": 1.058068,
+              "max_ms": 1.282122001,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9248633885185127,
+              "samples_ms": [
+                1.282122001,
+                1.094762,
+                1.210715001,
+                1.22085,
+                1.20789,
+                1.165447999,
+                1.085067001,
+                1.058068,
+                1.155893,
+                1.135482
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 1.4199168,
+              "median_ms": 1.3119155,
+              "min_ms": 1.137755999,
+              "max_ms": 2.218277,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9248633885185127,
+              "samples_ms": [
+                2.218277,
+                1.779122,
+                1.347249,
+                1.302471001,
+                1.169474,
+                1.32136,
+                1.137755999,
+                1.399276,
+                1.299126,
+                1.225057
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 1.3186999,
+              "median_ms": 1.294004,
+              "min_ms": 1.126458999,
+              "max_ms": 1.586625,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9248633885185127,
+              "samples_ms": [
+                1.260088,
+                1.32792,
+                1.167621001,
+                1.352406,
+                1.586625,
+                1.242142,
+                1.126458999,
+                1.36147,
+                1.208692,
+                1.553575999
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 1.1750865,
+          "mean_ms": 1.1928163336666666,
+          "min_ms": 1.162067001,
+          "max_ms": 1.2412955,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 72,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 1.2004085,
+              "median_ms": 1.162067001,
+              "min_ms": 1.136645,
+              "max_ms": 1.443172,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9232968384744393,
+              "samples_ms": [
+                1.159658001,
+                1.136645,
+                1.150163999,
+                1.443172,
+                1.181431,
+                1.164476001,
+                1.142423,
+                1.278967,
+                1.191276,
+                1.155872999
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 1.3595207,
+              "median_ms": 1.2412955,
+              "min_ms": 1.105418,
+              "max_ms": 2.472476001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9232968384744393,
+              "samples_ms": [
+                1.447928,
+                1.283744,
+                2.472476001,
+                1.232387001,
+                1.353968,
+                1.250204,
+                1.163074,
+                1.105418,
+                1.152758,
+                1.13325
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 2.7693067,
+              "median_ms": 1.1750865,
+              "min_ms": 1.090746,
+              "max_ms": 17.194957,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9232968384744393,
+              "samples_ms": [
+                17.194957,
+                1.173608999,
+                1.201812,
+                1.182843001,
+                1.158828,
+                1.193829,
+                1.161372001,
+                1.090746,
+                1.158507,
+                1.176564
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.0000905,
+          "mean_ms": 0.00009350000000000001,
+          "min_ms": 0.00009,
+          "max_ms": 0.0001,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 72,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0001233,
+              "median_ms": 0.0000905,
+              "min_ms": 0.00009,
+              "max_ms": 0.000271,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9853668747288147,
+              "samples_ms": [
+                0.000271,
+                0.00017,
+                0.00016,
+                0.000090999,
+                0.00009,
+                0.00009,
+                0.00009,
+                0.00009,
+                0.000091,
+                0.00009
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0001372,
+              "median_ms": 0.0001,
+              "min_ms": 0.00009,
+              "max_ms": 0.000319999,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9853668747288147,
+              "samples_ms": [
+                0.000319999,
+                0.000211,
+                0.00015,
+                0.0001,
+                0.00009,
+                0.0001,
+                0.000101,
+                0.000100001,
+                0.0001,
+                0.0001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0001282,
+              "median_ms": 0.00009,
+              "min_ms": 0.00009,
+              "max_ms": 0.0003,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 72,
+              "checksum": 1.9853668747288147,
+              "samples_ms": [
+                0.0003,
+                0.000191,
+                0.00016,
+                0.00009,
+                0.00009,
+                0.000091,
+                0.00009,
+                0.00009,
+                0.00009,
+                0.00009
+              ]
+            }
+          ]
+        }
       },
       "parallel": [
         {
           "workers": 2,
-          "median_ms_per_problem": 0.621701033,
-          "median_problems_per_second": 1608.490168721,
+          "median_ms_per_problem": 0.71778955,
+          "median_problems_per_second": 1393.166005222,
           "raw": [
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 18.608077,
-              "ms_per_problem": 0.620269233,
-              "problems_per_second": 1612.203130915,
-              "checksum": 1.3286717937475072
+              "problems": 20,
+              "wall_ms": 7.849841,
+              "ms_per_problem": 0.39249205,
+              "problems_per_second": 2547.822306119,
+              "checksum": 4.187468281548167
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 19.232646,
-              "ms_per_problem": 0.6410882,
-              "problems_per_second": 1559.847771329,
-              "checksum": 1.3286717937475072
+              "problems": 20,
+              "wall_ms": 14.355791001,
+              "ms_per_problem": 0.71778955,
+              "problems_per_second": 1393.166005222,
+              "checksum": 4.187468281548167
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 18.651031,
-              "ms_per_problem": 0.621701033,
-              "problems_per_second": 1608.490168721,
-              "checksum": 1.3286717937475072
+              "problems": 20,
+              "wall_ms": 34.653459,
+              "ms_per_problem": 1.73267295,
+              "problems_per_second": 577.142962845,
+              "checksum": 4.187468281548167
             }
           ]
         },
         {
           "workers": 4,
-          "median_ms_per_problem": 0.35277085,
-          "median_problems_per_second": 2834.701336567,
+          "median_ms_per_problem": 0.3129455,
+          "median_problems_per_second": 3195.444574077,
           "raw": [
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 19.465762,
-              "ms_per_problem": 0.324429367,
-              "problems_per_second": 3082.335024956,
-              "checksum": 2.8185897049622968
+              "problems": 40,
+              "wall_ms": 12.408968,
+              "ms_per_problem": 0.3102242,
+              "problems_per_second": 3223.475151126,
+              "checksum": 8.01384656060958
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 21.166251,
-              "ms_per_problem": 0.35277085,
-              "problems_per_second": 2834.701336567,
-              "checksum": 2.8185897049622968
+              "problems": 40,
+              "wall_ms": 12.517820001,
+              "ms_per_problem": 0.3129455,
+              "problems_per_second": 3195.444574077,
+              "checksum": 8.01384656060958
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 22.912327,
-              "ms_per_problem": 0.381872117,
-              "problems_per_second": 2618.677710028,
-              "checksum": 2.8185897049622968
+              "problems": 40,
+              "wall_ms": 13.021516999,
+              "ms_per_problem": 0.325537925,
+              "problems_per_second": 3071.838711433,
+              "checksum": 8.01384656060958
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 0.213897362,
+          "median_problems_per_second": 4675.139461008,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 17.111789,
+              "ms_per_problem": 0.213897362,
+              "problems_per_second": 4675.139461008,
+              "checksum": 13.075316965129485
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 13.712200999,
+              "ms_per_problem": 0.171402512,
+              "problems_per_second": 5834.220195925,
+              "checksum": 13.075316965129485
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 17.289319,
+              "ms_per_problem": 0.216116488,
+              "problems_per_second": 4627.134243939,
+              "checksum": 13.075316965129485
             }
           ]
         }
@@ -104,94 +498,322 @@
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 1.2833054,
-            "median_ms": 1.25127,
-            "min_ms": 1.10988,
-            "max_ms": 1.58053,
-            "rss_delta_kb": 128,
-            "checksum": 0.546191858673041
+            "problems": 10,
+            "mean_ms": 1.1616297,
+            "median_ms": 1.1606705,
+            "min_ms": 1.058068,
+            "max_ms": 1.282122001,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              1.282122001,
+              1.094762,
+              1.210715001,
+              1.22085,
+              1.20789,
+              1.165447999,
+              1.085067001,
+              1.058068,
+              1.155893,
+              1.135482
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 1.2004085,
+            "median_ms": 1.162067001,
+            "min_ms": 1.136645,
+            "max_ms": 1.443172,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9232968384744393,
+            "samples_ms": [
+              1.159658001,
+              1.136645,
+              1.150163999,
+              1.443172,
+              1.181431,
+              1.164476001,
+              1.142423,
+              1.278967,
+              1.191276,
+              1.155872999
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0001233,
+            "median_ms": 0.0000905,
+            "min_ms": 0.00009,
+            "max_ms": 0.000271,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9853668747288147,
+            "samples_ms": [
+              0.000271,
+              0.00017,
+              0.00016,
+              0.000090999,
+              0.00009,
+              0.00009,
+              0.00009,
+              0.00009,
+              0.000091,
+              0.00009
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 18.608077,
-            "ms_per_problem": 0.620269233,
-            "problems_per_second": 1612.203130915,
-            "checksum": 1.3286717937475072
+            "problems": 20,
+            "wall_ms": 7.849841,
+            "ms_per_problem": 0.39249205,
+            "problems_per_second": 2547.822306119,
+            "checksum": 4.187468281548167
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 19.465762,
-            "ms_per_problem": 0.324429367,
-            "problems_per_second": 3082.335024956,
-            "checksum": 2.8185897049622968
+            "problems": 40,
+            "wall_ms": 12.408968,
+            "ms_per_problem": 0.3102242,
+            "problems_per_second": 3223.475151126,
+            "checksum": 8.01384656060958
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 17.111789,
+            "ms_per_problem": 0.213897362,
+            "problems_per_second": 4675.139461008,
+            "checksum": 13.075316965129485
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 1.2719078,
-            "median_ms": 1.213324,
-            "min_ms": 1.064753,
-            "max_ms": 1.568643,
-            "rss_delta_kb": 128,
-            "checksum": 0.546191858673041
+            "problems": 10,
+            "mean_ms": 1.4199168,
+            "median_ms": 1.3119155,
+            "min_ms": 1.137755999,
+            "max_ms": 2.218277,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              2.218277,
+              1.779122,
+              1.347249,
+              1.302471001,
+              1.169474,
+              1.32136,
+              1.137755999,
+              1.399276,
+              1.299126,
+              1.225057
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 1.3595207,
+            "median_ms": 1.2412955,
+            "min_ms": 1.105418,
+            "max_ms": 2.472476001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9232968384744393,
+            "samples_ms": [
+              1.447928,
+              1.283744,
+              2.472476001,
+              1.232387001,
+              1.353968,
+              1.250204,
+              1.163074,
+              1.105418,
+              1.152758,
+              1.13325
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0001372,
+            "median_ms": 0.0001,
+            "min_ms": 0.00009,
+            "max_ms": 0.000319999,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9853668747288147,
+            "samples_ms": [
+              0.000319999,
+              0.000211,
+              0.00015,
+              0.0001,
+              0.00009,
+              0.0001,
+              0.000101,
+              0.000100001,
+              0.0001,
+              0.0001
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 19.232646,
-            "ms_per_problem": 0.6410882,
-            "problems_per_second": 1559.847771329,
-            "checksum": 1.3286717937475072
+            "problems": 20,
+            "wall_ms": 14.355791001,
+            "ms_per_problem": 0.71778955,
+            "problems_per_second": 1393.166005222,
+            "checksum": 4.187468281548167
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 21.166251,
-            "ms_per_problem": 0.35277085,
-            "problems_per_second": 2834.701336567,
-            "checksum": 2.8185897049622968
+            "problems": 40,
+            "wall_ms": 12.517820001,
+            "ms_per_problem": 0.3129455,
+            "problems_per_second": 3195.444574077,
+            "checksum": 8.01384656060958
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 13.712200999,
+            "ms_per_problem": 0.171402512,
+            "problems_per_second": 5834.220195925,
+            "checksum": 13.075316965129485
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 1.413900267,
-            "median_ms": 1.375666,
-            "min_ms": 1.194236,
-            "max_ms": 2.069517,
-            "rss_delta_kb": 128,
-            "checksum": 0.546191858673041
+            "problems": 10,
+            "mean_ms": 1.3186999,
+            "median_ms": 1.294004,
+            "min_ms": 1.126458999,
+            "max_ms": 1.586625,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9248633885185127,
+            "samples_ms": [
+              1.260088,
+              1.32792,
+              1.167621001,
+              1.352406,
+              1.586625,
+              1.242142,
+              1.126458999,
+              1.36147,
+              1.208692,
+              1.553575999
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 2.7693067,
+            "median_ms": 1.1750865,
+            "min_ms": 1.090746,
+            "max_ms": 17.194957,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9232968384744393,
+            "samples_ms": [
+              17.194957,
+              1.173608999,
+              1.201812,
+              1.182843001,
+              1.158828,
+              1.193829,
+              1.161372001,
+              1.090746,
+              1.158507,
+              1.176564
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0001282,
+            "median_ms": 0.00009,
+            "min_ms": 0.00009,
+            "max_ms": 0.0003,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 72,
+            "checksum": 1.9853668747288147,
+            "samples_ms": [
+              0.0003,
+              0.000191,
+              0.00016,
+              0.00009,
+              0.00009,
+              0.000091,
+              0.00009,
+              0.00009,
+              0.00009,
+              0.00009
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 18.651031,
-            "ms_per_problem": 0.621701033,
-            "problems_per_second": 1608.490168721,
-            "checksum": 1.3286717937475072
+            "problems": 20,
+            "wall_ms": 34.653459,
+            "ms_per_problem": 1.73267295,
+            "problems_per_second": 577.142962845,
+            "checksum": 4.187468281548167
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 22.912327,
-            "ms_per_problem": 0.381872117,
-            "problems_per_second": 2618.677710028,
-            "checksum": 2.8185897049622968
+            "problems": 40,
+            "wall_ms": 13.021516999,
+            "ms_per_problem": 0.325537925,
+            "problems_per_second": 3071.838711433,
+            "checksum": 8.01384656060958
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 17.289319,
+            "ms_per_problem": 0.216116488,
+            "problems_per_second": 4627.134243939,
+            "checksum": 13.075316965129485
           }
         ]
       ]
@@ -199,84 +821,473 @@
     {
       "assets": 24,
       "horizons": 8,
-      "codegen_seconds": 0.41420135099997424,
-      "compile_seconds": 1.3453086370000165,
-      "generated_header_bytes": 981629,
-      "binary_bytes": 2880056,
+      "codegen_seconds": 0.25990446400010114,
+      "codegen_reused": false,
+      "compile_seconds": 1.2266246739991402,
+      "generated_header_bytes": 1050083,
+      "binary_bytes": 2868232,
       "serial": {
         "repetitions": 3,
-        "median_ms": 7.540362,
-        "mean_ms": 7.46405,
-        "min_ms": 7.139826,
-        "max_ms": 7.711962,
-        "rss_delta_kb_median": 128.0
+        "median_ms": 7.5839005,
+        "mean_ms": 7.663541,
+        "min_ms": 7.5649625,
+        "max_ms": 7.84176,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 192,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.9808421,
+            "median_ms": 7.84176,
+            "min_ms": 7.423386,
+            "max_ms": 9.809472999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              7.484788,
+              7.514432001,
+              8.107296,
+              8.161126,
+              8.004692,
+              7.815671001,
+              7.867849,
+              9.809472999,
+              7.423386,
+              7.619708
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.5933644,
+            "median_ms": 7.5649625,
+            "min_ms": 7.331127999,
+            "max_ms": 7.873918,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              7.376716,
+              7.331127999,
+              7.585959,
+              7.834409,
+              7.873918,
+              7.543966,
+              7.743854,
+              7.723213,
+              7.45311,
+              7.467371
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.7166214,
+            "median_ms": 7.5839005,
+            "min_ms": 7.102067,
+            "max_ms": 9.157772,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              9.157772,
+              8.449206,
+              7.158982,
+              8.108317,
+              7.608332,
+              7.740399,
+              7.17815,
+              7.10352,
+              7.559469,
+              7.102067
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 7.5839005,
+          "mean_ms": 7.663541,
+          "min_ms": 7.5649625,
+          "max_ms": 7.84176,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 192,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.9808421,
+              "median_ms": 7.84176,
+              "min_ms": 7.423386,
+              "max_ms": 9.809472999,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49887230646373115,
+              "samples_ms": [
+                7.484788,
+                7.514432001,
+                8.107296,
+                8.161126,
+                8.004692,
+                7.815671001,
+                7.867849,
+                9.809472999,
+                7.423386,
+                7.619708
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.5933644,
+              "median_ms": 7.5649625,
+              "min_ms": 7.331127999,
+              "max_ms": 7.873918,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49887230646373115,
+              "samples_ms": [
+                7.376716,
+                7.331127999,
+                7.585959,
+                7.834409,
+                7.873918,
+                7.543966,
+                7.743854,
+                7.723213,
+                7.45311,
+                7.467371
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.7166214,
+              "median_ms": 7.5839005,
+              "min_ms": 7.102067,
+              "max_ms": 9.157772,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49887230646373115,
+              "samples_ms": [
+                9.157772,
+                8.449206,
+                7.158982,
+                8.108317,
+                7.608332,
+                7.740399,
+                7.17815,
+                7.10352,
+                7.559469,
+                7.102067
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 7.1652765,
+          "mean_ms": 7.159831667,
+          "min_ms": 7.136348,
+          "max_ms": 7.177870501,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 192,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.2612344,
+              "median_ms": 7.1652765,
+              "min_ms": 7.083369,
+              "max_ms": 7.755711,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49794953092615896,
+              "samples_ms": [
+                7.755711,
+                7.154055001,
+                7.083369,
+                7.250238,
+                7.521683,
+                7.176497999,
+                7.086634,
+                7.147405,
+                7.350648,
+                7.086103
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.2223765,
+              "median_ms": 7.136348,
+              "min_ms": 7.104521,
+              "max_ms": 8.046325001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49794953092615896,
+              "samples_ms": [
+                8.046325001,
+                7.13789,
+                7.176248,
+                7.138211,
+                7.104521,
+                7.134806,
+                7.141526,
+                7.116839,
+                7.122647999,
+                7.104751
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 7.2990098,
+              "median_ms": 7.177870501,
+              "min_ms": 7.112172,
+              "max_ms": 7.910773,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.49794953092615896,
+              "samples_ms": [
+                7.179914001,
+                7.143579001,
+                7.583975,
+                7.199813,
+                7.147265,
+                7.910773,
+                7.141766,
+                7.395014,
+                7.112172,
+                7.175827001
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.000481,
+          "mean_ms": 0.0004806666666666667,
+          "min_ms": 0.00048,
+          "max_ms": 0.000481,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 192,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0005549,
+              "median_ms": 0.000481,
+              "min_ms": 0.000471,
+              "max_ms": 0.000992,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.33433448665739474,
+              "samples_ms": [
+                0.000992,
+                0.000561,
+                0.000641,
+                0.0005,
+                0.000481,
+                0.000471,
+                0.000481,
+                0.00048,
+                0.000471,
+                0.000471
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0005299,
+              "median_ms": 0.000481,
+              "min_ms": 0.00047,
+              "max_ms": 0.000862,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.33433448665739474,
+              "samples_ms": [
+                0.000862,
+                0.00055,
+                0.000561,
+                0.000481,
+                0.000471,
+                0.000471,
+                0.00047,
+                0.000471,
+                0.000481,
+                0.000481
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0005869,
+              "median_ms": 0.00048,
+              "min_ms": 0.000471,
+              "max_ms": 0.001422,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 192,
+              "checksum": -0.33433448665739474,
+              "samples_ms": [
+                0.001422,
+                0.000540999,
+                0.000581,
+                0.00048,
+                0.000471,
+                0.000471,
+                0.000481,
+                0.00048,
+                0.000471,
+                0.000471
+              ]
+            }
+          ]
+        }
       },
       "parallel": [
         {
           "workers": 2,
-          "median_ms_per_problem": 3.780459333,
-          "median_problems_per_second": 264.518121167,
+          "median_ms_per_problem": 4.1959224,
+          "median_problems_per_second": 238.326619196,
           "raw": [
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 113.41378,
-              "ms_per_problem": 3.780459333,
-              "problems_per_second": 264.518121167,
-              "checksum": 0.7465255258995545
+              "problems": 20,
+              "wall_ms": 73.143476,
+              "ms_per_problem": 3.6571738,
+              "problems_per_second": 273.435186482,
+              "checksum": -1.2204147642539387
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 113.94536,
-              "ms_per_problem": 3.798178667,
-              "problems_per_second": 263.284086338,
-              "checksum": 0.7465255258995545
+              "problems": 20,
+              "wall_ms": 83.918448,
+              "ms_per_problem": 4.1959224,
+              "problems_per_second": 238.326619196,
+              "checksum": -1.2204147642539387
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 112.001925,
-              "ms_per_problem": 3.7333975,
-              "problems_per_second": 267.852539141,
-              "checksum": 0.7465255258995545
+              "problems": 20,
+              "wall_ms": 92.883428,
+              "ms_per_problem": 4.6441714,
+              "problems_per_second": 215.323663549,
+              "checksum": -1.2204147642539387
             }
           ]
         },
         {
           "workers": 4,
-          "median_ms_per_problem": 1.9398284,
-          "median_problems_per_second": 515.509516203,
+          "median_ms_per_problem": 2.1714331,
+          "median_problems_per_second": 460.525355349,
           "raw": [
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 136.867963,
-              "ms_per_problem": 2.281132717,
-              "problems_per_second": 438.378702253,
-              "checksum": 1.5615408985210206
+              "problems": 40,
+              "wall_ms": 75.865113,
+              "ms_per_problem": 1.896627825,
+              "problems_per_second": 527.251570824,
+              "checksum": -2.986340213836443
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 115.585178,
-              "ms_per_problem": 1.926419633,
-              "problems_per_second": 519.097699534,
-              "checksum": 1.5615408985210206
+              "problems": 40,
+              "wall_ms": 86.857324,
+              "ms_per_problem": 2.1714331,
+              "problems_per_second": 460.525355349,
+              "checksum": -2.986340213836443
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 116.389704,
-              "ms_per_problem": 1.9398284,
-              "problems_per_second": 515.509516203,
-              "checksum": 1.5615408985210206
+              "problems": 40,
+              "wall_ms": 96.93985,
+              "ms_per_problem": 2.42349625,
+              "problems_per_second": 412.627005302,
+              "checksum": -2.986340213836443
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 1.274108088,
+          "median_problems_per_second": 784.862767775,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 101.928647,
+              "ms_per_problem": 1.274108088,
+              "problems_per_second": 784.862767775,
+              "checksum": -8.17592669062408
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 98.351239,
+              "ms_per_problem": 1.229390488,
+              "problems_per_second": 813.411206744,
+              "checksum": -8.17592669062408
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 149.114553,
+              "ms_per_problem": 1.863931912,
+              "problems_per_second": 536.500283779,
+              "checksum": -8.17592669062408
             }
           ]
         }
@@ -285,94 +1296,322 @@
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 7.679957333,
-            "median_ms": 7.540362,
-            "min_ms": 7.346388,
-            "max_ms": 8.804241,
-            "rss_delta_kb": 128,
-            "checksum": 0.30723801785329474
+            "problems": 10,
+            "mean_ms": 7.9808421,
+            "median_ms": 7.84176,
+            "min_ms": 7.423386,
+            "max_ms": 9.809472999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              7.484788,
+              7.514432001,
+              8.107296,
+              8.161126,
+              8.004692,
+              7.815671001,
+              7.867849,
+              9.809472999,
+              7.423386,
+              7.619708
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.2612344,
+            "median_ms": 7.1652765,
+            "min_ms": 7.083369,
+            "max_ms": 7.755711,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49794953092615896,
+            "samples_ms": [
+              7.755711,
+              7.154055001,
+              7.083369,
+              7.250238,
+              7.521683,
+              7.176497999,
+              7.086634,
+              7.147405,
+              7.350648,
+              7.086103
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0005549,
+            "median_ms": 0.000481,
+            "min_ms": 0.000471,
+            "max_ms": 0.000992,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.33433448665739474,
+            "samples_ms": [
+              0.000992,
+              0.000561,
+              0.000641,
+              0.0005,
+              0.000481,
+              0.000471,
+              0.000481,
+              0.00048,
+              0.000471,
+              0.000471
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 113.41378,
-            "ms_per_problem": 3.780459333,
-            "problems_per_second": 264.518121167,
-            "checksum": 0.7465255258995545
+            "problems": 20,
+            "wall_ms": 73.143476,
+            "ms_per_problem": 3.6571738,
+            "problems_per_second": 273.435186482,
+            "checksum": -1.2204147642539387
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 136.867963,
-            "ms_per_problem": 2.281132717,
-            "problems_per_second": 438.378702253,
-            "checksum": 1.5615408985210206
+            "problems": 40,
+            "wall_ms": 75.865113,
+            "ms_per_problem": 1.896627825,
+            "problems_per_second": 527.251570824,
+            "checksum": -2.986340213836443
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 101.928647,
+            "ms_per_problem": 1.274108088,
+            "problems_per_second": 784.862767775,
+            "checksum": -8.17592669062408
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 7.235912733,
-            "median_ms": 7.139826,
-            "min_ms": 7.109161,
-            "max_ms": 7.747239,
-            "rss_delta_kb": 128,
-            "checksum": 0.30723801785329474
+            "problems": 10,
+            "mean_ms": 7.5933644,
+            "median_ms": 7.5649625,
+            "min_ms": 7.331127999,
+            "max_ms": 7.873918,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              7.376716,
+              7.331127999,
+              7.585959,
+              7.834409,
+              7.873918,
+              7.543966,
+              7.743854,
+              7.723213,
+              7.45311,
+              7.467371
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.2223765,
+            "median_ms": 7.136348,
+            "min_ms": 7.104521,
+            "max_ms": 8.046325001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49794953092615896,
+            "samples_ms": [
+              8.046325001,
+              7.13789,
+              7.176248,
+              7.138211,
+              7.104521,
+              7.134806,
+              7.141526,
+              7.116839,
+              7.122647999,
+              7.104751
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0005299,
+            "median_ms": 0.000481,
+            "min_ms": 0.00047,
+            "max_ms": 0.000862,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.33433448665739474,
+            "samples_ms": [
+              0.000862,
+              0.00055,
+              0.000561,
+              0.000481,
+              0.000471,
+              0.000471,
+              0.00047,
+              0.000471,
+              0.000481,
+              0.000481
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 113.94536,
-            "ms_per_problem": 3.798178667,
-            "problems_per_second": 263.284086338,
-            "checksum": 0.7465255258995545
+            "problems": 20,
+            "wall_ms": 83.918448,
+            "ms_per_problem": 4.1959224,
+            "problems_per_second": 238.326619196,
+            "checksum": -1.2204147642539387
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 115.585178,
-            "ms_per_problem": 1.926419633,
-            "problems_per_second": 519.097699534,
-            "checksum": 1.5615408985210206
+            "problems": 40,
+            "wall_ms": 86.857324,
+            "ms_per_problem": 2.1714331,
+            "problems_per_second": 460.525355349,
+            "checksum": -2.986340213836443
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 98.351239,
+            "ms_per_problem": 1.229390488,
+            "problems_per_second": 813.411206744,
+            "checksum": -8.17592669062408
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 8.518113533,
-            "median_ms": 7.711962,
-            "min_ms": 7.131133,
-            "max_ms": 18.745662,
-            "rss_delta_kb": 128,
-            "checksum": 0.30723801785329474
+            "problems": 10,
+            "mean_ms": 7.7166214,
+            "median_ms": 7.5839005,
+            "min_ms": 7.102067,
+            "max_ms": 9.157772,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49887230646373115,
+            "samples_ms": [
+              9.157772,
+              8.449206,
+              7.158982,
+              8.108317,
+              7.608332,
+              7.740399,
+              7.17815,
+              7.10352,
+              7.559469,
+              7.102067
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 7.2990098,
+            "median_ms": 7.177870501,
+            "min_ms": 7.112172,
+            "max_ms": 7.910773,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.49794953092615896,
+            "samples_ms": [
+              7.179914001,
+              7.143579001,
+              7.583975,
+              7.199813,
+              7.147265,
+              7.910773,
+              7.141766,
+              7.395014,
+              7.112172,
+              7.175827001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0005869,
+            "median_ms": 0.00048,
+            "min_ms": 0.000471,
+            "max_ms": 0.001422,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 192,
+            "checksum": -0.33433448665739474,
+            "samples_ms": [
+              0.001422,
+              0.000540999,
+              0.000581,
+              0.00048,
+              0.000471,
+              0.000471,
+              0.000481,
+              0.00048,
+              0.000471,
+              0.000471
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 112.001925,
-            "ms_per_problem": 3.7333975,
-            "problems_per_second": 267.852539141,
-            "checksum": 0.7465255258995545
+            "problems": 20,
+            "wall_ms": 92.883428,
+            "ms_per_problem": 4.6441714,
+            "problems_per_second": 215.323663549,
+            "checksum": -1.2204147642539387
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 116.389704,
-            "ms_per_problem": 1.9398284,
-            "problems_per_second": 515.509516203,
-            "checksum": 1.5615408985210206
+            "problems": 40,
+            "wall_ms": 96.93985,
+            "ms_per_problem": 2.42349625,
+            "problems_per_second": 412.627005302,
+            "checksum": -2.986340213836443
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 149.114553,
+            "ms_per_problem": 1.863931912,
+            "problems_per_second": 536.500283779,
+            "checksum": -8.17592669062408
           }
         ]
       ]
@@ -380,84 +1619,473 @@
     {
       "assets": 50,
       "horizons": 8,
-      "codegen_seconds": 3.309949283999913,
-      "compile_seconds": 2.30199393099997,
-      "generated_header_bytes": 3460740,
-      "binary_bytes": 3742168,
+      "codegen_seconds": 1.648520238999481,
+      "codegen_reused": false,
+      "compile_seconds": 1.9237442170006034,
+      "generated_header_bytes": 3595964,
+      "binary_bytes": 3717976,
       "serial": {
         "repetitions": 3,
-        "median_ms": 39.43175,
-        "mean_ms": 39.10042333333333,
-        "min_ms": 38.36979,
-        "max_ms": 39.49973,
-        "rss_delta_kb_median": 128.0
+        "median_ms": 39.6402425,
+        "mean_ms": 39.5886005,
+        "min_ms": 38.9426875,
+        "max_ms": 40.1828715,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 400,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 40.4117991,
+            "median_ms": 40.1828715,
+            "min_ms": 38.198663,
+            "max_ms": 42.825410999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.883025,
+              39.425412,
+              40.482718,
+              41.414527001,
+              39.574925,
+              42.825410999,
+              41.351544,
+              41.381853001,
+              39.579913,
+              38.198663
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 40.0369018,
+            "median_ms": 39.6402425,
+            "min_ms": 37.784505001,
+            "max_ms": 42.507932,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.935728,
+              38.67324,
+              42.507932,
+              41.042082,
+              39.157652,
+              37.784505001,
+              41.499083,
+              41.337272,
+              39.086766999,
+              39.344757
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 39.1082377,
+            "median_ms": 38.9426875,
+            "min_ms": 37.685008,
+            "max_ms": 42.096629,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.869524,
+              42.096629,
+              39.825477999,
+              39.767723,
+              37.685008,
+              38.117652,
+              40.038966999,
+              37.861790999,
+              38.084353,
+              37.735252
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 39.6402425,
+          "mean_ms": 39.5886005,
+          "min_ms": 38.9426875,
+          "max_ms": 40.1828715,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 400,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 40.4117991,
+              "median_ms": 40.1828715,
+              "min_ms": 38.198663,
+              "max_ms": 42.825410999,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6376044800319891,
+              "samples_ms": [
+                39.883025,
+                39.425412,
+                40.482718,
+                41.414527001,
+                39.574925,
+                42.825410999,
+                41.351544,
+                41.381853001,
+                39.579913,
+                38.198663
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 40.0369018,
+              "median_ms": 39.6402425,
+              "min_ms": 37.784505001,
+              "max_ms": 42.507932,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6376044800319891,
+              "samples_ms": [
+                39.935728,
+                38.67324,
+                42.507932,
+                41.042082,
+                39.157652,
+                37.784505001,
+                41.499083,
+                41.337272,
+                39.086766999,
+                39.344757
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 39.1082377,
+              "median_ms": 38.9426875,
+              "min_ms": 37.685008,
+              "max_ms": 42.096629,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6376044800319891,
+              "samples_ms": [
+                39.869524,
+                42.096629,
+                39.825477999,
+                39.767723,
+                37.685008,
+                38.117652,
+                40.038966999,
+                37.861790999,
+                38.084353,
+                37.735252
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 38.542556,
+          "mean_ms": 39.85577133333333,
+          "min_ms": 38.5233175,
+          "max_ms": 42.5014405,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 400,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 43.3249708,
+              "median_ms": 42.5014405,
+              "min_ms": 39.965187,
+              "max_ms": 48.072833,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6460802759588142,
+              "samples_ms": [
+                48.072833,
+                47.5478,
+                42.922256001,
+                42.080624999,
+                39.965187,
+                43.659945,
+                40.916244,
+                44.425135,
+                41.582708,
+                42.076975
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 38.5768982,
+              "median_ms": 38.542556,
+              "min_ms": 37.12986,
+              "max_ms": 40.176852001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6460802759588142,
+              "samples_ms": [
+                37.12986,
+                37.400954,
+                37.23053,
+                37.575985,
+                37.720541,
+                39.947881,
+                39.698318999,
+                39.364571,
+                39.523489,
+                40.176852001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 38.4764855,
+              "median_ms": 38.5233175,
+              "min_ms": 37.068549,
+              "max_ms": 39.850996,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.6460802759588142,
+              "samples_ms": [
+                37.496717,
+                37.100506,
+                37.320143,
+                37.360745,
+                37.068549,
+                39.611169001,
+                39.549918,
+                39.850996,
+                39.697558001,
+                39.708554
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.001342,
+          "mean_ms": 0.001407,
+          "min_ms": 0.001342,
+          "max_ms": 0.001537,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 400,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0017335,
+              "median_ms": 0.001342,
+              "min_ms": 0.001341999,
+              "max_ms": 0.005047001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.8991417328858282,
+              "samples_ms": [
+                0.005047001,
+                0.001402,
+                0.001482,
+                0.001342,
+                0.001341999,
+                0.001341999,
+                0.001341999,
+                0.001352,
+                0.001342,
+                0.001342
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0015734,
+              "median_ms": 0.001342,
+              "min_ms": 0.001322,
+              "max_ms": 0.003515001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.8991417328858282,
+              "samples_ms": [
+                0.003515001,
+                0.001402,
+                0.001472999,
+                0.001342,
+                0.001332,
+                0.001322,
+                0.001332,
+                0.001332,
+                0.001342,
+                0.001342
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0018016,
+              "median_ms": 0.001537,
+              "min_ms": 0.001332,
+              "max_ms": 0.004226,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 400,
+              "checksum": 0.8991417328858282,
+              "samples_ms": [
+                0.004226,
+                0.001412001,
+                0.001492001,
+                0.001332,
+                0.001341999,
+                0.001582,
+                0.001713001,
+                0.001973,
+                0.001611999,
+                0.001332
+              ]
+            }
+          ]
+        }
       },
       "parallel": [
         {
           "workers": 2,
-          "median_ms_per_problem": 21.665041733,
-          "median_problems_per_second": 46.15730781,
+          "median_ms_per_problem": 20.21590945,
+          "median_problems_per_second": 49.465991252,
           "raw": [
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 705.744683,
-              "ms_per_problem": 23.524822767,
-              "problems_per_second": 42.508290495,
-              "checksum": 0.5365786985164391
+              "problems": 20,
+              "wall_ms": 430.261007,
+              "ms_per_problem": 21.51305035,
+              "problems_per_second": 46.4834128,
+              "checksum": 1.139529976113454
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 649.951252,
-              "ms_per_problem": 21.665041733,
-              "problems_per_second": 46.15730781,
-              "checksum": 0.5365786985164391
+              "problems": 20,
+              "wall_ms": 404.318189,
+              "ms_per_problem": 20.21590945,
+              "problems_per_second": 49.465991252,
+              "checksum": 1.139529976113454
             },
             {
               "mode": "parallel",
               "workers": 2,
-              "problems": 30,
-              "wall_ms": 591.192446,
-              "ms_per_problem": 19.706414867,
-              "problems_per_second": 50.744897373,
-              "checksum": 0.5365786985164391
+              "problems": 20,
+              "wall_ms": 400.68017,
+              "ms_per_problem": 20.0340085,
+              "problems_per_second": 49.915123077,
+              "checksum": 1.139529976113454
             }
           ]
         },
         {
           "workers": 4,
-          "median_ms_per_problem": 10.4862612,
-          "median_problems_per_second": 95.362873471,
+          "median_ms_per_problem": 10.4927248,
+          "median_problems_per_second": 95.3041292,
           "raw": [
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 746.86597,
-              "ms_per_problem": 12.447766167,
-              "problems_per_second": 80.335699322,
-              "checksum": 1.0984237005753172
+              "problems": 40,
+              "wall_ms": 550.758479,
+              "ms_per_problem": 13.768961975,
+              "problems_per_second": 72.627116105,
+              "checksum": 0.9842807104485061
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 629.175672,
-              "ms_per_problem": 10.4862612,
-              "problems_per_second": 95.362873471,
-              "checksum": 1.0984237005753172
+              "problems": 40,
+              "wall_ms": 419.708992,
+              "ms_per_problem": 10.4927248,
+              "problems_per_second": 95.3041292,
+              "checksum": 0.9842807104485061
             },
             {
               "mode": "parallel",
               "workers": 4,
-              "problems": 60,
-              "wall_ms": 621.182131,
-              "ms_per_problem": 10.353035517,
-              "problems_per_second": 96.590028923,
-              "checksum": 1.0984237005753172
+              "problems": 40,
+              "wall_ms": 406.462860999,
+              "ms_per_problem": 10.161571525,
+              "problems_per_second": 98.409975026,
+              "checksum": 0.9842807104485061
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 7.153663275,
+          "median_problems_per_second": 139.78851975,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 600.187479,
+              "ms_per_problem": 7.502343487,
+              "problems_per_second": 133.291684347,
+              "checksum": -1.5539136022386524
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 572.293062,
+              "ms_per_problem": 7.153663275,
+              "problems_per_second": 139.78851975,
+              "checksum": -1.5539136022386524
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 428.627678,
+              "ms_per_problem": 5.357845975,
+              "problems_per_second": 186.642170131,
+              "checksum": -1.5539136022386524
             }
           ]
         }
@@ -466,97 +2094,2740 @@
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 39.298879733,
-            "median_ms": 39.43175,
-            "min_ms": 37.697601,
-            "max_ms": 40.607687,
-            "rss_delta_kb": 128,
-            "checksum": 0.2228100849547179
+            "problems": 10,
+            "mean_ms": 40.4117991,
+            "median_ms": 40.1828715,
+            "min_ms": 38.198663,
+            "max_ms": 42.825410999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.883025,
+              39.425412,
+              40.482718,
+              41.414527001,
+              39.574925,
+              42.825410999,
+              41.351544,
+              41.381853001,
+              39.579913,
+              38.198663
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 43.3249708,
+            "median_ms": 42.5014405,
+            "min_ms": 39.965187,
+            "max_ms": 48.072833,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6460802759588142,
+            "samples_ms": [
+              48.072833,
+              47.5478,
+              42.922256001,
+              42.080624999,
+              39.965187,
+              43.659945,
+              40.916244,
+              44.425135,
+              41.582708,
+              42.076975
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0017335,
+            "median_ms": 0.001342,
+            "min_ms": 0.001341999,
+            "max_ms": 0.005047001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.8991417328858282,
+            "samples_ms": [
+              0.005047001,
+              0.001402,
+              0.001482,
+              0.001342,
+              0.001341999,
+              0.001341999,
+              0.001341999,
+              0.001352,
+              0.001342,
+              0.001342
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 705.744683,
-            "ms_per_problem": 23.524822767,
-            "problems_per_second": 42.508290495,
-            "checksum": 0.5365786985164391
+            "problems": 20,
+            "wall_ms": 430.261007,
+            "ms_per_problem": 21.51305035,
+            "problems_per_second": 46.4834128,
+            "checksum": 1.139529976113454
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 746.86597,
-            "ms_per_problem": 12.447766167,
-            "problems_per_second": 80.335699322,
-            "checksum": 1.0984237005753172
+            "problems": 40,
+            "wall_ms": 550.758479,
+            "ms_per_problem": 13.768961975,
+            "problems_per_second": 72.627116105,
+            "checksum": 0.9842807104485061
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 600.187479,
+            "ms_per_problem": 7.502343487,
+            "problems_per_second": 133.291684347,
+            "checksum": -1.5539136022386524
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 39.933623533,
-            "median_ms": 39.49973,
-            "min_ms": 38.327527,
-            "max_ms": 42.426311,
-            "rss_delta_kb": 128,
-            "checksum": 0.2228100849547179
+            "problems": 10,
+            "mean_ms": 40.0369018,
+            "median_ms": 39.6402425,
+            "min_ms": 37.784505001,
+            "max_ms": 42.507932,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.935728,
+              38.67324,
+              42.507932,
+              41.042082,
+              39.157652,
+              37.784505001,
+              41.499083,
+              41.337272,
+              39.086766999,
+              39.344757
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 38.5768982,
+            "median_ms": 38.542556,
+            "min_ms": 37.12986,
+            "max_ms": 40.176852001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6460802759588142,
+            "samples_ms": [
+              37.12986,
+              37.400954,
+              37.23053,
+              37.575985,
+              37.720541,
+              39.947881,
+              39.698318999,
+              39.364571,
+              39.523489,
+              40.176852001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0015734,
+            "median_ms": 0.001342,
+            "min_ms": 0.001322,
+            "max_ms": 0.003515001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.8991417328858282,
+            "samples_ms": [
+              0.003515001,
+              0.001402,
+              0.001472999,
+              0.001342,
+              0.001332,
+              0.001322,
+              0.001332,
+              0.001332,
+              0.001342,
+              0.001342
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 649.951252,
-            "ms_per_problem": 21.665041733,
-            "problems_per_second": 46.15730781,
-            "checksum": 0.5365786985164391
+            "problems": 20,
+            "wall_ms": 404.318189,
+            "ms_per_problem": 20.21590945,
+            "problems_per_second": 49.465991252,
+            "checksum": 1.139529976113454
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 629.175672,
-            "ms_per_problem": 10.4862612,
-            "problems_per_second": 95.362873471,
-            "checksum": 1.0984237005753172
+            "problems": 40,
+            "wall_ms": 419.708992,
+            "ms_per_problem": 10.4927248,
+            "problems_per_second": 95.3041292,
+            "checksum": 0.9842807104485061
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 572.293062,
+            "ms_per_problem": 7.153663275,
+            "problems_per_second": 139.78851975,
+            "checksum": -1.5539136022386524
           }
         ],
         [
           {
             "mode": "serial",
+            "scenario": "all_changed",
             "workers": 1,
-            "problems": 15,
-            "mean_ms": 39.262354067,
-            "median_ms": 38.36979,
-            "min_ms": 37.695237,
-            "max_ms": 42.817854,
-            "rss_delta_kb": 152,
-            "checksum": 0.2228100849547179
+            "problems": 10,
+            "mean_ms": 39.1082377,
+            "median_ms": 38.9426875,
+            "min_ms": 37.685008,
+            "max_ms": 42.096629,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6376044800319891,
+            "samples_ms": [
+              39.869524,
+              42.096629,
+              39.825477999,
+              39.767723,
+              37.685008,
+              38.117652,
+              40.038966999,
+              37.861790999,
+              38.084353,
+              37.735252
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 38.4764855,
+            "median_ms": 38.5233175,
+            "min_ms": 37.068549,
+            "max_ms": 39.850996,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.6460802759588142,
+            "samples_ms": [
+              37.496717,
+              37.100506,
+              37.320143,
+              37.360745,
+              37.068549,
+              39.611169001,
+              39.549918,
+              39.850996,
+              39.697558001,
+              39.708554
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0018016,
+            "median_ms": 0.001537,
+            "min_ms": 0.001332,
+            "max_ms": 0.004226,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 400,
+            "checksum": 0.8991417328858282,
+            "samples_ms": [
+              0.004226,
+              0.001412001,
+              0.001492001,
+              0.001332,
+              0.001341999,
+              0.001582,
+              0.001713001,
+              0.001973,
+              0.001611999,
+              0.001332
+            ]
           },
           {
             "mode": "parallel",
             "workers": 2,
-            "problems": 30,
-            "wall_ms": 591.192446,
-            "ms_per_problem": 19.706414867,
-            "problems_per_second": 50.744897373,
-            "checksum": 0.5365786985164391
+            "problems": 20,
+            "wall_ms": 400.68017,
+            "ms_per_problem": 20.0340085,
+            "problems_per_second": 49.915123077,
+            "checksum": 1.139529976113454
           },
           {
             "mode": "parallel",
             "workers": 4,
-            "problems": 60,
-            "wall_ms": 621.182131,
-            "ms_per_problem": 10.353035517,
-            "problems_per_second": 96.590028923,
-            "checksum": 1.0984237005753172
+            "problems": 40,
+            "wall_ms": 406.462860999,
+            "ms_per_problem": 10.161571525,
+            "problems_per_second": 98.409975026,
+            "checksum": 0.9842807104485061
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 428.627678,
+            "ms_per_problem": 5.357845975,
+            "problems_per_second": 186.642170131,
+            "checksum": -1.5539136022386524
+          }
+        ]
+      ]
+    },
+    {
+      "assets": 75,
+      "horizons": 8,
+      "codegen_seconds": 5.216391381999529,
+      "codegen_reused": false,
+      "compile_seconds": 2.731958138000664,
+      "generated_header_bytes": 7478416,
+      "binary_bytes": 5031416,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 112.7866385,
+        "mean_ms": 131.05005666666668,
+        "min_ms": 110.9224535,
+        "max_ms": 169.441078,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 600,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 119.3248108,
+            "median_ms": 110.9224535,
+            "min_ms": 106.781125,
+            "max_ms": 186.744503,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              118.065027,
+              119.184846,
+              112.426676001,
+              186.744503,
+              117.254448,
+              106.781125,
+              109.418231,
+              108.507843999,
+              106.938024,
+              107.927384001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 113.6295962,
+            "median_ms": 112.7866385,
+            "min_ms": 108.416879,
+            "max_ms": 123.657799,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              119.186323,
+              112.634616999,
+              116.404686,
+              112.93866,
+              114.825903001,
+              109.285284,
+              123.657799,
+              108.848481999,
+              108.416879,
+              110.097328999
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 178.0174783,
+            "median_ms": 169.441078,
+            "min_ms": 119.592509001,
+            "max_ms": 267.927995,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              171.557923,
+              201.443474,
+              123.664989001,
+              267.927995,
+              123.389549,
+              244.89561,
+              119.592509001,
+              210.180268,
+              167.324233,
+              150.198233
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 112.7866385,
+          "mean_ms": 131.05005666666668,
+          "min_ms": 110.9224535,
+          "max_ms": 169.441078,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 600,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 119.3248108,
+              "median_ms": 110.9224535,
+              "min_ms": 106.781125,
+              "max_ms": 186.744503,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12235396661593602,
+              "samples_ms": [
+                118.065027,
+                119.184846,
+                112.426676001,
+                186.744503,
+                117.254448,
+                106.781125,
+                109.418231,
+                108.507843999,
+                106.938024,
+                107.927384001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 113.6295962,
+              "median_ms": 112.7866385,
+              "min_ms": 108.416879,
+              "max_ms": 123.657799,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12235396661593602,
+              "samples_ms": [
+                119.186323,
+                112.634616999,
+                116.404686,
+                112.93866,
+                114.825903001,
+                109.285284,
+                123.657799,
+                108.848481999,
+                108.416879,
+                110.097328999
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 178.0174783,
+              "median_ms": 169.441078,
+              "min_ms": 119.592509001,
+              "max_ms": 267.927995,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12235396661593602,
+              "samples_ms": [
+                171.557923,
+                201.443474,
+                123.664989001,
+                267.927995,
+                123.389549,
+                244.89561,
+                119.592509001,
+                210.180268,
+                167.324233,
+                150.198233
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 116.464701,
+          "mean_ms": 129.71732016666667,
+          "min_ms": 111.7134385,
+          "max_ms": 160.973821,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 600,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 113.2487921,
+              "median_ms": 111.7134385,
+              "min_ms": 106.487472,
+              "max_ms": 127.825166,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12523581720831187,
+              "samples_ms": [
+                109.391035,
+                127.825166,
+                106.487472,
+                106.910893,
+                114.526501,
+                111.458163,
+                114.156705,
+                109.998286,
+                111.968714001,
+                119.764986001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 114.175582,
+              "median_ms": 116.464701,
+              "min_ms": 107.23667,
+              "max_ms": 119.060044,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12523581720831187,
+              "samples_ms": [
+                108.399879,
+                108.737467001,
+                117.206086,
+                107.23667,
+                115.882538,
+                117.426009,
+                117.73845,
+                117.046864,
+                113.021812999,
+                119.060044
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 168.9869699,
+              "median_ms": 160.973821,
+              "min_ms": 120.463627,
+              "max_ms": 245.951139,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.12523581720831187,
+              "samples_ms": [
+                160.360731999,
+                120.463627,
+                161.586910001,
+                200.050427999,
+                159.542668,
+                167.547105,
+                245.951139,
+                155.87802,
+                121.144436001,
+                197.344634
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.003726,
+          "mean_ms": 0.003764,
+          "min_ms": 0.0037255,
+          "max_ms": 0.0038405,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 600,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0040801,
+              "median_ms": 0.003726,
+              "min_ms": 0.003705,
+              "max_ms": 0.00707,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.11605224117389237,
+              "samples_ms": [
+                0.00707,
+                0.003766,
+                0.003886,
+                0.003765,
+                0.003726,
+                0.003725,
+                0.003716001,
+                0.003716,
+                0.003705,
+                0.003726001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0041992,
+              "median_ms": 0.0037255,
+              "min_ms": 0.003705,
+              "max_ms": 0.008232,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.11605224117389237,
+              "samples_ms": [
+                0.008232,
+                0.003796,
+                0.003896001,
+                0.003776,
+                0.003725,
+                0.003726,
+                0.003714999,
+                0.003706,
+                0.003705,
+                0.003715
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0152687,
+              "median_ms": 0.0038405,
+              "min_ms": 0.003835,
+              "max_ms": 0.117876,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 600,
+              "checksum": 0.11605224117389237,
+              "samples_ms": [
+                0.117876,
+                0.003896001,
+                0.003996,
+                0.003896,
+                0.003845,
+                0.003835,
+                0.003835999,
+                0.003836,
+                0.003836,
+                0.003835
+              ]
+            }
+          ]
+        }
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 78.62251335,
+          "median_problems_per_second": 12.719003214,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 1192.566252001,
+              "ms_per_problem": 59.6283126,
+              "problems_per_second": 16.770556744,
+              "checksum": 0.2590582278607567
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 1572.450267,
+              "ms_per_problem": 78.62251335,
+              "problems_per_second": 12.719003214,
+              "checksum": 0.2590582278607567
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 2195.229559,
+              "ms_per_problem": 109.76147795,
+              "problems_per_second": 9.110664494,
+              "checksum": 0.2590582278607567
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 46.957904125,
+          "median_problems_per_second": 21.295669358,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 1435.941551,
+              "ms_per_problem": 35.898538775,
+              "problems_per_second": 27.856287028,
+              "checksum": 0.4947322225568292
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 1900.971529,
+              "ms_per_problem": 47.524288225,
+              "problems_per_second": 21.041872216,
+              "checksum": 0.4947322225568292
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 1878.316165,
+              "ms_per_problem": 46.957904125,
+              "problems_per_second": 21.295669358,
+              "checksum": 0.4947322225568292
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 22.662893125,
+          "median_problems_per_second": 44.124992978,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 1617.046757,
+              "ms_per_problem": 20.213084463,
+              "problems_per_second": 49.472904635,
+              "checksum": 1.0687874646294442
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 2237.30411,
+              "ms_per_problem": 27.966301375,
+              "problems_per_second": 35.757320448,
+              "checksum": 1.0687874646294442
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 1813.03145,
+              "ms_per_problem": 22.662893125,
+              "problems_per_second": 44.124992978,
+              "checksum": 1.0687874646294442
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 119.3248108,
+            "median_ms": 110.9224535,
+            "min_ms": 106.781125,
+            "max_ms": 186.744503,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              118.065027,
+              119.184846,
+              112.426676001,
+              186.744503,
+              117.254448,
+              106.781125,
+              109.418231,
+              108.507843999,
+              106.938024,
+              107.927384001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 113.2487921,
+            "median_ms": 111.7134385,
+            "min_ms": 106.487472,
+            "max_ms": 127.825166,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12523581720831187,
+            "samples_ms": [
+              109.391035,
+              127.825166,
+              106.487472,
+              106.910893,
+              114.526501,
+              111.458163,
+              114.156705,
+              109.998286,
+              111.968714001,
+              119.764986001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0040801,
+            "median_ms": 0.003726,
+            "min_ms": 0.003705,
+            "max_ms": 0.00707,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.11605224117389237,
+            "samples_ms": [
+              0.00707,
+              0.003766,
+              0.003886,
+              0.003765,
+              0.003726,
+              0.003725,
+              0.003716001,
+              0.003716,
+              0.003705,
+              0.003726001
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 1192.566252001,
+            "ms_per_problem": 59.6283126,
+            "problems_per_second": 16.770556744,
+            "checksum": 0.2590582278607567
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 1435.941551,
+            "ms_per_problem": 35.898538775,
+            "problems_per_second": 27.856287028,
+            "checksum": 0.4947322225568292
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 1617.046757,
+            "ms_per_problem": 20.213084463,
+            "problems_per_second": 49.472904635,
+            "checksum": 1.0687874646294442
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 113.6295962,
+            "median_ms": 112.7866385,
+            "min_ms": 108.416879,
+            "max_ms": 123.657799,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              119.186323,
+              112.634616999,
+              116.404686,
+              112.93866,
+              114.825903001,
+              109.285284,
+              123.657799,
+              108.848481999,
+              108.416879,
+              110.097328999
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 114.175582,
+            "median_ms": 116.464701,
+            "min_ms": 107.23667,
+            "max_ms": 119.060044,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12523581720831187,
+            "samples_ms": [
+              108.399879,
+              108.737467001,
+              117.206086,
+              107.23667,
+              115.882538,
+              117.426009,
+              117.73845,
+              117.046864,
+              113.021812999,
+              119.060044
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0041992,
+            "median_ms": 0.0037255,
+            "min_ms": 0.003705,
+            "max_ms": 0.008232,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.11605224117389237,
+            "samples_ms": [
+              0.008232,
+              0.003796,
+              0.003896001,
+              0.003776,
+              0.003725,
+              0.003726,
+              0.003714999,
+              0.003706,
+              0.003705,
+              0.003715
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 1572.450267,
+            "ms_per_problem": 78.62251335,
+            "problems_per_second": 12.719003214,
+            "checksum": 0.2590582278607567
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 1900.971529,
+            "ms_per_problem": 47.524288225,
+            "problems_per_second": 21.041872216,
+            "checksum": 0.4947322225568292
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 2237.30411,
+            "ms_per_problem": 27.966301375,
+            "problems_per_second": 35.757320448,
+            "checksum": 1.0687874646294442
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 178.0174783,
+            "median_ms": 169.441078,
+            "min_ms": 119.592509001,
+            "max_ms": 267.927995,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12235396661593602,
+            "samples_ms": [
+              171.557923,
+              201.443474,
+              123.664989001,
+              267.927995,
+              123.389549,
+              244.89561,
+              119.592509001,
+              210.180268,
+              167.324233,
+              150.198233
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 168.9869699,
+            "median_ms": 160.973821,
+            "min_ms": 120.463627,
+            "max_ms": 245.951139,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.12523581720831187,
+            "samples_ms": [
+              160.360731999,
+              120.463627,
+              161.586910001,
+              200.050427999,
+              159.542668,
+              167.547105,
+              245.951139,
+              155.87802,
+              121.144436001,
+              197.344634
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0152687,
+            "median_ms": 0.0038405,
+            "min_ms": 0.003835,
+            "max_ms": 0.117876,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 600,
+            "checksum": 0.11605224117389237,
+            "samples_ms": [
+              0.117876,
+              0.003896001,
+              0.003996,
+              0.003896,
+              0.003845,
+              0.003835,
+              0.003835999,
+              0.003836,
+              0.003836,
+              0.003835
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 2195.229559,
+            "ms_per_problem": 109.76147795,
+            "problems_per_second": 9.110664494,
+            "checksum": 0.2590582278607567
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 1878.316165,
+            "ms_per_problem": 46.957904125,
+            "problems_per_second": 21.295669358,
+            "checksum": 0.4947322225568292
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 1813.03145,
+            "ms_per_problem": 22.662893125,
+            "problems_per_second": 44.124992978,
+            "checksum": 1.0687874646294442
+          }
+        ]
+      ]
+    },
+    {
+      "assets": 100,
+      "horizons": 8,
+      "codegen_seconds": 20.97462673300015,
+      "codegen_reused": false,
+      "compile_seconds": 24.205156990999967,
+      "generated_header_bytes": 12750409,
+      "binary_bytes": 6834848,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 249.4609055,
+        "mean_ms": 246.46109766666666,
+        "min_ms": 231.784765,
+        "max_ms": 258.1376225,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 800,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 259.766375,
+            "median_ms": 258.1376225,
+            "min_ms": 248.025646,
+            "max_ms": 281.717514999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              268.222119,
+              249.580939,
+              252.379181,
+              248.025646,
+              257.685671,
+              265.024120999,
+              281.717514999,
+              250.509558,
+              258.589574,
+              265.929426
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 250.6844428,
+            "median_ms": 249.4609055,
+            "min_ms": 234.814240001,
+            "max_ms": 268.631989999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              244.011973,
+              242.028225,
+              246.313824,
+              234.814240001,
+              253.919762,
+              252.607986999,
+              246.091893,
+              268.631989999,
+              263.693192,
+              254.731342
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 234.0253013,
+            "median_ms": 231.784765,
+            "min_ms": 225.443872,
+            "max_ms": 248.885657999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              248.885657999,
+              238.972751,
+              240.983819,
+              234.388617,
+              242.084279001,
+              226.40154,
+              225.443872,
+              229.180912999,
+              228.094304,
+              225.81726
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 249.4609055,
+          "mean_ms": 246.46109766666666,
+          "min_ms": 231.784765,
+          "max_ms": 258.1376225,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 800,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 259.766375,
+              "median_ms": 258.1376225,
+              "min_ms": 248.025646,
+              "max_ms": 281.717514999,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5120043264122505,
+              "samples_ms": [
+                268.222119,
+                249.580939,
+                252.379181,
+                248.025646,
+                257.685671,
+                265.024120999,
+                281.717514999,
+                250.509558,
+                258.589574,
+                265.929426
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 250.6844428,
+              "median_ms": 249.4609055,
+              "min_ms": 234.814240001,
+              "max_ms": 268.631989999,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5120043264122505,
+              "samples_ms": [
+                244.011973,
+                242.028225,
+                246.313824,
+                234.814240001,
+                253.919762,
+                252.607986999,
+                246.091893,
+                268.631989999,
+                263.693192,
+                254.731342
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 234.0253013,
+              "median_ms": 231.784765,
+              "min_ms": 225.443872,
+              "max_ms": 248.885657999,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5120043264122505,
+              "samples_ms": [
+                248.885657999,
+                238.972751,
+                240.983819,
+                234.388617,
+                242.084279001,
+                226.40154,
+                225.443872,
+                229.180912999,
+                228.094304,
+                225.81726
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 247.9651755,
+          "mean_ms": 249.61771133333332,
+          "min_ms": 233.516512,
+          "max_ms": 267.3714465,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 800,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 249.22796,
+              "median_ms": 247.9651755,
+              "min_ms": 228.976038001,
+              "max_ms": 286.729697,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5072122851781273,
+              "samples_ms": [
+                228.976038001,
+                244.678405999,
+                247.581023,
+                249.823615,
+                251.324484,
+                242.371758,
+                248.349328,
+                240.059369999,
+                252.385881,
+                286.729697
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 278.9314652,
+              "median_ms": 267.3714465,
+              "min_ms": 245.30552,
+              "max_ms": 343.45946,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5072122851781273,
+              "samples_ms": [
+                265.910246,
+                275.159610001,
+                253.956467001,
+                245.30552,
+                343.45946,
+                325.048539,
+                311.74624,
+                251.159468,
+                248.736455001,
+                268.832647
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 243.1265487,
+              "median_ms": 233.516512,
+              "min_ms": 225.449902,
+              "max_ms": 286.622403,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.5072122851781273,
+              "samples_ms": [
+                231.812577,
+                286.622403,
+                286.036605,
+                235.220447,
+                241.757381,
+                227.869483,
+                226.278758,
+                228.654488999,
+                225.449902,
+                241.563442
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.0063295,
+          "mean_ms": 0.006338166666666666,
+          "min_ms": 0.00632,
+          "max_ms": 0.006365,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 800,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0066738,
+              "median_ms": 0.00632,
+              "min_ms": 0.006309,
+              "max_ms": 0.009644,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.47088527582385736,
+              "samples_ms": [
+                0.009644,
+                0.006368999,
+                0.006429999,
+                0.006399,
+                0.00632,
+                0.006309,
+                0.00632,
+                0.006319,
+                0.006319,
+                0.006309
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0069324,
+              "median_ms": 0.0063295,
+              "min_ms": 0.006309,
+              "max_ms": 0.012198,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.47088527582385736,
+              "samples_ms": [
+                0.012198,
+                0.00637,
+                0.006429001,
+                0.0064,
+                0.006329,
+                0.00632,
+                0.006309,
+                0.00631,
+                0.006329,
+                0.00633
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0102013,
+              "median_ms": 0.006365,
+              "min_ms": 0.00631,
+              "max_ms": 0.028523,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 800,
+              "checksum": -0.47088527582385736,
+              "samples_ms": [
+                0.008823,
+                0.00637,
+                0.028523,
+                0.006449,
+                0.00636,
+                0.006319,
+                0.00631,
+                0.006319,
+                0.00632,
+                0.020220001
+              ]
+            }
+          ]
+        }
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 128.52111745,
+          "median_problems_per_second": 7.780822481,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 2679.724799,
+              "ms_per_problem": 133.98623995,
+              "problems_per_second": 7.463452966,
+              "checksum": -1.178164190851196
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 2570.422349,
+              "ms_per_problem": 128.52111745,
+              "problems_per_second": 7.780822481,
+              "checksum": -1.178164190851196
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 2475.107396,
+              "ms_per_problem": 123.7553698,
+              "problems_per_second": 8.080457451,
+              "checksum": -1.178164190851196
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 62.9155656,
+          "median_problems_per_second": 15.894317892,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 2516.622624001,
+              "ms_per_problem": 62.9155656,
+              "problems_per_second": 15.894317892,
+              "checksum": -2.5843522581100906
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 2536.563526,
+              "ms_per_problem": 63.41408815,
+              "problems_per_second": 15.769366543,
+              "checksum": -2.5843522581100906
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 2504.094633,
+              "ms_per_problem": 62.602365825,
+              "problems_per_second": 15.9738372,
+              "checksum": -2.5843522581100906
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 33.877127675,
+          "median_problems_per_second": 29.518441162,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 2822.536925,
+              "ms_per_problem": 35.281711563,
+              "problems_per_second": 28.343296164,
+              "checksum": -5.906276771376245
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 2530.849977001,
+              "ms_per_problem": 31.635624713,
+              "problems_per_second": 31.609933709,
+              "checksum": -5.906276771376245
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 2710.170214001,
+              "ms_per_problem": 33.877127675,
+              "problems_per_second": 29.518441162,
+              "checksum": -5.906276771376245
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 259.766375,
+            "median_ms": 258.1376225,
+            "min_ms": 248.025646,
+            "max_ms": 281.717514999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              268.222119,
+              249.580939,
+              252.379181,
+              248.025646,
+              257.685671,
+              265.024120999,
+              281.717514999,
+              250.509558,
+              258.589574,
+              265.929426
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 249.22796,
+            "median_ms": 247.9651755,
+            "min_ms": 228.976038001,
+            "max_ms": 286.729697,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5072122851781273,
+            "samples_ms": [
+              228.976038001,
+              244.678405999,
+              247.581023,
+              249.823615,
+              251.324484,
+              242.371758,
+              248.349328,
+              240.059369999,
+              252.385881,
+              286.729697
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0066738,
+            "median_ms": 0.00632,
+            "min_ms": 0.006309,
+            "max_ms": 0.009644,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.47088527582385736,
+            "samples_ms": [
+              0.009644,
+              0.006368999,
+              0.006429999,
+              0.006399,
+              0.00632,
+              0.006309,
+              0.00632,
+              0.006319,
+              0.006319,
+              0.006309
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 2679.724799,
+            "ms_per_problem": 133.98623995,
+            "problems_per_second": 7.463452966,
+            "checksum": -1.178164190851196
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 2516.622624001,
+            "ms_per_problem": 62.9155656,
+            "problems_per_second": 15.894317892,
+            "checksum": -2.5843522581100906
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 2822.536925,
+            "ms_per_problem": 35.281711563,
+            "problems_per_second": 28.343296164,
+            "checksum": -5.906276771376245
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 250.6844428,
+            "median_ms": 249.4609055,
+            "min_ms": 234.814240001,
+            "max_ms": 268.631989999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              244.011973,
+              242.028225,
+              246.313824,
+              234.814240001,
+              253.919762,
+              252.607986999,
+              246.091893,
+              268.631989999,
+              263.693192,
+              254.731342
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 278.9314652,
+            "median_ms": 267.3714465,
+            "min_ms": 245.30552,
+            "max_ms": 343.45946,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5072122851781273,
+            "samples_ms": [
+              265.910246,
+              275.159610001,
+              253.956467001,
+              245.30552,
+              343.45946,
+              325.048539,
+              311.74624,
+              251.159468,
+              248.736455001,
+              268.832647
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0069324,
+            "median_ms": 0.0063295,
+            "min_ms": 0.006309,
+            "max_ms": 0.012198,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.47088527582385736,
+            "samples_ms": [
+              0.012198,
+              0.00637,
+              0.006429001,
+              0.0064,
+              0.006329,
+              0.00632,
+              0.006309,
+              0.00631,
+              0.006329,
+              0.00633
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 2570.422349,
+            "ms_per_problem": 128.52111745,
+            "problems_per_second": 7.780822481,
+            "checksum": -1.178164190851196
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 2536.563526,
+            "ms_per_problem": 63.41408815,
+            "problems_per_second": 15.769366543,
+            "checksum": -2.5843522581100906
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 2530.849977001,
+            "ms_per_problem": 31.635624713,
+            "problems_per_second": 31.609933709,
+            "checksum": -5.906276771376245
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 234.0253013,
+            "median_ms": 231.784765,
+            "min_ms": 225.443872,
+            "max_ms": 248.885657999,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5120043264122505,
+            "samples_ms": [
+              248.885657999,
+              238.972751,
+              240.983819,
+              234.388617,
+              242.084279001,
+              226.40154,
+              225.443872,
+              229.180912999,
+              228.094304,
+              225.81726
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 243.1265487,
+            "median_ms": 233.516512,
+            "min_ms": 225.449902,
+            "max_ms": 286.622403,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.5072122851781273,
+            "samples_ms": [
+              231.812577,
+              286.622403,
+              286.036605,
+              235.220447,
+              241.757381,
+              227.869483,
+              226.278758,
+              228.654488999,
+              225.449902,
+              241.563442
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0102013,
+            "median_ms": 0.006365,
+            "min_ms": 0.00631,
+            "max_ms": 0.028523,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 800,
+            "checksum": -0.47088527582385736,
+            "samples_ms": [
+              0.008823,
+              0.00637,
+              0.028523,
+              0.006449,
+              0.00636,
+              0.006319,
+              0.00631,
+              0.006319,
+              0.00632,
+              0.020220001
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 2475.107396,
+            "ms_per_problem": 123.7553698,
+            "problems_per_second": 8.080457451,
+            "checksum": -1.178164190851196
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 2504.094633,
+            "ms_per_problem": 62.602365825,
+            "problems_per_second": 15.9738372,
+            "checksum": -2.5843522581100906
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 2710.170214001,
+            "ms_per_problem": 33.877127675,
+            "problems_per_second": 29.518441162,
+            "checksum": -5.906276771376245
+          }
+        ]
+      ]
+    },
+    {
+      "assets": 150,
+      "horizons": 8,
+      "codegen_seconds": 54.35136344300008,
+      "codegen_reused": false,
+      "compile_seconds": 7.735693496000749,
+      "generated_header_bytes": 27555960,
+      "binary_bytes": 11912128,
+      "serial": {
+        "repetitions": 3,
+        "median_ms": 792.3837245,
+        "mean_ms": 782.6596355,
+        "min_ms": 760.779443,
+        "max_ms": 794.815739,
+        "rss_delta_kb_median": 192.0,
+        "allocations_max": 0,
+        "output_bytes_per_problem": 1200,
+        "raw": [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 947.2321791,
+            "median_ms": 760.779443,
+            "min_ms": 705.784299,
+            "max_ms": 2433.382538,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              750.917771,
+              925.567453,
+              2433.382538,
+              805.280809,
+              705.784299,
+              863.269274,
+              768.042458,
+              730.226651001,
+              753.516428,
+              736.334110001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 798.4715356,
+            "median_ms": 792.3837245,
+            "min_ms": 734.492979001,
+            "max_ms": 860.018984,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              782.152146,
+              860.018984,
+              859.652898,
+              807.818468,
+              734.492979001,
+              833.169689,
+              772.522882,
+              788.636694,
+              796.130755,
+              750.119861
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 800.2531971,
+            "median_ms": 794.815739,
+            "min_ms": 727.344695,
+            "max_ms": 882.134066001,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              780.165225,
+              876.883529,
+              815.302625,
+              805.660501,
+              727.344695,
+              835.349899,
+              783.970977,
+              745.235354,
+              882.134066001,
+              750.4851
+            ]
+          }
+        ]
+      },
+      "scenarios": {
+        "all_changed": {
+          "repetitions": 3,
+          "median_ms": 792.3837245,
+          "mean_ms": 782.6596355,
+          "min_ms": 760.779443,
+          "max_ms": 794.815739,
+          "rss_delta_kb_median": 192.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 1200,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 947.2321791,
+              "median_ms": 760.779443,
+              "min_ms": 705.784299,
+              "max_ms": 2433.382538,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12906158600411766,
+              "samples_ms": [
+                750.917771,
+                925.567453,
+                2433.382538,
+                805.280809,
+                705.784299,
+                863.269274,
+                768.042458,
+                730.226651001,
+                753.516428,
+                736.334110001
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 798.4715356,
+              "median_ms": 792.3837245,
+              "min_ms": 734.492979001,
+              "max_ms": 860.018984,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12906158600411766,
+              "samples_ms": [
+                782.152146,
+                860.018984,
+                859.652898,
+                807.818468,
+                734.492979001,
+                833.169689,
+                772.522882,
+                788.636694,
+                796.130755,
+                750.119861
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "all_changed",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 800.2531971,
+              "median_ms": 794.815739,
+              "min_ms": 727.344695,
+              "max_ms": 882.134066001,
+              "rss_delta_kb": 192,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12906158600411766,
+              "samples_ms": [
+                780.165225,
+                876.883529,
+                815.302625,
+                805.660501,
+                727.344695,
+                835.349899,
+                783.970977,
+                745.235354,
+                882.134066001,
+                750.4851
+              ]
+            }
+          ]
+        },
+        "objective_only": {
+          "repetitions": 3,
+          "median_ms": 803.334984,
+          "mean_ms": 850.6864058333333,
+          "min_ms": 802.417036,
+          "max_ms": 946.3071975,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 1200,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 793.2804153,
+              "median_ms": 802.417036,
+              "min_ms": 737.874392,
+              "max_ms": 831.386084999,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12982350033810633,
+              "samples_ms": [
+                755.488163,
+                737.874392,
+                753.717408,
+                815.846841,
+                787.522357,
+                825.418779999,
+                831.386084999,
+                812.788757,
+                820.716055,
+                792.045315
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 795.516628,
+              "median_ms": 803.334984,
+              "min_ms": 732.266575999,
+              "max_ms": 855.444309001,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12982350033810633,
+              "samples_ms": [
+                765.334972,
+                732.266575999,
+                754.791675,
+                822.74582,
+                822.160513,
+                834.128662999,
+                855.444309001,
+                817.936421,
+                788.733547,
+                761.623784
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "objective_only",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 962.1422743,
+              "median_ms": 946.3071975,
+              "min_ms": 823.052217,
+              "max_ms": 1127.835102,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12982350033810633,
+              "samples_ms": [
+                928.528087,
+                823.052217,
+                900.497105,
+                964.086308,
+                912.895829,
+                1030.198253,
+                1127.835102,
+                1043.681042,
+                908.114841,
+                982.533959
+              ]
+            }
+          ]
+        },
+        "unchanged": {
+          "repetitions": 3,
+          "median_ms": 0.0135005,
+          "mean_ms": 0.0135255,
+          "min_ms": 0.0133,
+          "max_ms": 0.013776,
+          "rss_delta_kb_median": 0.0,
+          "allocations_max": 0,
+          "output_bytes_per_problem": 1200,
+          "raw": [
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0137045,
+              "median_ms": 0.0133,
+              "min_ms": 0.013279,
+              "max_ms": 0.016986,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12322657232815211,
+              "samples_ms": [
+                0.016986,
+                0.013540001,
+                0.01344,
+                0.01328,
+                0.01329,
+                0.013279,
+                0.01329,
+                0.01329,
+                0.01331,
+                0.01334
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.0144085,
+              "median_ms": 0.013776,
+              "min_ms": 0.01372,
+              "max_ms": 0.02003,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12322657232815211,
+              "samples_ms": [
+                0.02003,
+                0.013861,
+                0.01389,
+                0.013781,
+                0.013771,
+                0.01373,
+                0.013751,
+                0.01377,
+                0.013781,
+                0.01372
+              ]
+            },
+            {
+              "mode": "serial",
+              "scenario": "unchanged",
+              "workers": 1,
+              "problems": 10,
+              "mean_ms": 0.014097,
+              "median_ms": 0.0135005,
+              "min_ms": 0.01348,
+              "max_ms": 0.019099,
+              "rss_delta_kb": 0,
+              "allocations": 0,
+              "output_bytes_per_problem": 1200,
+              "checksum": 0.12322657232815211,
+              "samples_ms": [
+                0.019099,
+                0.01358,
+                0.01365,
+                0.0135,
+                0.01367,
+                0.0135,
+                0.01348,
+                0.013501,
+                0.01349,
+                0.0135
+              ]
+            }
+          ]
+        }
+      },
+      "parallel": [
+        {
+          "workers": 2,
+          "median_ms_per_problem": 408.0146882,
+          "median_problems_per_second": 2.450892159,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 8046.616252999,
+              "ms_per_problem": 402.33081265,
+              "problems_per_second": 2.485516815,
+              "checksum": 0.3005655701608776
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 9190.277852,
+              "ms_per_problem": 459.5138926,
+              "problems_per_second": 2.176212768,
+              "checksum": 0.3005655701608776
+            },
+            {
+              "mode": "parallel",
+              "workers": 2,
+              "problems": 20,
+              "wall_ms": 8160.293764,
+              "ms_per_problem": 408.0146882,
+              "problems_per_second": 2.450892159,
+              "checksum": 0.3005655701608776
+            }
+          ]
+        },
+        {
+          "workers": 4,
+          "median_ms_per_problem": 210.10530805,
+          "median_problems_per_second": 4.759518021,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 25749.486427,
+              "ms_per_problem": 643.737160675,
+              "problems_per_second": 1.553429041,
+              "checksum": 0.6305393417455949
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 8404.212322,
+              "ms_per_problem": 210.10530805,
+              "problems_per_second": 4.759518021,
+              "checksum": 0.6305393417455949
+            },
+            {
+              "mode": "parallel",
+              "workers": 4,
+              "problems": 40,
+              "wall_ms": 8271.029314999,
+              "ms_per_problem": 206.775732875,
+              "problems_per_second": 4.836157445,
+              "checksum": 0.6305393417455949
+            }
+          ]
+        },
+        {
+          "workers": 8,
+          "median_ms_per_problem": 115.181841463,
+          "median_problems_per_second": 8.681924054,
+          "raw": [
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 8625.468091,
+              "ms_per_problem": 107.818351137,
+              "problems_per_second": 9.274858959,
+              "checksum": 1.1365323513973657
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 9214.547317,
+              "ms_per_problem": 115.181841463,
+              "problems_per_second": 8.681924054,
+              "checksum": 1.1365323513973657
+            },
+            {
+              "mode": "parallel",
+              "workers": 8,
+              "problems": 80,
+              "wall_ms": 10448.967917,
+              "ms_per_problem": 130.612098963,
+              "problems_per_second": 7.656258554,
+              "checksum": 1.1365323513973657
+            }
+          ]
+        }
+      ],
+      "raw": [
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 947.2321791,
+            "median_ms": 760.779443,
+            "min_ms": 705.784299,
+            "max_ms": 2433.382538,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              750.917771,
+              925.567453,
+              2433.382538,
+              805.280809,
+              705.784299,
+              863.269274,
+              768.042458,
+              730.226651001,
+              753.516428,
+              736.334110001
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 793.2804153,
+            "median_ms": 802.417036,
+            "min_ms": 737.874392,
+            "max_ms": 831.386084999,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12982350033810633,
+            "samples_ms": [
+              755.488163,
+              737.874392,
+              753.717408,
+              815.846841,
+              787.522357,
+              825.418779999,
+              831.386084999,
+              812.788757,
+              820.716055,
+              792.045315
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0137045,
+            "median_ms": 0.0133,
+            "min_ms": 0.013279,
+            "max_ms": 0.016986,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12322657232815211,
+            "samples_ms": [
+              0.016986,
+              0.013540001,
+              0.01344,
+              0.01328,
+              0.01329,
+              0.013279,
+              0.01329,
+              0.01329,
+              0.01331,
+              0.01334
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 8046.616252999,
+            "ms_per_problem": 402.33081265,
+            "problems_per_second": 2.485516815,
+            "checksum": 0.3005655701608776
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 25749.486427,
+            "ms_per_problem": 643.737160675,
+            "problems_per_second": 1.553429041,
+            "checksum": 0.6305393417455949
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 8625.468091,
+            "ms_per_problem": 107.818351137,
+            "problems_per_second": 9.274858959,
+            "checksum": 1.1365323513973657
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 798.4715356,
+            "median_ms": 792.3837245,
+            "min_ms": 734.492979001,
+            "max_ms": 860.018984,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              782.152146,
+              860.018984,
+              859.652898,
+              807.818468,
+              734.492979001,
+              833.169689,
+              772.522882,
+              788.636694,
+              796.130755,
+              750.119861
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 795.516628,
+            "median_ms": 803.334984,
+            "min_ms": 732.266575999,
+            "max_ms": 855.444309001,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12982350033810633,
+            "samples_ms": [
+              765.334972,
+              732.266575999,
+              754.791675,
+              822.74582,
+              822.160513,
+              834.128662999,
+              855.444309001,
+              817.936421,
+              788.733547,
+              761.623784
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.0144085,
+            "median_ms": 0.013776,
+            "min_ms": 0.01372,
+            "max_ms": 0.02003,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12322657232815211,
+            "samples_ms": [
+              0.02003,
+              0.013861,
+              0.01389,
+              0.013781,
+              0.013771,
+              0.01373,
+              0.013751,
+              0.01377,
+              0.013781,
+              0.01372
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 9190.277852,
+            "ms_per_problem": 459.5138926,
+            "problems_per_second": 2.176212768,
+            "checksum": 0.3005655701608776
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 8404.212322,
+            "ms_per_problem": 210.10530805,
+            "problems_per_second": 4.759518021,
+            "checksum": 0.6305393417455949
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 9214.547317,
+            "ms_per_problem": 115.181841463,
+            "problems_per_second": 8.681924054,
+            "checksum": 1.1365323513973657
+          }
+        ],
+        [
+          {
+            "mode": "serial",
+            "scenario": "all_changed",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 800.2531971,
+            "median_ms": 794.815739,
+            "min_ms": 727.344695,
+            "max_ms": 882.134066001,
+            "rss_delta_kb": 192,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12906158600411766,
+            "samples_ms": [
+              780.165225,
+              876.883529,
+              815.302625,
+              805.660501,
+              727.344695,
+              835.349899,
+              783.970977,
+              745.235354,
+              882.134066001,
+              750.4851
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "objective_only",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 962.1422743,
+            "median_ms": 946.3071975,
+            "min_ms": 823.052217,
+            "max_ms": 1127.835102,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12982350033810633,
+            "samples_ms": [
+              928.528087,
+              823.052217,
+              900.497105,
+              964.086308,
+              912.895829,
+              1030.198253,
+              1127.835102,
+              1043.681042,
+              908.114841,
+              982.533959
+            ]
+          },
+          {
+            "mode": "serial",
+            "scenario": "unchanged",
+            "workers": 1,
+            "problems": 10,
+            "mean_ms": 0.014097,
+            "median_ms": 0.0135005,
+            "min_ms": 0.01348,
+            "max_ms": 0.019099,
+            "rss_delta_kb": 0,
+            "allocations": 0,
+            "output_bytes_per_problem": 1200,
+            "checksum": 0.12322657232815211,
+            "samples_ms": [
+              0.019099,
+              0.01358,
+              0.01365,
+              0.0135,
+              0.01367,
+              0.0135,
+              0.01348,
+              0.013501,
+              0.01349,
+              0.0135
+            ]
+          },
+          {
+            "mode": "parallel",
+            "workers": 2,
+            "problems": 20,
+            "wall_ms": 8160.293764,
+            "ms_per_problem": 408.0146882,
+            "problems_per_second": 2.450892159,
+            "checksum": 0.3005655701608776
+          },
+          {
+            "mode": "parallel",
+            "workers": 4,
+            "problems": 40,
+            "wall_ms": 8271.029314999,
+            "ms_per_problem": 206.775732875,
+            "problems_per_second": 4.836157445,
+            "checksum": 0.6305393417455949
+          },
+          {
+            "mode": "parallel",
+            "workers": 8,
+            "problems": 80,
+            "wall_ms": 10448.967917,
+            "ms_per_problem": 130.612098963,
+            "problems_per_second": 7.656258554,
+            "checksum": 1.1365323513973657
           }
         ]
       ]
     }
-  ]
+  ],
+  "notes": {
+    "aggregation": "median of three process medians; each process has one warm-up and ten measured iterations",
+    "allocation_wrappers": [
+      "malloc",
+      "calloc",
+      "realloc",
+      "aligned_alloc"
+    ],
+    "fifty_asset_case": "runtime rerun after an overlay filesystem dropped the executable bit; uncached codegen timing retained from the first clean sweep",
+    "final_sparse_codegen": {
+      "seconds_by_assets": {
+        "9": 0.099486086,
+        "24": 0.24944431,
+        "50": 1.669360803,
+        "75": 4.785185317,
+        "100": 11.441982079,
+        "150": 36.84360805
+      },
+      "peak_rss_kib_150x8": 4674060
+    }
+  }
 }

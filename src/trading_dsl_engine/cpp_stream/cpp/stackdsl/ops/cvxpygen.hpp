@@ -1,6 +1,8 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 #include "stackdsl/ops/einsum.hpp"
@@ -17,6 +19,29 @@ struct CvxpygenParameterBinding {
 template <class... Bindings>
 struct CvxpygenParameterList {};
 
+enum class CvxpygenResultKind : std::uint8_t {
+    Primal,
+    Dual,
+    Info,
+};
+
+template <
+    CvxpygenResultKind Kind,
+    std::size_t SourceIndex,
+    std::size_t Offset,
+    std::size_t Count,
+    std::size_t Stride,
+    class Out
+>
+struct CvxpygenProjection {
+    static constexpr CvxpygenResultKind kind = Kind;
+    static constexpr std::size_t source_index = SourceIndex;
+    static constexpr std::size_t offset = Offset;
+    static constexpr std::size_t count = Count;
+    static constexpr std::size_t stride = Stride;
+    using output_type = Out;
+};
+
 template <
     std::size_t PrimalIndex,
     std::size_t Offset,
@@ -24,13 +49,14 @@ template <
     std::size_t Stride,
     class Out
 >
-struct CvxpygenPrimalProjection {
-    static constexpr std::size_t primal_index = PrimalIndex;
-    static constexpr std::size_t offset = Offset;
-    static constexpr std::size_t count = Count;
-    static constexpr std::size_t stride = Stride;
-    using output_type = Out;
-};
+using CvxpygenPrimalProjection = CvxpygenProjection<
+    CvxpygenResultKind::Primal,
+    PrimalIndex,
+    Offset,
+    Count,
+    Stride,
+    Out
+>;
 
 template <class... Projections>
 struct CvxpygenProjectionList {};
@@ -44,10 +70,16 @@ class CvxpygenNode<
     CvxpygenParameterList<Bindings...>,
     CvxpygenProjectionList<Projections...>
 > {
-    Program program_{};
+    alignas(64) Program program_{};
+    bool has_solution_{false};
+
+    STACKDSL_HOT static bool same_value(double left, double right) noexcept {
+        return std::bit_cast<std::uint64_t>(left)
+            == std::bit_cast<std::uint64_t>(right);
+    }
 
     template <class Binding, class Context>
-    STACKDSL_HOT void load_parameter(const Context& ctx) {
+    STACKDSL_HOT bool load_parameter(const Context& ctx) {
         constexpr std::size_t index = Binding::index;
         using Source = typename Binding::source_type;
         static_assert(
@@ -55,19 +87,44 @@ class CvxpygenNode<
             "CVXPYgen parameter and cpp_stream source sizes differ"
         );
         auto target = program_.template parameter_buffer<index>();
+        bool changed = false;
+        for (std::size_t offset = 0; offset < target.size(); ++offset) {
+            if (!same_value(
+                    static_cast<double>(target[offset]),
+                    Source::read_flat(ctx, offset)
+                )) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return false;
         Source::load_contiguous(ctx, 0, target.size(), target.data());
         program_.template mark_parameter_dirty<index>();
+        return true;
     }
 
     template <class Projection, class Context>
-    STACKDSL_HOT void project(Context& ctx) const noexcept {
-        const auto source = program_.template primal<Projection::primal_index>();
+    STACKDSL_HOT void project(Context& ctx) noexcept {
         auto* STACKDSL_RESTRICT out =
             ctx.template write_ptr<typename Projection::output_type>();
-        for (std::size_t index = 0; index < Projection::count; ++index) {
-            out[index] = source[
-                Projection::offset + index * Projection::stride
-            ];
+        if constexpr (Projection::kind == CvxpygenResultKind::Info) {
+            static_assert(Projection::count == 1);
+            out[0] = program_.template info<Projection::source_index>();
+        } else {
+            const auto source = [&]() {
+                if constexpr (
+                    Projection::kind == CvxpygenResultKind::Primal
+                ) {
+                    return program_.template primal<Projection::source_index>();
+                } else {
+                    return program_.template dual<Projection::source_index>();
+                }
+            }();
+            for (std::size_t index = 0; index < Projection::count; ++index) {
+                out[index] = source[
+                    Projection::offset + index * Projection::stride
+                ];
+            }
         }
     }
 
@@ -76,8 +133,14 @@ public:
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) {
-        (load_parameter<Bindings>(ctx), ...);
-        program_.solve();
+        bool changed = false;
+        ((changed = load_parameter<Bindings>(ctx) || changed), ...);
+        // Generated settings are fixed for this node, so bitwise-identical
+        // parameters imply an identical problem and the cached result is valid.
+        if (changed || !has_solution_) {
+            program_.solve();
+            has_solution_ = true;
+        }
         (project<Projections>(ctx), ...);
     }
 };

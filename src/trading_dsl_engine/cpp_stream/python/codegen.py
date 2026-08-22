@@ -704,8 +704,15 @@ def _stage_type(
             field = program.resolve_field(member.projection)
             projections.append(
                 tmpl(
-                    "stackdsl::CvxpygenPrimalProjection",
-                    IntArg(field.primal_index),
+                    "stackdsl::CvxpygenProjection",
+                    Name(
+                        {
+                            "primal": "stackdsl::CvxpygenResultKind::Primal",
+                            "dual": "stackdsl::CvxpygenResultKind::Dual",
+                            "info": "stackdsl::CvxpygenResultKind::Info",
+                        }[field.kind]
+                    ),
+                    IntArg(field.source_index),
                     IntArg(field.offset),
                     IntArg(field.count),
                     IntArg(field.stride),

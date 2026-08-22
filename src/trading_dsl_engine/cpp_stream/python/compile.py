@@ -166,6 +166,7 @@ def compile_formula(
             dsl_registry=dsl_registry,
             column_names=column_names,
             input_value_types=referenced_types,
+            n_instruments=n_instruments,
         )
         validate_names(program, data, what="source")
         infos = referenced_types.infos_for(program.input_names)
@@ -183,6 +184,7 @@ def compile_formula(
                 name: input_value_type(info.input_type, n)
                 for name, info in infos.items()
             },
+            n_instruments=n,
         )
         validate_names(program, data, what="source")
         ordered = tuple(infos[name].input_type for name in program.input_names)
@@ -210,6 +212,7 @@ def compile_formula(
             dsl_registry=dsl_registry,
             column_names=column_names,
             input_value_types=input_value_types,
+            n_instruments=n,
         )
         if input_types is None:
             ordered = tuple(

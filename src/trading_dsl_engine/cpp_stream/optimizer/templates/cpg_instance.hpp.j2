@@ -7,10 +7,13 @@
 #include <span>
 #include <stdexcept>
 
-class {{ class_name }} final {
+class alignas(64) {{ class_name }} final {
   cpg_int i{0};
   cpg_int j{0};
   bool solver_settings_dirty_{false};
+  std::array<bool, {{ primals|length }}> primal_retrieved_{};
+  std::array<bool, {{ duals|length }}> dual_retrieved_{};
+  bool info_retrieved_{false};
 {% for member in compound_members %}
   std::array<{{ member.c_type }}, {{ member.values|length }}> {{ member.name }}{{ "{{" }}{{ member.values|join(', ') }}{{ "}}" }};
 {% endfor %}
@@ -38,7 +41,12 @@ class {{ class_name }} final {
     }
   }
 
-  void solve() { {{ prefix }}cpg_solve(); }
+  void solve() {
+    {{ prefix }}cpg_solve();
+    primal_retrieved_.fill(false);
+    dual_retrieved_.fill(false);
+    info_retrieved_ = false;
+  }
 
 {% for parameter in parameters %}
   void set_{{ parameter.name }}(std::span<const cpg_float> values) {
@@ -94,14 +102,15 @@ class {{ class_name }} final {
   }
 
 {% for primal in primals %}
-  [[nodiscard]] std::span<const cpg_float> primal_{{ primal.name }}() const noexcept {
+  [[nodiscard]] std::span<const cpg_float> primal_{{ primal.name }}() noexcept {
+    retrieve_primal<{{ loop.index0 }}>();
     return std::span<const cpg_float>(
         {{ prefix }}CPG_Result.prim->{{ primal.name }}, {{ primal.size }});
   }
 
 {% endfor %}
   template <std::size_t Index>
-  [[nodiscard]] std::span<const cpg_float> primal() const noexcept {
+  [[nodiscard]] std::span<const cpg_float> primal() noexcept {
 {% for primal in primals %}
     if constexpr (Index == {{ loop.index0 }}) return primal_{{ primal.name }}();
     else
@@ -112,7 +121,88 @@ class {{ class_name }} final {
     }
   }
 
-  [[nodiscard]] const CPG_Result_t& result() const noexcept {
+  template <std::size_t Index>
+  void retrieve_primal() noexcept {
+    static_assert(Index < {{ primals|length }}, "invalid CVXPYgen primal index");
+    if (primal_retrieved_[Index]) return;
+{% for retrieval in primal_retrievals %}
+    if constexpr (Index == {{ loop.index0 }}) {
+{% for statement in retrieval.statements %}
+      {{ statement }}
+{% endfor %}
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ primals|length }}, "invalid CVXPYgen primal index");
+    }
+    primal_retrieved_[Index] = true;
+  }
+
+{% for dual in duals %}
+  [[nodiscard]] std::span<const cpg_float> dual_{{ dual.name }}() noexcept {
+    retrieve_dual<{{ loop.index0 }}>();
+    return std::span<const cpg_float>(
+        {{ prefix }}CPG_Result.dual->{{ dual.name }}, {{ dual.size }});
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const cpg_float> dual() noexcept {
+{% for dual in duals %}
+    if constexpr (Index == {{ loop.index0 }}) return dual_{{ dual.name }}();
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ duals|length }}, "invalid CVXPYgen dual index");
+      return {};
+    }
+  }
+
+  template <std::size_t Index>
+  void retrieve_dual() noexcept {
+    static_assert(Index < {{ duals|length }}, "invalid CVXPYgen dual index");
+    if (dual_retrieved_[Index]) return;
+{% for retrieval in dual_retrievals %}
+    if constexpr (Index == {{ loop.index0 }}) {
+{% for statement in retrieval.statements %}
+      {{ statement }}
+{% endfor %}
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ duals|length }}, "invalid CVXPYgen dual index");
+    }
+    dual_retrieved_[Index] = true;
+  }
+
+  void retrieve_info() noexcept {
+    if (info_retrieved_) return;
+    {{ prefix }}cpg_retrieve_info();
+    info_retrieved_ = true;
+  }
+
+  template <std::size_t Index>
+  [[nodiscard]] double info() noexcept {
+    retrieve_info();
+{% for public_name, member_name in info_fields %}
+    if constexpr (Index == {{ loop.index0 }}) {
+      return static_cast<double>({{ prefix }}CPG_Result.info->{{ member_name }});
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ info_fields|length }}, "invalid CVXPYgen info index");
+      return 0.0;
+    }
+  }
+
+  [[nodiscard]] const CPG_Result_t& result() noexcept {
+{% for primal in primals %}
+    retrieve_primal<{{ loop.index0 }}>();
+{% endfor %}
+{% for dual in duals %}
+    retrieve_dual<{{ loop.index0 }}>();
+{% endfor %}
+    retrieve_info();
     return {{ prefix }}CPG_Result;
   }
 };

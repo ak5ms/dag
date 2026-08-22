@@ -5,14 +5,16 @@ from dataclasses import dataclass
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
+from math import prod
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+from threading import RLock
 import types
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -22,6 +24,14 @@ _DEFAULT_CLARABEL_RS_TAG = "v0.11.1"
 _SUPPORTED_CVXPYGEN_VERSION = "1.0.0"
 _CANONICAL_BLOCKS = ("P", "q", "A", "b", "d")
 _SOLVER_UPDATE_BLOCKS = ("P", "A", "q", "b")
+_INFO_FIELDS = (
+    ("objective", "obj_val"),
+    ("iterations", "iter"),
+    ("status", "status"),
+    ("primal_residual", "pri_res"),
+    ("dual_residual", "dua_res"),
+)
+_CPG_GENERATION_LOCK = RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,16 +74,48 @@ class PrimalLayout:
 
 
 @dataclass(frozen=True, slots=True)
-class FieldLayout:
-    """One compile-time view into a generated primal result buffer."""
+class DualLayout:
+    """One CVXPY constraint dual mapped by CVXPYgen."""
+
+    name: str
+    constraint_index: int
+    label: str | None
+    shape: tuple[int, ...]
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class FieldAlias:
+    """A public field name backed by a generated primal variable."""
 
     name: str
     primal_name: str
-    primal_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class FieldLayout:
+    """One compile-time view into a generated result buffer."""
+
+    name: str
+    kind: str
+    source_name: str
+    source_index: int
     offset: int
     count: int
     stride: int
     logical_shape: tuple[int, ...]
+
+    @property
+    def primal_name(self) -> str:
+        """Compatibility alias for callers written before dual/info fields."""
+
+        return self.source_name
+
+    @property
+    def primal_index(self) -> int:
+        """Compatibility alias for callers written before dual/info fields."""
+
+        return self.source_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +129,8 @@ class GeneratedCvxpygenProgram:
     prefix: str
     parameters: tuple[ParameterLayout, ...]
     primals: tuple[PrimalLayout, ...]
+    duals: tuple[DualLayout, ...]
+    aliases: tuple[FieldAlias, ...]
     clarabel: ClarabelNativePaths
     instrument_count: int | None = None
 
@@ -144,53 +188,171 @@ class GeneratedCvxpygenProgram:
         return tuple(reversed(shape)) if len(shape) > 1 else shape
 
     def resolve_field(self, name: str) -> FieldLayout:
-        """Resolve ``variable`` or ``variable[index]`` without runtime parsing."""
+        """Resolve primal, constraint-dual, constraint-value, or info fields."""
 
-        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?", name)
-        if match is None:
+        return _resolve_result_field(
+            str(name),
+            primals=self.primals,
+            duals=self.duals,
+            aliases=self.aliases,
+        )
+
+
+def _indexed_result_layout(
+    requested_name: str,
+    *,
+    kind: str,
+    source_name: str,
+    source_index: int,
+    shape: tuple[int, ...],
+    size: int,
+    index_text: str | None,
+) -> FieldLayout:
+    if index_text is None:
+        logical_shape = tuple(reversed(shape)) if len(shape) > 1 else shape
+        return FieldLayout(
+            requested_name,
+            kind,
+            source_name,
+            source_index,
+            0,
+            size,
+            1,
+            logical_shape,
+        )
+    if not shape:
+        raise KeyError(f"scalar field {requested_name!r} cannot be indexed")
+    index = int(index_text)
+    if index >= shape[0]:
+        raise KeyError(
+            f"field {requested_name!r} indexes axis 0 of size {shape[0]}"
+        )
+    count = prod(shape[1:]) if len(shape) > 1 else 1
+    return FieldLayout(
+        requested_name,
+        kind,
+        source_name,
+        source_index,
+        index,
+        int(count),
+        int(shape[0]),
+        tuple(reversed(shape[1:])),
+    )
+
+
+def _match_base_field(name: str, base: str) -> str | None | object:
+    if name == base:
+        return None
+    match = re.fullmatch(re.escape(base) + r"\[(\d+)\]", name)
+    return _NO_FIELD_MATCH if match is None else match.group(1)
+
+
+_NO_FIELD_MATCH = object()
+
+
+def _resolve_result_field(
+    name: str,
+    *,
+    primals: tuple[PrimalLayout, ...],
+    duals: tuple[DualLayout, ...],
+    aliases: tuple[FieldAlias, ...],
+) -> FieldLayout:
+    alias_by_name = {alias.name: alias.primal_name for alias in aliases}
+    primal_by_name = {primal.name: primal for primal in primals}
+
+    for public_name, primal_name in alias_by_name.items():
+        index_text = _match_base_field(name, public_name)
+        if index_text is _NO_FIELD_MATCH:
+            continue
+        primal = primal_by_name.get(primal_name)
+        if primal is None:
             raise KeyError(
-                f"unsupported generated field {name!r}; use a primal name or name[index]"
+                f"generated field alias {public_name!r} targets missing primal "
+                f"{primal_name!r}"
             )
-        primal_name, index_text = match.groups()
-        for primal_index, primal in enumerate(self.primals):
-            if primal.name != primal_name:
+        return _indexed_result_layout(
+            name,
+            kind="primal",
+            source_name=primal.name,
+            source_index=primals.index(primal),
+            shape=primal.shape,
+            size=primal.size,
+            index_text=index_text,
+        )
+
+    for primal_index, primal in enumerate(primals):
+        index_text = _match_base_field(name, primal.name)
+        if index_text is _NO_FIELD_MATCH:
+            continue
+        return _indexed_result_layout(
+            name,
+            kind="primal",
+            source_name=primal.name,
+            source_index=primal_index,
+            shape=primal.shape,
+            size=primal.size,
+            index_text=index_text,
+        )
+
+    for dual_index, dual in enumerate(duals):
+        bases = [
+            dual.name,
+            f"dual[{dual.constraint_index}]",
+            f"lagrangian[{dual.constraint_index}]",
+            f"constraint[{dual.constraint_index}].dual",
+            f"constraint[{dual.constraint_index}].lagrangian",
+        ]
+        if dual.label is not None:
+            bases.extend((f"{dual.label}.dual", f"{dual.label}.lagrangian"))
+        for base in bases:
+            index_text = _match_base_field(name, base)
+            if index_text is _NO_FIELD_MATCH:
                 continue
-            if index_text is None:
-                logical_shape = (
-                    tuple(reversed(primal.shape))
-                    if len(primal.shape) > 1
-                    else primal.shape
-                )
-                return FieldLayout(
-                    name,
-                    primal_name,
-                    primal_index,
-                    0,
-                    primal.size,
-                    1,
-                    logical_shape,
-                )
-            if not primal.shape:
-                raise KeyError(f"scalar primal {primal_name!r} cannot be indexed")
-            index = int(index_text)
-            if index >= primal.shape[0]:
-                raise KeyError(
-                    f"field {name!r} indexes axis 0 of size {primal.shape[0]}"
-                )
-            count = 1
-            for extent in primal.shape[1:]:
-                count *= int(extent)
-            logical_shape = tuple(reversed(primal.shape[1:]))
+            return _indexed_result_layout(
+                name,
+                kind="dual",
+                source_name=dual.name,
+                source_index=dual_index,
+                shape=dual.shape,
+                size=dual.size,
+                index_text=index_text,
+            )
+
+    info_aliases = {
+        "objective_value": "objective",
+        "obj_val": "objective",
+        "iter": "iterations",
+        "pri_res": "primal_residual",
+        "dua_res": "dual_residual",
+    }
+    normalized = info_aliases.get(name, name)
+    if normalized.startswith("info."):
+        raw = normalized.removeprefix("info.")
+        normalized = info_aliases.get(raw, raw)
+        for public_name, member_name in _INFO_FIELDS:
+            if normalized == member_name:
+                normalized = public_name
+                break
+    for info_index, (public_name, member_name) in enumerate(_INFO_FIELDS):
+        if normalized == public_name:
             return FieldLayout(
                 name,
-                primal_name,
-                primal_index,
-                index,
-                count,
-                int(primal.shape[0]),
-                logical_shape,
+                "info",
+                member_name,
+                info_index,
+                0,
+                1,
+                1,
+                (),
             )
-        raise KeyError(f"unknown generated primal field {name!r}")
+
+    available = [primal.name for primal in primals]
+    available.extend(alias.name for alias in aliases)
+    available.extend(("dual[index]", "constraint[index].dual"))
+    available.extend(name for name, _ in _INFO_FIELDS)
+    raise KeyError(
+        f"unknown generated field {name!r}; available fields include {available}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +367,18 @@ class _GeneratedParameter:
 class _GeneratedPrimal:
     name: str
     size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedDual:
+    name: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ResultRetrieval:
+    name: str
+    statements: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +428,120 @@ def _import_cpg():
         from cvxpygen import cpg
 
     return cpg
+
+
+@contextmanager
+def _sparse_cvxpygen_canonical_maps():
+    """Keep CVXPYgen 1.0 canonical maps sparse during code generation.
+
+    CVXPYgen 1.0 initializes one sparse result through a dense zero array, then
+    densifies each already-sparse affine parameter map solely to apply a scalar
+    or row-wise sign. A 150-asset, eight-horizon MPO attempts a roughly 35 GiB
+    temporary in the latter step. The adapter is version-pinned, so patch that
+    method while generation is serialized and restore it immediately afterward.
+    """
+
+    from cvxpygen import canonicalizer as canonicalizer_module
+
+    canonicalizer = canonicalizer_module.Canonicalizer
+    original = canonicalizer._process_canonical_parameters
+
+    def sparse_process(
+        self,
+        constraint_info,
+        param_prob,
+        parameter_info,
+        solver_interface,
+        solver_opts,
+        problem,
+    ):
+        parameter_canon = canonicalizer_module.ParameterCanon()
+        parameter_canon.quad_obj = self._get_quad_obj(
+            problem, solver_interface, solver_opts
+        )
+        canon_p_ids = (
+            solver_interface.canon_p_ids
+            if parameter_canon.quad_obj
+            else [
+                p_id
+                for p_id in solver_interface.canon_p_ids
+                if p_id != "P"
+            ]
+        )
+        adjacency = canonicalizer_module.np.zeros(
+            (len(canon_p_ids), parameter_info.num), dtype=bool
+        )
+        for index, p_id in enumerate(canon_p_ids):
+            affine_map = solver_interface.get_affine_map(
+                p_id, param_prob, constraint_info
+            )
+            if not affine_map:
+                parameter_canon.p_id_to_mapping[p_id] = None
+                parameter_canon.p_id_to_changes[p_id] = False
+                parameter_canon.p_id_to_size[p_id] = 0
+                continue
+            if p_id in solver_interface.canon_p_ids_constr_vec:
+                mapping_to_sparse = param_prob.reduced_A.reduced_mat[
+                    affine_map.mapping_rows
+                ]
+                dense_shape = (
+                    affine_map.shape[0],
+                    mapping_to_sparse.shape[1],
+                )
+                mapping_to_dense = canonicalizer_module.sparse.lil_matrix(
+                    dense_shape, dtype=mapping_to_sparse.dtype
+                )
+                for data_index, sparse_row in enumerate(mapping_to_sparse):
+                    mapping_to_dense[
+                        affine_map.indices[data_index], :
+                    ] = sparse_row
+                affine_map.mapping = mapping_to_dense.tocsr()
+            if len(affine_map.mapping.shape) < 2:
+                affine_map.mapping = affine_map.mapping.reshape(1, -1)
+            affine_map.mapping = affine_map.mapping.tocsr()
+            if p_id == "d":
+                parameter_canon.nonzero_d = affine_map.mapping.nnz > 0
+            adjacency = self._update_adjacency_matrix(
+                adjacency,
+                index,
+                parameter_info,
+                affine_map.mapping,
+            )
+            sign = canonicalizer_module.np.asarray(affine_map.sign).reshape(-1)
+            if sign.size == 1:
+                affine_map.mapping.data *= sign.item()
+            else:
+                if sign.size != affine_map.mapping.shape[0]:
+                    raise ValueError(
+                        f"unexpected CVXPYgen affine-map sign shape {sign.shape}"
+                    )
+                indptr = affine_map.mapping.indptr
+                for row in canonicalizer_module.np.flatnonzero(sign != 1):
+                    affine_map.mapping.data[
+                        indptr[row] : indptr[row + 1]
+                    ] *= sign[row]
+            affine_map, parameter_canon = self._set_default_values(
+                affine_map,
+                p_id,
+                parameter_canon,
+                parameter_info,
+                solver_interface,
+            )
+            parameter_canon.p_id_to_mapping[p_id] = affine_map.mapping.tocsr()
+            parameter_canon.p_id_to_changes[p_id] = (
+                affine_map.mapping[:, :-1].nnz > 0
+            )
+            parameter_canon.p_id_to_size[p_id] = affine_map.mapping.shape[0]
+        parameter_canon.is_maximization = isinstance(
+            problem.objective, canonicalizer_module.Maximize
+        )
+        return adjacency, parameter_canon, canon_p_ids
+
+    canonicalizer._process_canonical_parameters = sparse_process
+    try:
+        yield
+    finally:
+        canonicalizer._process_canonical_parameters = original
 
 
 def _package_version(name: str) -> str:
@@ -379,6 +667,63 @@ def _generated_primals(
             )
         result.append(_GeneratedPrimal(name, size))
     return tuple(result)
+
+
+def _generated_duals(
+    workspace_header: str,
+    problem: Any,
+    prefix: str,
+) -> tuple[_GeneratedDual, ...]:
+    result: list[_GeneratedDual] = []
+    for index, _constraint in enumerate(problem.constraints):
+        name = f"d{index}"
+        array = re.search(
+            rf"extern\s+cpg_float\s+{re.escape(prefix)}cpg_{name}\[(\d+)\]\s*;",
+            workspace_header,
+        )
+        if array is not None:
+            size = int(array.group(1))
+        else:
+            scalar = re.search(
+                rf"extern\s+cpg_float\s+{re.escape(prefix)}cpg_{name}\s*;",
+                workspace_header,
+            )
+            if scalar is None:
+                raise ValueError(
+                    f"CVXPYgen omitted dual result for constraint {index}"
+                )
+            size = 1
+        result.append(_GeneratedDual(name, size))
+    return tuple(result)
+
+
+def _result_retrievals(
+    solve_source: str,
+    prefix: str,
+    owner: str,
+    results: tuple[_GeneratedPrimal, ...] | tuple[_GeneratedDual, ...],
+) -> tuple[_ResultRetrieval, ...]:
+    signature = f"void {prefix}cpg_retrieve_{'prim' if owner == 'Prim' else 'dual'}()"
+    start, end = _find_function_span(solve_source, signature)
+    body = solve_source[start:end]
+    retrievals: list[_ResultRetrieval] = []
+    for result in results:
+        statements = tuple(
+            match.group(0).strip()
+            for match in re.finditer(
+                rf"{re.escape(prefix)}CPG_{owner}\.{re.escape(result.name)}"
+                rf"(?:\s*\[[^\]]+\])?\s*=.*?;",
+                body,
+                flags=re.S,
+            )
+        )
+        if not statements:
+            raise ValueError(
+                f"could not isolate generated {owner.lower()} retrieval "
+                f"for {result.name!r}"
+            )
+        retrievals.append(_ResultRetrieval(result.name, statements))
+    return tuple(retrievals)
 
 
 def _loop_count(solve_source: str, prefix: str, block: str) -> int:
@@ -563,7 +908,13 @@ def _emit_instance_header(
     generated_root: Path,
     class_name: str,
     problem: Any,
-) -> tuple[Path, str, tuple[_GeneratedParameter, ...], tuple[_GeneratedPrimal, ...]]:
+) -> tuple[
+    Path,
+    str,
+    tuple[_GeneratedParameter, ...],
+    tuple[_GeneratedPrimal, ...],
+    tuple[_GeneratedDual, ...],
+]:
     solve_path = generated_root / "c" / "src" / "cpg_solve.c"
     workspace_source_path = generated_root / "c" / "src" / "cpg_workspace.c"
     workspace_header_path = generated_root / "c" / "include" / "cpg_workspace.h"
@@ -573,6 +924,13 @@ def _emit_instance_header(
     prefix = _generated_prefix(solve_source)
     parameters = _generated_parameters(solve_source, problem, prefix)
     primals = _generated_primals(workspace_header, problem, prefix)
+    duals = _generated_duals(workspace_header, problem, prefix)
+    primal_retrievals = _result_retrievals(
+        solve_source, prefix, "Prim", primals
+    )
+    dual_retrievals = _result_retrievals(
+        solve_source, prefix, "Dual", duals
+    )
     solve_body = _strip_generated_preamble(solve_source, "cpg_workspace.h")
     solve_body, compound_members = _replace_compound_literals(solve_body)
     solve_body = re.sub(
@@ -602,6 +960,10 @@ def _emit_instance_header(
             solve_body=solve_body,
             parameters=parameters,
             primals=primals,
+            duals=duals,
+            primal_retrievals=primal_retrievals,
+            dual_retrievals=dual_retrievals,
+            info_fields=_INFO_FIELDS,
         )
     )
     (header_dir / "cpg_instance.hpp").write_text(
@@ -609,7 +971,24 @@ def _emit_instance_header(
             instance_header=header.name,
         )
     )
-    return header, prefix, parameters, primals
+    return header, prefix, parameters, primals, duals
+
+
+def _constraint_dual_shape(constraint: Any, size: int) -> tuple[int, ...]:
+    dual_variables = tuple(getattr(constraint, "dual_variables", ()))
+    if len(dual_variables) == 1:
+        shape = tuple(int(extent) for extent in dual_variables[0].shape)
+        if (prod(shape) if shape else 1) == size:
+            return shape
+    return (size,)
+
+
+def _constraint_label(constraint: Any) -> str | None:
+    label = getattr(constraint, "label", None)
+    if label is None:
+        return None
+    label = str(label)
+    return label if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label) else None
 
 
 def generate_clarabel_program(
@@ -628,6 +1007,7 @@ def generate_clarabel_program(
         "tol_feas",
         "presolve_enable",
     ),
+    field_aliases: Mapping[str, str] | None = None,
     force: bool = False,
 ) -> GeneratedCvxpygenProgram:
     """Generate a reentrant persistent Clarabel class from a CVXPY problem.
@@ -651,6 +1031,14 @@ def generate_clarabel_program(
         )
     if not problem.is_dcp(dpp=True):
         raise ValueError("CVXPY problem must be DPP-compliant")
+    labels = tuple(_constraint_label(constraint) for constraint in problem.constraints)
+    duplicate_labels = sorted(
+        label
+        for label in set(labels)
+        if label is not None and labels.count(label) > 1
+    )
+    if duplicate_labels:
+        raise ValueError(f"constraint labels must be unique: {duplicate_labels}")
     root = Path(code_dir).expanduser().resolve()
     if root.exists():
         if not force:
@@ -660,15 +1048,16 @@ def generate_clarabel_program(
         shutil.rmtree(root)
     root.parent.mkdir(parents=True, exist_ok=True)
     cpg = _import_cpg()
-    cpg.generate_code(
-        problem,
-        code_dir=str(root),
-        solver="CLARABEL",
-        enable_settings=list(enable_settings),
-        prefix=prefix,
-        wrapper=False,
-    )
-    header, generated_prefix, parameters, primals = _emit_instance_header(
+    with _CPG_GENERATION_LOCK, _sparse_cvxpygen_canonical_maps():
+        cpg.generate_code(
+            problem,
+            code_dir=str(root),
+            solver="CLARABEL",
+            enable_settings=list(enable_settings),
+            prefix=prefix,
+            wrapper=False,
+        )
+    header, generated_prefix, parameters, primals, duals = _emit_instance_header(
         root, class_name, problem
     )
     clarabel = clarabel.normalized()
@@ -692,7 +1081,32 @@ def generate_clarabel_program(
         )
         for item in primals
     )
+    public_duals = tuple(
+        DualLayout(
+            item.name,
+            index,
+            labels[index],
+            _constraint_dual_shape(problem.constraints[index], item.size),
+            item.size,
+        )
+        for index, item in enumerate(duals)
+    )
+    alias_mapping = dict(field_aliases or {})
+    primal_names = {primal.name for primal in public_primals}
+    for alias_name, primal_name in alias_mapping.items():
+        if not alias_name or not isinstance(alias_name, str):
+            raise ValueError(f"invalid generated field alias {alias_name!r}")
+        if primal_name not in primal_names:
+            raise ValueError(
+                f"generated field alias {alias_name!r} targets unknown primal "
+                f"{primal_name!r}"
+            )
+    public_aliases = tuple(
+        FieldAlias(name, primal_name)
+        for name, primal_name in sorted(alias_mapping.items())
+    )
     manifest = {
+        "schema_version": 2,
         "class_name": class_name,
         "prefix": generated_prefix,
         "cvxpy_version": _package_version("cvxpy"),
@@ -721,6 +1135,20 @@ def generate_clarabel_program(
             }
             for item in public_primals
         ],
+        "duals": [
+            {
+                "name": item.name,
+                "constraint_index": item.constraint_index,
+                "label": item.label,
+                "shape": list(item.shape),
+                "size": item.size,
+            }
+            for item in public_duals
+        ],
+        "aliases": [
+            {"name": item.name, "primal_name": item.primal_name}
+            for item in public_aliases
+        ],
     }
     manifest_path = root / "cpp" / "cpg_instance_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -732,8 +1160,120 @@ def generate_clarabel_program(
         generated_prefix,
         public_parameters,
         public_primals,
+        public_duals,
+        public_aliases,
         clarabel,
         None if instrument_count is None else int(instrument_count),
+    )
+
+
+def load_clarabel_program(
+    code_dir: str | os.PathLike[str],
+    *,
+    clarabel: ClarabelNativePaths,
+) -> GeneratedCvxpygenProgram:
+    """Load a previously generated native program from its manifest."""
+
+    root = Path(code_dir).expanduser().resolve()
+    manifest_path = root / "cpp" / "cpg_instance_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema_version") != 2:
+        raise ValueError(
+            f"unsupported generated-program manifest schema in {manifest_path}"
+        )
+    if manifest.get("cvxpygen_version") != _SUPPORTED_CVXPYGEN_VERSION:
+        raise ValueError(
+            "cached generated program uses CVXPYgen "
+            f"{manifest.get('cvxpygen_version')!r}, expected "
+            f"{_SUPPORTED_CVXPYGEN_VERSION!r}"
+        )
+    clarabel = clarabel.normalized()
+    if manifest.get("clarabel_version") != clarabel.version:
+        raise ValueError(
+            "cached generated program targets Clarabel "
+            f"{manifest.get('clarabel_version')!r}, found {clarabel.version!r}"
+        )
+    prefix = str(manifest["prefix"])
+    instance_header = root / "cpp" / "include" / f"{prefix}instance.hpp"
+    if not instance_header.is_file():
+        raise FileNotFoundError(
+            f"cached generated instance header not found: {instance_header}"
+        )
+    parameters = tuple(
+        ParameterLayout(
+            str(item["name"]),
+            tuple(int(extent) for extent in item["shape"]),
+            int(item["size"]),
+            int(item["offset"]),
+            tuple(str(block) for block in item["dirty_blocks"]),
+            bool(item.get("column_major", True)),
+        )
+        for item in manifest["parameters"]
+    )
+    primals = tuple(
+        PrimalLayout(
+            str(item["name"]),
+            tuple(int(extent) for extent in item["shape"]),
+            int(item["size"]),
+        )
+        for item in manifest["primals"]
+    )
+    duals = tuple(
+        DualLayout(
+            str(item["name"]),
+            int(item["constraint_index"]),
+            None if item.get("label") is None else str(item["label"]),
+            tuple(int(extent) for extent in item["shape"]),
+            int(item["size"]),
+        )
+        for item in manifest["duals"]
+    )
+    aliases = tuple(
+        FieldAlias(str(item["name"]), str(item["primal_name"]))
+        for item in manifest.get("aliases", ())
+    )
+    instrument_count = manifest.get("instrument_count")
+    return GeneratedCvxpygenProgram(
+        root,
+        instance_header,
+        manifest_path,
+        str(manifest["class_name"]),
+        prefix,
+        parameters,
+        primals,
+        duals,
+        aliases,
+        clarabel,
+        None if instrument_count is None else int(instrument_count),
+    )
+
+
+def _patch_clarabel_allocation_free_timers(source_root: Path) -> None:
+    timer_path = source_root / "src" / "timers" / "timers.rs"
+    text = timer_path.read_text()
+    old = """impl SubTimersMap {
+    fn reset_subtimer(&mut self, key: &'static str) {
+"""
+    new = """impl SubTimersMap {
+    fn reset(&mut self) {
+        for timer in self.values_mut() {
+            timer.reset();
+        }
+    }
+
+    fn reset_subtimer(&mut self, key: &'static str) {
+"""
+    if old not in text or "self.subtimers.clear();" not in text:
+        if "self.subtimers.reset();" in text:
+            return
+        raise RuntimeError(
+            "Clarabel timer source no longer matches the reviewed "
+            "allocation-free reset patch"
+        )
+    timer_path.write_text(
+        text.replace(old, new, 1).replace(
+            "self.subtimers.clear();", "self.subtimers.reset();", 1
+        )
     )
 
 
@@ -750,16 +1290,36 @@ def build_current_clarabel(
     ``CLARABEL_RS_SOURCE_DIR`` to pre-populated checkouts for offline builds.
     """
 
+    build_id = (
+        f"Clarabel.rs {rs_tag} + allocation-free timer reset v1\n"
+    )
     root = (
         Path(cache_dir).expanduser()
         if cache_dir is not None
-        else Path.home() / ".cache" / "trading_dsl_engine" / "clarabel" / rs_tag
+        else Path.home()
+        / ".cache"
+        / "trading_dsl_engine"
+        / "clarabel"
+        / f"{rs_tag}-noalloc1"
     ).resolve()
     include = root / "native" / "include"
     library = root / "native" / "lib" / "libclarabel_c.a"
-    if include.is_dir() and library.is_file() and not force:
+    marker = root / "native" / "BUILD_ID"
+    if (
+        include.is_dir()
+        and library.is_file()
+        and marker.is_file()
+        and marker.read_text() == build_id
+        and not force
+    ):
         return ClarabelNativePaths(include, library, rs_tag.removeprefix("v"))
-    if force and root.exists():
+    if root.exists():
+        if not force:
+            raise RuntimeError(
+                f"Clarabel cache {root} exists but does not contain the "
+                "expected allocation-free build; pass force=True to replace "
+                "that dedicated cache directory"
+            )
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
     cpp = root / "Clarabel.cpp"
@@ -799,6 +1359,7 @@ def build_current_clarabel(
     if target_rs.exists():
         shutil.rmtree(target_rs)
     shutil.copytree(rs, target_rs, ignore=shutil.ignore_patterns(".git"))
+    _patch_clarabel_allocation_free_timers(target_rs)
     subprocess.run(
         [
             "cargo",
@@ -816,6 +1377,7 @@ def build_current_clarabel(
         cpp / "rust_wrapper" / "target" / "release" / "libclarabel_c.a",
         library,
     )
+    marker.write_text(build_id)
     return ClarabelNativePaths(include, library, rs_tag.removeprefix("v"))
 
 
@@ -831,6 +1393,8 @@ def artifact_fingerprint(artifact: GeneratedCvxpygenProgram) -> str:
 
 __all__ = [
     "ClarabelNativePaths",
+    "DualLayout",
+    "FieldAlias",
     "FieldLayout",
     "GeneratedCvxpygenProgram",
     "ParameterLayout",
@@ -838,4 +1402,5 @@ __all__ = [
     "artifact_fingerprint",
     "build_current_clarabel",
     "generate_clarabel_program",
+    "load_clarabel_program",
 ]

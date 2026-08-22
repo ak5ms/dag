@@ -13,7 +13,9 @@ import pytest
 
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
+    clarabel_program,
     generate_clarabel_program,
+    get_field,
 )
 from trading_dsl_engine.cpp_stream.python.compiler_support import build_shared
 
@@ -83,7 +85,7 @@ def _generate_qp(tmp_path: Path):
 def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
     artifact = _generate(tmp_path)
     source = artifact.instance_header.read_text()
-    assert "class GeneratedMpo final" in source
+    assert "class alignas(64) GeneratedMpo final" in source
     assert "clarabel_DefaultSolver_update_A" in source
     assert "clarabel_DefaultSolver_update_q" in source
     assert "clarabel_DefaultSolver_update_b" in source
@@ -102,6 +104,9 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
         "risk_factor",
     ]
     assert manifest["parameters"][-1]["dirty_blocks"] == ["A"]
+    assert manifest["schema_version"] == 2
+    assert len(manifest["duals"]) == len(_mpo_problem().constraints)
+    assert "cpg_retrieve_prim();" not in source[source.index("void solve()") :]
 
 
 def test_two_generated_instances_solve_concurrently(tmp_path: Path):
@@ -323,6 +328,310 @@ def test_generated_instance_supports_quadratic_objective(tmp_path: Path, monkeyp
     library.solve_qp.restype = ctypes.c_double
     assert library.solve_qp(1.5) == pytest.approx(1.5, abs=1e-7)
     assert library.solve_qp(-1.5) == pytest.approx(0.0, abs=1e-7)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="GNU linker allocation wrappers")
+def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
+    artifact = _generate_qp(tmp_path)
+    driver = tmp_path / "allocation_audit.cpp"
+    binary = tmp_path / "allocation_audit"
+    driver.write_text(
+        textwrap.dedent(
+            """
+            #include "cpg_instance.hpp"
+            #include <array>
+            #include <atomic>
+            #include <cstddef>
+            #include <cstdio>
+            #include <cstdlib>
+
+            static std::atomic<unsigned long long> allocations{0};
+            static std::atomic<bool> count_allocations{false};
+
+            extern "C" void* __real_malloc(std::size_t);
+            extern "C" void* __real_calloc(std::size_t, std::size_t);
+            extern "C" void* __real_realloc(void*, std::size_t);
+            extern "C" void* __real_aligned_alloc(std::size_t, std::size_t);
+
+            extern "C" void* __wrap_malloc(std::size_t size) {
+                if (count_allocations.load(std::memory_order_relaxed)) {
+                    allocations.fetch_add(1, std::memory_order_relaxed);
+                }
+                return __real_malloc(size);
+            }
+            extern "C" void* __wrap_calloc(std::size_t count, std::size_t size) {
+                if (count_allocations.load(std::memory_order_relaxed)) {
+                    allocations.fetch_add(1, std::memory_order_relaxed);
+                }
+                return __real_calloc(count, size);
+            }
+            extern "C" void* __wrap_realloc(void* pointer, std::size_t size) {
+                if (count_allocations.load(std::memory_order_relaxed)) {
+                    allocations.fetch_add(1, std::memory_order_relaxed);
+                }
+                return __real_realloc(pointer, size);
+            }
+            extern "C" void* __wrap_aligned_alloc(
+                std::size_t alignment, std::size_t size
+            ) {
+                if (count_allocations.load(std::memory_order_relaxed)) {
+                    allocations.fetch_add(1, std::memory_order_relaxed);
+                }
+                return __real_aligned_alloc(alignment, size);
+            }
+
+            int main() {
+                GeneratedQp solver;
+                std::array<double, 3> target{1.0, 2.0, 3.0};
+                std::array<double, 3> lower{0.0, 0.0, 0.0};
+                auto solve = [&](int iteration) {
+                    target[0] = 1.0 + 1e-5 * iteration;
+                    solver.set_target(target);
+                    solver.set_lower(lower);
+                    solver.solve();
+                    return solver.primal_x()[0]
+                        + 1e-12 * solver.result().info->iter;
+                };
+                volatile double checksum = 0.0;
+                for (int iteration = 0; iteration < 10; ++iteration) {
+                    checksum += solve(iteration);
+                }
+                allocations.store(0, std::memory_order_relaxed);
+                count_allocations.store(true, std::memory_order_relaxed);
+                for (int iteration = 0; iteration < 100; ++iteration) {
+                    checksum += solve(iteration + 10);
+                }
+                count_allocations.store(false, std::memory_order_relaxed);
+                const auto count = allocations.load(std::memory_order_relaxed);
+                std::printf("%llu %.17g\\n", count, static_cast<double>(checksum));
+                return count == 0 ? 0 : 1;
+            }
+            """
+        )
+    )
+    command = [
+        os.environ.get("CXX", "g++"),
+        "-std=gnu++20",
+        "-O3",
+        *(f"-I{path}" for path in artifact.include_dirs),
+        str(driver),
+        str(artifact.clarabel.static_library),
+        "-Wl,--wrap=malloc",
+        "-Wl,--wrap=calloc",
+        "-Wl,--wrap=realloc",
+        "-Wl,--wrap=aligned_alloc",
+        "-ldl",
+        "-lpthread",
+        "-lm",
+        "-o",
+        str(binary),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    completed = subprocess.run(
+        [str(binary)], check=True, capture_output=True, text=True
+    )
+    allocations, checksum = completed.stdout.split()
+    assert int(allocations) == 0
+    assert np.isfinite(float(checksum))
+
+
+def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
+    tmp_path: Path, monkeypatch
+):
+    from trading_dsl_engine.base.dsl import var
+    from trading_dsl_engine.cpp_stream import compile_formula
+
+    native = _clarabel_native()
+
+    @clarabel_program(
+        cache_dir=tmp_path / "program-cache",
+        clarabel=native,
+        parameter_options={
+            "half_spread_bps": {"nonneg": True},
+            "risk_radius": {"nonneg": True},
+        },
+    )
+    def MPO(
+        expected_returns,
+        half_spread_bps,
+        current_weights,
+        risk_factor,
+        risk_radius=0.08,
+    ) -> cp.Problem:
+        n_horizons, n_assets = expected_returns.shape
+        weights = cp.Variable((n_horizons, n_assets), name="weights")
+        turnover = cp.Variable((n_horizons, n_assets), name="turnover")
+        delta = weights - cp.vstack([current_weights, weights[:-1]])
+        turnover_up = turnover >= delta
+        turnover_up.set_label("turnover_up")
+        turnover_down = turnover >= -delta
+        turnover_down.set_label("turnover_down")
+        constraints = [turnover_up, turnover_down]
+        for horizon in range(n_horizons):
+            risk = cp.SOC(risk_radius, risk_factor @ weights[horizon])
+            risk.set_label(f"risk_{horizon}")
+            constraints.append(risk)
+        return cp.Problem(
+            cp.Minimize(
+                -cp.sum(cp.multiply(expected_returns, weights))
+                + cp.sum(
+                    cp.multiply(half_spread_bps * 1e-4, turnover)
+                )
+            ),
+            constraints,
+        )
+
+    rows, n_assets, n_horizons = 12, 3, 2
+    rng = np.random.default_rng(44)
+    data = {
+        "expected_returns": rng.normal(
+            scale=1e-4, size=(rows, n_assets, n_horizons)
+        ),
+        "half_spread_bps": np.broadcast_to(
+            np.linspace(0.5, 1.0, n_assets), (rows, n_assets)
+        ).copy(),
+        "current_weights": np.zeros((rows, n_assets)),
+        "risk_factor": np.broadcast_to(
+            np.eye(n_assets), (rows, n_assets, n_assets)
+        ).copy(),
+    }
+    mpo = MPO(
+        expected_returns=var("expected_returns"),
+        half_spread_bps=var("half_spread_bps"),
+        current_weights=var("current_weights"),
+        risk_factor=var("risk_factor"),
+    )
+    fields = [
+        get_field(mpo, "weights[0]"),
+        get_field(mpo, "turnover_up.dual[0]"),
+        get_field(mpo, "risk_0.dual"),
+        get_field(mpo, "risk_0.value"),
+        get_field(mpo, "objective"),
+        get_field(mpo, "iterations"),
+        get_field(mpo, "status"),
+        get_field(mpo, "primal_residual"),
+        get_field(mpo, "dual_residual"),
+    ]
+    monkeypatch.setenv(
+        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE", str(tmp_path / "native-cache")
+    )
+    runtime = compile_formula(fields, data)
+    generated = runtime.generated_cpp.read_text()
+    row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
+    assert generated.count(row_loop) == 1
+    assert generated.count("stackdsl::CvxpygenNode<") == 1
+    assert "CvxpygenResultKind::Dual" in generated
+    assert "CvxpygenResultKind::Info" in generated
+    optimizer_stages = [
+        stage
+        for stage in runtime.plan.stages
+        if stage.kind in {"cvxpygen", "cvxpygen_bundle"}
+    ]
+    assert len(optimizer_stages) == 1
+    assert optimizer_stages[0].kind == "cvxpygen_bundle"
+    assert len(optimizer_stages[0].members) == len(fields)
+
+    result = runtime.run(out_path=tmp_path / "decorated-mpo.npy")
+    (
+        weight_values,
+        turnover_duals,
+        risk_duals,
+        risk_values,
+        objectives,
+        iterations,
+        statuses,
+        primal_residuals,
+        dual_residuals,
+    ) = result.load(mmap_mode=None)
+    assert weight_values.shape == (rows, n_assets)
+    assert turnover_duals.shape == (rows, n_assets)
+    assert risk_duals.shape == (rows, n_assets + 1)
+    assert risk_values.shape == (rows, n_assets + 1)
+    for values in (
+        weight_values,
+        turnover_duals,
+        risk_duals,
+        risk_values,
+        objectives,
+        iterations,
+        statuses,
+        primal_residuals,
+        dual_residuals,
+    ):
+        assert np.isfinite(values).all()
+
+    reference = MPO.factory(
+        data["expected_returns"][-1].T,
+        data["half_spread_bps"][-1],
+        data["current_weights"][-1],
+        data["risk_factor"][-1],
+        0.08,
+    )
+    reference.solve(solver=cp.CLARABEL, presolve_enable=False)
+    reference_weights = next(
+        variable for variable in reference.variables() if variable.name() == "weights"
+    )
+    np.testing.assert_allclose(
+        weight_values[-1], reference_weights.value[0], rtol=2e-5, atol=2e-7
+    )
+    np.testing.assert_allclose(
+        turnover_duals[-1],
+        reference.constraints[0].dual_value[0],
+        rtol=2e-4,
+        atol=2e-7,
+    )
+    reference_risk_dual = np.concatenate(
+        [
+            np.asarray(part, dtype=np.float64).reshape(-1)
+            for part in reference.constraints[2].dual_value
+        ]
+    )
+    np.testing.assert_allclose(
+        risk_duals[-1], reference_risk_dual, rtol=2e-4, atol=2e-7
+    )
+    expected_risk_value = np.concatenate(
+        ([0.08], data["risk_factor"][-1] @ reference_weights.value[0])
+    )
+    np.testing.assert_allclose(
+        risk_values[-1], expected_risk_value, rtol=2e-5, atol=2e-7
+    )
+    assert objectives[-1] == pytest.approx(reference.value, rel=2e-5, abs=2e-7)
+
+    # The exact factory/shape/request set owns one generated sub-program and is
+    # reused by a second full-DAG compile rather than invoking CVXPYgen again.
+    manifests = tuple((tmp_path / "program-cache").rglob("cpg_instance_manifest.json"))
+    assert len(manifests) == 1
+    manifest_mtime = manifests[0].stat().st_mtime_ns
+    second_runtime = compile_formula(fields, data)
+    assert manifests[0].stat().st_mtime_ns == manifest_mtime
+    assert second_runtime.generated_cpp.read_text().count(
+        "stackdsl::CvxpygenNode<"
+    ) == 1
+
+    alternate_mpo = MPO(
+        expected_returns=var("expected_returns"),
+        half_spread_bps=var("half_spread_bps"),
+        current_weights=var("current_weights"),
+        risk_factor=var("risk_factor"),
+    )
+    alternate_fields = [
+        get_field(alternate_mpo, "weights[1]"),
+        get_field(alternate_mpo, "risk_0.value"),
+    ]
+    compile_formula(alternate_fields, data)
+    assert tuple(
+        (tmp_path / "program-cache").rglob("cpg_instance_manifest.json")
+    ) == manifests
+    assert manifests[0].stat().st_mtime_ns == manifest_mtime
+
+    invalid = MPO(
+        expected_returns=var("expected_returns"),
+        half_spread_bps=var("half_spread_bps"),
+        current_weights=var("current_weights"),
+        risk_factor=var("risk_factor"),
+    )
+    with pytest.raises(KeyError, match="unknown generated field"):
+        compile_formula(get_field(invalid, "not_a_solver_field"), data)
 
 
 def test_full_ridge_riskmodel_mpo_pipeline_has_one_time_loop(

@@ -3,10 +3,22 @@ name: build allocation-free Clarabel
 on:
   push:
     branches: [agent/cvxpygen-one-pass-mpo]
-    paths: [.github/workflows/build-clarabel-noalloc.yml]
+    paths:
+      - .github/workflows/build-clarabel-noalloc.yml
+      - src/trading_dsl_engine/cpp_stream/optimizer/**
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/cvxpygen.hpp
+      - src/trading_dsl_engine/cpp_stream/python/**
+      - src/trading_dsl_engine/ir/**
+      - tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py
   pull_request:
     branches: [main]
-    paths: [.github/workflows/build-clarabel-noalloc.yml]
+    paths:
+      - .github/workflows/build-clarabel-noalloc.yml
+      - src/trading_dsl_engine/cpp_stream/optimizer/**
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/cvxpygen.hpp
+      - src/trading_dsl_engine/cpp_stream/python/**
+      - src/trading_dsl_engine/ir/**
+      - tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py
   workflow_dispatch:
 
 concurrency:
@@ -16,9 +28,13 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
       - name: Build patched Clarabel 0.11.1
         shell: bash
         run: |
@@ -57,6 +73,19 @@ jobs:
           cp Clarabel.cpp/Clarabel.rs/src/timers/timers.rs artifact/source/timers.rs
           printf '%s\n' 'Clarabel.rs v0.11.1 + allocation-free timer reset' > artifact/BUILD_ID
           tar -czf clarabel-noalloc.tar.gz -C artifact .
+      - name: Test persistent and allocation-free integration
+        shell: bash
+        env:
+          CXX: g++
+          CLARABEL_INCLUDE_DIR: ${{ github.workspace }}/artifact/include
+          CLARABEL_STATIC_LIBRARY: ${{ github.workspace }}/artifact/lib/libclarabel_c.a
+          TRADING_DSL_ENGINE_CPP_STREAM_CACHE: ${{ runner.temp }}/cpp-stream-cache
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[optimizer]'
+          python -m pytest -n 0 \
+            tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: clarabel-noalloc

@@ -31,9 +31,6 @@ void {{ prefix }}cpg_solve(){
   }
   clarabel_DefaultSolver_solve({{ prefix }}solver);
   {{ prefix }}solution = clarabel_DefaultSolver_solution({{ prefix }}solver);
-  {{ prefix }}cpg_retrieve_prim();
-  {{ prefix }}cpg_retrieve_dual();
-  {{ prefix }}cpg_retrieve_info();
 {% for block in blocks %}
   {{ prefix }}Canon_Outdated.{{ block }} = 0;
 {% endfor %}

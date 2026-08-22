@@ -109,6 +109,21 @@ This backend must remain independent of `jax_flat`.
 - Native build-cache fingerprints must include generated public headers,
   manifests, and the linked solver archive. A changed CVXPY ABI or Clarabel
   binary must invalidate the compiled formula.
+- `@clarabel_program` is the low-boilerplate formula boundary. Keep its
+  CVXPYgen sub-program cache independent of the complete outer-DAG native cache:
+  key it by factory/problem structure, concrete parameter shapes/attributes,
+  adapter schema, and solver settings. Different ordinary primal/dual/info
+  projections must reuse the same sub-program; requested constraint-value
+  auxiliaries may require a distinct problem artifact.
+- `get_field` names are compile-time contracts. Preserve named primals,
+  indexed/labeled constraint duals (`dual` and `lagrangian`), requested-only
+  constraint numeric values, and objective/iteration/status/residual info.
+  Reject unknown names during IR construction and retrieve only projected
+  result structures in the row loop.
+- Before writing a generated parameter buffer, compare its current bytes with
+  the bound DAG value. Do not mark unchanged canonical blocks dirty. Preserve
+  fixed/instance-owned storage and the patched Clarabel timer reset so allocator
+  wrapping remains exactly zero after solver warm-up.
 
 ## Streaming statistics
 

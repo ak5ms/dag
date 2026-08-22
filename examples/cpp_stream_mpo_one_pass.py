@@ -27,9 +27,8 @@ from trading_dsl_engine.base.dsl import (
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
-    bind_program,
     build_current_clarabel,
-    generate_clarabel_program,
+    clarabel_program,
     get_field,
 )
 
@@ -47,27 +46,37 @@ def _clarabel() -> ClarabelNativePaths:
     return build_current_clarabel()
 
 
-def _build_cvxpy_problem() -> cp.Problem:
-    weights = cp.Variable((N_HORIZONS, N_ASSETS), name="weights")
-    turnover = cp.Variable((N_HORIZONS, N_ASSETS), name="turnover")
+@clarabel_program(
+    cache_dir=CACHE / "cvxpygen",
+    clarabel=_clarabel,
+    parameter_options={
+        "half_spread_bps": {"nonneg": True},
+        "risk_radius": {"nonneg": True},
+    },
+)
+def MPO(
+    expected_returns,
+    half_spread_bps,
+    current_weights,
+    risk_factor,
+    risk_radius=0.08,
+) -> cp.Problem:
+    """Define the optimizer once; the decorator supplies CVXPY Parameters."""
 
-    expected_returns = cp.Parameter(
-        (N_HORIZONS, N_ASSETS), name="expected_returns"
-    )
-    half_spread_bps = cp.Parameter(
-        N_ASSETS, nonneg=True, name="half_spread_bps"
-    )
-    current_weights = cp.Parameter(N_ASSETS, name="current_weights")
-    risk_factor = cp.Parameter((N_ASSETS, N_ASSETS), name="risk_factor")
-    risk_radius = cp.Parameter(nonneg=True, name="risk_radius")
-
+    n_horizons, n_assets = expected_returns.shape
+    weights = cp.Variable((n_horizons, n_assets), name="weights")
+    turnover = cp.Variable((n_horizons, n_assets), name="turnover")
     previous = cp.vstack([current_weights, weights[:-1]])
     delta = weights - previous
-    constraints = [turnover >= delta, turnover >= -delta]
-    constraints.extend(
-        cp.SOC(risk_radius, risk_factor @ weights[horizon])
-        for horizon in range(N_HORIZONS)
-    )
+    turnover_up = turnover >= delta
+    turnover_up.set_label("turnover_up")
+    turnover_down = turnover >= -delta
+    turnover_down.set_label("turnover_down")
+    constraints = [turnover_up, turnover_down]
+    for horizon in range(n_horizons):
+        risk = cp.SOC(risk_radius, risk_factor @ weights[horizon])
+        risk.set_label(f"risk_{horizon}")
+        constraints.append(risk)
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
@@ -77,7 +86,7 @@ def _build_cvxpy_problem() -> cp.Problem:
     )
 
 
-def _formula(program):
+def _formula():
     returns = var("returns")
     lagged = shift(returns, 1, 1)
     fast_level = ewm(returns, 8, min_periods=2)
@@ -108,8 +117,7 @@ def _formula(program):
     # so C.T @ C equals L @ L.T, the repaired covariance matrix.
     risk_factor = psd_factor(covariance, eigenvalue_floor=1e-8)
 
-    mpo = bind_program(
-        program,
+    mpo = MPO(
         expected_returns=expected_returns,
         half_spread_bps=var("half_spread_bps"),
         current_weights=var("current_weights"),
@@ -118,10 +126,24 @@ def _formula(program):
     )
     next_weights = get_field(mpo, "weights[0]")
     first_horizon_turnover = get_field(mpo, "turnover[0]")
+    turnover_lagrangian = get_field(mpo, "turnover_up.lagrangian[0]")
+    first_risk_dual = get_field(mpo, "risk_0.dual")
+    first_risk_value = get_field(mpo, "risk_0.value")
+    objective = get_field(mpo, "objective")
+    iterations = get_field(mpo, "iterations")
 
     # This remains downstream of the native optimizer in the same row transition.
     pnl = shift(next_weights, 1, 1) * returns
-    return pnl, next_weights, first_horizon_turnover
+    return (
+        pnl,
+        next_weights,
+        first_horizon_turnover,
+        turnover_lagrangian,
+        first_risk_dual,
+        first_risk_value,
+        objective,
+        iterations,
+    )
 
 
 def _simulation() -> dict[str, np.ndarray]:
@@ -146,17 +168,8 @@ def _simulation() -> dict[str, np.ndarray]:
 
 
 def main() -> None:
-    program = generate_clarabel_program(
-        _build_cvxpy_problem(),
-        code_dir=CACHE / "cvxpygen",
-        clarabel=_clarabel(),
-        class_name="GeneratedMpo",
-        prefix="mpo_",
-        instrument_count=N_ASSETS,
-        force=True,
-    )
     data = _simulation()
-    runtime = compile_formula(list(_formula(program)), data)
+    runtime = compile_formula(list(_formula()), data)
 
     generated = runtime.generated_cpp.read_text()
     row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
@@ -166,13 +179,25 @@ def main() -> None:
     assert "stackdsl::RidgeNode<" in generated or "stackdsl::RidgeBundleNode<" in generated
 
     result = runtime.run(out_path=CACHE / "result.npy")
-    pnl, weights, turnover = result.load()
+    (
+        pnl,
+        weights,
+        turnover,
+        turnover_lagrangian,
+        risk_dual,
+        risk_value,
+        objective,
+        iterations,
+    ) = result.load()
     print(runtime.explain())
     print(f"single temporal loop: {generated.count(row_loop)}")
     print(f"rows={result.rows}, seconds={result.seconds:.6f}")
     print(f"pnl shape={pnl.shape}")
     print(f"weights shape={weights.shape}")
     print(f"turnover shape={turnover.shape}")
+    print(f"turnover Lagrangian shape={turnover_lagrangian.shape}")
+    print(f"risk dual/value shapes={risk_dual.shape}/{risk_value.shape}")
+    print(f"objective/iterations shapes={objective.shape}/{iterations.shape}")
     print(f"last weights={np.asarray(weights[-1])}")
 
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping
+from dataclasses import dataclass, field
 
 from trading_dsl_engine.base.dsl import ensure_expr
 from trading_dsl_engine.base.parser import Expr
@@ -14,8 +13,9 @@ from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
 class CvxpygenProgramExpr(Expr):
     """Object-valued call to one generated CVXPYgen program."""
 
-    program: GeneratedCvxpygenProgram
+    program: object
     bindings: tuple[tuple[str, Expr], ...]
+    requested_fields: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, eq=False)
@@ -52,12 +52,20 @@ def bind_program(
 
 
 def get_field(program_expr: CvxpygenProgramExpr, field: str) -> CvxpygenFieldExpr:
-    """Project a named primal or ``primal[index]`` from one native solve."""
+    """Project a named primal, constraint result, dual, or solver diagnostic."""
 
     if not isinstance(program_expr, CvxpygenProgramExpr):
         raise TypeError("get_field expects a CVXPYgen program expression")
-    program_expr.program.resolve_field(field)
-    return CvxpygenFieldExpr(program_expr, str(field))
+    field = str(field)
+    if isinstance(program_expr.program, GeneratedCvxpygenProgram):
+        program_expr.program.resolve_field(field)
+    else:
+        validator = getattr(program_expr.program, "validate_field_request", None)
+        if validator is None:
+            raise TypeError("unsupported deferred CVXPYgen program definition")
+        validator(field)
+        program_expr.requested_fields.add(field)
+    return CvxpygenFieldExpr(program_expr, field)
 
 
 __all__ = [

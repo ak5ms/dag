@@ -191,12 +191,18 @@ def _expr_key(node: Expr) -> tuple:
             tuple(_expr_key(arg) for arg in node.args),
         )
     if isinstance(node, CvxpygenProgramExpr):
+        program_key = getattr(node.program, "expression_key", None)
+        if program_key is None:
+            program_key = (
+                str(node.program.root),
+                node.program.class_name,
+                node.program.prefix,
+            )
         return (
             "cvxpygen_program",
-            str(node.program.root),
-            node.program.class_name,
-            node.program.prefix,
+            program_key,
             tuple((name, _expr_key(value)) for name, value in node.bindings),
+            tuple(sorted(node.requested_fields)),
         )
     if isinstance(node, CvxpygenFieldExpr):
         return (
@@ -766,15 +772,35 @@ class _BaseBuilder:
                 _custom_value_type(node, [self.nodes[index] for index in children]),
             )
         if isinstance(node, CvxpygenProgramExpr):
-            program = node.program
             binding_names = tuple(name for name, _ in node.bindings)
-            expected_names = tuple(parameter.name for parameter in program.parameters)
-            if binding_names != expected_names:
+            if len(set(binding_names)) != len(binding_names):
                 raise FormulaIRCompileError(
-                    "CVXPYgen bindings must follow generated parameter order"
+                    "CVXPYgen parameter bindings contain duplicate names"
                 )
-            children = tuple(self.build(value) for _, value in node.bindings)
-            for name, child in zip(binding_names, children):
+            children_by_name = {
+                name: self.build(value) for name, value in node.bindings
+            }
+            program = node.program
+            resolver = getattr(program, "resolve_for_types", None)
+            if resolver is not None:
+                program = resolver(
+                    {
+                        name: self.nodes[child].value_type
+                        for name, child in children_by_name.items()
+                    },
+                    requested_fields=frozenset(node.requested_fields),
+                    n_instruments=getattr(self, "n_instruments", None),
+                )
+            expected_names = tuple(parameter.name for parameter in program.parameters)
+            missing = sorted(set(expected_names) - set(binding_names))
+            extra = sorted(set(binding_names) - set(expected_names))
+            if missing or extra:
+                raise FormulaIRCompileError(
+                    "CVXPYgen parameter mismatch: "
+                    f"missing={missing}, extra={extra}"
+                )
+            children = tuple(children_by_name[name] for name in expected_names)
+            for name, child in zip(expected_names, children):
                 child_type = self.nodes[child].value_type
                 try:
                     actual_shape = child_type.logical_shape
@@ -789,7 +815,7 @@ class _BaseBuilder:
                         f"{expected_shape}, got {actual_shape}"
                     )
             return self._append(
-                CvxpygenProgramOp(program, binding_names),
+                CvxpygenProgramOp(program, expected_names),
                 children,
                 object_value(1),
             )
@@ -800,12 +826,12 @@ class _BaseBuilder:
                 raise FormulaIRCompileError(
                     "CVXPYgen field projection lost its generated program object"
                 )
-            field = node.program_expr.program.resolve_field(node.field)
+            field = child_op.program.resolve_field(node.field)
             return self._append(
                 CvxpygenProjectionOp(field),
                 (child,),
                 _generated_field_value_type(
-                    node.program_expr.program, field.logical_shape
+                    child_op.program, field.logical_shape
                 ),
             )
         if isinstance(node, Call):
@@ -1346,6 +1372,7 @@ class _OuterBuilder(_BaseBuilder):
     registry: DSLFunctionRegistry
     columns: dict[str, int]
     input_value_types: Mapping[str, ValueType]
+    n_instruments: int | None = None
     grouped: bool = False
 
     def __post_init__(self) -> None:

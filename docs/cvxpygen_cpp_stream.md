@@ -1,10 +1,9 @@
 # CVXPYgen programs inside `cpp_stream`
 
-`cpp_stream.optimizer.generate_clarabel_program` turns a static-shape,
-DPP-compliant CVXPY problem into one C++ class suitable for formula-specific
-native builds. The numerical row path calls CVXPYgen's generated parameter maps
-and result maps directly; it does not invoke Python, CVXPY, or the CVXPYgen
-Python wrapper.
+`cpp_stream.optimizer.clarabel_program` turns a static-shape, DPP-compliant
+CVXPY problem factory into a normal callable in the formula DSL. The numerical
+row path calls CVXPYgen's generated parameter maps and result maps directly; it
+does not invoke Python, CVXPY, or the CVXPYgen Python wrapper.
 
 ## Ownership boundary
 
@@ -34,7 +33,7 @@ This permits one generated object per cpp_stream operator state or independent
 worker, with no global mutable generated solver state and no lock around a
 shared Clarabel object.
 
-## Compile-time use
+## Problem-factory DSL
 
 Install the optional Python code-generation dependencies:
 
@@ -42,39 +41,129 @@ Install the optional Python code-generation dependencies:
 python -m pip install -e '.[optimizer]'
 ```
 
-Provide a current Clarabel C header and static library. They may be built and
-cached with `build_current_clarabel()`, or supplied explicitly when builds are
-offline:
+The decorator replaces each function argument with a correctly shaped
+`cp.Parameter` at formula compile time. Consequently the same function name is
+used to bind streaming expressions; there is no separate `bind_program()` or
+`generate_clarabel_program()` call:
 
 ```python
-from pathlib import Path
-
 import cvxpy as cp
 
+from trading_dsl_engine.base.dsl import var
 from trading_dsl_engine.cpp_stream.optimizer import (
-    ClarabelNativePaths,
-    generate_clarabel_program,
+    clarabel_program,
+    get_field,
 )
 
+@clarabel_program(
+    parameter_options={
+        "half_spread_bps": {"nonneg": True},
+        "risk_radius": {"nonneg": True},
+    }
+)
+def MPO(
+    expected_returns,
+    half_spread_bps,
+    current_weights,
+    risk_factor,
+    risk_radius=0.08,
+) -> cp.Problem:
+    horizons, assets = expected_returns.shape
+    weights = cp.Variable((horizons, assets), name="weights")
+    turnover = cp.Variable((horizons, assets), name="turnover")
+    delta = weights - cp.vstack([current_weights, weights[:-1]])
+
+    turnover_limit = turnover >= delta
+    turnover_limit.set_label("turnover_limit")
+    risk_limit = cp.SOC(risk_radius, risk_factor @ weights[0])
+    risk_limit.set_label("risk_limit")
+    return cp.Problem(
+        cp.Minimize(
+            -cp.sum(cp.multiply(expected_returns, weights))
+            + cp.sum(cp.multiply(half_spread_bps * 1e-4, turnover))
+        ),
+        [turnover_limit, turnover >= -delta, risk_limit],
+    )
+
+mpo = MPO(
+    expected_returns=var("expected_returns"),
+    half_spread_bps=var("half_spread_bps"),
+    current_weights=var("current_weights"),
+    risk_factor=var("risk_factor"),
+    risk_radius=0.08,
+)
+next_weights = get_field(mpo, "weights[0]")
+risk_lagrangian = get_field(mpo, "risk_limit.lagrangian")
+solver_iterations = get_field(mpo, "iterations")
+```
+
+Concrete instrument count and fixed widths specialize the cached sub-program.
+For multi-dimensional DSL values, the adapter accounts for CVXPY's
+column-major parameter ABI, so an `(assets, horizons)` DSL value is presented to
+the problem factory as `(horizons, assets)`. `parameter_options` carries CVXPY
+attributes such as `nonneg=True` when DCP/DPP analysis needs them.
+
+### Result fields
+
+`get_field()` resolves fields at compile time. Unknown names fail compilation;
+the row loop retrieves only the primal, dual, or info structures actually
+projected by the formula.
+
+| Request | Result |
+|---|---|
+| `weights`, `weights[0]` | named primal, or its CVXPY axis-0 slice |
+| `constraint[2].dual` | dual for the third original constraint |
+| `risk_limit.dual` | dual for a constraint labeled with `set_label()` |
+| `risk_limit.lagrangian` | alias for the same dual |
+| `risk_limit.value` | numeric constraint expression: signed residual for equality/inequality, `[t; x]` for SOC |
+| `objective` | solver objective value |
+| `iterations`, `status` | solver iteration count and status code |
+| `primal_residual`, `dual_residual` | solver residual diagnostics |
+
+Constraint-value projections add a requested-only auxiliary primal to the
+sub-program. Merely requesting a dual or solver diagnostic does not change the
+optimization problem.
+
+### Cache boundary
+
+The CVXPYgen sub-compilation is cached independently of the surrounding formula.
+Its key covers the factory implementation, concrete parameter shapes and
+attributes, resulting problem structure, generated-adapter schema, and enabled
+solver settings. The same MPO can therefore be reused in another outer formula
+without regenerating its native parameter maps. A requested constraint value
+gets a distinct entry only because it changes the generated problem by adding
+the auxiliary projection variable.
+
+Compiling the complete outer DAG still matters for CSE, scheduling, native
+link-cache invalidation, and placing upstream formulas, the solve, and downstream
+consumers in one row loop. It does not make CVXPYgen's isolated DPP
+canonicalization faster, so the MPO sub-program and the full fused runner use
+separate cache layers.
+
+## Explicit generation API
+
+`generate_clarabel_program()` remains available when a generated solver class
+is needed outside the formula DSL. Provide a current Clarabel C header and
+static library explicitly, or use the allocation-free pinned build returned by
+`build_current_clarabel()`.
+
+```python
 x = cp.Variable(3, name="x")
 A = cp.Parameter((4, 3), name="A")
 b = cp.Parameter(4, name="b")
 problem = cp.Problem(cp.Minimize(cp.sum_squares(A @ x - b)))
-
 program = generate_clarabel_program(
     problem,
     code_dir=".generated/least_squares",
-    clarabel=ClarabelNativePaths(
-        Path("/opt/clarabel/include"),
-        Path("/opt/clarabel/lib/libclarabel_c.a"),
-    ),
+    clarabel=build_current_clarabel(),
     class_name="GeneratedLeastSquares",
     prefix="least_squares_",
 )
 ```
 
 The generated header exposes bulk, column-major parameter setters, a persistent
-`solve()`, named primal views, and the normal CVXPYgen result object:
+`solve()`, lazy named primal/dual/info views, and the normal CVXPYgen result
+object:
 
 ```cpp
 #include "cpg_instance.hpp"
@@ -121,18 +210,20 @@ across rows.
 
 ## Performance
 
-`benchmarks/cvxpygen_persistent_instances.md` measures changing covariance, so
-canonical `A`, `q`, and `b` all change on every problem. The benchmark includes
-bulk parameter copies, CVXPYgen canonicalization, Clarabel updates and solve,
-and primal projection. It also measures 2- and 4-worker independent-problem
-throughput and resident-memory growth.
+`benchmarks/cvxpygen_persistent_instances.md` covers 9–150 assets at eight
+horizons in all-changing, objective-only, and bitwise-unchanged regimes. It
+includes parameter change detection, any required copies and canonicalization,
+Clarabel update/solve, requested-only projection, allocation wrapping, resident
+growth, and 2/4/8-worker independent-problem throughput. The companion JSON
+retains every raw timing and checksum.
 
 ## One temporal loop with upstream and downstream formulas
 
-`bind_program()` creates an object-valued IR node rather than a batch callback.
-Its bound parameters remain ordinary DAG expressions. During lowering, all
-requested `get_field()` projections from the same object are collected into one
-physical `CvxpygenNode`, which is placed among the normal cpp_stream stages.
+Calling a decorated problem factory creates an object-valued IR node rather than
+a batch callback. Its bound parameters remain ordinary DAG expressions. During
+lowering, all requested `get_field()` projections from the same object are
+collected into one physical `CvxpygenNode`, which is placed among the normal
+cpp_stream stages.
 Consequently the generated runner executes, for each row:
 
 ```text
@@ -148,6 +239,13 @@ There is no historical parameter materialization and no optimizer-specific
 second loop. `examples/cpp_stream_mpo_one_pass.py` asserts that the generated
 translation unit contains exactly one temporal `for (t)` loop and one generated
 optimizer stage even though it requests both weights and turnover.
+
+Before copying a bound parameter, `CvxpygenNode` bitwise-compares it with the
+instance-owned parameter buffer. Unchanged parameters do not dirty their
+canonical blocks. Result inverse maps are likewise lazy and requested-field
+only. The pinned Clarabel build preserves timer storage across resets; allocator
+wrapping verifies zero `malloc`, `calloc`, `realloc`, or `aligned_alloc` calls
+after warm-up.
 
 The C++ instance and persistent-solve source are rendered from Jinja templates
 under `cpp_stream/optimizer/templates`; Python code supplies structured template
