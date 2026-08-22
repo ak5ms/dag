@@ -380,3 +380,12 @@ compile/link flags, platform/machine, and Python ABI. The default cache is:
 ```
 
 Override it with `TRADING_DSL_ENGINE_CPP_STREAM_CACHE`.
+
+### Generated convex-program stages
+
+A generated CVXPYgen artifact can be bound to normal formulas with
+`bind_program(...)` and projected with `get_field(...)`. The object stage is
+lowered into the ordinary runner stage list: upstream Ridge/risk-model values,
+the Clarabel solve, and downstream formulas all execute in the runner's single
+row loop. Sibling field projections share one solve. See
+`examples/cpp_stream_mpo_one_pass.py`.

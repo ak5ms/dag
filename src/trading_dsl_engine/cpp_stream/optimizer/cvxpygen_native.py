@@ -12,7 +12,9 @@ import shutil
 import subprocess
 import sys
 import types
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 
 _DEFAULT_CLARABEL_CPP_COMMIT = "0de6259a3edfd5cc041ec42b2148599ce63e73cb"
@@ -62,6 +64,19 @@ class PrimalLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class FieldLayout:
+    """One compile-time view into a generated primal result buffer."""
+
+    name: str
+    primal_name: str
+    primal_index: int
+    offset: int
+    count: int
+    stride: int
+    logical_shape: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratedCvxpygenProgram:
     """Generated, persistent, reentrant CVXPYgen/Clarabel program."""
 
@@ -73,6 +88,7 @@ class GeneratedCvxpygenProgram:
     parameters: tuple[ParameterLayout, ...]
     primals: tuple[PrimalLayout, ...]
     clarabel: ClarabelNativePaths
+    instrument_count: int | None = None
 
     @property
     def include_dirs(self) -> tuple[Path, ...]:
@@ -115,6 +131,67 @@ class GeneratedCvxpygenProgram:
             "-lm",
         )
 
+    def parameter_index(self, name: str) -> int:
+        for index, parameter in enumerate(self.parameters):
+            if parameter.name == name:
+                return index
+        raise KeyError(f"unknown generated parameter {name!r}")
+
+    def parameter_logical_shape(self, name: str) -> tuple[int, ...]:
+        """Return the C-order row shape matching CVXPY's Fortran parameter ABI."""
+
+        shape = self.parameters[self.parameter_index(name)].shape
+        return tuple(reversed(shape)) if len(shape) > 1 else shape
+
+    def resolve_field(self, name: str) -> FieldLayout:
+        """Resolve ``variable`` or ``variable[index]`` without runtime parsing."""
+
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?", name)
+        if match is None:
+            raise KeyError(
+                f"unsupported generated field {name!r}; use a primal name or name[index]"
+            )
+        primal_name, index_text = match.groups()
+        for primal_index, primal in enumerate(self.primals):
+            if primal.name != primal_name:
+                continue
+            if index_text is None:
+                logical_shape = (
+                    tuple(reversed(primal.shape))
+                    if len(primal.shape) > 1
+                    else primal.shape
+                )
+                return FieldLayout(
+                    name,
+                    primal_name,
+                    primal_index,
+                    0,
+                    primal.size,
+                    1,
+                    logical_shape,
+                )
+            if not primal.shape:
+                raise KeyError(f"scalar primal {primal_name!r} cannot be indexed")
+            index = int(index_text)
+            if index >= primal.shape[0]:
+                raise KeyError(
+                    f"field {name!r} indexes axis 0 of size {primal.shape[0]}"
+                )
+            count = 1
+            for extent in primal.shape[1:]:
+                count *= int(extent)
+            logical_shape = tuple(reversed(primal.shape[1:]))
+            return FieldLayout(
+                name,
+                primal_name,
+                primal_index,
+                index,
+                count,
+                int(primal.shape[0]),
+                logical_shape,
+            )
+        raise KeyError(f"unknown generated primal field {name!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class _GeneratedParameter:
@@ -128,6 +205,24 @@ class _GeneratedParameter:
 class _GeneratedPrimal:
     name: str
     size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CompoundLiteral:
+    c_type: str
+    name: str
+    values: tuple[str, ...]
+
+
+def _template_environment() -> Environment:
+    return Environment(
+        loader=FileSystemLoader(Path(__file__).with_name("templates")),
+        undefined=StrictUndefined,
+        autoescape=False,
+        keep_trailing_newline=True,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
 
 
 @contextmanager
@@ -380,66 +475,29 @@ def _patch_persistent_solve(solve_source: str, prefix: str) -> str:
     constructor = _solver_constructor(original, prefix)
     settings = _settings_assignments(original, prefix)
 
-    lines = [f"void {prefix}cpg_solve(){{"]
-    for block in blocks:
-        lines.append(
-            f"  const bool {block}_changed = {prefix}Canon_Outdated.{block};"
-        )
-    for block in blocks:
-        lines.append(
-            f"  if ({block}_changed) {prefix}cpg_canonicalize_{block}();"
-        )
-    lines.extend(
-        [
-            f"  if (solver_settings_dirty_ && {prefix}solver) {{",
-            f"    clarabel_DefaultSolver_free({prefix}solver);",
-            f"    {prefix}solver = nullptr;",
-            "  }",
-            f"  if (!{prefix}solver) {{",
-            f"    {prefix}cpg_copy_all();",
-        ]
+    updates = tuple(
+        {
+            "name": block,
+            "count": _loop_count(solve_source, prefix, block),
+            "value": (
+                f"{prefix}Canon_Params_conditioning.{block}->x"
+                if block in {"P", "A"}
+                else f"{prefix}Canon_Params_conditioning.{block}"
+            ),
+        }
+        for block in blocks
+        if block in _SOLVER_UPDATE_BLOCKS
     )
-    lines.extend(f"    {initializer}" for initializer in matrices)
-    lines.extend(
-        [
-            f"    {prefix}settings = clarabel_DefaultSettings_default();",
-            *(f"    {line}" for line in settings.splitlines()),
-            f"    {constructor}",
-            "    solver_settings_dirty_ = false;",
-            "  } else {",
-        ]
-    )
-    for block in blocks:
-        if block not in _SOLVER_UPDATE_BLOCKS:
-            continue
-        count = _loop_count(solve_source, prefix, block)
-        value = (
-            f"{prefix}Canon_Params_conditioning.{block}->x"
-            if block in {"P", "A"}
-            else f"{prefix}Canon_Params_conditioning.{block}"
-        )
-        lines.extend(
-            [
-                f"    if ({block}_changed) {{",
-                f"      {prefix}cpg_copy_{block}();",
-                f"      clarabel_DefaultSolver_update_{block}({prefix}solver, {value}, {count});",
-                "    }",
-            ]
-        )
-    lines.extend(
-        [
-            "  }",
-            f"  clarabel_DefaultSolver_solve({prefix}solver);",
-            f"  {prefix}solution = clarabel_DefaultSolver_solution({prefix}solver);",
-            f"  {prefix}cpg_retrieve_prim();",
-            f"  {prefix}cpg_retrieve_dual();",
-            f"  {prefix}cpg_retrieve_info();",
-        ]
-    )
-    for block in blocks:
-        lines.append(f"  {prefix}Canon_Outdated.{block} = 0;")
-    lines.append("}")
-    replacement = "\n".join(lines)
+    replacement = _template_environment().get_template(
+        "persistent_solve.cpp.j2"
+    ).render(
+        prefix=prefix,
+        blocks=blocks,
+        updates=updates,
+        matrix_initializers=matrices,
+        settings_assignments=tuple(settings.splitlines()),
+        solver_constructor=constructor,
+    ).rstrip()
     patched = solve_source[:start] + replacement + solve_source[end:]
     return _patch_setting_setters(patched, prefix)
 
@@ -480,37 +538,12 @@ def _instance_workspace_body(workspace_source: str, prefix: str) -> str:
     return "\n".join(result).rstrip() + "\n"
 
 
-def _bulk_setters(parameters: Sequence[_GeneratedParameter], prefix: str) -> str:
-    methods: list[str] = []
-    for parameter in parameters:
-        flags = " ".join(
-            f"{prefix}Canon_Outdated.{block} = 1;"
-            for block in parameter.dirty_blocks
-        )
-        methods.append(
-            f"""  void set_{parameter.name}(std::span<const cpg_float> values) {{
-    if (values.size() != {parameter.size}) throw std::invalid_argument(
-        \"parameter {parameter.name} expects {parameter.size} values\");
-    std::copy(values.begin(), values.end(), {prefix}cpg_params_vec + {parameter.offset});
-    {flags}
-  }}"""
-        )
-    return "\n\n".join(methods)
-
-
-def _primal_accessors(primals: Sequence[_GeneratedPrimal], prefix: str) -> str:
-    return "\n\n".join(
-        f"""  [[nodiscard]] std::span<const cpg_float> primal_{item.name}() const noexcept {{
-    return std::span<const cpg_float>({prefix}CPG_Result.prim->{item.name}, {item.size});
-  }}"""
-        for item in primals
-    )
-
-
-def _replace_compound_literals(source: str) -> tuple[str, str]:
+def _replace_compound_literals(
+    source: str,
+) -> tuple[str, tuple[_CompoundLiteral, ...]]:
     """Lift C compound-literal arrays into persistent C++ object members."""
 
-    declarations: list[str] = []
+    declarations: list[_CompoundLiteral] = []
     counter = 0
     pattern = re.compile(r"\((cpg_int|cpg_float)\[\]\)\s*\{([^{}]*)\}")
 
@@ -520,12 +553,10 @@ def _replace_compound_literals(source: str) -> tuple[str, str]:
         values = [value.strip() for value in match.group(2).split(",") if value.strip()]
         name = f"compound_literal_{counter}_"
         counter += 1
-        declarations.append(
-            f"  std::array<{c_type}, {len(values)}> {name}{{{{{', '.join(values)}}}}};"
-        )
+        declarations.append(_CompoundLiteral(c_type, name, tuple(values)))
         return f"{name}.data()"
 
-    return pattern.sub(replace, source), "\n".join(declarations)
+    return pattern.sub(replace, source), tuple(declarations)
 
 
 def _emit_instance_header(
@@ -556,61 +587,27 @@ def _emit_instance_header(
 
     header_dir = generated_root / "cpp" / "include"
     header_dir.mkdir(parents=True, exist_ok=True)
+    environment = _template_environment()
     compatibility = header_dir / "Clarabel"
     compatibility.write_text(
-        '#pragma once\nextern "C" {\n#include <clarabel.h>\n}\n'
+        environment.get_template("clarabel_compat.hpp.j2").render()
     )
-    header = header_dir / "cpg_instance.hpp"
+    header = header_dir / f"{prefix}instance.hpp"
     header.write_text(
-        f"""#pragma once
-
-#include \"cpg_workspace.h\"
-#include <algorithm>
-#include <array>
-#include <cstddef>
-#include <span>
-#include <stdexcept>
-
-class {class_name} final {{
-  cpg_int i{{0}};
-  cpg_int j{{0}};
-  bool solver_settings_dirty_{{false}};
-{compound_members}
-
- public:
-{workspace_body}
-{solve_body}
-  {class_name}() {{
-    {prefix}cpg_set_solver_default_settings();
-    {prefix}cpg_set_solver_verbose(0);
-    {prefix}cpg_set_solver_presolve_enable(0);
-    solver_settings_dirty_ = false;
-  }}
-
-  ~{class_name}() {{ reset_solver(); }}
-  {class_name}(const {class_name}&) = delete;
-  {class_name}& operator=(const {class_name}&) = delete;
-  {class_name}({class_name}&&) = delete;
-  {class_name}& operator=({class_name}&&) = delete;
-
-  void reset_solver() noexcept {{
-    if ({prefix}solver) {{
-      clarabel_DefaultSolver_free({prefix}solver);
-      {prefix}solver = nullptr;
-    }}
-  }}
-
-  void solve() {{ {prefix}cpg_solve(); }}
-
-{_bulk_setters(parameters, prefix)}
-
-{_primal_accessors(primals, prefix)}
-
-  [[nodiscard]] const CPG_Result_t& result() const noexcept {{
-    return {prefix}CPG_Result;
-  }}
-}};
-"""
+        environment.get_template("cpg_instance.hpp.j2").render(
+            class_name=class_name,
+            prefix=prefix,
+            compound_members=compound_members,
+            workspace_body=workspace_body,
+            solve_body=solve_body,
+            parameters=parameters,
+            primals=primals,
+        )
+    )
+    (header_dir / "cpg_instance.hpp").write_text(
+        environment.get_template("cpg_instance_alias.hpp.j2").render(
+            instance_header=header.name,
+        )
     )
     return header, prefix, parameters, primals
 
@@ -622,6 +619,7 @@ def generate_clarabel_program(
     clarabel: ClarabelNativePaths,
     class_name: str = "GeneratedCvxpyProgram",
     prefix: str = "cpg_",
+    instrument_count: int | None = None,
     enable_settings: Iterable[str] = (
         "verbose",
         "max_iter",
@@ -642,6 +640,8 @@ def generate_clarabel_program(
 
     _safe_identifier(class_name, label="C++ class name")
     _safe_identifier(prefix, label="CVXPYgen prefix")
+    if instrument_count is not None and int(instrument_count) <= 0:
+        raise ValueError("instrument_count must be positive")
     cvxpygen_version = _package_version("cvxpygen")
     if cvxpygen_version != _SUPPORTED_CVXPYGEN_VERSION:
         raise RuntimeError(
@@ -701,6 +701,7 @@ def generate_clarabel_program(
         "clarabel_version": clarabel.version,
         "instance_owned": True,
         "persistent_solver": True,
+        "instrument_count": instrument_count,
         "parameters": [
             {
                 "name": item.name,
@@ -732,6 +733,7 @@ def generate_clarabel_program(
         public_parameters,
         public_primals,
         clarabel,
+        None if instrument_count is None else int(instrument_count),
     )
 
 
@@ -829,6 +831,7 @@ def artifact_fingerprint(artifact: GeneratedCvxpygenProgram) -> str:
 
 __all__ = [
     "ClarabelNativePaths",
+    "FieldLayout",
     "GeneratedCvxpygenProgram",
     "ParameterLayout",
     "PrimalLayout",

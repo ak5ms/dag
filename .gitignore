@@ -8,3 +8,5 @@ build/
 
 *.so
 _*.build.json
+
+.generated/

@@ -126,3 +126,29 @@ canonical `A`, `q`, and `b` all change on every problem. The benchmark includes
 bulk parameter copies, CVXPYgen canonicalization, Clarabel updates and solve,
 and primal projection. It also measures 2- and 4-worker independent-problem
 throughput and resident-memory growth.
+
+## One temporal loop with upstream and downstream formulas
+
+`bind_program()` creates an object-valued IR node rather than a batch callback.
+Its bound parameters remain ordinary DAG expressions. During lowering, all
+requested `get_field()` projections from the same object are collected into one
+physical `CvxpygenNode`, which is placed among the normal cpp_stream stages.
+Consequently the generated runner executes, for each row:
+
+```text
+Ridge/EWM/risk-model updates
+    -> native PSD factor
+    -> CVXPYgen parameter maps
+    -> persistent Clarabel update/solve
+    -> requested result projections
+    -> downstream shift/PnL expressions
+```
+
+There is no historical parameter materialization and no optimizer-specific
+second loop. `examples/cpp_stream_mpo_one_pass.py` asserts that the generated
+translation unit contains exactly one temporal `for (t)` loop and one generated
+optimizer stage even though it requests both weights and turnover.
+
+The C++ instance and persistent-solve source are rendered from Jinja templates
+under `cpp_stream/optimizer/templates`; Python code supplies structured template
+context rather than assembling C++ files with handwritten print/string loops.

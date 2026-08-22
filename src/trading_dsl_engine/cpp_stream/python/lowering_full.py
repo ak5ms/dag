@@ -22,6 +22,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    PsdFactorOp,
     FFillOp,
     FutureRbfBasisSumOp,
     HumpOp,
@@ -37,6 +38,8 @@ from trading_dsl_engine.ir.ops import (
     ReductionOp,
     RidgeOp,
     RidgeProjectionOp,
+    CvxpygenProgramOp,
+    CvxpygenProjectionOp,
     RollingDecayOp,
     RollingEntropyOp,
     RollingKthOp,
@@ -89,6 +92,7 @@ def _build_plan(
     next_matrix_slot = 0
     max_matrix_width = 1
     materialized_sources: dict[Source, Source] = {}
+    cvxpygen_stage_by_object: dict[Source, int] = {}
 
     def source_slot_dependencies(source: Source) -> frozenset[tuple[str, int]]:
         dependencies: set[tuple[str, int]] = set()
@@ -534,6 +538,63 @@ def _build_plan(
             )
             continue
 
+        if isinstance(op, CvxpygenProgramOp):
+            sources[node_id] = Source(
+                "cvxpygen",
+                width=1,
+                shape=(),
+                parts=children,
+                op=op,
+                final_only=final_only,
+            )
+            if is_root:
+                raise CppStreamLoweringError(
+                    "CVXPYgen program object must be projected with get_field"
+                )
+            continue
+
+        if isinstance(op, CvxpygenProjectionOp):
+            object_source = children[0]
+            if object_source.kind != "cvxpygen" or not isinstance(
+                object_source.op, CvxpygenProgramOp
+            ):
+                raise CppStreamLoweringError(
+                    "CVXPYgen projection lost its generated program object"
+                )
+            field = op.field
+            out = value_dest(is_root, node_shape)
+            member = Stage(
+                "cvxpygen",
+                object_source.parts,
+                out,
+                1,
+                output_kind=node.value_type.kind,
+                output_width=int(node.value_type.width),
+                op=object_source.op,
+                projection=field.name,
+                final_only=final_only,
+            )
+            previous_index = cvxpygen_stage_by_object.get(object_source)
+            if previous_index is None:
+                cvxpygen_stage_by_object[object_source] = len(stages)
+                stages.append(member)
+            else:
+                previous = stages[previous_index]
+                members = (
+                    previous.members
+                    if previous.kind == "cvxpygen_bundle"
+                    else (previous,)
+                )
+                stages[previous_index] = replace(
+                    previous,
+                    kind="cvxpygen_bundle",
+                    members=(*members, member),
+                )
+            sources[node_id] = source_from_dest(
+                out, node_shape, final_only=final_only
+            )
+            continue
+
         if isinstance(op, InstrumentBasisMeanOp):
             sources[node_id] = Source(
                 "instrument_basis",
@@ -782,6 +843,17 @@ def _build_plan(
                 output_kind=node.value_type.kind,
                 output_width=int(node.value_type.width),
                 final_only=final_only,
+            )
+        elif isinstance(op, PsdFactorOp):
+            out = value_dest(is_root, node_shape)
+            stage = Stage(
+                "psd_factor",
+                children,
+                out,
+                1,
+                output_kind=node.value_type.kind,
+                output_width=int(node.value_type.width),
+                op=op,
             )
         elif isinstance(op, CumsumOp):
             out = value_dest(is_root, node_shape)

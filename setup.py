@@ -82,6 +82,7 @@ setup(
             "cpp/stackdsl/*.hpp",
             "cpp/stackdsl/ops/*.hpp",
             "python/templates/*.j2",
+            "optimizer/templates/*.j2",
         ],
     },
     include_package_data=True,

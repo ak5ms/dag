@@ -1,0 +1,40 @@
+void {{ prefix }}cpg_solve(){
+{% for block in blocks %}
+  const bool {{ block }}_changed = {{ prefix }}Canon_Outdated.{{ block }};
+{% endfor %}
+{% for block in blocks %}
+  if ({{ block }}_changed) {{ prefix }}cpg_canonicalize_{{ block }}();
+{% endfor %}
+  if (solver_settings_dirty_ && {{ prefix }}solver) {
+    clarabel_DefaultSolver_free({{ prefix }}solver);
+    {{ prefix }}solver = nullptr;
+  }
+  if (!{{ prefix }}solver) {
+    {{ prefix }}cpg_copy_all();
+{% for initializer in matrix_initializers %}
+    {{ initializer }}
+{% endfor %}
+    {{ prefix }}settings = clarabel_DefaultSettings_default();
+{% for assignment in settings_assignments %}
+    {{ assignment }}
+{% endfor %}
+    {{ solver_constructor }}
+    solver_settings_dirty_ = false;
+  } else {
+{% for update in updates %}
+    if ({{ update.name }}_changed) {
+      {{ prefix }}cpg_copy_{{ update.name }}();
+      clarabel_DefaultSolver_update_{{ update.name }}(
+          {{ prefix }}solver, {{ update.value }}, {{ update.count }});
+    }
+{% endfor %}
+  }
+  clarabel_DefaultSolver_solve({{ prefix }}solver);
+  {{ prefix }}solution = clarabel_DefaultSolver_solution({{ prefix }}solver);
+  {{ prefix }}cpg_retrieve_prim();
+  {{ prefix }}cpg_retrieve_dual();
+  {{ prefix }}cpg_retrieve_info();
+{% for block in blocks %}
+  {{ prefix }}Canon_Outdated.{{ block }} = 0;
+{% endfor %}
+}

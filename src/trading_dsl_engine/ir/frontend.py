@@ -18,6 +18,10 @@ from trading_dsl_engine.base.parser import (
     Universe,
     parse_formula,
 )
+from trading_dsl_engine.cpp_stream.optimizer.dsl import (
+    CvxpygenFieldExpr,
+    CvxpygenProgramExpr,
+)
 from trading_dsl_engine.ir.einsum import EinsumParseError, parse_einsum
 from trading_dsl_engine.ir.ops import (
     CatOp,
@@ -27,6 +31,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    PsdFactorOp,
     FFillOp,
     FutureRbfBasisSumOp,
     GroupByOp,
@@ -39,6 +44,8 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
+    CvxpygenProgramOp,
+    CvxpygenProjectionOp,
     RollingOp,
     ReductionOp,
     ShiftOp,
@@ -183,6 +190,20 @@ def _expr_key(node: Expr) -> tuple:
             node.output_width,
             tuple(_expr_key(arg) for arg in node.args),
         )
+    if isinstance(node, CvxpygenProgramExpr):
+        return (
+            "cvxpygen_program",
+            str(node.program.root),
+            node.program.class_name,
+            node.program.prefix,
+            tuple((name, _expr_key(value)) for name, value in node.bindings),
+        )
+    if isinstance(node, CvxpygenFieldExpr):
+        return (
+            "cvxpygen_field",
+            _expr_key(node.program_expr),
+            node.field,
+        )
     if isinstance(node, Call):
         args = tuple(_expr_key(arg) for arg in node.args)
         if node.fn in _COMMUTATIVE_NARY and len(args) == 2:
@@ -203,6 +224,10 @@ def _contains_self(node: Expr) -> bool:
         return _contains_self(node.expr)
     if isinstance(node, StatelessCall):
         return any(_contains_self(arg) for arg in node.args)
+    if isinstance(node, CvxpygenProgramExpr):
+        return any(_contains_self(value) for _, value in node.bindings)
+    if isinstance(node, CvxpygenFieldExpr):
+        return _contains_self(node.program_expr)
     if isinstance(node, Call):
         return any(_contains_self(arg) for arg in node.args) or any(
             _contains_self(value) for _, value in node.kwargs
@@ -275,6 +300,24 @@ def _feature_width(value_type: ValueType) -> int:
     if value_type.kind == "matrix":
         return int(value_type.width)
     raise FormulaIRCompileError(f"{value_type.kind!r} cannot be used as a feature")
+
+
+def _shape_matches_generated(
+    actual: tuple[int | None, ...], expected: tuple[int, ...]
+) -> bool:
+    return len(actual) == len(expected) and all(
+        left is None or int(left) == int(right)
+        for left, right in zip(actual, expected)
+    )
+
+
+def _generated_field_value_type(program, logical_shape: tuple[int, ...]) -> ValueType:
+    if not logical_shape:
+        return SCALAR
+    instrument_count = program.instrument_count
+    if instrument_count is not None and logical_shape[0] == instrument_count:
+        return tensor((None, *logical_shape[1:]))
+    return tensor(logical_shape)
 
 
 def _lane_state_result_type(name: str, child: Node) -> ValueType:
@@ -722,6 +765,49 @@ class _BaseBuilder:
                 children,
                 _custom_value_type(node, [self.nodes[index] for index in children]),
             )
+        if isinstance(node, CvxpygenProgramExpr):
+            program = node.program
+            binding_names = tuple(name for name, _ in node.bindings)
+            expected_names = tuple(parameter.name for parameter in program.parameters)
+            if binding_names != expected_names:
+                raise FormulaIRCompileError(
+                    "CVXPYgen bindings must follow generated parameter order"
+                )
+            children = tuple(self.build(value) for _, value in node.bindings)
+            for name, child in zip(binding_names, children):
+                child_type = self.nodes[child].value_type
+                try:
+                    actual_shape = child_type.logical_shape
+                except ValueError as exc:
+                    raise FormulaIRCompileError(
+                        f"CVXPYgen parameter {name!r} cannot consume object values"
+                    ) from exc
+                expected_shape = program.parameter_logical_shape(name)
+                if not _shape_matches_generated(actual_shape, expected_shape):
+                    raise FormulaIRCompileError(
+                        f"CVXPYgen parameter {name!r} expects logical shape "
+                        f"{expected_shape}, got {actual_shape}"
+                    )
+            return self._append(
+                CvxpygenProgramOp(program, binding_names),
+                children,
+                object_value(1),
+            )
+        if isinstance(node, CvxpygenFieldExpr):
+            child = self.build(node.program_expr)
+            child_op = self.nodes[child].op
+            if not isinstance(child_op, CvxpygenProgramOp):
+                raise FormulaIRCompileError(
+                    "CVXPYgen field projection lost its generated program object"
+                )
+            field = node.program_expr.program.resolve_field(node.field)
+            return self._append(
+                CvxpygenProjectionOp(field),
+                (child,),
+                _generated_field_value_type(
+                    node.program_expr.program, field.logical_shape
+                ),
+            )
         if isinstance(node, Call):
             expanded = self._expand(node)
             if expanded is not None:
@@ -805,6 +891,38 @@ class _BaseBuilder:
                 EwmOp(span, minimum, ignore, adjust),
                 (child,),
                 _lane_state_result_type("ewm", self.nodes[child]),
+            )
+        if node.fn == "psd_factor":
+            values = _bind_literal_call(
+                node,
+                ("matrix", "eigenvalue_floor"),
+                {"eigenvalue_floor": Number(1e-10)},
+            )
+            if "matrix" not in values:
+                raise FormulaIRCompileError("psd_factor requires a matrix")
+            child = self.build(values["matrix"])
+            child_type = self.nodes[child].value_type
+            try:
+                shape = child_type.logical_shape
+            except ValueError as exc:
+                raise FormulaIRCompileError(
+                    "psd_factor requires a numeric rank-2 tensor"
+                ) from exc
+            if len(shape) != 2 or (
+                shape[0] is not None and shape[0] != shape[1]
+            ):
+                raise FormulaIRCompileError(
+                    f"psd_factor requires a square matrix, got {shape}"
+                )
+            return self._append(
+                PsdFactorOp(
+                    _literal_number(
+                        values["eigenvalue_floor"],
+                        "psd_factor eigenvalue_floor",
+                    )
+                ),
+                (child,),
+                child_type,
             )
         if node.fn in _ROLLING_KIND:
             expression, op = _normalize_rolling(node)

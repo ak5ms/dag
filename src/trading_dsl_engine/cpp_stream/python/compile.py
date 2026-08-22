@@ -24,6 +24,7 @@ from trading_dsl_engine.cpp_stream.python.output_projection import (
 from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
 from trading_dsl_engine.cpp_stream.python.parallel import select_parallel_plan
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
+from trading_dsl_engine.ir.ops import CvxpygenProgramOp
 from trading_dsl_engine.cpp_stream.python.sources import SourceValue
 
 
@@ -47,7 +48,7 @@ def _compile_program(
         root_kind = program.nodes[root_id].value_type.kind
         if root_kind == "object":
             raise ValueError(
-                "project Ridge with get_beta(...) or get_preds(...) before output"
+                "project object-valued operators before returning them from cpp_stream"
             )
         if root_kind not in {"scalar", "vector", "matrix", "fixed", "tensor"}:
             raise ValueError(f"unsupported cpp_stream root kind {root_kind!r}")
@@ -73,14 +74,51 @@ def _compile_program(
         n_instruments,
         output_layout=layout,
     )
+    generated_programs = []
+    seen_programs = set()
+    for node in program.nodes:
+        if not isinstance(node.op, CvxpygenProgramOp):
+            continue
+        artifact = node.op.program
+        key = (str(artifact.root), artifact.class_name, artifact.prefix)
+        if key not in seen_programs:
+            seen_programs.add(key)
+            generated_programs.append(artifact)
+    if len(generated_programs) > 1:
+        raise ValueError(
+            "one cpp_stream translation unit currently supports one distinct "
+            "CVXPYgen artifact; reuse the same artifact for multiple projections"
+        )
+    native_headers = tuple(
+        artifact.instance_header.name for artifact in generated_programs
+    )
     generated = render_translation_unit(
         plan,
         n_instruments=n_instruments,
         prefetch_rows=prefetch_rows,
         input_types=input_types,
         output_layout=layout,
+        native_headers=native_headers,
     )
-    library_path, cpp_path = build_shared(generated.text)
+    include_dirs = tuple(
+        directory
+        for artifact in generated_programs
+        for directory in artifact.include_dirs
+    )
+    link_files = tuple(
+        path for artifact in generated_programs for path in artifact.link_files
+    )
+    fingerprint_files = tuple(
+        path
+        for artifact in generated_programs
+        for path in artifact.fingerprint_files
+    )
+    library_path, cpp_path = build_shared(
+        generated.text,
+        extra_include_dirs=include_dirs,
+        extra_link_files=link_files,
+        extra_fingerprint_files=fingerprint_files,
+    )
     return CppStreamRuntime(
         program=program,
         plan=plan,

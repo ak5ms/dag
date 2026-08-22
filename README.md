@@ -248,3 +248,10 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 - Add graph-level IR + CSE for shared subtrees across multi-feature workflows.
 - Expand shape system for richer multi-output model/optimizer nodes.
 - Continue reducing memory movement in batch paths for large memmap workloads.
+
+### One-pass native CVXPYgen optimization
+
+`examples/cpp_stream_mpo_one_pass.py` demonstrates streaming Ridge expected
+returns, the native risk covariance flow, PSD factorization, a persistent
+CVXPYgen/Clarabel MPO solve, and downstream PnL in one generated temporal loop.
+The optimizer inputs are not materialized and replayed in a second pass.

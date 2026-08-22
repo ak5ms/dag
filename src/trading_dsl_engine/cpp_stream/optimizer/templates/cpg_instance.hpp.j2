@@ -1,0 +1,118 @@
+#pragma once
+
+#include "cpg_workspace.h"
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <span>
+#include <stdexcept>
+
+class {{ class_name }} final {
+  cpg_int i{0};
+  cpg_int j{0};
+  bool solver_settings_dirty_{false};
+{% for member in compound_members %}
+  std::array<{{ member.c_type }}, {{ member.values|length }}> {{ member.name }}{{ "{{" }}{{ member.values|join(', ') }}{{ "}}" }};
+{% endfor %}
+
+ public:
+{{ workspace_body }}
+{{ solve_body }}
+  {{ class_name }}() {
+    {{ prefix }}cpg_set_solver_default_settings();
+    {{ prefix }}cpg_set_solver_verbose(0);
+    {{ prefix }}cpg_set_solver_presolve_enable(0);
+    solver_settings_dirty_ = false;
+  }
+
+  ~{{ class_name }}() { reset_solver(); }
+  {{ class_name }}(const {{ class_name }}&) = delete;
+  {{ class_name }}& operator=(const {{ class_name }}&) = delete;
+  {{ class_name }}({{ class_name }}&&) = delete;
+  {{ class_name }}& operator=({{ class_name }}&&) = delete;
+
+  void reset_solver() noexcept {
+    if ({{ prefix }}solver) {
+      clarabel_DefaultSolver_free({{ prefix }}solver);
+      {{ prefix }}solver = nullptr;
+    }
+  }
+
+  void solve() { {{ prefix }}cpg_solve(); }
+
+{% for parameter in parameters %}
+  void set_{{ parameter.name }}(std::span<const cpg_float> values) {
+    if (values.size() != {{ parameter.size }}) throw std::invalid_argument(
+        "parameter {{ parameter.name }} expects {{ parameter.size }} values");
+    std::copy(
+        values.begin(), values.end(),
+        {{ prefix }}cpg_params_vec + {{ parameter.offset }});
+{% for block in parameter.dirty_blocks %}
+    {{ prefix }}Canon_Outdated.{{ block }} = 1;
+{% endfor %}
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<cpg_float> parameter_buffer() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ loop.index0 }}) {
+      return std::span<cpg_float>(
+          {{ prefix }}cpg_params_vec + {{ parameter.offset }}, {{ parameter.size }});
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameters|length }}, "invalid CVXPYgen parameter index");
+      return {};
+    }
+  }
+
+  template <std::size_t Index>
+  void mark_parameter_dirty() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ loop.index0 }}) {
+{% for block in parameter.dirty_blocks %}
+      {{ prefix }}Canon_Outdated.{{ block }} = 1;
+{% endfor %}
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameters|length }}, "invalid CVXPYgen parameter index");
+    }
+  }
+
+  template <std::size_t Index>
+  static consteval std::size_t parameter_size() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ loop.index0 }}) return {{ parameter.size }};
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameters|length }}, "invalid CVXPYgen parameter index");
+      return 0;
+    }
+  }
+
+{% for primal in primals %}
+  [[nodiscard]] std::span<const cpg_float> primal_{{ primal.name }}() const noexcept {
+    return std::span<const cpg_float>(
+        {{ prefix }}CPG_Result.prim->{{ primal.name }}, {{ primal.size }});
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const cpg_float> primal() const noexcept {
+{% for primal in primals %}
+    if constexpr (Index == {{ loop.index0 }}) return primal_{{ primal.name }}();
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ primals|length }}, "invalid CVXPYgen primal index");
+      return {};
+    }
+  }
+
+  [[nodiscard]] const CPG_Result_t& result() const noexcept {
+    return {{ prefix }}CPG_Result;
+  }
+};

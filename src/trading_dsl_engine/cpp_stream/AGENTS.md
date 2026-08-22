@@ -170,3 +170,10 @@ This backend must remain independent of `jax_flat`.
 - Use fixed-size accumulators only. `std` uses Welford state and no hot-path allocation.
 - Benchmarks must compare the fused native reduction with full materialization and
   post-hoc reduction, validate output checksums, and report output byte counts.
+
+- CVXPYgen object nodes are physical cpp_stream stages. Keep bound parameters as
+  DAG sources, collect sibling `get_field` projections into one solve, and run
+  upstream formulas, solve, projections, and descendants inside the same runner
+  row loop. Do not reintroduce a post-batch optimizer pass or historical input
+  materialization. Render generated adapter C++ through the optimizer Jinja
+  templates rather than handwritten source-string assembly.
