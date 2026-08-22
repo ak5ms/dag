@@ -1,0 +1,65 @@
+name: build allocation-free Clarabel
+
+on:
+  push:
+    branches: [agent/cvxpygen-one-pass-mpo]
+    paths: [.github/workflows/build-clarabel-noalloc.yml]
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/build-clarabel-noalloc.yml]
+  workflow_dispatch:
+
+concurrency:
+  group: build-clarabel-noalloc
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build patched Clarabel 0.11.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/oxfordcontrol/Clarabel.cpp.git Clarabel.cpp
+          git -C Clarabel.cpp fetch --depth 1 origin 0de6259a3edfd5cc041ec42b2148599ce63e73cb
+          git -C Clarabel.cpp checkout 0de6259a3edfd5cc041ec42b2148599ce63e73cb
+          rm -rf Clarabel.cpp/Clarabel.rs
+          git clone --depth 1 --branch v0.11.1 https://github.com/oxfordcontrol/Clarabel.rs.git Clarabel.cpp/Clarabel.rs
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('Clarabel.cpp/Clarabel.rs/src/timers/timers.rs')
+          text = path.read_text()
+          old = '''impl SubTimersMap {
+              fn reset_subtimer(&mut self, key: &'static str) {
+          '''
+          new = '''impl SubTimersMap {
+              fn reset(&mut self) {
+                  for timer in self.values_mut() {
+                      timer.reset();
+                  }
+              }
+
+              fn reset_subtimer(&mut self, key: &'static str) {
+          '''
+          if old not in text or 'self.subtimers.clear();' not in text:
+              raise SystemExit('Clarabel timer source no longer matches reviewed patch')
+          text = text.replace(old, new, 1)
+          text = text.replace('self.subtimers.clear();', 'self.subtimers.reset();', 1)
+          path.write_text(text)
+          PY
+          cargo build --release --manifest-path Clarabel.cpp/rust_wrapper/Cargo.toml
+          mkdir -p artifact/include artifact/lib artifact/source
+          cp -a Clarabel.cpp/include/. artifact/include/
+          cp Clarabel.cpp/rust_wrapper/target/release/libclarabel_c.a artifact/lib/
+          cp Clarabel.cpp/Clarabel.rs/src/timers/timers.rs artifact/source/timers.rs
+          printf '%s\n' 'Clarabel.rs v0.11.1 + allocation-free timer reset' > artifact/BUILD_ID
+          tar -czf clarabel-noalloc.tar.gz -C artifact .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clarabel-noalloc
+          path: clarabel-noalloc.tar.gz
+          if-no-files-found: error
+          retention-days: 1
