@@ -109,12 +109,24 @@ This backend must remain independent of `jax_flat`.
 - Native build-cache fingerprints must include generated public headers,
   manifests, and the linked solver archive. A changed CVXPY ABI or Clarabel
   binary must invalidate the compiled formula.
-- `@clarabel_program` is the low-boilerplate formula boundary. Keep its
-  CVXPYgen sub-program cache independent of the complete outer-DAG native cache:
-  key it by factory/problem structure, concrete parameter shapes/attributes,
-  adapter schema, and solver settings. Different ordinary primal/dual/info
-  projections must reuse the same sub-program; requested constraint-value
-  auxiliaries may require a distinct problem artifact.
+- `@cvxpy_program` is the low-boilerplate formula boundary. Each factory
+  argument must be replaced by an explicitly named `cp.Parameter` inside the
+  function; CVXPY attributes belong on that declaration, not in a parallel
+  decorator options dictionary. Keep the CVXPYgen sub-program cache independent
+  of the complete outer-DAG native cache: key it by factory/problem structure,
+  declared parameter shapes/attributes, and solver settings. Outer source
+  dtype/layout belongs to the complete native-runner cache. Different ordinary
+  primal/dual/info projections and direct versus feedback bindings must reuse
+  the same sub-program; requested constraint-value auxiliaries may require a
+  distinct problem artifact.
+- `previous_solution(field, initial=...)` is a delayed optimizer-state edge.
+  The first row accepts a scalar broadcast or exact-shape initializer; later
+  rows copy the selected prior primal directly into the parameter buffer before
+  solving. Such a binding forces ordered row execution and must be rejected
+  with `sequential=False`. With `sequential=None`, infer this dependency and
+  still let whole-DAG analysis find other temporal state; `sequential=True`
+  forces ordering, while an independent complete DAG remains row-parallel with
+  one solver instance per worker.
 - `get_field` names are compile-time contracts. Preserve named primals,
   indexed/labeled constraint duals (`dual` and `lagrangian`), requested-only
   constraint numeric values, and objective/iteration/status/residual info.

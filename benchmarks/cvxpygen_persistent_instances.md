@@ -45,6 +45,10 @@ every size; objective-only and unchanged regimes recorded no additional resident
 growth. The output is only first-horizon weights, so projected bytes scale as
 `assets × sizeof(double)`.
 
+The dedicated node-level audit also binds one parameter through
+`previous_solution`, retrieves/caches the carried primal after each solve, and
+runs 100 changed warm solves with zero wrapped allocator calls.
+
 ## Independent-problem parallel throughput
 
 These are all-changing problems. Each worker owns a separate generated program
@@ -75,13 +79,25 @@ is wall time divided by total problems across workers.
 ## Compile-time scaling
 
 CVXPYgen 1.0 previously densified an affine parameter map merely to apply its
-sign, and the 150 × 8 case attempted a roughly 34.9 GiB temporary. The adapter
-now applies that scalar/row-wise sign directly to the sparse map. The 150 × 8
-program successfully generated, compiled, and executed.
+sign, and the 150 × 8 case attempted a roughly 34.9 GiB temporary. It also
+constructed a sparse LIL target from a dense `np.zeros(dense_shape)` array. The
+adapter now scatters COO/CSR nonzeros directly into destination rows and applies
+scalar/row-wise signs in place to CSR data. The 150 × 8 program successfully
+generated, compiled, and executed.
+
+The offending canonical `A` affine map was `186,900 × 25,059`; converting those
+4,683,527,100 entries to float64 requested 37,468,216,800 bytes (34.895 GiB).
 
 A fresh 150 × 8 generation after both sparse fixes took 36.844 s with a 4.46
 GiB process peak RSS. The remaining peak comes from CVXPYgen's retained
 canonical/code-writer structures, rather than a dense 34.9 GiB map.
+
+A second fresh 150 × 8 generation wrapped `numpy.zeros` and every SciPy sparse
+`toarray()` implementation with a 512 MiB rejection guard. It completed in
+36.443 s with a 4,675,040 KiB peak RSS and **zero rejected dense allocation
+attempts**. The generated header was 27,825,020 bytes. This directly guards both
+CVXPYgen 1.0 materialization sites in addition to the source-level sparse-only
+implementation.
 
 Representative uncached measurements from the clean sweep:
 
@@ -100,5 +116,10 @@ Run `scripts/benchmark_cvxpygen_persistent_instances.py` with the Clarabel
 include and archive paths set. The script checkpoints after every size, verifies
 stable finite checksums, fails on any warm-path allocation, and retains all ten
 raw samples for every process repetition.
+
+Run `scripts/audit_cvxpygen_sparse_generation.py` for a fresh guarded 150 × 8
+generation. `CVXPYGEN_AUDIT_ASSETS`, `CVXPYGEN_AUDIT_HORIZONS`,
+`CVXPYGEN_AUDIT_DENSE_LIMIT_BYTES`, and `CVXPYGEN_AUDIT_OUTPUT_DIR` override its
+plug-and-play defaults.
 
 Raw samples and checksums: [`cvxpygen_persistent_instances.json`](cvxpygen_persistent_instances.json).

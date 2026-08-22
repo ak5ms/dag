@@ -256,10 +256,16 @@ returns, the native risk covariance flow, PSD factorization, a persistent
 CVXPYgen/Clarabel MPO solve, and downstream PnL in one generated temporal loop.
 The optimizer inputs are not materialized and replayed in a second pass.
 
-Define a DPP-compliant problem once with `@clarabel_program`, then call that same
-function with DSL expressions. Concrete shapes and the MPO sub-compilation are
-cached independently of the fused outer runner—no explicit `bind_program()` or
-`generate_clarabel_program()` step is required. `get_field()` projects named
+Define a DPP-compliant problem once with `@cvxpy_program`, explicitly declaring
+its shaped `cp.Parameter` objects and attributes inside the function, then call
+that same function with DSL expressions. `previous_solution("weights[0]",
+initial=0.0)` feeds the prior solve's actual first-horizon portfolio into the
+next row; it automatically makes the stage sequential. Independent programs
+remain eligible for row-parallel worker-owned solvers, and `sequential=True` or
+`False` can assert the intended solver dependency. Concrete shapes and the MPO
+sub-compilation are cached independently of the fused outer runner—no explicit
+`bind_program()` or `generate_clarabel_program()` step is required.
+`get_field()` projects named
 primals, labeled constraint values, duals/Lagrangians, objective, status,
 iterations, and residual diagnostics. Sibling fields share one solve and only
 their requested inverse result maps execute. See

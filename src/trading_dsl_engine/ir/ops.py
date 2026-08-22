@@ -402,6 +402,8 @@ class CvxpygenProgramOp:
 
     program: object
     parameter_names: tuple[str, ...]
+    feedback_fields: tuple[object | None, ...] = ()
+    sequential: bool = False
 
 
 @dataclass(frozen=True, slots=True)

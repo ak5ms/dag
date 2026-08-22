@@ -156,6 +156,12 @@ def _reduction_is_temporal(stage: Stage) -> bool:
     )
 
 
+def _cvxpygen_is_sequential(stage: Stage) -> bool:
+    return stage.kind in {"cvxpygen", "cvxpygen_bundle"} and bool(
+        getattr(stage.op, "sequential", False)
+    )
+
+
 def _reduction_is_lane_local(stage: Stage, n_instruments: int) -> bool:
     if (
         stage.kind not in {"reduce", "reduction_bundle"}
@@ -191,6 +197,7 @@ def plan_is_row_independent(plan: Plan) -> bool:
             stage.kind in _TEMPORAL_KINDS
             or _ridge_is_stateful(stage)
             or _reduction_is_temporal(stage)
+            or _cvxpygen_is_sequential(stage)
             or stage.kind == "emit_last"
         ):
             return False
@@ -396,6 +403,13 @@ def select_parallel_plan(
             "rows",
             "all rows are independent",
             True,
+            score,
+        )
+    if any(_cvxpygen_is_sequential(stage) for stage in plan.stages):
+        return ParallelPlan(
+            "serial",
+            "CVXPY program carries prior-solve state across rows",
+            False,
             score,
         )
     if plan_is_lane_independent(

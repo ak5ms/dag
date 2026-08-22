@@ -688,14 +688,42 @@ def _stage_type(
         program = physical.op.program
         if len(physical.inputs) != len(program.parameters):
             raise ValueError("CVXPYgen parameter/source count mismatch")
-        bindings = tuple(
-            tmpl(
-                "stackdsl::CvxpygenParameterBinding",
-                IntArg(index),
-                _tensor_source_type(source, n=n, input_types=input_types),
-            )
-            for index, source in enumerate(physical.inputs)
+        feedback_fields = physical.op.feedback_fields or (
+            (None,) * len(physical.inputs)
         )
+        if len(feedback_fields) != len(physical.inputs):
+            raise ValueError("CVXPYgen feedback/source count mismatch")
+        bindings = []
+        for index, (source, feedback) in enumerate(
+            zip(physical.inputs, feedback_fields)
+        ):
+            source_type = _tensor_source_type(
+                source, n=n, input_types=input_types
+            )
+            if feedback is None:
+                bindings.append(
+                    tmpl(
+                        "stackdsl::CvxpygenParameterBinding",
+                        IntArg(index),
+                        source_type,
+                    )
+                )
+                continue
+            if feedback.kind != "primal":
+                raise ValueError(
+                    "CVXPYgen feedback currently requires a primal field"
+                )
+            bindings.append(
+                tmpl(
+                    "stackdsl::CvxpygenPreviousPrimalBinding",
+                    IntArg(index),
+                    IntArg(feedback.source_index),
+                    IntArg(feedback.offset),
+                    IntArg(feedback.count),
+                    IntArg(feedback.stride),
+                    source_type,
+                )
+            )
         members = stage.members if stage.kind == "cvxpygen_bundle" else (stage,)
         projections = []
         for member in members:

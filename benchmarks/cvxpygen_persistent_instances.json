@@ -4817,6 +4817,10 @@
       "realloc",
       "aligned_alloc"
     ],
+    "previous_solution_node_allocation_audit": {
+      "warm_changed_solves": 100,
+      "allocations": 0
+    },
     "fifty_asset_case": "runtime rerun after an overlay filesystem dropped the executable bit; uncached codegen timing retained from the first clean sweep",
     "final_sparse_codegen": {
       "seconds_by_assets": {
@@ -4828,6 +4832,23 @@
         "150": 36.84360805
       },
       "peak_rss_kib_150x8": 4674060
+    },
+    "guarded_dense_materialization_audit_150x8": {
+      "date": "2026-08-22",
+      "original_dense_A_map_shape": [
+        186900,
+        25059
+      ],
+      "original_dense_A_map_bytes": 37468216800,
+      "dense_allocation_guard_bytes": 536870912,
+      "rejected_dense_allocations": [],
+      "cvxpygen_seconds": 36.4429988360007,
+      "peak_rss_kib": 4675040,
+      "generated_header_bytes": 27825020,
+      "guarded_operations": [
+        "numpy.zeros",
+        "scipy.sparse.*.toarray"
+      ]
     }
   }
 }

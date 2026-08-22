@@ -28,8 +28,9 @@ from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
     build_current_clarabel,
-    clarabel_program,
+    cvxpy_program,
     get_field,
+    previous_solution,
 )
 
 N_ASSETS = 6
@@ -46,13 +47,10 @@ def _clarabel() -> ClarabelNativePaths:
     return build_current_clarabel()
 
 
-@clarabel_program(
+@cvxpy_program(
     cache_dir=CACHE / "cvxpygen",
     clarabel=_clarabel,
-    parameter_options={
-        "half_spread_bps": {"nonneg": True},
-        "risk_radius": {"nonneg": True},
-    },
+    sequential=None,
 )
 def MPO(
     expected_returns,
@@ -61,9 +59,22 @@ def MPO(
     risk_factor,
     risk_radius=0.08,
 ) -> cp.Problem:
-    """Define the optimizer once; the decorator supplies CVXPY Parameters."""
+    """Define the optimizer once, including its CVXPY Parameter attributes."""
 
     n_horizons, n_assets = expected_returns.shape
+    expected_returns = cp.Parameter(
+        expected_returns.shape, name="expected_returns"
+    )
+    half_spread_bps = cp.Parameter(
+        half_spread_bps.shape,
+        name="half_spread_bps",
+        nonneg=True,
+    )
+    current_weights = cp.Parameter(
+        (n_assets,), name="current_weights"
+    )
+    risk_factor = cp.Parameter(risk_factor.shape, name="risk_factor")
+    risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
     weights = cp.Variable((n_horizons, n_assets), name="weights")
     turnover = cp.Variable((n_horizons, n_assets), name="turnover")
     previous = cp.vstack([current_weights, weights[:-1]])
@@ -120,7 +131,9 @@ def _formula():
     mpo = MPO(
         expected_returns=expected_returns,
         half_spread_bps=var("half_spread_bps"),
-        current_weights=var("current_weights"),
+        # The first solve starts flat. Every later solve consumes the prior
+        # first-horizon solution as the portfolio actually carried into the row.
+        current_weights=previous_solution("weights[0]", initial=0.0),
         risk_factor=risk_factor,
         risk_radius=0.08,
     )
@@ -159,11 +172,9 @@ def _simulation() -> dict[str, np.ndarray]:
     half_spread = np.broadcast_to(
         np.linspace(0.5, 1.5, N_ASSETS), (ROWS, N_ASSETS)
     ).copy()
-    current_weights = np.zeros((ROWS, N_ASSETS), dtype=np.float64)
     return {
         "returns": returns,
         "half_spread_bps": half_spread,
-        "current_weights": current_weights,
     }
 
 

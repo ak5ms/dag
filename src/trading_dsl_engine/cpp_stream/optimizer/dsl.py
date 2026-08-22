@@ -26,6 +26,31 @@ class CvxpygenFieldExpr(Expr):
     field: str
 
 
+@dataclass(frozen=True, eq=False)
+class CvxpygenPreviousSolutionExpr(Expr):
+    """A delayed edge from the preceding solve into the next parameter set."""
+
+    field: str
+    initial: Expr
+
+
+def previous_solution(
+    field: str,
+    *,
+    initial: Expr | int | float = 0.0,
+) -> CvxpygenPreviousSolutionExpr:
+    """Feed a prior primal field into the next row's optimizer parameters.
+
+    ``initial`` supplies the first row. A scalar initial value broadcasts over
+    the bound parameter; otherwise its logical shape must match exactly.
+    """
+
+    field = str(field)
+    if not field or any(character.isspace() for character in field):
+        raise KeyError(f"invalid previous solution field {field!r}")
+    return CvxpygenPreviousSolutionExpr(field, ensure_expr(initial))
+
+
 def bind_program(
     program: GeneratedCvxpygenProgram,
     /,
@@ -70,7 +95,9 @@ def get_field(program_expr: CvxpygenProgramExpr, field: str) -> CvxpygenFieldExp
 
 __all__ = [
     "CvxpygenFieldExpr",
+    "CvxpygenPreviousSolutionExpr",
     "CvxpygenProgramExpr",
     "bind_program",
     "get_field",
+    "previous_solution",
 ]

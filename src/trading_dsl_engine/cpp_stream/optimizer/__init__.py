@@ -13,19 +13,22 @@ from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
 )
 from trading_dsl_engine.cpp_stream.optimizer.dsl import (
     CvxpygenFieldExpr,
+    CvxpygenPreviousSolutionExpr,
     CvxpygenProgramExpr,
     bind_program,
     get_field,
+    previous_solution,
 )
 from trading_dsl_engine.cpp_stream.optimizer.factory import (
     CvxpygenProgramDefinition,
     CvxpygenProgramPrototype,
-    clarabel_program,
+    cvxpy_program,
 )
 
 __all__ = [
     "ClarabelNativePaths",
     "CvxpygenFieldExpr",
+    "CvxpygenPreviousSolutionExpr",
     "CvxpygenProgramDefinition",
     "CvxpygenProgramExpr",
     "CvxpygenProgramPrototype",
@@ -38,8 +41,9 @@ __all__ = [
     "artifact_fingerprint",
     "build_current_clarabel",
     "bind_program",
-    "clarabel_program",
+    "cvxpy_program",
     "generate_clarabel_program",
     "get_field",
     "load_clarabel_program",
+    "previous_solution",
 ]

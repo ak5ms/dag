@@ -34,7 +34,7 @@ from trading_dsl_engine.ir.types import ValueType
 
 
 _SYMBOLIC_INSTRUMENT_COUNT = 113
-_FACTORY_CACHE_SCHEMA = 1
+_FACTORY_CACHE_SCHEMA = 2
 _PROGRAM_CACHE_LOCK = RLock()
 _DEFAULT_ENABLE_SETTINGS = (
     "verbose",
@@ -237,6 +237,31 @@ def _call_with_named_values(factory, signature, values):
     return factory(*positional, **keywords)
 
 
+@dataclass(frozen=True, slots=True)
+class _CvxpyFactoryArgument:
+    """Compile-time shape metadata passed to a decorated problem factory.
+
+    The factory replaces each argument with an explicitly declared
+    ``cp.Parameter``. Keeping this object deliberately small makes accidental
+    use as a CVXPY expression fail immediately, while still exposing the shape
+    needed to declare a static parameter.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    logical_shape: tuple[int, ...]
+    dtype: str
+
+
+def _parameter_attributes(parameter) -> dict[str, str]:
+    """Return a stable cache representation of CVXPY leaf attributes."""
+
+    return {
+        str(name): repr(value)
+        for name, value in sorted(parameter.attributes.items())
+    }
+
+
 class CvxpygenProgramDefinition:
     """A cached CVXPY problem factory that is callable from the formula DSL."""
 
@@ -248,7 +273,7 @@ class CvxpygenProgramDefinition:
         clarabel: ClarabelNativePaths | Callable[[], ClarabelNativePaths] | None = None,
         class_name: str | None = None,
         prefix: str | None = None,
-        parameter_options: Mapping[str, Mapping[str, Any]] | None = None,
+        sequential: bool | None = None,
         enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
     ) -> None:
         self.factory = factory
@@ -265,17 +290,9 @@ class CvxpygenProgramDefinition:
         self.clarabel = clarabel
         self.configured_class_name = class_name
         self.configured_prefix = prefix
-        self.parameter_options = {
-            str(name): dict(options)
-            for name, options in (parameter_options or {}).items()
-        }
-        unknown_options = sorted(
-            set(self.parameter_options) - set(self.signature.parameters)
-        )
-        if unknown_options:
-            raise KeyError(
-                f"parameter_options contains unknown arguments {unknown_options}"
-            )
+        if sequential is not None and not isinstance(sequential, bool):
+            raise TypeError("sequential must be True, False, or None")
+        self.sequential = sequential
         self.enable_settings = tuple(enable_settings)
         self._factory_hash = _factory_fingerprint(factory)
         self._lock = RLock()
@@ -283,11 +300,12 @@ class CvxpygenProgramDefinition:
         functools.update_wrapper(self, factory)
 
     @property
-    def expression_key(self) -> tuple[str, str, str]:
+    def expression_key(self) -> tuple[object, ...]:
         return (
             self.factory.__module__,
             self.factory.__qualname__,
             self._factory_hash,
+            self.sequential,
         )
 
     def validate_field_request(self, field: str) -> None:
@@ -299,6 +317,10 @@ class CvxpygenProgramDefinition:
             raise KeyError(f"invalid generated field request {field!r}")
 
     def __call__(self, *args, **kwargs) -> CvxpygenProgramExpr:
+        from trading_dsl_engine.cpp_stream.optimizer.dsl import (
+            CvxpygenPreviousSolutionExpr,
+        )
+
         bound = self.signature.bind(*args, **kwargs)
         bound.apply_defaults()
         missing = [
@@ -308,12 +330,29 @@ class CvxpygenProgramDefinition:
         ]
         if missing:
             raise TypeError(f"missing CVXPY program arguments {missing}")
+        bindings = tuple(
+            (
+                name,
+                bound.arguments[name]
+                if isinstance(
+                    bound.arguments[name], CvxpygenPreviousSolutionExpr
+                )
+                else ensure_expr(bound.arguments[name]),
+            )
+            for name in self.signature.parameters
+        )
+        has_feedback = any(
+            isinstance(value, CvxpygenPreviousSolutionExpr)
+            for _, value in bindings
+        )
+        if has_feedback and self.sequential is False:
+            raise ValueError(
+                "previous_solution() creates a temporal dependency and cannot "
+                "be used with @cvxpy_program(sequential=False)"
+            )
         return CvxpygenProgramExpr(
             self,
-            tuple(
-                (name, ensure_expr(bound.arguments[name]))
-                for name in self.signature.parameters
-            ),
+            bindings,
         )
 
     def _instantiate_problem(
@@ -322,10 +361,11 @@ class CvxpygenProgramDefinition:
         *,
         requested_fields: frozenset[str],
         n_instruments: int,
+        feedback_names: frozenset[str],
     ):
         import cvxpy as cp
 
-        parameters = {}
+        arguments = {}
         for name in self.signature.parameters:
             value_type = parameter_types[name]
             logical_shape = tuple(
@@ -337,13 +377,14 @@ class CvxpygenProgramDefinition:
                 if len(logical_shape) > 1
                 else logical_shape
             )
-            parameters[name] = cp.Parameter(
-                cvxpy_shape,
+            arguments[name] = _CvxpyFactoryArgument(
                 name=name,
-                **self.parameter_options.get(name, {}),
+                shape=cvxpy_shape,
+                logical_shape=logical_shape,
+                dtype=value_type.dtype,
             )
         problem = _call_with_named_values(
-            self.factory, self.signature, parameters
+            self.factory, self.signature, arguments
         )
         if not isinstance(problem, cp.Problem):
             raise TypeError(
@@ -353,17 +394,33 @@ class CvxpygenProgramDefinition:
         problem, aliases = _augment_constraint_values(
             cp, problem, requested_fields
         )
-        problem_parameter_names = {
-            parameter.name() for parameter in problem.parameters()
-        }
-        expected_names = set(parameters)
-        missing = sorted(expected_names - problem_parameter_names)
-        extra = sorted(problem_parameter_names - expected_names)
+        parameters = {}
+        for parameter in problem.parameters():
+            name = parameter.name()
+            if name in parameters:
+                raise KeyError(f"duplicate CVXPY parameter name {name!r}")
+            parameters[name] = parameter
+        expected_names = set(arguments)
+        actual_names = set(parameters)
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
         if missing or extra:
             raise KeyError(
-                "CVXPY problem parameters must be exactly its factory arguments: "
+                "declare one cp.Parameter inside the decorated function for "
+                "each factory argument, using the argument name: "
                 f"missing={missing}, extra={extra}"
             )
+        for name, argument in arguments.items():
+            if name in feedback_names:
+                # A scalar feedback initializer may broadcast into a parameter
+                # whose shape is declared from another factory argument.
+                continue
+            parameter_shape = tuple(int(extent) for extent in parameters[name].shape)
+            if parameter_shape != argument.shape:
+                raise ValueError(
+                    f"cp.Parameter {name!r} has shape {parameter_shape}, but "
+                    f"its bound DSL argument has CVXPY shape {argument.shape}"
+                )
         return problem, aliases
 
     def _prototype(self, problem, aliases, n_instruments):
@@ -410,25 +467,26 @@ class CvxpygenProgramDefinition:
             n_instruments,
         )
 
-    def _cache_key(self, problem, parameter_types, n_instruments: int) -> str:
+    def _cache_key(self, problem, n_instruments: int) -> str:
         payload = {
             "cache_schema": _FACTORY_CACHE_SCHEMA,
             "factory": self._factory_hash,
             "instrument_count": int(n_instruments),
+            # The generated solver depends on the declared CVXPY parameters,
+            # not on whether an outer DAG source is direct or a scalar-broadcast
+            # feedback initializer. Source dtype/layout remains in the complete
+            # cpp_stream native cache key.
             "parameters": {
-                name: {
-                    "shape": list(value_type.logical_shape),
-                    "cvxpy_shape": list(
-                        next(
-                            parameter.shape
-                            for parameter in problem.parameters()
-                            if parameter.name() == name
-                        )
+                parameter.name(): {
+                    "logical_shape": list(
+                        tuple(reversed(parameter.shape))
+                        if len(parameter.shape) > 1
+                        else parameter.shape
                     ),
-                    "dtype": value_type.dtype,
-                    "options": self.parameter_options.get(name, {}),
+                    "cvxpy_shape": list(parameter.shape),
+                    "attributes": _parameter_attributes(parameter),
                 }
-                for name, value_type in parameter_types.items()
+                for parameter in problem.parameters()
             },
             "problem": str(problem),
             "variables": [
@@ -462,6 +520,7 @@ class CvxpygenProgramDefinition:
         *,
         requested_fields: frozenset[str],
         n_instruments: int | None,
+        feedback_fields: Mapping[str, str] | None = None,
     ) -> GeneratedCvxpygenProgram | CvxpygenProgramPrototype:
         expected = tuple(self.signature.parameters)
         missing = sorted(set(expected) - set(parameter_types))
@@ -475,17 +534,26 @@ class CvxpygenProgramDefinition:
             if n_instruments is None
             else int(n_instruments)
         )
+        feedback_fields = {
+            str(name): str(field)
+            for name, field in (feedback_fields or {}).items()
+        }
+        unknown_feedback = sorted(set(feedback_fields) - set(expected))
+        if unknown_feedback:
+            raise KeyError(
+                f"feedback contains unknown CVXPY arguments {unknown_feedback}"
+            )
         problem, aliases = self._instantiate_problem(
             parameter_types,
-            requested_fields=requested_fields,
+            requested_fields=requested_fields
+            | frozenset(feedback_fields.values()),
             n_instruments=resolved_n,
+            feedback_names=frozenset(feedback_fields),
         )
         if n_instruments is None:
             return self._prototype(problem, aliases, resolved_n)
 
-        cache_key = self._cache_key(
-            problem, parameter_types, int(n_instruments)
-        )
+        cache_key = self._cache_key(problem, int(n_instruments))
         with self._lock, _PROGRAM_CACHE_LOCK:
             cached = self._resolved.get(cache_key)
             if cached is not None:
@@ -526,17 +594,17 @@ class CvxpygenProgramDefinition:
                 return artifact
 
 
-def clarabel_program(
+def cvxpy_program(
     factory: Callable[..., Any] | None = None,
     *,
     cache_dir: str | os.PathLike[str] | None = None,
     clarabel: ClarabelNativePaths | Callable[[], ClarabelNativePaths] | None = None,
     class_name: str | None = None,
     prefix: str | None = None,
-    parameter_options: Mapping[str, Mapping[str, Any]] | None = None,
+    sequential: bool | None = None,
     enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
 ):
-    """Decorate ``(**cvxpy.Parameters) -> cvxpy.Problem`` for DSL use."""
+    """Decorate a CVXPY problem factory for direct use in the formula DSL."""
 
     def decorate(function):
         return CvxpygenProgramDefinition(
@@ -545,7 +613,7 @@ def clarabel_program(
             clarabel=clarabel,
             class_name=class_name,
             prefix=prefix,
-            parameter_options=parameter_options,
+            sequential=sequential,
             enable_settings=enable_settings,
         )
 
@@ -555,5 +623,5 @@ def clarabel_program(
 __all__ = [
     "CvxpygenProgramDefinition",
     "CvxpygenProgramPrototype",
-    "clarabel_program",
+    "cvxpy_program",
 ]

@@ -20,6 +20,7 @@ from trading_dsl_engine.base.parser import (
 )
 from trading_dsl_engine.cpp_stream.optimizer.dsl import (
     CvxpygenFieldExpr,
+    CvxpygenPreviousSolutionExpr,
     CvxpygenProgramExpr,
 )
 from trading_dsl_engine.ir.einsum import EinsumParseError, parse_einsum
@@ -204,6 +205,12 @@ def _expr_key(node: Expr) -> tuple:
             tuple((name, _expr_key(value)) for name, value in node.bindings),
             tuple(sorted(node.requested_fields)),
         )
+    if isinstance(node, CvxpygenPreviousSolutionExpr):
+        return (
+            "cvxpygen_previous_solution",
+            node.field,
+            _expr_key(node.initial),
+        )
     if isinstance(node, CvxpygenFieldExpr):
         return (
             "cvxpygen_field",
@@ -232,6 +239,8 @@ def _contains_self(node: Expr) -> bool:
         return any(_contains_self(arg) for arg in node.args)
     if isinstance(node, CvxpygenProgramExpr):
         return any(_contains_self(value) for _, value in node.bindings)
+    if isinstance(node, CvxpygenPreviousSolutionExpr):
+        return _contains_self(node.initial)
     if isinstance(node, CvxpygenFieldExpr):
         return _contains_self(node.program_expr)
     if isinstance(node, Call):
@@ -777,8 +786,18 @@ class _BaseBuilder:
                 raise FormulaIRCompileError(
                     "CVXPYgen parameter bindings contain duplicate names"
                 )
+            feedback_by_name = {
+                name: value
+                for name, value in node.bindings
+                if isinstance(value, CvxpygenPreviousSolutionExpr)
+            }
             children_by_name = {
-                name: self.build(value) for name, value in node.bindings
+                name: self.build(
+                    value.initial
+                    if isinstance(value, CvxpygenPreviousSolutionExpr)
+                    else value
+                )
+                for name, value in node.bindings
             }
             program = node.program
             resolver = getattr(program, "resolve_for_types", None)
@@ -790,6 +809,10 @@ class _BaseBuilder:
                     },
                     requested_fields=frozenset(node.requested_fields),
                     n_instruments=getattr(self, "n_instruments", None),
+                    feedback_fields={
+                        name: value.field
+                        for name, value in feedback_by_name.items()
+                    },
                 )
             expected_names = tuple(parameter.name for parameter in program.parameters)
             missing = sorted(set(expected_names) - set(binding_names))
@@ -800,6 +823,7 @@ class _BaseBuilder:
                     f"missing={missing}, extra={extra}"
                 )
             children = tuple(children_by_name[name] for name in expected_names)
+            feedback_fields = []
             for name, child in zip(expected_names, children):
                 child_type = self.nodes[child].value_type
                 try:
@@ -809,13 +833,49 @@ class _BaseBuilder:
                         f"CVXPYgen parameter {name!r} cannot consume object values"
                     ) from exc
                 expected_shape = program.parameter_logical_shape(name)
-                if not _shape_matches_generated(actual_shape, expected_shape):
+                feedback = feedback_by_name.get(name)
+                if feedback is None:
+                    shape_matches = _shape_matches_generated(
+                        actual_shape, expected_shape
+                    )
+                    feedback_fields.append(None)
+                else:
+                    field = program.resolve_field(feedback.field)
+                    if field.kind != "primal":
+                        raise FormulaIRCompileError(
+                            "previous_solution() requires a named primal field, "
+                            f"got {feedback.field!r} ({field.kind})"
+                        )
+                    if field.logical_shape != expected_shape:
+                        raise FormulaIRCompileError(
+                            f"previous solution field {feedback.field!r} has "
+                            f"logical shape {field.logical_shape}, but parameter "
+                            f"{name!r} expects {expected_shape}"
+                        )
+                    # Scalar initialization broadcasts over the parameter; a
+                    # non-scalar initializer must have the exact logical shape.
+                    shape_matches = actual_shape == () or _shape_matches_generated(
+                        actual_shape, expected_shape
+                    )
+                    feedback_fields.append(field)
+                if not shape_matches:
                     raise FormulaIRCompileError(
                         f"CVXPYgen parameter {name!r} expects logical shape "
                         f"{expected_shape}, got {actual_shape}"
                     )
+            definition_sequential = getattr(node.program, "sequential", None)
+            sequential = bool(feedback_by_name) or definition_sequential is True
+            if feedback_by_name and definition_sequential is False:
+                raise FormulaIRCompileError(
+                    "previous_solution() cannot be combined with sequential=False"
+                )
             return self._append(
-                CvxpygenProgramOp(program, expected_names),
+                CvxpygenProgramOp(
+                    program,
+                    expected_names,
+                    tuple(feedback_fields),
+                    sequential,
+                ),
                 children,
                 object_value(1),
             )

@@ -296,6 +296,13 @@ half-life in rows, and `rettype` accepts descriptive values such as `"residual"`
 
 ## Generated convex programs
 
+`@cpp_stream.optimizer.cvxpy_program` is the normal DSL boundary. The decorated
+function declares its explicitly named `cp.Parameter` objects and attributes,
+then the same function binds DAG expressions. `previous_solution("weights[0]",
+initial=...)` carries an actual prior primal into the next solve and is inferred
+as temporal state; independent programs remain row-parallel with one generated
+instance per worker.
+
 `cpp_stream.optimizer.generate_clarabel_program(...)` compiles a static-shape,
 DPP-compliant CVXPY problem through CVXPYgen and emits an instance-owned C++
 class. CVXPYgen retains responsibility for parameter-to-`P/A/q/b` maps, cone

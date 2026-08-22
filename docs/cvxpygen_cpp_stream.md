@@ -1,6 +1,6 @@
 # CVXPYgen programs inside `cpp_stream`
 
-`cpp_stream.optimizer.clarabel_program` turns a static-shape, DPP-compliant
+`cpp_stream.optimizer.cvxpy_program` turns a static-shape, DPP-compliant
 CVXPY problem factory into a normal callable in the formula DSL. The numerical
 row path calls CVXPYgen's generated parameter maps and result maps directly; it
 does not invoke Python, CVXPY, or the CVXPYgen Python wrapper.
@@ -41,26 +41,24 @@ Install the optional Python code-generation dependencies:
 python -m pip install -e '.[optimizer]'
 ```
 
-The decorator replaces each function argument with a correctly shaped
-`cp.Parameter` at formula compile time. Consequently the same function name is
-used to bind streaming expressions; there is no separate `bind_program()` or
-`generate_clarabel_program()` call:
+At formula compile time each function argument is a small descriptor exposing
+its concrete CVXPY shape. The function explicitly declares `cp.Parameter`
+objects, so attributes such as `nonneg=True`, sparsity, bounds, and symmetry
+live next to the CVXPY model rather than in a second decorator dictionary.
+Consequently the same function name binds streaming expressions; there is no
+separate `bind_program()` or `generate_clarabel_program()` call:
 
 ```python
 import cvxpy as cp
 
 from trading_dsl_engine.base.dsl import var
 from trading_dsl_engine.cpp_stream.optimizer import (
-    clarabel_program,
+    cvxpy_program,
     get_field,
+    previous_solution,
 )
 
-@clarabel_program(
-    parameter_options={
-        "half_spread_bps": {"nonneg": True},
-        "risk_radius": {"nonneg": True},
-    }
-)
+@cvxpy_program(sequential=None)
 def MPO(
     expected_returns,
     half_spread_bps,
@@ -69,6 +67,19 @@ def MPO(
     risk_radius=0.08,
 ) -> cp.Problem:
     horizons, assets = expected_returns.shape
+    expected_returns = cp.Parameter(
+        expected_returns.shape, name="expected_returns"
+    )
+    half_spread_bps = cp.Parameter(
+        half_spread_bps.shape,
+        name="half_spread_bps",
+        nonneg=True,
+    )
+    current_weights = cp.Parameter(
+        (assets,), name="current_weights"
+    )
+    risk_factor = cp.Parameter(risk_factor.shape, name="risk_factor")
+    risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
     weights = cp.Variable((horizons, assets), name="weights")
     turnover = cp.Variable((horizons, assets), name="turnover")
     delta = weights - cp.vstack([current_weights, weights[:-1]])
@@ -88,7 +99,7 @@ def MPO(
 mpo = MPO(
     expected_returns=var("expected_returns"),
     half_spread_bps=var("half_spread_bps"),
-    current_weights=var("current_weights"),
+    current_weights=previous_solution("weights[0]", initial=0.0),
     risk_factor=var("risk_factor"),
     risk_radius=0.08,
 )
@@ -100,8 +111,32 @@ solver_iterations = get_field(mpo, "iterations")
 Concrete instrument count and fixed widths specialize the cached sub-program.
 For multi-dimensional DSL values, the adapter accounts for CVXPY's
 column-major parameter ABI, so an `(assets, horizons)` DSL value is presented to
-the problem factory as `(horizons, assets)`. `parameter_options` carries CVXPY
-attributes such as `nonneg=True` when DCP/DPP analysis needs them.
+the problem factory as `(horizons, assets)`. Every problem parameter must be
+explicitly named after its function argument. Shape mismatches and missing or
+extra parameters fail during IR construction.
+
+### Prior-solution state and parallelism
+
+`previous_solution("weights[0]", initial=0.0)` is an internal delayed edge. On
+the first row, a scalar initializer broadcasts over `current_weights`; a
+non-scalar initializer must match its logical shape. On every later row, the
+generated node retrieves the prior solve's first-horizon weights directly from
+its instance-owned result buffer and writes them into `current_weights` before
+the next solve. It does not materialize history and it does not create a second
+loop.
+
+The decorator's `sequential` setting is tri-state:
+
+- `None` (default): infer dependencies. `previous_solution()` makes the stage
+  sequential; otherwise the complete DAG decides whether rows are independent.
+- `True`: force ordered solves even without an explicit feedback edge.
+- `False`: assert that the solver itself has no cross-row state dependency.
+  Combining it with `previous_solution()` is a compile-time error.
+
+`sequential=False` cannot override a real dependency elsewhere in the DAG. For
+example, an MPO fed by stateful Ridge/EWM nodes still runs in temporal order.
+An entirely independent DAG is row-parallel and gives each native worker its
+own persistent generated object and Clarabel solver.
 
 ### Result fields
 
@@ -127,12 +162,14 @@ optimization problem.
 ### Cache boundary
 
 The CVXPYgen sub-compilation is cached independently of the surrounding formula.
-Its key covers the factory implementation, concrete parameter shapes and
-attributes, resulting problem structure, generated-adapter schema, and enabled
-solver settings. The same MPO can therefore be reused in another outer formula
-without regenerating its native parameter maps. A requested constraint value
-gets a distinct entry only because it changes the generated problem by adding
-the auxiliary projection variable.
+Its key covers the factory implementation, declared parameter shapes and
+attributes, resulting problem structure, and enabled solver settings. Direct
+bindings and prior-solution bindings therefore reuse the same solver artifact;
+their source dtype/layout remains part of the surrounding native-runner cache.
+The same MPO can be reused in another outer formula without regenerating its
+native parameter maps. A requested constraint value gets a distinct entry only
+because it changes the generated problem by adding the auxiliary projection
+variable.
 
 Compiling the complete outer DAG still matters for CSE, scheduling, native
 link-cache invalidation, and placing upstream formulas, the solve, and downstream
@@ -216,6 +253,23 @@ includes parameter change detection, any required copies and canonicalization,
 Clarabel update/solve, requested-only projection, allocation wrapping, resident
 growth, and 2/4/8-worker independent-problem throughput. The companion JSON
 retains every raw timing and checksum.
+
+CVXPYgen 1.0's original canonicalizer had two dense-materialization sites. Its
+`_update_to_dense_mapping()` constructed a sparse LIL matrix from
+`np.zeros(dense_shape)`, and `_process_canonical_parameters()` evaluated
+`affine_map.mapping.toarray() * affine_map.sign`. The latter requested about
+34.9 GiB for the 150-asset, eight-horizon benchmark: the canonical `A` affine
+map had shape `186,900 × 25,059`, or 37,468,216,800 float64 bytes if dense. The
+version-pinned adapter
+now scatters COO/CSR nonzeros directly into their destination rows and applies
+signs in place to CSR `data` slices. Neither path calls `np.zeros(dense_shape)`,
+`toarray()`, nor `todense()`.
+
+The fresh 150×8 audit completed with a 4.46 GiB peak RSS, so the 34.9 GiB dense
+array was not resident or lazily retained. That remaining generation-time peak
+comes from CVXPYgen's canonical and code-writer structures; it is separate from
+the native row hot path, whose allocation wrappers remain at zero after warm-up.
+`scripts/audit_cvxpygen_sparse_generation.py` reproduces the guarded generation.
 
 ## One temporal loop with upstream and downstream formulas
 

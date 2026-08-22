@@ -430,15 +430,60 @@ def _import_cpg():
     return cpg
 
 
+def _scatter_sparse_rows(sparse_module, np_module, mapping, rows, row_count):
+    """Scatter CSR rows without allocating a dense or LIL-shaped workspace."""
+
+    mapping = mapping.tocsr()
+    rows = np_module.asarray(rows, dtype=np_module.int64).reshape(-1)
+    if rows.size != mapping.shape[0]:
+        raise ValueError(
+            "CVXPYgen sparse row map size does not match its affine mapping"
+        )
+    if rows.size and (
+        int(rows.min()) < 0 or int(rows.max()) >= int(row_count)
+    ):
+        raise ValueError("CVXPYgen sparse row map is out of bounds")
+    if np_module.unique(rows).size != rows.size:
+        raise ValueError("CVXPYgen sparse row map unexpectedly contains duplicates")
+    coordinate = mapping.tocoo(copy=False)
+    return sparse_module.csr_matrix(
+        (
+            coordinate.data,
+            (rows[coordinate.row], coordinate.col),
+        ),
+        shape=(int(row_count), int(mapping.shape[1])),
+    )
+
+
+def _apply_sparse_sign(np_module, mapping, sign):
+    """Apply CVXPYgen's affine-map sign directly to CSR nonzeros."""
+
+    mapping = mapping.tocsr()
+    sign = np_module.asarray(sign).reshape(-1)
+    if sign.size == 1:
+        scalar = sign.item()
+        if scalar != 1:
+            mapping.data *= scalar
+        return mapping
+    if sign.size != mapping.shape[0]:
+        raise ValueError(
+            f"unexpected CVXPYgen affine-map sign shape {sign.shape}"
+        )
+    indptr = mapping.indptr
+    for row in np_module.flatnonzero(sign != 1):
+        mapping.data[indptr[row] : indptr[row + 1]] *= sign[row]
+    return mapping
+
+
 @contextmanager
 def _sparse_cvxpygen_canonical_maps():
     """Keep CVXPYgen 1.0 canonical maps sparse during code generation.
 
     CVXPYgen 1.0 initializes one sparse result through a dense zero array, then
-    densifies each already-sparse affine parameter map solely to apply a scalar
-    or row-wise sign. A 150-asset, eight-horizon MPO attempts a roughly 35 GiB
-    temporary in the latter step. The adapter is version-pinned, so patch that
-    method while generation is serialized and restore it immediately afterward.
+    calls ``affine_map.mapping.toarray()`` solely to apply a scalar or row-wise
+    sign. A 150-asset, eight-horizon MPO makes that second array roughly 34.9
+    GiB. The adapter is version-pinned, so patch that method while generation is
+    serialized and restore it immediately afterward.
     """
 
     from cvxpygen import canonicalizer as canonicalizer_module
@@ -484,18 +529,13 @@ def _sparse_cvxpygen_canonical_maps():
                 mapping_to_sparse = param_prob.reduced_A.reduced_mat[
                     affine_map.mapping_rows
                 ]
-                dense_shape = (
+                affine_map.mapping = _scatter_sparse_rows(
+                    canonicalizer_module.sparse,
+                    canonicalizer_module.np,
+                    mapping_to_sparse,
+                    affine_map.indices,
                     affine_map.shape[0],
-                    mapping_to_sparse.shape[1],
                 )
-                mapping_to_dense = canonicalizer_module.sparse.lil_matrix(
-                    dense_shape, dtype=mapping_to_sparse.dtype
-                )
-                for data_index, sparse_row in enumerate(mapping_to_sparse):
-                    mapping_to_dense[
-                        affine_map.indices[data_index], :
-                    ] = sparse_row
-                affine_map.mapping = mapping_to_dense.tocsr()
             if len(affine_map.mapping.shape) < 2:
                 affine_map.mapping = affine_map.mapping.reshape(1, -1)
             affine_map.mapping = affine_map.mapping.tocsr()
@@ -507,19 +547,11 @@ def _sparse_cvxpygen_canonical_maps():
                 parameter_info,
                 affine_map.mapping,
             )
-            sign = canonicalizer_module.np.asarray(affine_map.sign).reshape(-1)
-            if sign.size == 1:
-                affine_map.mapping.data *= sign.item()
-            else:
-                if sign.size != affine_map.mapping.shape[0]:
-                    raise ValueError(
-                        f"unexpected CVXPYgen affine-map sign shape {sign.shape}"
-                    )
-                indptr = affine_map.mapping.indptr
-                for row in canonicalizer_module.np.flatnonzero(sign != 1):
-                    affine_map.mapping.data[
-                        indptr[row] : indptr[row + 1]
-                    ] *= sign[row]
+            affine_map.mapping = _apply_sparse_sign(
+                canonicalizer_module.np,
+                affine_map.mapping,
+                affine_map.sign,
+            )
             affine_map, parameter_canon = self._set_default_values(
                 affine_map,
                 p_id,

@@ -13,9 +13,10 @@ import pytest
 
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
-    clarabel_program,
+    cvxpy_program,
     generate_clarabel_program,
     get_field,
+    previous_solution,
 )
 from trading_dsl_engine.cpp_stream.python.compiler_support import build_shared
 
@@ -80,6 +81,52 @@ def _generate_qp(tmp_path: Path):
         class_name="GeneratedQp",
         prefix="qp_",
     )
+
+
+def test_sparse_canonical_map_helpers_never_densify(monkeypatch):
+    from scipy import sparse
+
+    from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
+        _apply_sparse_sign,
+        _scatter_sparse_rows,
+    )
+
+    source = sparse.csr_matrix(
+        np.asarray(
+            [
+                [1.0, 0.0, 2.0, 0.0],
+                [0.0, 3.0, 0.0, 4.0],
+                [5.0, 0.0, 0.0, 6.0],
+            ]
+        )
+    )
+    scattered = _scatter_sparse_rows(
+        sparse, np, source, np.asarray([4, 1, 3]), 6
+    )
+    expected = np.zeros((6, 4))
+    expected[[4, 1, 3]] = source.toarray()
+    np.testing.assert_array_equal(scattered.toarray(), expected)
+
+    def forbidden_toarray(*_args, **_kwargs):
+        raise AssertionError("sparse canonical map was materialized")
+
+    monkeypatch.setattr(sparse.csr_matrix, "toarray", forbidden_toarray)
+    signed = _apply_sparse_sign(
+        np, scattered, np.asarray([1.0, -1.0, 1.0, 2.0, -3.0, 1.0])
+    )
+    rows, columns = signed.nonzero()
+    values = {
+        (int(row), int(column)): float(signed[row, column])
+        for row, column in zip(rows, columns)
+    }
+    assert values == {
+        (1, 1): -3.0,
+        (1, 3): -4.0,
+        (3, 0): 10.0,
+        (3, 3): 12.0,
+        (4, 0): -3.0,
+        (4, 2): -6.0,
+    }
 
 
 def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
@@ -339,6 +386,7 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
         textwrap.dedent(
             """
             #include "cpg_instance.hpp"
+            #include "stackdsl/ops/cvxpygen.hpp"
             #include <array>
             #include <atomic>
             #include <cstddef>
@@ -380,17 +428,78 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
                 return __real_aligned_alloc(alignment, size);
             }
 
-            int main() {
-                GeneratedQp solver;
-                std::array<double, 3> target{1.0, 2.0, 3.0};
+            struct InitialSource {
+                using shape = stackdsl::TensorShape<3>;
+                template <class Context>
+                static double read_flat(
+                    const Context& ctx, std::size_t offset
+                ) noexcept {
+                    return ctx.initial[offset];
+                }
+                template <class Context>
+                static void load_contiguous(
+                    const Context& ctx,
+                    std::size_t base,
+                    std::size_t count,
+                    double* out
+                ) noexcept {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        out[index] = ctx.initial[base + index];
+                    }
+                }
+            };
+
+            struct LowerSource {
+                using shape = stackdsl::TensorShape<3>;
+                template <class Context>
+                static double read_flat(
+                    const Context& ctx, std::size_t offset
+                ) noexcept {
+                    return ctx.lower[offset];
+                }
+                template <class Context>
+                static void load_contiguous(
+                    const Context& ctx,
+                    std::size_t base,
+                    std::size_t count,
+                    double* out
+                ) noexcept {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        out[index] = ctx.lower[base + index];
+                    }
+                }
+            };
+
+            struct Output {};
+            struct Context {
+                std::array<double, 3> initial{1.0, 2.0, 3.0};
                 std::array<double, 3> lower{0.0, 0.0, 0.0};
+                std::array<double, 3> output{};
+
+                template <class>
+                double* write_ptr() noexcept { return output.data(); }
+            };
+
+            using Node = stackdsl::CvxpygenNode<
+                GeneratedQp,
+                stackdsl::CvxpygenParameterList<
+                    stackdsl::CvxpygenPreviousPrimalBinding<
+                        0, 0, 0, 3, 1, InitialSource>,
+                    stackdsl::CvxpygenParameterBinding<1, LowerSource>
+                >,
+                stackdsl::CvxpygenProjectionList<
+                    stackdsl::CvxpygenPrimalProjection<0, 0, 3, 1, Output>
+                >
+            >;
+
+            int main() {
+                Node node;
+                Context context;
+                node.setup();
                 auto solve = [&](int iteration) {
-                    target[0] = 1.0 + 1e-5 * iteration;
-                    solver.set_target(target);
-                    solver.set_lower(lower);
-                    solver.solve();
-                    return solver.primal_x()[0]
-                        + 1e-12 * solver.result().info->iter;
+                    context.lower[0] = 1e-6 * iteration;
+                    node.on_data(context);
+                    return context.output[0];
                 };
                 volatile double checksum = 0.0;
                 for (int iteration = 0; iteration < 10; ++iteration) {
@@ -413,6 +522,7 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
         os.environ.get("CXX", "g++"),
         "-std=gnu++20",
         "-O3",
+        "-Isrc/trading_dsl_engine/cpp_stream/cpp",
         *(f"-I{path}" for path in artifact.include_dirs),
         str(driver),
         str(artifact.clarabel.static_library),
@@ -443,13 +553,9 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
 
     native = _clarabel_native()
 
-    @clarabel_program(
+    @cvxpy_program(
         cache_dir=tmp_path / "program-cache",
         clarabel=native,
-        parameter_options={
-            "half_spread_bps": {"nonneg": True},
-            "risk_radius": {"nonneg": True},
-        },
     )
     def MPO(
         expected_returns,
@@ -459,6 +565,19 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
         risk_radius=0.08,
     ) -> cp.Problem:
         n_horizons, n_assets = expected_returns.shape
+        expected_returns = cp.Parameter(
+            expected_returns.shape, name="expected_returns"
+        )
+        half_spread_bps = cp.Parameter(
+            half_spread_bps.shape,
+            name="half_spread_bps",
+            nonneg=True,
+        )
+        current_weights = cp.Parameter(
+            current_weights.shape, name="current_weights"
+        )
+        risk_factor = cp.Parameter(risk_factor.shape, name="risk_factor")
+        risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
         weights = cp.Variable((n_horizons, n_assets), name="weights")
         turnover = cp.Variable((n_horizons, n_assets), name="turnover")
         delta = weights - cp.vstack([current_weights, weights[:-1]])
@@ -567,6 +686,15 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
         data["risk_factor"][-1],
         0.08,
     )
+    reference_values = {
+        "expected_returns": data["expected_returns"][-1].T,
+        "half_spread_bps": data["half_spread_bps"][-1],
+        "current_weights": data["current_weights"][-1],
+        "risk_factor": data["risk_factor"][-1],
+        "risk_radius": 0.08,
+    }
+    for parameter in reference.parameters():
+        parameter.value = reference_values[parameter.name()]
     reference.solve(solver=cp.CLARABEL, presolve_enable=False)
     reference_weights = next(
         variable for variable in reference.variables() if variable.name() == "weights"
@@ -632,6 +760,152 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
     )
     with pytest.raises(KeyError, match="unknown generated field"):
         compile_formula(get_field(invalid, "not_a_solver_field"), data)
+
+
+def test_previous_solution_feedback_is_initialized_and_forces_sequential_rows(
+    tmp_path: Path, monkeypatch
+):
+    from trading_dsl_engine.base.dsl import ewm, var
+    from trading_dsl_engine.cpp_stream import compile_formula
+
+    @cvxpy_program(
+        cache_dir=tmp_path / "feedback-program-cache",
+        clarabel=_clarabel_native(),
+    )
+    def FollowTarget(target, current_weights) -> cp.Problem:
+        shape = target.shape
+        target = cp.Parameter(shape, name="target")
+        # This parameter's shape comes from the target declaration, allowing a
+        # scalar first-row initializer to broadcast without weakening shape
+        # validation of ordinary direct bindings.
+        current_weights = cp.Parameter(shape, name="current_weights")
+        weights = cp.Variable(shape, name="weights")
+        return cp.Problem(
+            cp.Minimize(
+                cp.sum_squares(weights - target)
+                + cp.sum_squares(weights - current_weights)
+            )
+        )
+
+    rows, n_assets = 9, 4
+    rng = np.random.default_rng(707)
+    targets = rng.normal(scale=0.1, size=(rows, n_assets))
+    mpo = FollowTarget(
+        target=var("target"),
+        current_weights=previous_solution("weights", initial=0.0),
+    )
+    weights = get_field(mpo, "weights")
+    monkeypatch.setenv(
+        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE",
+        str(tmp_path / "feedback-native-cache"),
+    )
+    runtime = compile_formula(weights, {"target": targets})
+    assert runtime.parallel_plan.mode == "serial"
+    assert "prior-solve state" in runtime.parallel_plan.reason
+    generated = runtime.generated_cpp.read_text()
+    assert "stackdsl::CvxpygenPreviousPrimalBinding" in generated
+
+    actual = runtime.run(
+        out_path=tmp_path / "feedback.npy", threads=8
+    ).load(mmap_mode=None)
+    expected = np.empty_like(targets)
+    previous = np.zeros(n_assets)
+    for row in range(rows):
+        expected[row] = 0.5 * (targets[row] + previous)
+        previous = expected[row]
+    np.testing.assert_allclose(actual, expected, rtol=5e-5, atol=2e-7)
+
+    initial_weights = rng.normal(scale=0.05, size=n_assets)
+    vector_initialized = FollowTarget(
+        target=var("target"),
+        current_weights=previous_solution(
+            "weights", initial=var("initial_weights")
+        ),
+    )
+    vector_runtime = compile_formula(
+        get_field(vector_initialized, "weights"),
+        {
+            "target": targets,
+            "initial_weights": np.broadcast_to(
+                initial_weights, targets.shape
+            ).copy(),
+        },
+    )
+    vector_actual = vector_runtime.run(
+        out_path=tmp_path / "feedback-vector-initial.npy"
+    ).load(mmap_mode=None)
+    vector_expected = np.empty_like(targets)
+    previous = initial_weights
+    for row in range(rows):
+        vector_expected[row] = 0.5 * (targets[row] + previous)
+        previous = vector_expected[row]
+    np.testing.assert_allclose(
+        vector_actual, vector_expected, rtol=5e-5, atol=2e-7
+    )
+
+    independent = FollowTarget(
+        target=var("target"),
+        current_weights=var("current_weights"),
+    )
+    independent_runtime = compile_formula(
+        get_field(independent, "weights"),
+        {
+            "target": targets,
+            "current_weights": np.zeros_like(targets),
+        },
+    )
+    assert independent_runtime.parallel_plan.mode == "rows"
+
+    IndependentHint = cvxpy_program(
+        FollowTarget.factory,
+        cache_dir=tmp_path / "feedback-program-cache",
+        clarabel=_clarabel_native(),
+        sequential=False,
+    )
+    stateful_input = IndependentHint(
+        target=ewm(var("target"), 3),
+        current_weights=var("current_weights"),
+    )
+    stateful_runtime = compile_formula(
+        get_field(stateful_input, "weights"),
+        {
+            "target": targets,
+            "current_weights": np.zeros_like(targets),
+        },
+    )
+    assert stateful_runtime.parallel_plan.mode == "serial"
+
+    OrderedTarget = cvxpy_program(
+        FollowTarget.factory,
+        cache_dir=tmp_path / "feedback-program-cache",
+        clarabel=_clarabel_native(),
+        sequential=True,
+    )
+    ordered = OrderedTarget(
+        target=var("target"),
+        current_weights=var("current_weights"),
+    )
+    ordered_runtime = compile_formula(
+        get_field(ordered, "weights"),
+        {
+            "target": targets,
+            "current_weights": np.zeros_like(targets),
+        },
+    )
+    assert ordered_runtime.parallel_plan.mode == "serial"
+    assert len(
+        tuple(
+            (tmp_path / "feedback-program-cache").rglob(
+                "cpg_instance_manifest.json"
+            )
+        )
+    ) == 1
+
+    with pytest.raises(ValueError, match="temporal dependency"):
+        IndependentHint(
+            target=var("target"),
+            current_weights=previous_solution("weights", initial=0.0),
+        )
 
 
 def test_full_ridge_riskmodel_mpo_pipeline_has_one_time_loop(

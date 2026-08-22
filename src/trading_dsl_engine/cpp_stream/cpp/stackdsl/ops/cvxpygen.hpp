@@ -13,7 +13,26 @@ namespace stackdsl {
 template <std::size_t Index, class TensorSource>
 struct CvxpygenParameterBinding {
     static constexpr std::size_t index = Index;
+    static constexpr bool feedback = false;
     using source_type = TensorSource;
+};
+
+template <
+    std::size_t Index,
+    std::size_t PrimalIndex,
+    std::size_t Offset,
+    std::size_t Count,
+    std::size_t Stride,
+    class InitialSource
+>
+struct CvxpygenPreviousPrimalBinding {
+    static constexpr std::size_t index = Index;
+    static constexpr bool feedback = true;
+    static constexpr std::size_t primal_index = PrimalIndex;
+    static constexpr std::size_t offset = Offset;
+    static constexpr std::size_t count = Count;
+    static constexpr std::size_t stride = Stride;
+    using source_type = InitialSource;
 };
 
 template <class... Bindings>
@@ -79,7 +98,7 @@ class CvxpygenNode<
     }
 
     template <class Binding, class Context>
-    STACKDSL_HOT bool load_parameter(const Context& ctx) {
+    STACKDSL_HOT bool load_direct_parameter(const Context& ctx) {
         constexpr std::size_t index = Binding::index;
         using Source = typename Binding::source_type;
         static_assert(
@@ -101,6 +120,87 @@ class CvxpygenNode<
         Source::load_contiguous(ctx, 0, target.size(), target.data());
         program_.template mark_parameter_dirty<index>();
         return true;
+    }
+
+    template <class Binding, class Context>
+    STACKDSL_HOT bool load_feedback_parameter(const Context& ctx) {
+        constexpr std::size_t index = Binding::index;
+        using Initial = typename Binding::source_type;
+        static_assert(
+            Binding::count == Program::template parameter_size<index>(),
+            "CVXPYgen feedback field and parameter sizes differ"
+        );
+        static_assert(
+            Initial::shape::size == 1
+                || Initial::shape::size
+                    == Program::template parameter_size<index>(),
+            "CVXPYgen feedback initializer must be scalar or parameter-shaped"
+        );
+        auto target = program_.template parameter_buffer<index>();
+        bool changed = false;
+        if (!has_solution_) {
+            if constexpr (Initial::shape::size == 1) {
+                const double value = Initial::read_flat(ctx, 0);
+                for (std::size_t offset = 0; offset < target.size(); ++offset) {
+                    if (!same_value(static_cast<double>(target[offset]), value)) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if (!changed) return false;
+                for (auto& item : target) item = value;
+            } else {
+                for (std::size_t offset = 0; offset < target.size(); ++offset) {
+                    if (!same_value(
+                            static_cast<double>(target[offset]),
+                            Initial::read_flat(ctx, offset)
+                        )) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if (!changed) return false;
+                Initial::load_contiguous(
+                    ctx, 0, target.size(), target.data());
+            }
+        } else {
+            const auto previous =
+                program_.template primal<Binding::primal_index>();
+            for (std::size_t offset = 0; offset < target.size(); ++offset) {
+                const double value = previous[
+                    Binding::offset + offset * Binding::stride];
+                if (!same_value(static_cast<double>(target[offset]), value)) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed) return false;
+            for (std::size_t offset = 0; offset < target.size(); ++offset) {
+                target[offset] = previous[
+                    Binding::offset + offset * Binding::stride];
+            }
+        }
+        program_.template mark_parameter_dirty<index>();
+        return true;
+    }
+
+    template <class Binding, class Context>
+    STACKDSL_HOT bool load_parameter(const Context& ctx) {
+        if constexpr (Binding::feedback) {
+            return load_feedback_parameter<Binding>(ctx);
+        } else {
+            return load_direct_parameter<Binding>(ctx);
+        }
+    }
+
+    template <class Binding>
+    STACKDSL_HOT void cache_feedback_result() noexcept {
+        if constexpr (Binding::feedback) {
+            // Some CVXPY inverse maps depend on parameter values. Retrieve the
+            // carried primal immediately after its solve, before the following
+            // row writes any new parameter buffers.
+            (void)program_.template primal<Binding::primal_index>();
+        }
     }
 
     template <class Projection, class Context>
@@ -141,6 +241,7 @@ public:
             program_.solve();
             has_solution_ = true;
         }
+        (cache_feedback_result<Bindings>(), ...);
         (project<Projections>(ctx), ...);
     }
 };
