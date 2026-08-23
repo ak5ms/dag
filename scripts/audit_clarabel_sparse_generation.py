@@ -23,38 +23,24 @@ from scipy import sparse
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
     build_current_clarabel,
-    generate_clarabel_program,
+)
+from trading_dsl_engine.cpp_stream.optimizer.direct_clarabel import (
+    generate_clarabel_artifact,
 )
 
 
-N_ASSETS = int(
-    os.environ.get(
-        "CLARABEL_AUDIT_ASSETS",
-        os.environ.get("CVXPYGEN_AUDIT_ASSETS", "150"),
-    )
-)
-N_HORIZONS = int(
-    os.environ.get(
-        "CLARABEL_AUDIT_HORIZONS",
-        os.environ.get("CVXPYGEN_AUDIT_HORIZONS", "8"),
-    )
-)
+N_ASSETS = int(os.environ.get("CLARABEL_AUDIT_ASSETS", "150"))
+N_HORIZONS = int(os.environ.get("CLARABEL_AUDIT_HORIZONS", "8"))
 DENSE_LIMIT_BYTES = int(
     os.environ.get(
         "CLARABEL_AUDIT_DENSE_LIMIT_BYTES",
-        os.environ.get(
-            "CVXPYGEN_AUDIT_DENSE_LIMIT_BYTES",
-            str(512 * 1024 * 1024),
-        ),
+        str(512 * 1024 * 1024),
     )
 )
 OUTPUT_DIR = Path(
     os.environ.get(
         "CLARABEL_AUDIT_OUTPUT_DIR",
-        os.environ.get(
-            "CVXPYGEN_AUDIT_OUTPUT_DIR",
-            f".generated/clarabel-sharded-audit-{N_ASSETS}x{N_HORIZONS}",
-        ),
+        f".generated/clarabel-sharded-audit-{N_ASSETS}x{N_HORIZONS}",
     )
 )
 PARAMETER_SHARD_SIZE = int(
@@ -171,7 +157,7 @@ def main() -> None:
                     guarded_toarray(original, cls.__name__),
                 )
             )
-        artifact = generate_clarabel_program(
+        artifact = generate_clarabel_artifact(
             _problem(),
             code_dir=OUTPUT_DIR,
             clarabel=_clarabel(),

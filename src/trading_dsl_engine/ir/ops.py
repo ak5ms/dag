@@ -397,7 +397,7 @@ class RidgeProjectionOp:
 
 
 @dataclass(frozen=True, slots=True)
-class CvxpygenProgramOp:
+class CvxpyProgramOp:
     """Object-valued generated convex program with named parameter bindings."""
 
     program: object
@@ -407,7 +407,7 @@ class CvxpygenProgramOp:
 
 
 @dataclass(frozen=True, slots=True)
-class CvxpygenProjectionOp:
+class CvxpyProjectionOp:
     """One compile-time projection from a generated convex-program result."""
 
     field: object
@@ -475,8 +475,8 @@ OpSpec: TypeAlias = (
     | InstrumentBasisProjectionOp
     | RidgeOp
     | RidgeProjectionOp
-    | CvxpygenProgramOp
-    | CvxpygenProjectionOp
+    | CvxpyProgramOp
+    | CvxpyProjectionOp
     | GroupByOp
 )
 
@@ -521,8 +521,8 @@ __all__ = [
     "InstrumentBasisProjectionOp",
     "RidgeOp",
     "RidgeProjectionOp",
-    "CvxpygenProgramOp",
-    "CvxpygenProjectionOp",
+    "CvxpyProgramOp",
+    "CvxpyProjectionOp",
     "GroupKeySpec",
     "GroupByOp",
     "OpSpec",

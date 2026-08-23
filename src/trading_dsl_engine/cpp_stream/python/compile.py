@@ -24,7 +24,7 @@ from trading_dsl_engine.cpp_stream.python.output_projection import (
 from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
 from trading_dsl_engine.cpp_stream.python.parallel import select_parallel_plan
 from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
-from trading_dsl_engine.ir.ops import CvxpygenProgramOp
+from trading_dsl_engine.ir.ops import CvxpyProgramOp
 from trading_dsl_engine.cpp_stream.python.sources import SourceValue
 
 
@@ -77,7 +77,7 @@ def _compile_program(
     generated_programs = []
     seen_programs = set()
     for node in program.nodes:
-        if not isinstance(node.op, CvxpygenProgramOp):
+        if not isinstance(node.op, CvxpyProgramOp):
             continue
         artifact = node.op.program
         key = (str(artifact.root), artifact.class_name, artifact.prefix)

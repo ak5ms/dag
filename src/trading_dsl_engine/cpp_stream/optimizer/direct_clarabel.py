@@ -867,31 +867,33 @@ def _emit_direct_header(
             ),
         )
     )
-    (header_dir / "cpg_instance.hpp").write_text(
-        environment.get_template("cpg_instance_alias.hpp.j2").render(
-            instance_header=header.name,
-        )
-    )
     return header
 
 
-def generate_direct_clarabel_program(
+def generate_clarabel_artifact(
     problem: Any,
     *,
     code_dir: str | os.PathLike[str],
     clarabel: Any,
-    class_name: str,
-    prefix: str,
-    instrument_count: int | None,
-    enable_settings: Iterable[str],
-    field_aliases: Mapping[str, str] | None,
-    force: bool,
+    class_name: str = "GeneratedClarabelProgram",
+    prefix: str = "clarabel_",
+    instrument_count: int | None = None,
+    enable_settings: Iterable[str] = (
+        "verbose",
+        "max_iter",
+        "tol_gap_abs",
+        "tol_gap_rel",
+        "tol_feas",
+        "presolve_enable",
+    ),
+    field_aliases: Mapping[str, str] | None = None,
+    force: bool = False,
     parameter_shard_size: int = 512,
 ):
     from .clarabel_native import (
         DualLayout,
         FieldAlias,
-        GeneratedCvxpygenProgram,
+        GeneratedClarabelProgram,
         ParameterLayout,
         PrimalLayout,
         _constraint_dual_shape,
@@ -985,7 +987,7 @@ def generate_direct_clarabel_program(
         for name, primal_name in sorted(alias_mapping.items())
     )
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "backend": "cvxpy-direct-clarabel",
         "class_name": class_name,
         "prefix": prefix,
@@ -1028,9 +1030,9 @@ def generate_direct_clarabel_program(
             for item in aliases
         ],
     }
-    manifest_path = root / "cpp" / "cpg_instance_manifest.json"
+    manifest_path = root / "cpp" / "clarabel_program_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    return GeneratedCvxpygenProgram(
+    return GeneratedClarabelProgram(
         root,
         header,
         manifest_path,
@@ -1045,7 +1047,7 @@ def generate_direct_clarabel_program(
     )
 
 
-def load_direct_clarabel_program(
+def load_clarabel_artifact(
     code_dir: str | os.PathLike[str],
     *,
     clarabel: Any,
@@ -1053,16 +1055,16 @@ def load_direct_clarabel_program(
     from .clarabel_native import (
         DualLayout,
         FieldAlias,
-        GeneratedCvxpygenProgram,
+        GeneratedClarabelProgram,
         ParameterLayout,
         PrimalLayout,
         _package_version,
     )
 
     root = Path(code_dir).expanduser().resolve()
-    manifest_path = root / "cpp" / "cpg_instance_manifest.json"
+    manifest_path = root / "cpp" / "clarabel_program_manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema_version") != 3:
+    if manifest.get("schema_version") != 4:
         raise ValueError(
             f"unsupported generated-program manifest schema in {manifest_path}"
         )
@@ -1120,7 +1122,7 @@ def load_direct_clarabel_program(
         for item in manifest.get("aliases", ())
     )
     instrument_count = manifest.get("instrument_count")
-    return GeneratedCvxpygenProgram(
+    return GeneratedClarabelProgram(
         root,
         instance_header,
         manifest_path,
@@ -1137,6 +1139,6 @@ def load_direct_clarabel_program(
 
 __all__ = [
     "compile_sharded_canonical_program",
-    "generate_direct_clarabel_program",
-    "load_direct_clarabel_program",
+    "generate_clarabel_artifact",
+    "load_clarabel_artifact",
 ]

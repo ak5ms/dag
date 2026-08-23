@@ -57,8 +57,8 @@ bounds, fail generation explicitly rather than producing a wrong ABI.
 Primal fields likewise require ordinary CVXPY variables with a direct canonical
 offset; dimension-reducing variable attributes such as `symmetric=True` are
 rejected until an allocation-free inverse map is implemented.
-Consequently the same function name binds streaming expressions; there is no
-separate `bind_program()` or `generate_clarabel_program()` call:
+Consequently the decorated function is the sole public binding and generation
+boundary:
 
 ```python
 import cvxpy as cp
@@ -173,9 +173,9 @@ optimization problem.
 
 ### Cache boundary
 
-The CVXPY/Clarabel sub-compilation is cached independently of the surrounding formula.
-Its key covers the factory implementation, declared parameter shapes and
-attributes, resulting problem structure, and enabled solver settings. Direct
+The CVXPY/Clarabel sub-compilation is cached independently of the surrounding
+formula. Its key covers the factory implementation, declared parameter shapes
+and attributes, resulting problem structure, and enabled solver settings. Direct
 bindings and prior-solution bindings therefore reuse the same solver artifact;
 their source dtype/layout remains part of the surrounding native-runner cache.
 The same MPO can be reused in another outer formula without regenerating its
@@ -188,57 +188,6 @@ link-cache invalidation, and placing upstream formulas, the solve, and downstrea
 consumers in one row loop. It does not make the isolated cone canonicalization
 faster, so the MPO sub-program and the full fused runner use
 separate cache layers.
-
-## Explicit generation API
-
-`generate_clarabel_program()` remains available when a generated solver class
-is needed outside the formula DSL. Provide a current Clarabel C header and
-static library explicitly, or use the allocation-free pinned build returned by
-`build_current_clarabel()`.
-
-```python
-x = cp.Variable(3, name="x")
-A = cp.Parameter((4, 3), name="A")
-b = cp.Parameter(4, name="b")
-problem = cp.Problem(cp.Minimize(cp.sum_squares(A @ x - b)))
-program = generate_clarabel_program(
-    problem,
-    code_dir=".generated/least_squares",
-    clarabel=build_current_clarabel(),
-    class_name="GeneratedLeastSquares",
-    prefix="least_squares_",
-)
-```
-
-The generated header exposes bulk, column-major parameter setters, a persistent
-`solve()`, zero-copy named primal/dual/info views, and the Clarabel solution:
-
-```cpp
-#include "cpg_instance.hpp"
-
-GeneratedLeastSquares solver;
-solver.set_A(a_values);
-solver.set_b(b_values);
-solver.solve();
-auto x = solver.primal_x();
-auto const& solution = solver.result();
-```
-
-`GeneratedClarabelProgram.build_shared_kwargs()` supplies the include, link, and
-cache-fingerprint arguments required by cpp_stream's existing native build:
-
-```python
-from trading_dsl_engine.cpp_stream.python.compiler_support import build_shared
-
-library, source = build_shared(
-    generated_translation_unit,
-    **program.build_shared_kwargs(),
-)
-```
-
-The cache key includes every generated public header, the generated manifest,
-and the linked Clarabel archive. Changing the CVXPY problem, generated ABI, or
-native solver therefore produces a new compiled artifact.
 
 ## Parallel independent problems
 
@@ -258,7 +207,7 @@ across rows.
 
 ## Performance
 
-`benchmarks/cvxpygen_persistent_instances.md` covers 9–150 assets at eight
+`benchmarks/clarabel_persistent_instances.md` covers 9–150 assets at eight
 horizons in all-changing, objective-only, and bitwise-unchanged regimes. It
 includes parameter change detection, any required copies and canonicalization,
 Clarabel update/solve, requested-only projection, allocation wrapping, resident
@@ -284,7 +233,7 @@ The audit rejects any individual `numpy.zeros` or SciPy sparse `toarray()`
 allocation at or above 512 MiB; all five runs recorded zero rejected attempts.
 Using the conservative absolute process peak, this is a 97.3% generation-time
 reduction and a 91.3% peak-RSS reduction versus the patched CVXPYgen route.
-`scripts/audit_cvxpygen_sparse_generation.py` reproduces it;
+`scripts/audit_clarabel_sparse_generation.py` reproduces it;
 `CLARABEL_AUDIT_PARAMETER_SHARD_SIZE` tunes the compile-time time/memory
 tradeoff. The generator collects cyclic CVXPY objects once after all shards,
 releases shard graphs through normal reference counting, avoiding explicit
@@ -314,9 +263,9 @@ second loop. `examples/cpp_stream_mpo_one_pass.py` asserts that the generated
 translation unit contains exactly one temporal `for (t)` loop and one generated
 optimizer stage even though it requests both weights and turnover.
 
-Before copying a bound parameter, the native optimizer node bitwise-compares it with the
-instance-owned parameter buffer. Unchanged parameters do not dirty their
-canonical blocks. Primals and duals are direct zero-copy solution spans, and
+Before copying a bound parameter, the native optimizer node bitwise-compares it
+with the instance-owned parameter buffer. Unchanged parameters do not dirty
+their canonical blocks. Primals and duals are direct zero-copy solution spans, and
 only requested fields are projected. The pinned Clarabel build preserves timer
 storage across resets; allocator
 wrapping verifies zero `malloc`, `calloc`, `realloc`, or `aligned_alloc` calls

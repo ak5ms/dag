@@ -120,6 +120,9 @@ This backend must remain independent of `jax_flat`.
   primal/dual/info projections and direct versus feedback bindings must reuse
   the same sub-program; requested constraint-value auxiliaries may require a
   distinct problem artifact.
+- The decorated factory is the sole public binding/generation route. Keep
+  compile-time artifact emission internal and do not add manual bind helpers,
+  compatibility aliases, or CVXPYgen-named cache/header/stage paths.
 - `previous_solution(field, initial=...)` is a delayed optimizer-state edge.
   The first row accepts a scalar broadcast or exact-shape initializer; later
   rows copy the selected prior primal directly into the parameter buffer before

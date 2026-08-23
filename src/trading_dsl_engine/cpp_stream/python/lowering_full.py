@@ -38,8 +38,8 @@ from trading_dsl_engine.ir.ops import (
     ReductionOp,
     RidgeOp,
     RidgeProjectionOp,
-    CvxpygenProgramOp,
-    CvxpygenProjectionOp,
+    CvxpyProgramOp,
+    CvxpyProjectionOp,
     RollingDecayOp,
     RollingEntropyOp,
     RollingKthOp,
@@ -92,7 +92,7 @@ def _build_plan(
     next_matrix_slot = 0
     max_matrix_width = 1
     materialized_sources: dict[Source, Source] = {}
-    cvxpygen_stage_by_object: dict[Source, int] = {}
+    clarabel_stage_by_object: dict[Source, int] = {}
 
     def source_slot_dependencies(source: Source) -> frozenset[tuple[str, int]]:
         dependencies: set[tuple[str, int]] = set()
@@ -538,9 +538,9 @@ def _build_plan(
             )
             continue
 
-        if isinstance(op, CvxpygenProgramOp):
+        if isinstance(op, CvxpyProgramOp):
             sources[node_id] = Source(
-                "cvxpygen",
+                "clarabel",
                 width=1,
                 shape=(),
                 parts=children,
@@ -553,10 +553,10 @@ def _build_plan(
                 )
             continue
 
-        if isinstance(op, CvxpygenProjectionOp):
+        if isinstance(op, CvxpyProjectionOp):
             object_source = children[0]
-            if object_source.kind != "cvxpygen" or not isinstance(
-                object_source.op, CvxpygenProgramOp
+            if object_source.kind != "clarabel" or not isinstance(
+                object_source.op, CvxpyProgramOp
             ):
                 raise CppStreamLoweringError(
                     "optimizer projection lost its generated program object"
@@ -564,7 +564,7 @@ def _build_plan(
             field = op.field
             out = value_dest(is_root, node_shape)
             member = Stage(
-                "cvxpygen",
+                "clarabel",
                 object_source.parts,
                 out,
                 1,
@@ -574,20 +574,20 @@ def _build_plan(
                 projection=field.name,
                 final_only=final_only,
             )
-            previous_index = cvxpygen_stage_by_object.get(object_source)
+            previous_index = clarabel_stage_by_object.get(object_source)
             if previous_index is None:
-                cvxpygen_stage_by_object[object_source] = len(stages)
+                clarabel_stage_by_object[object_source] = len(stages)
                 stages.append(member)
             else:
                 previous = stages[previous_index]
                 members = (
                     previous.members
-                    if previous.kind == "cvxpygen_bundle"
+                    if previous.kind == "clarabel_bundle"
                     else (previous,)
                 )
                 stages[previous_index] = replace(
                     previous,
-                    kind="cvxpygen_bundle",
+                    kind="clarabel_bundle",
                     members=(*members, member),
                 )
             sources[node_id] = source_from_dest(

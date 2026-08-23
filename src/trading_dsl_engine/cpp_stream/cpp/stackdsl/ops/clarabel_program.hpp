@@ -3,7 +3,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -11,7 +10,7 @@
 namespace stackdsl {
 
 template <std::size_t Index, class TensorSource>
-struct CvxpygenParameterBinding {
+struct ClarabelParameterBinding {
     static constexpr std::size_t index = Index;
     static constexpr bool feedback = false;
     using source_type = TensorSource;
@@ -25,7 +24,7 @@ template <
     std::size_t Stride,
     class InitialSource
 >
-struct CvxpygenPreviousPrimalBinding {
+struct ClarabelPreviousPrimalBinding {
     static constexpr std::size_t index = Index;
     static constexpr bool feedback = true;
     static constexpr std::size_t primal_index = PrimalIndex;
@@ -36,24 +35,24 @@ struct CvxpygenPreviousPrimalBinding {
 };
 
 template <class... Bindings>
-struct CvxpygenParameterList {};
+struct ClarabelParameterList {};
 
-enum class CvxpygenResultKind : std::uint8_t {
+enum class ClarabelResultKind : std::uint8_t {
     Primal,
     Dual,
     Info,
 };
 
 template <
-    CvxpygenResultKind Kind,
+    ClarabelResultKind Kind,
     std::size_t SourceIndex,
     std::size_t Offset,
     std::size_t Count,
     std::size_t Stride,
     class Out
 >
-struct CvxpygenProjection {
-    static constexpr CvxpygenResultKind kind = Kind;
+struct ClarabelProjection {
+    static constexpr ClarabelResultKind kind = Kind;
     static constexpr std::size_t source_index = SourceIndex;
     static constexpr std::size_t offset = Offset;
     static constexpr std::size_t count = Count;
@@ -68,8 +67,8 @@ template <
     std::size_t Stride,
     class Out
 >
-using CvxpygenPrimalProjection = CvxpygenProjection<
-    CvxpygenResultKind::Primal,
+using ClarabelPrimalProjection = ClarabelProjection<
+    ClarabelResultKind::Primal,
     PrimalIndex,
     Offset,
     Count,
@@ -78,16 +77,16 @@ using CvxpygenPrimalProjection = CvxpygenProjection<
 >;
 
 template <class... Projections>
-struct CvxpygenProjectionList {};
+struct ClarabelProjectionList {};
 
 template <class Program, class Parameters, class Projections>
-class CvxpygenNode;
+class ClarabelNode;
 
 template <class Program, class... Bindings, class... Projections>
-class CvxpygenNode<
+class ClarabelNode<
     Program,
-    CvxpygenParameterList<Bindings...>,
-    CvxpygenProjectionList<Projections...>
+    ClarabelParameterList<Bindings...>,
+    ClarabelProjectionList<Projections...>
 > {
     alignas(64) Program program_{};
     bool has_solution_{false};
@@ -207,13 +206,13 @@ class CvxpygenNode<
     STACKDSL_HOT void project(Context& ctx) noexcept {
         auto* STACKDSL_RESTRICT out =
             ctx.template write_ptr<typename Projection::output_type>();
-        if constexpr (Projection::kind == CvxpygenResultKind::Info) {
+        if constexpr (Projection::kind == ClarabelResultKind::Info) {
             static_assert(Projection::count == 1);
             out[0] = program_.template info<Projection::source_index>();
         } else {
             const auto source = [&]() {
                 if constexpr (
-                    Projection::kind == CvxpygenResultKind::Primal
+                    Projection::kind == ClarabelResultKind::Primal
                 ) {
                     return program_.template primal<Projection::source_index>();
                 } else {

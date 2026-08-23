@@ -18,7 +18,7 @@
 #include "stackdsl/ops/instrument_basis_mean.hpp"
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/ops/psd_factor.hpp"
-#include "stackdsl/ops/cvxpygen.hpp"
+#include "stackdsl/ops/clarabel_program.hpp"
 #include "stackdsl/ops/dense_tensor.hpp"
 #include "stackdsl/ops/tensor_ops.hpp"
 #include "stackdsl/ops/output.hpp"

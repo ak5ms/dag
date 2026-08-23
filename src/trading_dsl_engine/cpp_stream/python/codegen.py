@@ -33,7 +33,7 @@ from trading_dsl_engine.ir.ops import (
     RollingEntropyOp,
     RollingKthOp,
     RidgeOp,
-    CvxpygenProgramOp,
+    CvxpyProgramOp,
     RollingOp,
     RollingPrevDiffOp,
     RollingProductOp,
@@ -682,9 +682,9 @@ def _stage_type(
 
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
-    if stage.kind in {"cvxpygen", "cvxpygen_bundle"}:
-        physical = stage if stage.kind == "cvxpygen" else stage.members[0]
-        assert isinstance(physical.op, CvxpygenProgramOp)
+    if stage.kind in {"clarabel", "clarabel_bundle"}:
+        physical = stage if stage.kind == "clarabel" else stage.members[0]
+        assert isinstance(physical.op, CvxpyProgramOp)
         program = physical.op.program
         if len(physical.inputs) != len(program.parameters):
             raise ValueError("generated optimizer parameter/source count mismatch")
@@ -703,7 +703,7 @@ def _stage_type(
             if feedback is None:
                 bindings.append(
                     tmpl(
-                        "stackdsl::CvxpygenParameterBinding",
+                        "stackdsl::ClarabelParameterBinding",
                         IntArg(index),
                         source_type,
                     )
@@ -715,7 +715,7 @@ def _stage_type(
                 )
             bindings.append(
                 tmpl(
-                    "stackdsl::CvxpygenPreviousPrimalBinding",
+                    "stackdsl::ClarabelPreviousPrimalBinding",
                     IntArg(index),
                     IntArg(feedback.source_index),
                     IntArg(feedback.offset),
@@ -724,7 +724,7 @@ def _stage_type(
                     source_type,
                 )
             )
-        members = stage.members if stage.kind == "cvxpygen_bundle" else (stage,)
+        members = stage.members if stage.kind == "clarabel_bundle" else (stage,)
         projections = []
         for member in members:
             if member.projection is None:
@@ -732,12 +732,12 @@ def _stage_type(
             field = program.resolve_field(member.projection)
             projections.append(
                 tmpl(
-                    "stackdsl::CvxpygenProjection",
+                    "stackdsl::ClarabelProjection",
                     Name(
                         {
-                            "primal": "stackdsl::CvxpygenResultKind::Primal",
-                            "dual": "stackdsl::CvxpygenResultKind::Dual",
-                            "info": "stackdsl::CvxpygenResultKind::Info",
+                            "primal": "stackdsl::ClarabelResultKind::Primal",
+                            "dual": "stackdsl::ClarabelResultKind::Dual",
+                            "info": "stackdsl::ClarabelResultKind::Info",
                         }[field.kind]
                     ),
                     IntArg(field.source_index),
@@ -748,10 +748,10 @@ def _stage_type(
                 )
             )
         return tmpl(
-            "stackdsl::CvxpygenNode",
+            "stackdsl::ClarabelNode",
             Name(program.class_name),
-            tmpl("stackdsl::CvxpygenParameterList", *bindings),
-            tmpl("stackdsl::CvxpygenProjectionList", *projections),
+            tmpl("stackdsl::ClarabelParameterList", *bindings),
+            tmpl("stackdsl::ClarabelProjectionList", *projections),
         )
     if stage.kind == "copy_bundle":
         assert len(stage.members) > 1

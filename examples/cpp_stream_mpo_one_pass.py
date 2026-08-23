@@ -1,7 +1,7 @@
-"""One-pass Ridge -> risk model -> CVXPYgen MPO -> downstream PnL example.
+"""One-pass Ridge -> risk model -> direct Clarabel MPO -> downstream PnL example.
 
 The generated runner has one temporal loop. Ridge forecasts, the matrix EWM risk
-model, PSD factorization, CVXPYgen canonicalization, persistent Clarabel solve,
+model, PSD factorization, bounded CVXPY canonicalization, persistent Clarabel solve,
 and downstream ``shift(weights[0]) * returns`` all run in that loop. No optimizer
 input is materialized as a historical array and there is no second pass over time.
 """
@@ -48,7 +48,7 @@ def _clarabel() -> ClarabelNativePaths:
 
 
 @cvxpy_program(
-    cache_dir=CACHE / "cvxpygen",
+    cache_dir=CACHE / "clarabel",
     clarabel=_clarabel,
     sequential=None,
 )
@@ -185,7 +185,7 @@ def main() -> None:
     generated = runtime.generated_cpp.read_text()
     row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
     assert generated.count(row_loop) == 1
-    assert generated.count("stackdsl::CvxpygenNode<") == 1
+    assert generated.count("stackdsl::ClarabelNode<") == 1
     assert "stackdsl::PsdFactorNode<" in generated
     assert "stackdsl::RidgeNode<" in generated or "stackdsl::RidgeBundleNode<" in generated
 

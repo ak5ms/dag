@@ -58,7 +58,7 @@ For generated convex programs, CVXPY is used only for bounded, compile-time cone
 canonicalization. Compact sparse parameter maps execute against Clarabel's C ABI
 inside the C++ runtime; CVXPYgen is not a dependency. Generated instances own
 persistent Clarabel state and can be allocated once per independent native
-worker. See [`docs/cvxpygen_cpp_stream.md`](docs/cvxpygen_cpp_stream.md).
+worker. See [`docs/cvxpy_program_cpp_stream.md`](docs/cvxpy_program_cpp_stream.md).
 
 ## DSL composition
 
@@ -264,15 +264,15 @@ initial=0.0)` feeds the prior solve's actual first-horizon portfolio into the
 next row; it automatically makes the stage sequential. Independent programs
 remain eligible for row-parallel worker-owned solvers, and `sequential=True` or
 `False` can assert the intended solver dependency. Concrete shapes and the MPO
-sub-compilation are cached independently of the fused outer runner—no explicit
-`bind_program()` or `generate_clarabel_program()` step is required.
+sub-compilation are cached independently of the fused outer runner. The
+decorated factory is the only supported binding and generation boundary.
 `get_field()` projects named
 primals, labeled constraint values, duals/Lagrangians, objective, status,
 iterations, and residual diagnostics. Sibling fields share one solve and only
 their requested inverse result maps execute. See
-[`docs/cvxpygen_cpp_stream.md`](docs/cvxpygen_cpp_stream.md) for the API and cache
+[`docs/cvxpy_program_cpp_stream.md`](docs/cvxpy_program_cpp_stream.md) for the API and cache
 boundary. The expanded 9–150 asset benchmark and raw samples are under
-[`benchmarks/cvxpygen_persistent_instances.md`](benchmarks/cvxpygen_persistent_instances.md);
+[`benchmarks/clarabel_persistent_instances.md`](benchmarks/clarabel_persistent_instances.md);
 allocator wrapping records zero warm-path allocations.
 
 CVXPYgen is no longer a dependency. Parameter maps are canonicalized in bounded

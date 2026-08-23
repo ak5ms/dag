@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from importlib.metadata import PackageNotFoundError, version
-import json
 from math import prod
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -91,14 +89,6 @@ class FieldLayout:
     stride: int
     logical_shape: tuple[int, ...]
 
-    @property
-    def primal_name(self) -> str:
-        return self.source_name
-
-    @property
-    def primal_index(self) -> int:
-        return self.source_index
-
 
 @dataclass(frozen=True, slots=True)
 class GeneratedClarabelProgram:
@@ -135,21 +125,6 @@ class GeneratedClarabelProgram:
         )
         return *headers, self.manifest_path
 
-    def build_shared_kwargs(self) -> dict[str, tuple[Path, ...]]:
-        return {
-            "extra_include_dirs": self.include_dirs,
-            "extra_link_files": self.link_files,
-            "extra_fingerprint_files": self.fingerprint_files,
-        }
-
-    def compiler_arguments(self) -> tuple[str, ...]:
-        return tuple(f"-I{path}" for path in self.include_dirs) + (
-            str(self.clarabel.static_library),
-            "-ldl",
-            "-lpthread",
-            "-lm",
-        )
-
     def parameter_index(self, name: str) -> int:
         for index, parameter in enumerate(self.parameters):
             if parameter.name == name:
@@ -167,11 +142,6 @@ class GeneratedClarabelProgram:
             duals=self.duals,
             aliases=self.aliases,
         )
-
-
-# Compatibility for the public name used before the direct backend.
-GeneratedCvxpygenProgram = GeneratedClarabelProgram
-
 
 _NO_FIELD_MATCH = object()
 
@@ -357,52 +327,6 @@ def _constraint_label(constraint: Any) -> str | None:
     return label if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", label) else None
 
 
-def generate_clarabel_program(
-    problem: Any,
-    *,
-    code_dir: str | os.PathLike[str],
-    clarabel: ClarabelNativePaths,
-    class_name: str = "GeneratedCvxpyProgram",
-    prefix: str = "cpg_",
-    instrument_count: int | None = None,
-    enable_settings: Iterable[str] = (
-        "verbose",
-        "max_iter",
-        "tol_gap_abs",
-        "tol_gap_rel",
-        "tol_feas",
-        "presolve_enable",
-    ),
-    field_aliases: Mapping[str, str] | None = None,
-    force: bool = False,
-    parameter_shard_size: int = 512,
-) -> GeneratedClarabelProgram:
-    from .direct_clarabel import generate_direct_clarabel_program
-
-    return generate_direct_clarabel_program(
-        problem,
-        code_dir=code_dir,
-        clarabel=clarabel,
-        class_name=class_name,
-        prefix=prefix,
-        instrument_count=instrument_count,
-        enable_settings=enable_settings,
-        field_aliases=field_aliases,
-        force=force,
-        parameter_shard_size=parameter_shard_size,
-    )
-
-
-def load_clarabel_program(
-    code_dir: str | os.PathLike[str],
-    *,
-    clarabel: ClarabelNativePaths,
-) -> GeneratedClarabelProgram:
-    from .direct_clarabel import load_direct_clarabel_program
-
-    return load_direct_clarabel_program(code_dir, clarabel=clarabel)
-
-
 def _patch_clarabel_allocation_free_timers(source_root: Path) -> None:
     timer_path = source_root / "src" / "timers" / "timers.rs"
     text = timer_path.read_text()
@@ -528,28 +452,13 @@ def build_current_clarabel(
     marker.write_text(build_id)
     return ClarabelNativePaths(include, library, rs_tag.removeprefix("v"))
 
-
-def artifact_fingerprint(artifact: GeneratedClarabelProgram) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(artifact.root.rglob("*")):
-        if path.is_file():
-            digest.update(path.relative_to(artifact.root).as_posix().encode())
-            digest.update(path.read_bytes())
-    digest.update(artifact.clarabel.static_library.read_bytes())
-    return digest.hexdigest()
-
-
 __all__ = [
     "ClarabelNativePaths",
     "DualLayout",
     "FieldAlias",
     "FieldLayout",
     "GeneratedClarabelProgram",
-    "GeneratedCvxpygenProgram",
     "ParameterLayout",
     "PrimalLayout",
-    "artifact_fingerprint",
     "build_current_clarabel",
-    "generate_clarabel_program",
-    "load_clarabel_program",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,11 @@ import pytest
 from trading_dsl_engine.cpp_stream.optimizer import (
     ClarabelNativePaths,
     cvxpy_program,
-    generate_clarabel_program,
     get_field,
     previous_solution,
+)
+from trading_dsl_engine.cpp_stream.optimizer.direct_clarabel import (
+    generate_clarabel_artifact,
 )
 from trading_dsl_engine.cpp_stream.python.compiler_support import build_shared
 
@@ -29,6 +32,21 @@ def _clarabel_native() -> ClarabelNativePaths:
             "set CLARABEL_INCLUDE_DIR and CLARABEL_STATIC_LIBRARY for native optimizer tests"
         )
     return ClarabelNativePaths(Path(include), Path(library))
+
+
+def test_optimizer_public_surface_has_no_legacy_codegen_path():
+    from trading_dsl_engine.cpp_stream import optimizer
+
+    assert set(optimizer.__all__) == {
+        "ClarabelNativePaths",
+        "build_current_clarabel",
+        "cvxpy_program",
+        "get_field",
+        "previous_solution",
+    }
+    assert find_spec(
+        "trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native"
+    ) is None
 
 
 def _mpo_problem(n_assets: int = 3, n_horizons: int = 2) -> cp.Problem:
@@ -60,7 +78,7 @@ def _mpo_problem(n_assets: int = 3, n_horizons: int = 2) -> cp.Problem:
 
 
 def _generate(tmp_path: Path):
-    return generate_clarabel_program(
+    return generate_clarabel_artifact(
         _mpo_problem(),
         code_dir=tmp_path / "generated",
         clarabel=_clarabel_native(),
@@ -74,7 +92,7 @@ def _generate_qp(tmp_path: Path):
     target = cp.Parameter(3, name="target")
     lower = cp.Parameter(3, name="lower")
     problem = cp.Problem(cp.Minimize(cp.sum_squares(x - target)), [x >= lower])
-    return generate_clarabel_program(
+    return generate_clarabel_artifact(
         problem,
         code_dir=tmp_path / "generated-qp",
         clarabel=_clarabel_native(),
@@ -240,9 +258,8 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
         "risk_factor",
     ]
     assert manifest["parameters"][-1]["dirty_blocks"] == ["A"]
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert len(manifest["duals"]) == len(_mpo_problem().constraints)
-    assert "cpg_retrieve_prim();" not in source[source.index("void solve()") :]
 
 
 def test_two_generated_instances_solve_concurrently(tmp_path: Path):
@@ -252,7 +269,7 @@ def test_two_generated_instances_solve_concurrently(tmp_path: Path):
     driver.write_text(
         textwrap.dedent(
             """
-            #include "cpg_instance.hpp"
+            #include "mpo_instance.hpp"
             #include <array>
             #include <cmath>
             #include <cstdio>
@@ -324,7 +341,7 @@ def test_repeated_solves_do_not_leak_one_solver_per_call(tmp_path: Path):
     driver.write_text(
         textwrap.dedent(
             """
-            #include "cpg_instance.hpp"
+            #include "mpo_instance.hpp"
             #include <array>
             #include <cstdio>
 
@@ -400,7 +417,7 @@ def test_cpp_stream_native_builder_links_generated_instance(tmp_path: Path, monk
     )
     source = textwrap.dedent(
         """
-        #include "cpg_instance.hpp"
+        #include "mpo_instance.hpp"
         #include <array>
 
         extern "C" double solve_once(double scale) {
@@ -426,7 +443,12 @@ def test_cpp_stream_native_builder_links_generated_instance(tmp_path: Path, monk
         }
         """
     )
-    shared, _ = build_shared(source, **artifact.build_shared_kwargs())
+    shared, _ = build_shared(
+        source,
+        extra_include_dirs=artifact.include_dirs,
+        extra_link_files=artifact.link_files,
+        extra_fingerprint_files=artifact.fingerprint_files,
+    )
     library = ctypes.CDLL(str(shared))
     library.solve_once.argtypes = [ctypes.c_double]
     library.solve_once.restype = ctypes.c_double
@@ -444,7 +466,7 @@ def test_generated_instance_supports_quadratic_objective(tmp_path: Path, monkeyp
     )
     source = textwrap.dedent(
         """
-        #include "cpg_instance.hpp"
+        #include "qp_instance.hpp"
         #include <array>
 
         extern "C" double solve_qp(double first_target) {
@@ -458,7 +480,12 @@ def test_generated_instance_supports_quadratic_objective(tmp_path: Path, monkeyp
         }
         """
     )
-    shared, _ = build_shared(source, **artifact.build_shared_kwargs())
+    shared, _ = build_shared(
+        source,
+        extra_include_dirs=artifact.include_dirs,
+        extra_link_files=artifact.link_files,
+        extra_fingerprint_files=artifact.fingerprint_files,
+    )
     library = ctypes.CDLL(str(shared))
     library.solve_qp.argtypes = [ctypes.c_double]
     library.solve_qp.restype = ctypes.c_double
@@ -474,8 +501,8 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
     driver.write_text(
         textwrap.dedent(
             """
-            #include "cpg_instance.hpp"
-            #include "stackdsl/ops/cvxpygen.hpp"
+            #include "qp_instance.hpp"
+            #include "stackdsl/ops/clarabel_program.hpp"
             #include <array>
             #include <atomic>
             #include <cstddef>
@@ -569,15 +596,15 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
                 double* write_ptr() noexcept { return output.data(); }
             };
 
-            using Node = stackdsl::CvxpygenNode<
+            using Node = stackdsl::ClarabelNode<
                 GeneratedQp,
-                stackdsl::CvxpygenParameterList<
-                    stackdsl::CvxpygenPreviousPrimalBinding<
+                stackdsl::ClarabelParameterList<
+                    stackdsl::ClarabelPreviousPrimalBinding<
                         0, 0, 0, 3, 1, InitialSource>,
-                    stackdsl::CvxpygenParameterBinding<1, LowerSource>
+                    stackdsl::ClarabelParameterBinding<1, LowerSource>
                 >,
-                stackdsl::CvxpygenProjectionList<
-                    stackdsl::CvxpygenPrimalProjection<0, 0, 3, 1, Output>
+                stackdsl::ClarabelProjectionList<
+                    stackdsl::ClarabelPrimalProjection<0, 0, 3, 1, Output>
                 >
             >;
 
@@ -727,16 +754,16 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
     generated = runtime.generated_cpp.read_text()
     row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
     assert generated.count(row_loop) == 1
-    assert generated.count("stackdsl::CvxpygenNode<") == 1
-    assert "CvxpygenResultKind::Dual" in generated
-    assert "CvxpygenResultKind::Info" in generated
+    assert generated.count("stackdsl::ClarabelNode<") == 1
+    assert "ClarabelResultKind::Dual" in generated
+    assert "ClarabelResultKind::Info" in generated
     optimizer_stages = [
         stage
         for stage in runtime.plan.stages
-        if stage.kind in {"cvxpygen", "cvxpygen_bundle"}
+        if stage.kind in {"clarabel", "clarabel_bundle"}
     ]
     assert len(optimizer_stages) == 1
-    assert optimizer_stages[0].kind == "cvxpygen_bundle"
+    assert optimizer_stages[0].kind == "clarabel_bundle"
     assert len(optimizer_stages[0].members) == len(fields)
 
     result = runtime.run(out_path=tmp_path / "decorated-mpo.npy")
@@ -816,13 +843,13 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
 
     # The exact factory/shape/request set owns one generated sub-program and is
     # reused by a second full-DAG compile rather than canonicalizing again.
-    manifests = tuple((tmp_path / "program-cache").rglob("cpg_instance_manifest.json"))
+    manifests = tuple((tmp_path / "program-cache").rglob("clarabel_program_manifest.json"))
     assert len(manifests) == 1
     manifest_mtime = manifests[0].stat().st_mtime_ns
     second_runtime = compile_formula(fields, data)
     assert manifests[0].stat().st_mtime_ns == manifest_mtime
     assert second_runtime.generated_cpp.read_text().count(
-        "stackdsl::CvxpygenNode<"
+        "stackdsl::ClarabelNode<"
     ) == 1
 
     alternate_mpo = MPO(
@@ -837,7 +864,7 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
     ]
     compile_formula(alternate_fields, data)
     assert tuple(
-        (tmp_path / "program-cache").rglob("cpg_instance_manifest.json")
+        (tmp_path / "program-cache").rglob("clarabel_program_manifest.json")
     ) == manifests
     assert manifests[0].stat().st_mtime_ns == manifest_mtime
 
@@ -892,7 +919,7 @@ def test_previous_solution_feedback_is_initialized_and_forces_sequential_rows(
     assert runtime.parallel_plan.mode == "serial"
     assert "prior-solve state" in runtime.parallel_plan.reason
     generated = runtime.generated_cpp.read_text()
-    assert "stackdsl::CvxpygenPreviousPrimalBinding" in generated
+    assert "stackdsl::ClarabelPreviousPrimalBinding" in generated
 
     actual = runtime.run(
         out_path=tmp_path / "feedback.npy", threads=8
@@ -985,7 +1012,7 @@ def test_previous_solution_feedback_is_initialized_and_forces_sequential_rows(
     assert len(
         tuple(
             (tmp_path / "feedback-program-cache").rglob(
-                "cpg_instance_manifest.json"
+                "clarabel_program_manifest.json"
             )
         )
     ) == 1
@@ -1011,42 +1038,50 @@ def test_full_ridge_riskmodel_mpo_pipeline_has_one_time_loop(
         var,
     )
     from trading_dsl_engine.cpp_stream import compile_formula
-    from trading_dsl_engine.cpp_stream.optimizer import bind_program, get_field
 
     n_assets, n_horizons, rows = 3, 2, 24
-    weights = cp.Variable((n_horizons, n_assets), name="weights")
-    turnover = cp.Variable((n_horizons, n_assets), name="turnover")
-    expected_returns = cp.Parameter(
-        (n_horizons, n_assets), name="expected_returns"
-    )
-    half_spread_bps = cp.Parameter(
-        n_assets, nonneg=True, name="half_spread_bps"
-    )
-    current_weights = cp.Parameter(n_assets, name="current_weights")
-    risk_factor = cp.Parameter((n_assets, n_assets), name="risk_factor")
-    risk_radius = cp.Parameter(nonneg=True, name="risk_radius")
-    previous = cp.vstack([current_weights, weights[:-1]])
-    delta = weights - previous
-    constraints = [turnover >= delta, turnover >= -delta]
-    constraints.extend(
-        cp.SOC(risk_radius, risk_factor @ weights[horizon])
-        for horizon in range(n_horizons)
-    )
-    problem = cp.Problem(
-        cp.Minimize(
-            -cp.sum(cp.multiply(expected_returns, weights))
-            + cp.sum(cp.multiply(half_spread_bps * 1e-4, turnover))
-        ),
-        constraints,
-    )
-    artifact = generate_clarabel_program(
-        problem,
-        code_dir=tmp_path / "fused-generated",
+
+    @cvxpy_program(
+        cache_dir=tmp_path / "fused-program-cache",
         clarabel=_clarabel_native(),
-        class_name="GeneratedFusedMpo",
-        prefix="fused_mpo_",
-        instrument_count=n_assets,
     )
+    def MPO(
+        expected_returns,
+        half_spread_bps,
+        current_weights,
+        risk_factor,
+        risk_radius=0.08,
+    ) -> cp.Problem:
+        n_horizons, n_assets = expected_returns.shape
+        expected_returns = cp.Parameter(
+            expected_returns.shape, name="expected_returns"
+        )
+        half_spread_bps = cp.Parameter(
+            half_spread_bps.shape,
+            nonneg=True,
+            name="half_spread_bps",
+        )
+        current_weights = cp.Parameter(
+            current_weights.shape, name="current_weights"
+        )
+        risk_factor = cp.Parameter(risk_factor.shape, name="risk_factor")
+        risk_radius = cp.Parameter(nonneg=True, name="risk_radius")
+        weights = cp.Variable((n_horizons, n_assets), name="weights")
+        turnover = cp.Variable((n_horizons, n_assets), name="turnover")
+        previous = cp.vstack([current_weights, weights[:-1]])
+        delta = weights - previous
+        constraints = [turnover >= delta, turnover >= -delta]
+        constraints.extend(
+            cp.SOC(risk_radius, risk_factor @ weights[horizon])
+            for horizon in range(n_horizons)
+        )
+        return cp.Problem(
+            cp.Minimize(
+                -cp.sum(cp.multiply(expected_returns, weights))
+                + cp.sum(cp.multiply(half_spread_bps * 1e-4, turnover))
+            ),
+            constraints,
+        )
 
     returns = var("returns")
     lagged = shift(returns, 1, 1)
@@ -1059,8 +1094,7 @@ def test_full_ridge_riskmodel_mpo_pipeline_has_one_time_loop(
         risk_covariance(returns, span=8, min_periods=2),
         eigenvalue_floor=1e-8,
     )
-    mpo = bind_program(
-        artifact,
+    mpo = MPO(
         expected_returns=forecasts,
         half_spread_bps=var("half_spread_bps"),
         current_weights=var("current_weights"),
@@ -1084,16 +1118,16 @@ def test_full_ridge_riskmodel_mpo_pipeline_has_one_time_loop(
     generated = runtime.generated_cpp.read_text()
     row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
     assert generated.count(row_loop) == 1
-    assert generated.count("stackdsl::CvxpygenNode<") == 1
+    assert generated.count("stackdsl::ClarabelNode<") == 1
     assert "stackdsl::PsdFactorNode<" in generated
-    cvxpygen_stages = [
+    clarabel_stages = [
         stage
         for stage in runtime.plan.stages
-        if stage.kind in {"cvxpygen", "cvxpygen_bundle"}
+        if stage.kind in {"clarabel", "clarabel_bundle"}
     ]
-    assert len(cvxpygen_stages) == 1
-    assert cvxpygen_stages[0].kind == "cvxpygen_bundle"
-    assert len(cvxpygen_stages[0].members) == 2
+    assert len(clarabel_stages) == 1
+    assert clarabel_stages[0].kind == "clarabel_bundle"
+    assert len(clarabel_stages[0].members) == 2
 
     result = runtime.run(out_path=tmp_path / "fused.npy")
     pnl_values, weight_values, turnover_values = result.load(mmap_mode=None)

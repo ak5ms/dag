@@ -19,9 +19,9 @@ from trading_dsl_engine.base.parser import (
     parse_formula,
 )
 from trading_dsl_engine.cpp_stream.optimizer.dsl import (
-    CvxpygenFieldExpr,
-    CvxpygenPreviousSolutionExpr,
-    CvxpygenProgramExpr,
+    CvxpyFieldExpr,
+    CvxpyPreviousSolutionExpr,
+    CvxpyProgramExpr,
 )
 from trading_dsl_engine.ir.einsum import EinsumParseError, parse_einsum
 from trading_dsl_engine.ir.ops import (
@@ -45,8 +45,8 @@ from trading_dsl_engine.ir.ops import (
     RbfBasisOp,
     RidgeOp,
     RidgeProjectionOp,
-    CvxpygenProgramOp,
-    CvxpygenProjectionOp,
+    CvxpyProgramOp,
+    CvxpyProjectionOp,
     RollingOp,
     ReductionOp,
     ShiftOp,
@@ -191,29 +191,22 @@ def _expr_key(node: Expr) -> tuple:
             node.output_width,
             tuple(_expr_key(arg) for arg in node.args),
         )
-    if isinstance(node, CvxpygenProgramExpr):
-        program_key = getattr(node.program, "expression_key", None)
-        if program_key is None:
-            program_key = (
-                str(node.program.root),
-                node.program.class_name,
-                node.program.prefix,
-            )
+    if isinstance(node, CvxpyProgramExpr):
         return (
-            "cvxpygen_program",
-            program_key,
+            "cvxpy_program",
+            node.program.expression_key,
             tuple((name, _expr_key(value)) for name, value in node.bindings),
             tuple(sorted(node.requested_fields)),
         )
-    if isinstance(node, CvxpygenPreviousSolutionExpr):
+    if isinstance(node, CvxpyPreviousSolutionExpr):
         return (
-            "cvxpygen_previous_solution",
+            "cvxpy_previous_solution",
             node.field,
             _expr_key(node.initial),
         )
-    if isinstance(node, CvxpygenFieldExpr):
+    if isinstance(node, CvxpyFieldExpr):
         return (
-            "cvxpygen_field",
+            "cvxpy_field",
             _expr_key(node.program_expr),
             node.field,
         )
@@ -237,11 +230,11 @@ def _contains_self(node: Expr) -> bool:
         return _contains_self(node.expr)
     if isinstance(node, StatelessCall):
         return any(_contains_self(arg) for arg in node.args)
-    if isinstance(node, CvxpygenProgramExpr):
+    if isinstance(node, CvxpyProgramExpr):
         return any(_contains_self(value) for _, value in node.bindings)
-    if isinstance(node, CvxpygenPreviousSolutionExpr):
+    if isinstance(node, CvxpyPreviousSolutionExpr):
         return _contains_self(node.initial)
-    if isinstance(node, CvxpygenFieldExpr):
+    if isinstance(node, CvxpyFieldExpr):
         return _contains_self(node.program_expr)
     if isinstance(node, Call):
         return any(_contains_self(arg) for arg in node.args) or any(
@@ -780,7 +773,7 @@ class _BaseBuilder:
                 children,
                 _custom_value_type(node, [self.nodes[index] for index in children]),
             )
-        if isinstance(node, CvxpygenProgramExpr):
+        if isinstance(node, CvxpyProgramExpr):
             binding_names = tuple(name for name, _ in node.bindings)
             if len(set(binding_names)) != len(binding_names):
                 raise FormulaIRCompileError(
@@ -789,31 +782,29 @@ class _BaseBuilder:
             feedback_by_name = {
                 name: value
                 for name, value in node.bindings
-                if isinstance(value, CvxpygenPreviousSolutionExpr)
+                if isinstance(value, CvxpyPreviousSolutionExpr)
             }
             children_by_name = {
                 name: self.build(
                     value.initial
-                    if isinstance(value, CvxpygenPreviousSolutionExpr)
+                    if isinstance(value, CvxpyPreviousSolutionExpr)
                     else value
                 )
                 for name, value in node.bindings
             }
             program = node.program
-            resolver = getattr(program, "resolve_for_types", None)
-            if resolver is not None:
-                program = resolver(
-                    {
-                        name: self.nodes[child].value_type
-                        for name, child in children_by_name.items()
-                    },
-                    requested_fields=frozenset(node.requested_fields),
-                    n_instruments=getattr(self, "n_instruments", None),
-                    feedback_fields={
-                        name: value.field
-                        for name, value in feedback_by_name.items()
-                    },
-                )
+            program = program.resolve_for_types(
+                {
+                    name: self.nodes[child].value_type
+                    for name, child in children_by_name.items()
+                },
+                requested_fields=frozenset(node.requested_fields),
+                n_instruments=getattr(self, "n_instruments", None),
+                feedback_fields={
+                    name: value.field
+                    for name, value in feedback_by_name.items()
+                },
+            )
             expected_names = tuple(parameter.name for parameter in program.parameters)
             missing = sorted(set(expected_names) - set(binding_names))
             extra = sorted(set(binding_names) - set(expected_names))
@@ -872,7 +863,7 @@ class _BaseBuilder:
                     "previous_solution() cannot be combined with sequential=False"
                 )
             return self._append(
-                CvxpygenProgramOp(
+                CvxpyProgramOp(
                     program,
                     expected_names,
                     tuple(feedback_fields),
@@ -881,16 +872,16 @@ class _BaseBuilder:
                 children,
                 object_value(1),
             )
-        if isinstance(node, CvxpygenFieldExpr):
+        if isinstance(node, CvxpyFieldExpr):
             child = self.build(node.program_expr)
             child_op = self.nodes[child].op
-            if not isinstance(child_op, CvxpygenProgramOp):
+            if not isinstance(child_op, CvxpyProgramOp):
                 raise FormulaIRCompileError(
                     "optimizer field projection lost its generated program object"
                 )
             field = child_op.program.resolve_field(node.field)
             return self._append(
-                CvxpygenProjectionOp(field),
+                CvxpyProjectionOp(field),
                 (child,),
                 _generated_field_value_type(
                     child_op.program, field.logical_shape

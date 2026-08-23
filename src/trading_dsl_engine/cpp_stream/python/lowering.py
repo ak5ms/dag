@@ -30,8 +30,8 @@ from trading_dsl_engine.ir.ops import (
     PeriodsSinceChangeOp,
     RidgeOp,
     RidgeProjectionOp,
-    CvxpygenProgramOp,
-    CvxpygenProjectionOp,
+    CvxpyProgramOp,
+    CvxpyProjectionOp,
     RollingDecayOp,
     RollingEntropyOp,
     RollingKthOp,
@@ -340,8 +340,8 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         InstrumentBasisProjectionOp,
         RidgeOp,
         RidgeProjectionOp,
-        CvxpygenProgramOp,
-        CvxpygenProjectionOp,
+        CvxpyProgramOp,
+        CvxpyProjectionOp,
         GroupByOp,
     )
     for node_id, node in enumerate(program.nodes):

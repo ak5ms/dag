@@ -83,6 +83,9 @@ Priorities, in order:
   an explicit delayed state edge: infer ordered row execution, preserve its
   first-row scalar-broadcast or exact-shape initialization, and never override
   a real DAG dependency with an independent-program parallel hint.
+- Keep the decorated factory as the only public optimizer binding/generation
+  path. Do not restore manual generated-artifact binding shims or legacy
+  CVXPYgen-named modules, stage kinds, headers, manifests, or cache variables.
 - Native optimizer generation uses CVXPY only for DPP cone canonicalization,
   compiles parameters in bounded sparse shards, and calls Clarabel directly;
   do not reintroduce CVXPYgen or a full dense parameter/variable tensor.

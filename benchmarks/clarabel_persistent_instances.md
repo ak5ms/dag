@@ -136,19 +136,19 @@ worker-local.
 
 ## Reproduction and raw data
 
-Run `scripts/benchmark_cvxpygen_persistent_instances.py` with the Clarabel
+Run `scripts/benchmark_clarabel_persistent_instances.py` with the Clarabel
 include and archive paths set. The legacy filename is retained for compatibility;
 the benchmark invokes only direct Clarabel generation. It checkpoints after
 each size, verifies stable finite checksums, fails on any warm-path allocation,
 and retains all ten samples for every repetition.
 
-Run `scripts/audit_cvxpygen_sparse_generation.py` for the fresh guarded 150 × 8
+Run `scripts/audit_clarabel_sparse_generation.py` for the fresh guarded 150 × 8
 generation. `CLARABEL_AUDIT_ASSETS`, `CLARABEL_AUDIT_HORIZONS`,
 `CLARABEL_AUDIT_DENSE_LIMIT_BYTES`, `CLARABEL_AUDIT_PARAMETER_SHARD_SIZE`, and
 `CLARABEL_AUDIT_OUTPUT_DIR` override its defaults.
 
 Raw samples and checksums:
-[`cvxpygen_persistent_instances.json`](cvxpygen_persistent_instances.json).
+[`clarabel_persistent_instances.json`](clarabel_persistent_instances.json).
 Fresh guarded generation samples:
 [`clarabel_generation_audit.json`](clarabel_generation_audit.json).
 Final fresh generation/compile sweep:

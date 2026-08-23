@@ -6,19 +6,19 @@ on:
     paths:
       - .github/workflows/build-clarabel-noalloc.yml
       - src/trading_dsl_engine/cpp_stream/optimizer/**
-      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/cvxpygen.hpp
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
       - src/trading_dsl_engine/cpp_stream/python/**
       - src/trading_dsl_engine/ir/**
-      - tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py
+      - tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/build-clarabel-noalloc.yml
       - src/trading_dsl_engine/cpp_stream/optimizer/**
-      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/cvxpygen.hpp
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
       - src/trading_dsl_engine/cpp_stream/python/**
       - src/trading_dsl_engine/ir/**
-      - tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py
+      - tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py
   workflow_dispatch:
 
 concurrency:
@@ -85,7 +85,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[optimizer]'
           python -m pytest -n 0 \
-            tests/trading_dsl_engine/cpp_stream/test_cvxpygen_native.py -q
+            tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: clarabel-noalloc

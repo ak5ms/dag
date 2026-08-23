@@ -19,22 +19,24 @@ from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     ClarabelNativePaths,
     DualLayout,
     FieldAlias,
-    GeneratedCvxpygenProgram,
+    GeneratedClarabelProgram,
     ParameterLayout,
     PrimalLayout,
     _constraint_dual_shape,
     _constraint_label,
     _resolve_result_field,
     build_current_clarabel,
-    generate_clarabel_program,
-    load_clarabel_program,
 )
-from trading_dsl_engine.cpp_stream.optimizer.dsl import CvxpygenProgramExpr
+from trading_dsl_engine.cpp_stream.optimizer.direct_clarabel import (
+    generate_clarabel_artifact,
+    load_clarabel_artifact,
+)
+from trading_dsl_engine.cpp_stream.optimizer.dsl import CvxpyProgramExpr
 from trading_dsl_engine.ir.types import ValueType
 
 
 _SYMBOLIC_INSTRUMENT_COUNT = 113
-_FACTORY_CACHE_SCHEMA = 3
+_FACTORY_CACHE_SCHEMA = 4
 _PROGRAM_CACHE_LOCK = RLock()
 _DEFAULT_ENABLE_SETTINGS = (
     "verbose",
@@ -47,7 +49,7 @@ _DEFAULT_ENABLE_SETTINGS = (
 
 
 @dataclass(frozen=True, slots=True)
-class CvxpygenProgramPrototype:
+class CvxpyProgramPrototype:
     """Shape-only program used during cpp_stream's input-discovery pass."""
 
     class_name: str
@@ -79,8 +81,6 @@ class CvxpygenProgramPrototype:
 
 def _default_cache_root() -> Path:
     configured = os.environ.get("TRADING_DSL_ENGINE_CLARABEL_CACHE")
-    if configured is None:
-        configured = os.environ.get("TRADING_DSL_ENGINE_CVXPYGEN_CACHE")
     return (
         Path(configured).expanduser()
         if configured
@@ -264,7 +264,7 @@ def _parameter_attributes(parameter) -> dict[str, str]:
     }
 
 
-class CvxpygenProgramDefinition:
+class CvxpyProgramDefinition:
     """A cached CVXPY problem factory that is callable from the formula DSL."""
 
     def __init__(
@@ -302,7 +302,7 @@ class CvxpygenProgramDefinition:
         self.parameter_shard_size = int(parameter_shard_size)
         self._factory_hash = _factory_fingerprint(factory)
         self._lock = RLock()
-        self._resolved: dict[str, GeneratedCvxpygenProgram] = {}
+        self._resolved: dict[str, GeneratedClarabelProgram] = {}
         functools.update_wrapper(self, factory)
 
     @property
@@ -322,9 +322,9 @@ class CvxpygenProgramDefinition:
         ):
             raise KeyError(f"invalid generated field request {field!r}")
 
-    def __call__(self, *args, **kwargs) -> CvxpygenProgramExpr:
+    def __call__(self, *args, **kwargs) -> CvxpyProgramExpr:
         from trading_dsl_engine.cpp_stream.optimizer.dsl import (
-            CvxpygenPreviousSolutionExpr,
+            CvxpyPreviousSolutionExpr,
         )
 
         bound = self.signature.bind(*args, **kwargs)
@@ -341,14 +341,14 @@ class CvxpygenProgramDefinition:
                 name,
                 bound.arguments[name]
                 if isinstance(
-                    bound.arguments[name], CvxpygenPreviousSolutionExpr
+                    bound.arguments[name], CvxpyPreviousSolutionExpr
                 )
                 else ensure_expr(bound.arguments[name]),
             )
             for name in self.signature.parameters
         )
         has_feedback = any(
-            isinstance(value, CvxpygenPreviousSolutionExpr)
+            isinstance(value, CvxpyPreviousSolutionExpr)
             for _, value in bindings
         )
         if has_feedback and self.sequential is False:
@@ -356,7 +356,7 @@ class CvxpygenProgramDefinition:
                 "previous_solution() creates a temporal dependency and cannot "
                 "be used with @cvxpy_program(sequential=False)"
             )
-        return CvxpygenProgramExpr(
+        return CvxpyProgramExpr(
             self,
             bindings,
         )
@@ -460,8 +460,8 @@ class CvxpygenProgramDefinition:
             )
             for index, constraint in enumerate(problem.constraints)
         )
-        return CvxpygenProgramPrototype(
-            "CvxpygenPrototype",
+        return CvxpyProgramPrototype(
+            "CvxpyPrototype",
             "prototype_",
             tuple(parameters),
             primals,
@@ -528,7 +528,7 @@ class CvxpygenProgramDefinition:
         requested_fields: frozenset[str],
         n_instruments: int | None,
         feedback_fields: Mapping[str, str] | None = None,
-    ) -> GeneratedCvxpygenProgram | CvxpygenProgramPrototype:
+    ) -> GeneratedClarabelProgram | CvxpyProgramPrototype:
         expected = tuple(self.signature.parameters)
         missing = sorted(set(expected) - set(parameter_types))
         extra = sorted(set(parameter_types) - set(expected))
@@ -572,7 +572,7 @@ class CvxpygenProgramDefinition:
                 clarabel = self._clarabel_paths()
                 if root.is_dir():
                     try:
-                        artifact = load_clarabel_program(root, clarabel=clarabel)
+                        artifact = load_clarabel_artifact(root, clarabel=clarabel)
                         self._resolved[cache_key] = artifact
                         return artifact
                     except (FileNotFoundError, KeyError, TypeError, ValueError):
@@ -586,7 +586,7 @@ class CvxpygenProgramDefinition:
                 prefix = self.configured_prefix or (
                     f"{_safe_stem(self.factory.__name__).lower()}_{short_hash}_"
                 )
-                artifact = generate_clarabel_program(
+                artifact = generate_clarabel_artifact(
                     problem,
                     code_dir=root,
                     clarabel=clarabel,
@@ -616,7 +616,7 @@ def cvxpy_program(
     """Decorate a CVXPY problem factory for direct use in the formula DSL."""
 
     def decorate(function):
-        return CvxpygenProgramDefinition(
+        return CvxpyProgramDefinition(
             function,
             cache_dir=cache_dir,
             clarabel=clarabel,
@@ -631,7 +631,7 @@ def cvxpy_program(
 
 
 __all__ = [
-    "CvxpygenProgramDefinition",
-    "CvxpygenProgramPrototype",
+    "CvxpyProgramDefinition",
+    "CvxpyProgramPrototype",
     "cvxpy_program",
 ]

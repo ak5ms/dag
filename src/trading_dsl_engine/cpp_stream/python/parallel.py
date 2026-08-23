@@ -123,8 +123,8 @@ _EXPERIMENTAL_STAGE_WORK = {
     "emit_last": 1,
     "einsum": 5,
     "psd_factor": 10,
-    "cvxpygen": 20,
-    "cvxpygen_bundle": 20,
+    "clarabel": 20,
+    "clarabel_bundle": 20,
     "instrument_basis": 10,
     "ridge": 12,
     "ridge_bundle": 12,
@@ -156,8 +156,8 @@ def _reduction_is_temporal(stage: Stage) -> bool:
     )
 
 
-def _cvxpygen_is_sequential(stage: Stage) -> bool:
-    return stage.kind in {"cvxpygen", "cvxpygen_bundle"} and bool(
+def _clarabel_is_sequential(stage: Stage) -> bool:
+    return stage.kind in {"clarabel", "clarabel_bundle"} and bool(
         getattr(stage.op, "sequential", False)
     )
 
@@ -197,7 +197,7 @@ def plan_is_row_independent(plan: Plan) -> bool:
             stage.kind in _TEMPORAL_KINDS
             or _ridge_is_stateful(stage)
             or _reduction_is_temporal(stage)
-            or _cvxpygen_is_sequential(stage)
+            or _clarabel_is_sequential(stage)
             or stage.kind == "emit_last"
         ):
             return False
@@ -405,7 +405,7 @@ def select_parallel_plan(
             True,
             score,
         )
-    if any(_cvxpygen_is_sequential(stage) for stage in plan.stages):
+    if any(_clarabel_is_sequential(stage) for stage in plan.stages):
         return ParallelPlan(
             "serial",
             "CVXPY program carries prior-solve state across rows",
