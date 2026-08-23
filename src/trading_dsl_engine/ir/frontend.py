@@ -784,7 +784,7 @@ class _BaseBuilder:
             binding_names = tuple(name for name, _ in node.bindings)
             if len(set(binding_names)) != len(binding_names):
                 raise FormulaIRCompileError(
-                    "CVXPYgen parameter bindings contain duplicate names"
+                    "generated optimizer parameter bindings contain duplicate names"
                 )
             feedback_by_name = {
                 name: value
@@ -819,7 +819,7 @@ class _BaseBuilder:
             extra = sorted(set(binding_names) - set(expected_names))
             if missing or extra:
                 raise FormulaIRCompileError(
-                    "CVXPYgen parameter mismatch: "
+                    "generated optimizer parameter mismatch: "
                     f"missing={missing}, extra={extra}"
                 )
             children = tuple(children_by_name[name] for name in expected_names)
@@ -830,7 +830,8 @@ class _BaseBuilder:
                     actual_shape = child_type.logical_shape
                 except ValueError as exc:
                     raise FormulaIRCompileError(
-                        f"CVXPYgen parameter {name!r} cannot consume object values"
+                        "generated optimizer parameter "
+                        f"{name!r} cannot consume object values"
                     ) from exc
                 expected_shape = program.parameter_logical_shape(name)
                 feedback = feedback_by_name.get(name)
@@ -860,7 +861,8 @@ class _BaseBuilder:
                     feedback_fields.append(field)
                 if not shape_matches:
                     raise FormulaIRCompileError(
-                        f"CVXPYgen parameter {name!r} expects logical shape "
+                        f"generated optimizer parameter {name!r} expects "
+                        "logical shape "
                         f"{expected_shape}, got {actual_shape}"
                     )
             definition_sequential = getattr(node.program, "sequential", None)
@@ -884,7 +886,7 @@ class _BaseBuilder:
             child_op = self.nodes[child].op
             if not isinstance(child_op, CvxpygenProgramOp):
                 raise FormulaIRCompileError(
-                    "CVXPYgen field projection lost its generated program object"
+                    "optimizer field projection lost its generated program object"
                 )
             field = child_op.program.resolve_field(node.field)
             return self._append(

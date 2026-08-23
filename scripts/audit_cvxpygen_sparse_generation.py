@@ -1,9 +1,9 @@
-"""Reject large dense arrays during a fresh CVXPYgen MPO generation.
+"""Reject large dense arrays during fresh direct-Clarabel MPO generation.
 
-The default 150-asset, eight-horizon model is large enough that unpatched
-CVXPYgen 1.0 attempts a roughly 34.9 GiB ``sparse.toarray()`` result. This audit
-wraps that call and ``numpy.zeros`` with a 512 MiB rejection threshold, then
-reports generation time and process peak RSS.
+The default 150-asset, eight-horizon model previously made CVXPYgen 1.0 attempt
+a roughly 34.9 GiB ``sparse.toarray()`` result. This audit wraps that call and
+``numpy.zeros`` with a 512 MiB rejection threshold, then reports direct backend
+generation time and process peak RSS.
 """
 
 from __future__ import annotations
@@ -27,15 +27,40 @@ from trading_dsl_engine.cpp_stream.optimizer import (
 )
 
 
-N_ASSETS = int(os.environ.get("CVXPYGEN_AUDIT_ASSETS", "150"))
-N_HORIZONS = int(os.environ.get("CVXPYGEN_AUDIT_HORIZONS", "8"))
+N_ASSETS = int(
+    os.environ.get(
+        "CLARABEL_AUDIT_ASSETS",
+        os.environ.get("CVXPYGEN_AUDIT_ASSETS", "150"),
+    )
+)
+N_HORIZONS = int(
+    os.environ.get(
+        "CLARABEL_AUDIT_HORIZONS",
+        os.environ.get("CVXPYGEN_AUDIT_HORIZONS", "8"),
+    )
+)
 DENSE_LIMIT_BYTES = int(
-    os.environ.get("CVXPYGEN_AUDIT_DENSE_LIMIT_BYTES", str(512 * 1024 * 1024))
+    os.environ.get(
+        "CLARABEL_AUDIT_DENSE_LIMIT_BYTES",
+        os.environ.get(
+            "CVXPYGEN_AUDIT_DENSE_LIMIT_BYTES",
+            str(512 * 1024 * 1024),
+        ),
+    )
 )
 OUTPUT_DIR = Path(
     os.environ.get(
-        "CVXPYGEN_AUDIT_OUTPUT_DIR",
-        f".generated/cvxpygen-sparse-audit-{N_ASSETS}x{N_HORIZONS}",
+        "CLARABEL_AUDIT_OUTPUT_DIR",
+        os.environ.get(
+            "CVXPYGEN_AUDIT_OUTPUT_DIR",
+            f".generated/clarabel-sharded-audit-{N_ASSETS}x{N_HORIZONS}",
+        ),
+    )
+)
+PARAMETER_SHARD_SIZE = int(
+    os.environ.get(
+        "CLARABEL_AUDIT_PARAMETER_SHARD_SIZE",
+        os.environ.get("CLARABEL_PARAMETER_SHARD_SIZE", "512"),
     )
 )
 
@@ -131,6 +156,7 @@ def main() -> None:
         if cls is not None
     )
 
+    baseline_rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     started = time.perf_counter()
     with ExitStack() as stack:
         stack.enter_context(patch.object(np, "zeros", guarded_zeros))
@@ -152,22 +178,27 @@ def main() -> None:
             class_name=f"SparseAuditMpo{N_ASSETS}",
             prefix=f"sparse_audit_mpo_{N_ASSETS}_",
             instrument_count=N_ASSETS,
+            parameter_shard_size=PARAMETER_SHARD_SIZE,
             force=True,
         )
 
+    peak_rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     result = {
         "assets": N_ASSETS,
         "horizons": N_HORIZONS,
         "dense_allocation_guard_bytes": DENSE_LIMIT_BYTES,
+        "parameter_shard_size": PARAMETER_SHARD_SIZE,
         "rejected_dense_allocations": rejected,
         "elapsed_seconds": time.perf_counter() - started,
-        "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "baseline_rss_kib": baseline_rss_kib,
+        "peak_rss_kib": peak_rss_kib,
+        "generation_rss_growth_kib": peak_rss_kib - baseline_rss_kib,
         "generated_header_bytes": artifact.instance_header.stat().st_size,
         "manifest": str(artifact.manifest_path),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     if rejected:
-        raise RuntimeError("CVXPYgen attempted an oversized dense allocation")
+        raise RuntimeError("optimizer generation attempted an oversized allocation")
 
 
 if __name__ == "__main__":

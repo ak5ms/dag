@@ -92,11 +92,12 @@ This backend must remain independent of `jax_flat`.
 
 ## Generated convex optimizer programs
 
-- CVXPY and CVXPYgen are compile-time tools only. Native per-row execution must
-  not invoke Python, pybind, CVXPY, or the CVXPYgen Python wrapper.
-- Preserve CVXPYgen as the owner of DPP validation, parameter-to-canonical maps,
-  cone layout, dirty-block tracking, and primal/dual result mappings. Do not
-  duplicate those maps in cpp_stream.
+- CVXPY is a compile-time tool only. Native per-row execution must not invoke
+  Python, pybind, or CVXPY; the optimizer package has no CVXPYgen dependency.
+- Compile DPP parameters in bounded sparse shards (512 scalars by default),
+  merge CVXPY's compact affine maps, and apply cone formatting as a signed row
+  permutation. Never restore the full parameter/variable DPP tensor or densify
+  a map to discover sparsity.
 - Generated Clarabel programs use one persistent solver per generated object.
   The first solve constructs it; later solves update dirty fixed-sparsity
   `P/A/q/b` blocks; destruction must call `clarabel_DefaultSolver_free`.
@@ -112,7 +113,7 @@ This backend must remain independent of `jax_flat`.
 - `@cvxpy_program` is the low-boilerplate formula boundary. Each factory
   argument must be replaced by an explicitly named `cp.Parameter` inside the
   function; CVXPY attributes belong on that declaration, not in a parallel
-  decorator options dictionary. Keep the CVXPYgen sub-program cache independent
+  decorator options dictionary. Keep the Clarabel sub-program cache independent
   of the complete outer-DAG native cache: key it by factory/problem structure,
   declared parameter shapes/attributes, and solver settings. Outer source
   dtype/layout belongs to the complete native-runner cache. Different ordinary
@@ -198,7 +199,8 @@ This backend must remain independent of `jax_flat`.
 - Benchmarks must compare the fused native reduction with full materialization and
   post-hoc reduction, validate output checksums, and report output byte counts.
 
-- CVXPYgen object nodes are physical cpp_stream stages. Keep bound parameters as
+- Generated optimizer object nodes are physical cpp_stream stages. Keep bound
+  parameters as
   DAG sources, collect sibling `get_field` projections into one solve, and run
   upstream formulas, solve, projections, and descendants inside the same runner
   row loop. Do not reintroduce a post-batch optimizer pass or historical input

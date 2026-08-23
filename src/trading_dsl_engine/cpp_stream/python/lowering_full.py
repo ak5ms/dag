@@ -549,7 +549,7 @@ def _build_plan(
             )
             if is_root:
                 raise CppStreamLoweringError(
-                    "CVXPYgen program object must be projected with get_field"
+                    "optimizer program object must be projected with get_field"
                 )
             continue
 
@@ -559,7 +559,7 @@ def _build_plan(
                 object_source.op, CvxpygenProgramOp
             ):
                 raise CppStreamLoweringError(
-                    "CVXPYgen projection lost its generated program object"
+                    "optimizer projection lost its generated program object"
                 )
             field = op.field
             out = value_dest(is_root, node_shape)

@@ -87,7 +87,7 @@ def _compile_program(
     if len(generated_programs) > 1:
         raise ValueError(
             "one cpp_stream translation unit currently supports one distinct "
-            "CVXPYgen artifact; reuse the same artifact for multiple projections"
+            "generated optimizer artifact; reuse it for multiple projections"
         )
     native_headers = tuple(
         artifact.instance_header.name for artifact in generated_programs

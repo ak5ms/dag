@@ -83,50 +83,136 @@ def _generate_qp(tmp_path: Path):
     )
 
 
-def test_sparse_canonical_map_helpers_never_densify(monkeypatch):
+def test_sharded_maps_reproduce_cvxpy_canonical_data():
     from scipy import sparse
 
-    from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
-        _apply_sparse_sign,
-        _scatter_sparse_rows,
+    from trading_dsl_engine.cpp_stream.optimizer.direct_clarabel import (
+        compile_sharded_canonical_program,
     )
 
-    source = sparse.csr_matrix(
-        np.asarray(
-            [
-                [1.0, 0.0, 2.0, 0.0],
-                [0.0, 3.0, 0.0, 4.0],
-                [5.0, 0.0, 0.0, 6.0],
-            ]
+    problem = _mpo_problem()
+    rng = np.random.default_rng(128)
+    for parameter in problem.parameters():
+        value = (
+            rng.uniform(0.01, 1.0, size=parameter.shape or ())
+            if parameter.is_nonneg()
+            else rng.normal(size=parameter.shape or ())
         )
+        parameter.value = value
+    compiled = compile_sharded_canonical_program(
+        problem,
+        parameter_shard_size=4,
     )
-    scattered = _scatter_sparse_rows(
-        sparse, np, source, np.asarray([4, 1, 3]), 6
+    parameter_vector = np.empty(
+        sum(parameter.size for parameter in problem.parameters()) + 1
     )
-    expected = np.zeros((6, 4))
-    expected[[4, 1, 3]] = source.toarray()
-    np.testing.assert_array_equal(scattered.toarray(), expected)
-
-    def forbidden_toarray(*_args, **_kwargs):
-        raise AssertionError("sparse canonical map was materialized")
-
-    monkeypatch.setattr(sparse.csr_matrix, "toarray", forbidden_toarray)
-    signed = _apply_sparse_sign(
-        np, scattered, np.asarray([1.0, -1.0, 1.0, 2.0, -3.0, 1.0])
-    )
-    rows, columns = signed.nonzero()
-    values = {
-        (int(row), int(column)): float(signed[row, column])
-        for row, column in zip(rows, columns)
+    for parameter, offset in zip(
+        problem.parameters(), compiled.parameter_offsets
+    ):
+        parameter_vector[offset : offset + parameter.size] = np.asarray(
+            parameter.value
+        ).ravel(order="F")
+    parameter_vector[-1] = 1.0
+    canonical = {
+        name: np.asarray(
+            sparse.csr_matrix(
+                (mapping.values, mapping.columns, mapping.row_ptr),
+                shape=(mapping.rows, parameter_vector.size),
+            )
+            @ parameter_vector
+        ).ravel()
+        for name, mapping in compiled.parameter_maps.items()
     }
-    assert values == {
-        (1, 1): -3.0,
-        (1, 3): -4.0,
-        (3, 0): 10.0,
-        (3, 3): 12.0,
-        (4, 0): -3.0,
-        (4, 2): -6.0,
+    actual_A = sparse.csc_matrix(
+        (
+            canonical["A"],
+            compiled.A.row_indices,
+            compiled.A.column_ptr,
+        ),
+        shape=(compiled.A.rows, compiled.A.columns),
+    )
+    expected, _, _ = problem.get_problem_data(
+        cp.CLARABEL,
+        enforce_dpp=True,
+        canon_backend="COO",
+    )
+    np.testing.assert_array_equal(canonical["q"], expected["c"])
+    np.testing.assert_array_equal(canonical["b"], expected["b"])
+    difference = actual_A - expected["A"]
+    assert difference.nnz == 0
+
+
+def test_sharded_maps_match_cvxpy_for_mixed_cones():
+    from scipy import sparse
+
+    from trading_dsl_engine.cpp_stream.optimizer.direct_clarabel import (
+        compile_sharded_canonical_program,
+    )
+
+    x = cp.Variable(5, name="x")
+    objective_parameter = cp.Parameter(5, name="objective_parameter")
+    psd_expression = cp.bmat(
+        [[x[0] + 2.0, x[1]], [x[1], x[2] + 2.0]]
+    )
+    problem = cp.Problem(
+        cp.Minimize(cp.sum_squares(x) + objective_parameter @ x + 2.0),
+        [
+            x[4] == 0.0,
+            x[3] >= -2.0,
+            cp.SOC(x[0] + 3.0, x[1:3]),
+            psd_expression >> 0,
+            cp.ExpCone(x[0], x[3] + 3.0, x[4] + 4.0),
+            cp.PowCone3D(x[0] + 3.0, x[1] + 3.0, x[2], 0.4),
+        ],
+    )
+    objective_parameter.value = np.array([0.1, -0.2, 0.3, 0.4, -0.5])
+    compiled = compile_sharded_canonical_program(
+        problem,
+        parameter_shard_size=2,
+    )
+    parameter_vector = np.concatenate(
+        [objective_parameter.value.ravel(order="F"), np.ones(1)]
+    )
+
+    def evaluate_map(name: str) -> np.ndarray:
+        mapping = compiled.parameter_maps[name]
+        return np.asarray(
+            sparse.csr_matrix(
+                (mapping.values, mapping.columns, mapping.row_ptr),
+                shape=(mapping.rows, parameter_vector.size),
+            )
+            @ parameter_vector
+        ).ravel()
+
+    canonical = {
+        name: evaluate_map(name) for name in ("P", "q", "A", "b", "d")
     }
+    actual_P = sparse.csc_matrix(
+        (canonical["P"], compiled.P.row_indices, compiled.P.column_ptr),
+        shape=(compiled.P.rows, compiled.P.columns),
+    )
+    actual_A = sparse.csc_matrix(
+        (canonical["A"], compiled.A.row_indices, compiled.A.column_ptr),
+        shape=(compiled.A.rows, compiled.A.columns),
+    )
+    expected, _, inverse_data = problem.get_problem_data(
+        cp.CLARABEL,
+        enforce_dpp=True,
+        canon_backend="COO",
+    )
+    np.testing.assert_array_equal(actual_P.toarray(), expected["P"].toarray())
+    np.testing.assert_array_equal(canonical["q"], expected["c"])
+    np.testing.assert_array_equal(actual_A.toarray(), expected["A"].toarray())
+    np.testing.assert_array_equal(canonical["b"], expected["b"])
+    np.testing.assert_array_equal(canonical["d"], [inverse_data[-1]["offset"]])
+    assert compiled.cone_initializers == (
+        "ClarabelZeroConeT(1)",
+        "ClarabelNonnegativeConeT(1)",
+        "ClarabelSecondOrderConeT(3)",
+        "ClarabelPSDTriangleConeT(2)",
+        "ClarabelExponentialConeT()",
+        "ClarabelPowerConeT(0.40000000000000002)",
+    )
 
 
 def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
@@ -138,11 +224,14 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
     assert "clarabel_DefaultSolver_update_b" in source
     assert "clarabel_DefaultSolver_free" in source
     assert "GeneratedMpo(const GeneratedMpo&) = delete" in source
-    assert "inline static cpg_int" in source
+    assert "inline static constexpr std::array" in source
+    assert "cvxpygen" not in source.lower()
     manifest = json.loads(artifact.manifest_path.read_text())
     assert manifest["instance_owned"] is True
     assert manifest["persistent_solver"] is True
-    assert manifest["cvxpygen_version"] == "1.0.0"
+    assert manifest["backend"] == "cvxpy-direct-clarabel"
+    assert manifest["canonicalization_backend"] == "COO"
+    assert manifest["parameter_shard_size"] == 512
     assert [item["name"] for item in manifest["parameters"]] == [
         "expected_returns",
         "half_spread",
@@ -151,7 +240,7 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
         "risk_factor",
     ]
     assert manifest["parameters"][-1]["dirty_blocks"] == ["A"]
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert len(manifest["duals"]) == len(_mpo_problem().constraints)
     assert "cpg_retrieve_prim();" not in source[source.index("void solve()") :]
 
@@ -726,7 +815,7 @@ def test_decorated_problem_factory_caches_and_projects_all_result_kinds(
     assert objectives[-1] == pytest.approx(reference.value, rel=2e-5, abs=2e-7)
 
     # The exact factory/shape/request set owns one generated sub-program and is
-    # reused by a second full-DAG compile rather than invoking CVXPYgen again.
+    # reused by a second full-DAG compile rather than canonicalizing again.
     manifests = tuple((tmp_path / "program-cache").rglob("cpg_instance_manifest.json"))
     assert len(manifests) == 1
     manifest_mtime = manifests[0].stat().st_mtime_ns

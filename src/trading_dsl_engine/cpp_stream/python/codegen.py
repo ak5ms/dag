@@ -687,12 +687,12 @@ def _stage_type(
         assert isinstance(physical.op, CvxpygenProgramOp)
         program = physical.op.program
         if len(physical.inputs) != len(program.parameters):
-            raise ValueError("CVXPYgen parameter/source count mismatch")
+            raise ValueError("generated optimizer parameter/source count mismatch")
         feedback_fields = physical.op.feedback_fields or (
             (None,) * len(physical.inputs)
         )
         if len(feedback_fields) != len(physical.inputs):
-            raise ValueError("CVXPYgen feedback/source count mismatch")
+            raise ValueError("generated optimizer feedback/source count mismatch")
         bindings = []
         for index, (source, feedback) in enumerate(
             zip(physical.inputs, feedback_fields)
@@ -711,7 +711,7 @@ def _stage_type(
                 continue
             if feedback.kind != "primal":
                 raise ValueError(
-                    "CVXPYgen feedback currently requires a primal field"
+                    "optimizer feedback currently requires a primal field"
                 )
             bindings.append(
                 tmpl(
@@ -728,7 +728,7 @@ def _stage_type(
         projections = []
         for member in members:
             if member.projection is None:
-                raise ValueError("CVXPYgen stage is missing a field projection")
+                raise ValueError("optimizer stage is missing a field projection")
             field = program.resolve_field(member.projection)
             projections.append(
                 tmpl(

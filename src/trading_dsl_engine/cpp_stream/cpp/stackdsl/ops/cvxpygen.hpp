@@ -103,7 +103,7 @@ class CvxpygenNode<
         using Source = typename Binding::source_type;
         static_assert(
             Source::shape::size == Program::template parameter_size<index>(),
-            "CVXPYgen parameter and cpp_stream source sizes differ"
+            "CVXPY parameter and cpp_stream source sizes differ"
         );
         auto target = program_.template parameter_buffer<index>();
         bool changed = false;
@@ -128,13 +128,13 @@ class CvxpygenNode<
         using Initial = typename Binding::source_type;
         static_assert(
             Binding::count == Program::template parameter_size<index>(),
-            "CVXPYgen feedback field and parameter sizes differ"
+            "CVXPY feedback field and parameter sizes differ"
         );
         static_assert(
             Initial::shape::size == 1
                 || Initial::shape::size
                     == Program::template parameter_size<index>(),
-            "CVXPYgen feedback initializer must be scalar or parameter-shaped"
+            "CVXPY feedback initializer must be scalar or parameter-shaped"
         );
         auto target = program_.template parameter_buffer<index>();
         bool changed = false;

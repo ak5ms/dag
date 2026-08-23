@@ -1,20 +1,24 @@
-# CVXPYgen programs inside `cpp_stream`
+# Direct CVXPY/Clarabel programs inside `cpp_stream`
 
 `cpp_stream.optimizer.cvxpy_program` turns a static-shape, DPP-compliant
 CVXPY problem factory into a normal callable in the formula DSL. The numerical
-row path calls CVXPYgen's generated parameter maps and result maps directly; it
-does not invoke Python, CVXPY, or the CVXPYgen Python wrapper.
+row path calls compact generated affine maps and Clarabel's C ABI directly; it
+does not invoke Python or CVXPY and has no CVXPYgen dependency.
 
 ## Ownership boundary
 
-CVXPY and CVXPYgen continue to own:
+CVXPY owns DCP/DPP validation and the initial cone canonicalization. The native
+compiler then:
 
-- DCP/DPP validation;
-- user-parameter to canonical `P/A/q/b` maps;
-- dirty-block metadata;
-- cone layout and fixed CSC sparsity;
-- primal/dual inverse mappings; and
-- generated solver settings and diagnostics.
+- shards the user parameter vector into at most 512 symbolic scalars per pass;
+- extracts CVXPY's sparse affine maps without ever constructing the full DPP
+  parameter/variable tensor;
+- merges the shards into compact CSR maps for `P/q/A/b` and the objective
+  offset;
+- applies CVXPY's signed cone-row permutation directly to sparse coordinates;
+- derives dirty-block metadata, fixed CSC sparsity, cone layout, and direct
+  primal/dual spans; and
+- renders one header that invokes Clarabel's C API without a generated wrapper.
 
 The generated C++ class changes only runtime ownership and solver lifetime:
 
@@ -23,7 +27,8 @@ The generated C++ class changes only runtime ownership and solver lifetime:
 - immutable sparse maps, CSC index arrays, and cone descriptors are shared
   `inline static` data;
 - the first `solve()` constructs Clarabel;
-- later `solve()` calls update the dirty fixed-sparsity blocks through
+- later `solve()` calls canonicalize only dirty blocks and update fixed-sparsity
+  data through
   `clarabel_DefaultSolver_update_P/A/q/b`;
 - the destructor frees the solver; and
 - copy and move are disabled so a solver workspace cannot be duplicated
@@ -43,8 +48,15 @@ python -m pip install -e '.[optimizer]'
 
 At formula compile time each function argument is a small descriptor exposing
 its concrete CVXPY shape. The function explicitly declares `cp.Parameter`
-objects, so attributes such as `nonneg=True`, sparsity, bounds, and symmetry
-live next to the CVXPY model rather than in a second decorator dictionary.
+objects, so attributes such as `nonneg=True` live next to the CVXPY model
+rather than in a second decorator dictionary.
+The direct emitter currently accepts ordinary real parameters and sign
+attributes (`nonneg`, `nonpos`, `pos`, or `neg`); dimension-reducing parameter
+attributes such as `sparsity`, `diag`, `symmetric`, and `PSD`, and parameter
+bounds, fail generation explicitly rather than producing a wrong ABI.
+Primal fields likewise require ordinary CVXPY variables with a direct canonical
+offset; dimension-reducing variable attributes such as `symmetric=True` are
+rejected until an allocation-free inverse map is implemented.
 Consequently the same function name binds streaming expressions; there is no
 separate `bind_program()` or `generate_clarabel_program()` call:
 
@@ -161,7 +173,7 @@ optimization problem.
 
 ### Cache boundary
 
-The CVXPYgen sub-compilation is cached independently of the surrounding formula.
+The CVXPY/Clarabel sub-compilation is cached independently of the surrounding formula.
 Its key covers the factory implementation, declared parameter shapes and
 attributes, resulting problem structure, and enabled solver settings. Direct
 bindings and prior-solution bindings therefore reuse the same solver artifact;
@@ -173,8 +185,8 @@ variable.
 
 Compiling the complete outer DAG still matters for CSE, scheduling, native
 link-cache invalidation, and placing upstream formulas, the solve, and downstream
-consumers in one row loop. It does not make CVXPYgen's isolated DPP
-canonicalization faster, so the MPO sub-program and the full fused runner use
+consumers in one row loop. It does not make the isolated cone canonicalization
+faster, so the MPO sub-program and the full fused runner use
 separate cache layers.
 
 ## Explicit generation API
@@ -199,8 +211,7 @@ program = generate_clarabel_program(
 ```
 
 The generated header exposes bulk, column-major parameter setters, a persistent
-`solve()`, lazy named primal/dual/info views, and the normal CVXPYgen result
-object:
+`solve()`, zero-copy named primal/dual/info views, and the Clarabel solution:
 
 ```cpp
 #include "cpg_instance.hpp"
@@ -210,10 +221,10 @@ solver.set_A(a_values);
 solver.set_b(b_values);
 solver.solve();
 auto x = solver.primal_x();
-auto const& info = solver.result().info;
+auto const& solution = solver.result();
 ```
 
-`GeneratedCvxpygenProgram.build_shared_kwargs()` supplies the include, link, and
+`GeneratedClarabelProgram.build_shared_kwargs()` supplies the include, link, and
 cache-fingerprint arguments required by cpp_stream's existing native build:
 
 ```python
@@ -254,36 +265,45 @@ Clarabel update/solve, requested-only projection, allocation wrapping, resident
 growth, and 2/4/8-worker independent-problem throughput. The companion JSON
 retains every raw timing and checksum.
 
-CVXPYgen 1.0's original canonicalizer had two dense-materialization sites. Its
-`_update_to_dense_mapping()` constructed a sparse LIL matrix from
-`np.zeros(dense_shape)`, and `_process_canonical_parameters()` evaluated
-`affine_map.mapping.toarray() * affine_map.sign`. The latter requested about
-34.9 GiB for the 150-asset, eight-horizon benchmark: the canonical `A` affine
-map had shape `186,900 × 25,059`, or 37,468,216,800 float64 bytes if dense. The
-version-pinned adapter
-now scatters COO/CSR nonzeros directly into their destination rows and applies
-signs in place to CSR `data` slices. Neither path calls `np.zeros(dense_shape)`,
-`toarray()`, nor `todense()`.
+The original CVXPYgen 1.0 route attempted a 34.895 GiB dense temporary while
+signing a `186,900 × 25,059` affine map. A sparse patch removed that allocation,
+but fresh 150-asset × 8-horizon generation still took 36.4–36.8 seconds, peaked
+at 4.46 GiB RSS, and emitted a 26.28 MiB header. Extracting CVXPY's full sparse
+map directly improved time but still peaked above 4 GiB because CVXPY formed a
+large intermediate parameter/variable tensor.
 
-The fresh 150×8 audit completed with a 4.46 GiB peak RSS, so the 34.9 GiB dense
-array was not resident or lazily retained. That remaining generation-time peak
-comes from CVXPYgen's canonical and code-writer structures; it is separate from
-the native row hot path, whose allocation wrappers remain at zero after warm-up.
-`scripts/audit_cvxpygen_sparse_generation.py` reproduces the guarded generation.
+The selected backend canonicalizes 512-scalar parameter shards, merges only
+their sparse nonzeros, and applies cone formatting as a signed coordinate
+permutation. In the complete project environment, including JAX 0.4.38, five
+fresh guarded 150×8 generations had a 1.001-second median. Median process peak
+was 405,068 KiB (395.6 MiB), of which only 40,132 KiB (39.2 MiB) was growth above
+the already-loaded CVXPY/JAX/project baseline. The generated header was
+5,449,354 bytes (5.20 MiB).
+
+The audit rejects any individual `numpy.zeros` or SciPy sparse `toarray()`
+allocation at or above 512 MiB; all five runs recorded zero rejected attempts.
+Using the conservative absolute process peak, this is a 97.3% generation-time
+reduction and a 91.3% peak-RSS reduction versus the patched CVXPYgen route.
+`scripts/audit_cvxpygen_sparse_generation.py` reproduces it;
+`CLARABEL_AUDIT_PARAMETER_SHARD_SIZE` tunes the compile-time time/memory
+tradeoff. The generator collects cyclic CVXPY objects once after all shards,
+releases shard graphs through normal reference counting, avoiding explicit
+full-GC scans of CVXPY's eagerly imported optional solver modules. Ten repeated
+generations reached a stable resident-memory plateau rather than growing.
 
 ## One temporal loop with upstream and downstream formulas
 
 Calling a decorated problem factory creates an object-valued IR node rather than
 a batch callback. Its bound parameters remain ordinary DAG expressions. During
 lowering, all requested `get_field()` projections from the same object are
-collected into one physical `CvxpygenNode`, which is placed among the normal
-cpp_stream stages.
+collected into one physical native optimizer node, which is placed among the
+normal cpp_stream stages.
 Consequently the generated runner executes, for each row:
 
 ```text
 Ridge/EWM/risk-model updates
     -> native PSD factor
-    -> CVXPYgen parameter maps
+    -> compact parameter maps
     -> persistent Clarabel update/solve
     -> requested result projections
     -> downstream shift/PnL expressions
@@ -294,10 +314,11 @@ second loop. `examples/cpp_stream_mpo_one_pass.py` asserts that the generated
 translation unit contains exactly one temporal `for (t)` loop and one generated
 optimizer stage even though it requests both weights and turnover.
 
-Before copying a bound parameter, `CvxpygenNode` bitwise-compares it with the
+Before copying a bound parameter, the native optimizer node bitwise-compares it with the
 instance-owned parameter buffer. Unchanged parameters do not dirty their
-canonical blocks. Result inverse maps are likewise lazy and requested-field
-only. The pinned Clarabel build preserves timer storage across resets; allocator
+canonical blocks. Primals and duals are direct zero-copy solution spans, and
+only requested fields are projected. The pinned Clarabel build preserves timer
+storage across resets; allocator
 wrapping verifies zero `malloc`, `calloc`, `realloc`, or `aligned_alloc` calls
 after warm-up.
 

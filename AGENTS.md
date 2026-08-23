@@ -83,6 +83,9 @@ Priorities, in order:
   an explicit delayed state edge: infer ordered row execution, preserve its
   first-row scalar-broadcast or exact-shape initialization, and never override
   a real DAG dependency with an independent-program parallel hint.
+- Native optimizer generation uses CVXPY only for DPP cone canonicalization,
+  compiles parameters in bounded sparse shards, and calls Clarabel directly;
+  do not reintroduce CVXPYgen or a full dense parameter/variable tensor.
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
 - Prefer clear NumPy/Numba slice and vectorized operations over unnecessary scalar loops, especially nested loops that only copy or assign contiguous rows, columns, or blocks (for example, use `dst[:] = src`, `dst[:, i:j] = block`, or `out[t, :] = values` where supported).

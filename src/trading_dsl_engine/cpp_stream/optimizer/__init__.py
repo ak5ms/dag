@@ -1,9 +1,10 @@
-from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
+from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     ClarabelNativePaths,
     DualLayout,
     FieldAlias,
     FieldLayout,
     GeneratedCvxpygenProgram,
+    GeneratedClarabelProgram,
     ParameterLayout,
     PrimalLayout,
     artifact_fingerprint,
@@ -36,6 +37,7 @@ __all__ = [
     "FieldAlias",
     "FieldLayout",
     "GeneratedCvxpygenProgram",
+    "GeneratedClarabelProgram",
     "ParameterLayout",
     "PrimalLayout",
     "artifact_fingerprint",

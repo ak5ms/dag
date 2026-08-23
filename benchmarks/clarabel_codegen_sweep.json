@@ -1,0 +1,58 @@
+{
+  "environment": {
+    "cpu_count": 9,
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cvxpy_version": "1.9.2",
+    "clarabel_version": "0.11.1",
+    "cxx_version": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0"
+  },
+  "configuration": {
+    "horizons": 8,
+    "fresh_generation": true,
+    "note": "One clean sweep; 150x8 is the median of three additional clean generation/compile repetitions."
+  },
+  "cases": [
+    {
+      "assets": 9,
+      "codegen_seconds": 0.035802216000774933,
+      "compile_seconds": 1.2347301469999366,
+      "generated_header_bytes": 45335,
+      "binary_bytes": 2596208
+    },
+    {
+      "assets": 24,
+      "codegen_seconds": 0.04825216400058707,
+      "compile_seconds": 1.3197142969993365,
+      "generated_header_bytes": 167729,
+      "binary_bytes": 2715008
+    },
+    {
+      "assets": 50,
+      "codegen_seconds": 0.14589138600058504,
+      "compile_seconds": 1.3424570209999729,
+      "generated_header_bytes": 633349,
+      "binary_bytes": 3128704
+    },
+    {
+      "assets": 75,
+      "codegen_seconds": 0.24865775299986126,
+      "compile_seconds": 1.3422563719996106,
+      "generated_header_bytes": 1378416,
+      "binary_bytes": 3771776
+    },
+    {
+      "assets": 100,
+      "codegen_seconds": 0.4314200430007986,
+      "compile_seconds": 1.5427053120001801,
+      "generated_header_bytes": 2406646,
+      "binary_bytes": 4656520
+    },
+    {
+      "assets": 150,
+      "codegen_seconds": 1.034723257999758,
+      "compile_seconds": 2.330972994000149,
+      "generated_header_bytes": 5449255,
+      "binary_bytes": 7142792
+    }
+  ]
+}

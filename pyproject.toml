@@ -28,7 +28,6 @@ dependencies = [
 [project.optional-dependencies]
 optimizer = [
     "cvxpy>=1.9.1,<2",
-    "cvxpygen==1.0.0",
 ]
 
 [tool.pytest.ini_options]

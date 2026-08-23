@@ -1,0 +1,282 @@
+#pragma once
+
+extern "C" {
+#include <clarabel.h>
+}
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+
+class alignas(64) {{ class_name }} final {
+  static constexpr std::size_t parameter_scalar_count_ = {{ parameter_scalar_count }};
+
+{% for name, mapping in maps.items() %}
+  alignas(64) inline static constexpr std::array<double, {{ mapping.nnz }}>
+      {{ name }}_map_values_{{ mapping["values"] }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.nnz }}>
+      {{ name }}_map_columns_{{ mapping.columns }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.rows + 1 }}>
+      {{ name }}_map_row_ptr_{{ mapping.row_ptr }};
+{% endfor %}
+{% for name, matrix in matrices.items() %}
+  alignas(64) inline static constexpr std::array<std::uintptr_t, {{ matrix.nnz }}>
+      {{ name }}_row_indices_{{ matrix.row_indices }};
+  alignas(64) inline static constexpr std::array<std::uintptr_t, {{ matrix.columns + 1 }}>
+      {{ name }}_column_ptr_{{ matrix.column_ptr }};
+{% endfor %}
+
+  alignas(64) std::array<double, parameter_scalar_count_ + 1> parameters_{};
+  alignas(64) std::array<double, {{ matrices.P.nnz }}> P_values_{};
+  alignas(64) std::array<double, {{ maps.q.rows }}> q_values_{};
+  alignas(64) std::array<double, {{ matrices.A.nnz }}> A_values_{};
+  alignas(64) std::array<double, {{ maps.b.rows }}> b_values_{};
+  std::array<double, 1> d_value_{};
+  std::array<ClarabelSupportedConeT, {{ cones|length }}> cones_{{ "{{" }}
+{% for cone in cones %}
+      {{ cone }}{{ "," if not loop.last else "" }}
+{% endfor %}
+  {{ "}}" }};
+  ClarabelCscMatrix P_matrix_{};
+  ClarabelCscMatrix A_matrix_{};
+  ClarabelDefaultSettings settings_{};
+  ClarabelDefaultSolver* solver_{nullptr};
+  ClarabelDefaultSolution solution_{};
+  bool solver_settings_dirty_{false};
+  bool P_dirty_{true};
+  bool q_dirty_{true};
+  bool A_dirty_{true};
+  bool b_dirty_{true};
+  bool d_dirty_{true};
+
+  static bool same_value(double left, double right) noexcept {
+    return std::bit_cast<std::uint64_t>(left)
+        == std::bit_cast<std::uint64_t>(right);
+  }
+
+{% for name, mapping in maps.items() %}
+  void canonicalize_{{ name }}() noexcept {
+    auto& output = {% if name == "P" %}P_values_{% elif name == "q" %}q_values_{% elif name == "A" %}A_values_{% elif name == "b" %}b_values_{% else %}d_value_{% endif %};
+    for (std::size_t row = 0; row < {{ mapping.rows }}; ++row) {
+      double value = 0.0;
+      const auto begin = {{ name }}_map_row_ptr_[row];
+      const auto end = {{ name }}_map_row_ptr_[row + 1];
+      for (std::uint32_t index = begin; index < end; ++index) {
+        value += {{ name }}_map_values_[index]
+               * parameters_[{{ name }}_map_columns_[index]];
+      }
+      output[row] = value;
+    }
+  }
+
+{% endfor %}
+  void initialize_solver() {
+    clarabel_CscMatrix_init(
+        &P_matrix_, {{ matrices.P.rows }}, {{ matrices.P.columns }},
+        P_column_ptr_.data(),
+        {% if matrices.P.nnz %}P_row_indices_.data(){% else %}nullptr{% endif %},
+        {% if matrices.P.nnz %}P_values_.data(){% else %}nullptr{% endif %});
+    clarabel_CscMatrix_init(
+        &A_matrix_, {{ matrices.A.rows }}, {{ matrices.A.columns }},
+        A_column_ptr_.data(),
+        {% if matrices.A.nnz %}A_row_indices_.data(){% else %}nullptr{% endif %},
+        {% if matrices.A.nnz %}A_values_.data(){% else %}nullptr{% endif %});
+    solver_ = clarabel_DefaultSolver_new(
+        &P_matrix_, q_values_.data(), &A_matrix_, b_values_.data(),
+        {{ cones|length }}, {% if cones %}cones_.data(){% else %}nullptr{% endif %},
+        &settings_);
+    solver_settings_dirty_ = false;
+  }
+
+ public:
+  {{ class_name }}() {
+    parameters_[parameter_scalar_count_] = 1.0;
+    settings_ = clarabel_DefaultSettings_default();
+    settings_.verbose = false;
+    settings_.presolve_enable = false;
+  }
+
+  ~{{ class_name }}() { reset_solver(); }
+  {{ class_name }}(const {{ class_name }}&) = delete;
+  {{ class_name }}& operator=(const {{ class_name }}&) = delete;
+  {{ class_name }}({{ class_name }}&&) = delete;
+  {{ class_name }}& operator=({{ class_name }}&&) = delete;
+
+  void reset_solver() noexcept {
+    if (solver_ != nullptr) {
+      clarabel_DefaultSolver_free(solver_);
+      solver_ = nullptr;
+    }
+  }
+
+{% for setting in settings %}
+  void set_solver_{{ setting.name }}({{ setting.type }} value) noexcept {
+    if (settings_.{{ setting.name }} == value) return;
+    settings_.{{ setting.name }} = value;
+    solver_settings_dirty_ = true;
+  }
+
+{% endfor %}
+  void solve() {
+    const bool P_changed = P_dirty_;
+    const bool q_changed = q_dirty_;
+    const bool A_changed = A_dirty_;
+    const bool b_changed = b_dirty_;
+    if (P_changed) canonicalize_P();
+    if (q_changed) canonicalize_q();
+    if (A_changed) canonicalize_A();
+    if (b_changed) canonicalize_b();
+    if (d_dirty_) canonicalize_d();
+    if (solver_ != nullptr && !solver_settings_dirty_
+        && !P_changed && !q_changed && !A_changed && !b_changed) {
+      d_dirty_ = false;
+      return;
+    }
+    if (solver_settings_dirty_) reset_solver();
+    if (solver_ == nullptr) {
+      initialize_solver();
+    } else {
+{% if matrices.P.nnz %}
+      if (P_changed) {
+        clarabel_DefaultSolver_update_P(
+            solver_, P_values_.data(), P_values_.size());
+      }
+{% endif %}
+      if (q_changed) {
+        clarabel_DefaultSolver_update_q(
+            solver_, q_values_.data(), q_values_.size());
+      }
+{% if matrices.A.nnz %}
+      if (A_changed) {
+        clarabel_DefaultSolver_update_A(
+            solver_, A_values_.data(), A_values_.size());
+      }
+{% endif %}
+      if (b_changed) {
+        clarabel_DefaultSolver_update_b(
+            solver_, b_values_.data(), b_values_.size());
+      }
+    }
+    clarabel_DefaultSolver_solve(solver_);
+    solution_ = clarabel_DefaultSolver_solution(solver_);
+    P_dirty_ = q_dirty_ = A_dirty_ = b_dirty_ = d_dirty_ = false;
+  }
+
+{% for parameter in parameters %}
+  void set_{{ parameter.name }}(std::span<const double> values) {
+    if (values.size() != {{ parameter.size }}) {
+      throw std::invalid_argument(
+          "parameter {{ parameter.name }} expects {{ parameter.size }} values");
+    }
+    auto target = std::span<double>(
+        parameters_.data() + {{ parameter.offset }}, {{ parameter.size }});
+    if (std::equal(
+            values.begin(), values.end(), target.begin(), same_value)) return;
+    std::copy(values.begin(), values.end(), target.begin());
+{% for block in parameter.dirty_blocks %}
+    {{ block }}_dirty_ = true;
+{% endfor %}
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<double> parameter_buffer() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ parameter.index }}) {
+      return std::span<double>(
+          parameters_.data() + {{ parameter.offset }}, {{ parameter.size }});
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameter_count }}, "invalid optimizer parameter index");
+      return {};
+    }
+  }
+
+  template <std::size_t Index>
+  void mark_parameter_dirty() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ parameter.index }}) {
+{% for block in parameter.dirty_blocks %}
+      {{ block }}_dirty_ = true;
+{% endfor %}
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameter_count }}, "invalid optimizer parameter index");
+    }
+  }
+
+  template <std::size_t Index>
+  static consteval std::size_t parameter_size() noexcept {
+{% for parameter in parameters %}
+    if constexpr (Index == {{ parameter.index }}) return {{ parameter.size }};
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ parameter_count }}, "invalid optimizer parameter index");
+      return 0;
+    }
+  }
+
+{% for primal in primals %}
+  [[nodiscard]] std::span<const double> primal_{{ primal.name }}() noexcept {
+    return std::span<const double>(solution_.x + {{ primal.offset }}, {{ primal.size }});
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const double> primal() noexcept {
+{% for primal in primals %}
+    if constexpr (Index == {{ primal.index }}) return primal_{{ primal.name }}();
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ primals|length }}, "invalid optimizer primal index");
+      return {};
+    }
+  }
+
+{% for dual in duals %}
+  [[nodiscard]] std::span<const double> dual_{{ dual.name }}() noexcept {
+    return std::span<const double>(solution_.z + {{ dual.offset }}, {{ dual.size }});
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const double> dual() noexcept {
+{% for dual in duals %}
+    if constexpr (Index == {{ dual.index }}) return dual_{{ dual.name }}();
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ duals|length }}, "invalid optimizer dual index");
+      return {};
+    }
+  }
+
+  template <std::size_t Index>
+  [[nodiscard]] double info() const noexcept {
+{% for public_name, member_name in info_fields %}
+    if constexpr (Index == {{ loop.index0 }}) {
+{% if public_name == "objective" %}
+      return static_cast<double>(solution_.{{ member_name }} + d_value_[0]);
+{% else %}
+      return static_cast<double>(solution_.{{ member_name }});
+{% endif %}
+    } else
+{% endfor %}
+    {
+      static_assert(Index < {{ info_fields|length }}, "invalid optimizer info index");
+      return 0.0;
+    }
+  }
+
+  [[nodiscard]] const ClarabelDefaultSolution& result() const noexcept {
+    return solution_;
+  }
+};

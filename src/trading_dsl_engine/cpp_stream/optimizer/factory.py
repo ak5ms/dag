@@ -15,7 +15,7 @@ from threading import RLock
 from typing import Any
 
 from trading_dsl_engine.base.dsl import ensure_expr
-from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
+from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     ClarabelNativePaths,
     DualLayout,
     FieldAlias,
@@ -34,7 +34,7 @@ from trading_dsl_engine.ir.types import ValueType
 
 
 _SYMBOLIC_INSTRUMENT_COUNT = 113
-_FACTORY_CACHE_SCHEMA = 2
+_FACTORY_CACHE_SCHEMA = 3
 _PROGRAM_CACHE_LOCK = RLock()
 _DEFAULT_ENABLE_SETTINGS = (
     "verbose",
@@ -78,11 +78,13 @@ class CvxpygenProgramPrototype:
 
 
 def _default_cache_root() -> Path:
-    configured = os.environ.get("TRADING_DSL_ENGINE_CVXPYGEN_CACHE")
+    configured = os.environ.get("TRADING_DSL_ENGINE_CLARABEL_CACHE")
+    if configured is None:
+        configured = os.environ.get("TRADING_DSL_ENGINE_CVXPYGEN_CACHE")
     return (
         Path(configured).expanduser()
         if configured
-        else Path.home() / ".cache" / "trading_dsl_engine" / "cvxpygen"
+        else Path.home() / ".cache" / "trading_dsl_engine" / "clarabel_programs"
     )
 
 
@@ -275,6 +277,7 @@ class CvxpygenProgramDefinition:
         prefix: str | None = None,
         sequential: bool | None = None,
         enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+        parameter_shard_size: int = 512,
     ) -> None:
         self.factory = factory
         self.signature = inspect.signature(factory)
@@ -294,6 +297,9 @@ class CvxpygenProgramDefinition:
             raise TypeError("sequential must be True, False, or None")
         self.sequential = sequential
         self.enable_settings = tuple(enable_settings)
+        if int(parameter_shard_size) <= 0:
+            raise ValueError("parameter_shard_size must be positive")
+        self.parameter_shard_size = int(parameter_shard_size)
         self._factory_hash = _factory_fingerprint(factory)
         self._lock = RLock()
         self._resolved: dict[str, GeneratedCvxpygenProgram] = {}
@@ -502,6 +508,7 @@ class CvxpygenProgramDefinition:
                 for constraint in problem.constraints
             ],
             "enable_settings": self.enable_settings,
+            "parameter_shard_size": self.parameter_shard_size,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=repr).encode()
@@ -587,6 +594,7 @@ class CvxpygenProgramDefinition:
                     prefix=prefix,
                     instrument_count=int(n_instruments),
                     enable_settings=self.enable_settings,
+                    parameter_shard_size=self.parameter_shard_size,
                     field_aliases=aliases,
                     force=force,
                 )
@@ -603,6 +611,7 @@ def cvxpy_program(
     prefix: str | None = None,
     sequential: bool | None = None,
     enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+    parameter_shard_size: int = 512,
 ):
     """Decorate a CVXPY problem factory for direct use in the formula DSL."""
 
@@ -615,6 +624,7 @@ def cvxpy_program(
             prefix=prefix,
             sequential=sequential,
             enable_settings=enable_settings,
+            parameter_shard_size=parameter_shard_size,
         )
 
     return decorate if factory is None else decorate(factory)

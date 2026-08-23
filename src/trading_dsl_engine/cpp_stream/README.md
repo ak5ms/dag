@@ -304,15 +304,16 @@ as temporal state; independent programs remain row-parallel with one generated
 instance per worker.
 
 `cpp_stream.optimizer.generate_clarabel_program(...)` compiles a static-shape,
-DPP-compliant CVXPY problem through CVXPYgen and emits an instance-owned C++
-class. CVXPYgen retains responsibility for parameter-to-`P/A/q/b` maps, cone
-layout, and result mapping. The generated class retains one Clarabel solver,
-updates dirty fixed-sparsity blocks on subsequent solves, and frees the solver
-in its destructor.
+DPP-compliant CVXPY problem in bounded parameter shards and emits an
+instance-owned direct-Clarabel C++ class. CVXPY supplies cone canonicalization;
+the generator merges compact parameter-to-`P/A/q/b` maps without building the
+full DPP tensor. The generated class retains one Clarabel solver, updates dirty
+fixed-sparsity blocks on subsequent solves, and frees the solver in its
+destructor.
 
 Every independent native worker must own a separate generated instance. Mutable
 parameter/canonical/result buffers are per instance; immutable generated maps
-and cone descriptors are shared. `GeneratedCvxpygenProgram.build_shared_kwargs()`
+and cone descriptors are shared. `GeneratedClarabelProgram.build_shared_kwargs()`
 connects the generated headers and pinned Clarabel archive to cpp_stream's
 normal translation-unit cache and build path. See
 [`docs/cvxpygen_cpp_stream.md`](../../../docs/cvxpygen_cpp_stream.md) for the
@@ -390,7 +391,7 @@ Override it with `TRADING_DSL_ENGINE_CPP_STREAM_CACHE`.
 
 ### Generated convex-program stages
 
-A generated CVXPYgen artifact can be bound to normal formulas with
+A generated direct-Clarabel artifact can be bound to normal formulas with
 `bind_program(...)` and projected with `get_field(...)`. The object stage is
 lowered into the ordinary runner stage list: upstream Ridge/risk-model values,
 the Clarabel solve, and downstream formulas all execute in the runner's single

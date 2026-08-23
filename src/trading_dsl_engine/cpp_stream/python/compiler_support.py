@@ -117,9 +117,10 @@ def build_shared(
 ) -> tuple[Path, Path]:
     """Compile one generated translation unit and cache all native dependencies.
 
-    Optimizer nodes use this hook to include CVXPYgen's generated instance class
-    and link a pinned Clarabel static library without introducing a second build
-    system. Existing formulas pass no extras and retain the previous behavior.
+    Optimizer nodes use this hook to include the generated Clarabel instance
+    class and link a pinned Clarabel static library without introducing a second
+    build system. Existing formulas pass no extras and retain the previous
+    behavior.
     """
 
     compiler = _compiler()

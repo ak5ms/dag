@@ -4,14 +4,14 @@ from dataclasses import dataclass, field
 
 from trading_dsl_engine.base.dsl import ensure_expr
 from trading_dsl_engine.base.parser import Expr
-from trading_dsl_engine.cpp_stream.optimizer.cvxpygen_native import (
+from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     GeneratedCvxpygenProgram,
 )
 
 
 @dataclass(frozen=True, eq=False)
 class CvxpygenProgramExpr(Expr):
-    """Object-valued call to one generated CVXPYgen program."""
+    """Object-valued call to one generated native CVXPY program."""
 
     program: object
     bindings: tuple[tuple[str, Expr], ...]
@@ -20,7 +20,7 @@ class CvxpygenProgramExpr(Expr):
 
 @dataclass(frozen=True, eq=False)
 class CvxpygenFieldExpr(Expr):
-    """Named compile-time projection from a generated CVXPYgen program."""
+    """Named compile-time projection from a generated Clarabel program."""
 
     program_expr: CvxpygenProgramExpr
     field: str
@@ -59,7 +59,7 @@ def bind_program(
     """Bind DAG expressions to every generated parameter by name.
 
     Values remain expressions in the cpp_stream graph. They are copied directly
-    into the generated CVXPYgen parameter buffer inside the runner's single row
+    into the generated Clarabel parameter buffer inside the runner's single row
     loop; this function never evaluates or materializes them in Python.
     """
 
@@ -80,14 +80,14 @@ def get_field(program_expr: CvxpygenProgramExpr, field: str) -> CvxpygenFieldExp
     """Project a named primal, constraint result, dual, or solver diagnostic."""
 
     if not isinstance(program_expr, CvxpygenProgramExpr):
-        raise TypeError("get_field expects a CVXPYgen program expression")
+        raise TypeError("get_field expects a CVXPY program expression")
     field = str(field)
     if isinstance(program_expr.program, GeneratedCvxpygenProgram):
         program_expr.program.resolve_field(field)
     else:
         validator = getattr(program_expr.program, "validate_field_request", None)
         if validator is None:
-            raise TypeError("unsupported deferred CVXPYgen program definition")
+            raise TypeError("unsupported deferred CVXPY program definition")
         validator(field)
         program_expr.requested_fields.add(field)
     return CvxpygenFieldExpr(program_expr, field)

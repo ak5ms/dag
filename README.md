@@ -25,7 +25,7 @@ Current development targets the `trading_dsl_engine.jax_flat` runtime plus share
 - `src/trading_dsl_engine/cpp_stream/`
   - Formula-specialized C++20 streaming backend with typed source adapters,
     generated native row loops, fixed-size streaming reductions, and persistent
-    CVXPYgen/Clarabel native-program support.
+    CVXPY/direct-Clarabel native-program support.
 - `tests/numba/`
   - Deprecated Numba runtime tests; do not run or update unless explicitly requested.
 - `tests/jax/`
@@ -54,9 +54,10 @@ Batch execution writes output to a NumPy memmap at `/tmp/trading_dsl_engine_out.
 
 Object-typed intermediate nodes are supported (e.g., stateful jitclass/structref emitters) as long as a downstream op projects them back to scalar/vector/matrix. Root object outputs are intentionally rejected in batch mode to keep the timestep loop on the compiled JIT path.
 
-For generated convex programs, CVXPY is used at compile time and CVXPYgen's
-native parameter/result maps execute inside the C++ runtime. Generated instances
-own persistent Clarabel state and can be allocated once per independent native
+For generated convex programs, CVXPY is used only for bounded, compile-time cone
+canonicalization. Compact sparse parameter maps execute against Clarabel's C ABI
+inside the C++ runtime; CVXPYgen is not a dependency. Generated instances own
+persistent Clarabel state and can be allocated once per independent native
 worker. See [`docs/cvxpygen_cpp_stream.md`](docs/cvxpygen_cpp_stream.md).
 
 ## DSL composition
@@ -249,11 +250,11 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 - Expand shape system for richer multi-output model/optimizer nodes.
 - Continue reducing memory movement in batch paths for large memmap workloads.
 
-### One-pass native CVXPYgen optimization
+### One-pass native CVXPY/Clarabel optimization
 
 `examples/cpp_stream_mpo_one_pass.py` demonstrates streaming Ridge expected
 returns, the native risk covariance flow, PSD factorization, a persistent
-CVXPYgen/Clarabel MPO solve, and downstream PnL in one generated temporal loop.
+direct Clarabel MPO solve, and downstream PnL in one generated temporal loop.
 The optimizer inputs are not materialized and replayed in a second pass.
 
 Define a DPP-compliant problem once with `@cvxpy_program`, explicitly declaring
@@ -273,3 +274,11 @@ their requested inverse result maps execute. See
 boundary. The expanded 9–150 asset benchmark and raw samples are under
 [`benchmarks/cvxpygen_persistent_instances.md`](benchmarks/cvxpygen_persistent_instances.md);
 allocator wrapping records zero warm-path allocations.
+
+CVXPYgen is no longer a dependency. Parameter maps are canonicalized in bounded
+sparse shards and merged before emitting the direct Clarabel C-ABI class. On the
+150-asset × 8-horizon audit this reduced fresh generation from 36.4–36.8 seconds
+and 4.46 GiB peak RSS to a 1.001-second median and 395.6 MiB absolute peak RSS
+in the full project environment. Generation itself added only 39.2 MiB above
+the already-loaded CVXPY/JAX baseline, and the header shrank from 26.28 MiB to
+5.20 MiB.
