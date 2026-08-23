@@ -1,0 +1,32 @@
+name: Export strongly typed GP source
+# export revision: 2
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/export-strongly-typed-gp-source.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 1
+      - name: Package source
+        shell: bash
+        run: |
+          tar --exclude=.git -czf /tmp/dag-strongly-typed-gp-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-strongly-typed-gp-source-${{ github.sha }}
+          path: /tmp/dag-strongly-typed-gp-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1

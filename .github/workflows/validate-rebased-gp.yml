@@ -1,0 +1,43 @@
+name: Validate rebased GP branch
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - .github/workflows/validate-rebased-gp.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install -e . pytest
+      - name: Run GP and cpp_stream compatibility tests
+        env:
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/flows/gp
+          tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py
+          tests/trading_dsl_engine/cpp_stream/test_roll_rets.py
+          tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+          tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+      - name: Remove temporary workflow after success
+        run: |
+          workflow_sha="$(git rev-parse HEAD)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git reset --hard HEAD^
+          git push --force-with-lease=refs/heads/agent/strongly-typed-gp:"$workflow_sha" origin HEAD:agent/strongly-typed-gp
