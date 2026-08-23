@@ -39,8 +39,36 @@ cov2corr = stateless(lambda x: _cov2corr(x), output_kind="matrix", name='cov2cor
 corr2cov = stateless(lambda corr, std: _corr2cov(corr, std), output_kind="matrix", name='corr2cov')
 near_psd = stateless(lambda x: _near_psd(x), output_kind="matrix", name='near_psd')
 
+def risk_covariance(
+    returns,
+    *,
+    span: float = 1440 * 21,
+    min_periods: int = 0,
+    ignore_na: bool = True,
+    adjust: bool = False,
+):
+    """Pairwise-missing exponentially weighted covariance-like second moment.
+
+    Exact-zero returns follow the production convention and are treated as
+    missing observations. The returned ``(N, N)`` matrix remains a normal DSL
+    expression, so cpp_stream updates it inside the same row transition as any
+    downstream optimizer.
+    """
+
+    cleaned = replace(returns, 0, float("nan"))
+    outer = einsum(fillna(cleaned, 0), fillna(cleaned, 0), "i,j->ij")
+    observed_outer = replace(outer, 0, float("nan"))
+    return ewm(
+        observed_outer,
+        span,
+        min_periods=min_periods,
+        ignore_na=ignore_na,
+        adjust=adjust,
+    )
+
+
 roll_rets = RollRets().roll_rets()
-cov = ewm(replace(einsum(fillna(roll_rets, 0), fillna(roll_rets, 0), "i,j->ij"), 0, float("nan")), 1440 * 21)
+cov = risk_covariance(roll_rets)
 # vol = ffill(ewm_std(roll_rets, 1440*10))
 
 # cov_clean = ffill(corr2cov(near_psd(cov2corr(cov)), vol))

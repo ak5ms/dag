@@ -12,6 +12,9 @@
 #include <vector>
 
 #include "stackdsl/runtime.hpp"
+{% for header in native_headers %}
+#include "{{ header }}"
+{% endfor %}
 
 namespace {
 thread_local std::string g_last_error;

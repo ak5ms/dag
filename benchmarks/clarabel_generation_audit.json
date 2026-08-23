@@ -1,0 +1,54 @@
+{
+  "environment": {
+    "cvxpy_version": "1.9.2",
+    "jax_version": "0.4.38",
+    "clarabel_version": "0.11.1"
+  },
+  "configuration": {
+    "assets": 150,
+    "horizons": 8,
+    "parameter_shard_size": 512,
+    "dense_allocation_guard_bytes": 536870912,
+    "repetitions": 5
+  },
+  "summary": {
+    "median_elapsed_seconds": 1.0013846179999746,
+    "median_baseline_rss_kib": 364820,
+    "median_peak_rss_kib": 405068,
+    "median_generation_rss_growth_kib": 40132,
+    "generated_header_bytes": 5449354,
+    "rejected_dense_allocations": []
+  },
+  "samples": [
+    {
+      "elapsed_seconds": 1.0013846179999746,
+      "baseline_rss_kib": 364820,
+      "peak_rss_kib": 405112,
+      "generation_rss_growth_kib": 40292
+    },
+    {
+      "elapsed_seconds": 1.1532268130004013,
+      "baseline_rss_kib": 364976,
+      "peak_rss_kib": 405108,
+      "generation_rss_growth_kib": 40132
+    },
+    {
+      "elapsed_seconds": 0.9407450440003231,
+      "baseline_rss_kib": 364672,
+      "peak_rss_kib": 404776,
+      "generation_rss_growth_kib": 40104
+    },
+    {
+      "elapsed_seconds": 1.000241334999373,
+      "baseline_rss_kib": 364708,
+      "peak_rss_kib": 404748,
+      "generation_rss_growth_kib": 40040
+    },
+    {
+      "elapsed_seconds": 1.7100152370003343,
+      "baseline_rss_kib": 364852,
+      "peak_rss_kib": 405068,
+      "generation_rss_growth_kib": 40216
+    }
+  ]
+}

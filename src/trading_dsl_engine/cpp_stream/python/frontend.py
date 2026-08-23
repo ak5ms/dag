@@ -91,6 +91,7 @@ def compile_ir(
     dsl_registry: DSLFunctionRegistry | None = None,
     column_names: list[str] | tuple[str, ...] | None = None,
     input_value_types: Mapping[str, ValueType] | None = None,
+    n_instruments: int | None = None,
 ) -> Program:
     """Build one neutral DAG and CSE table for one or many cpp_stream roots."""
 
@@ -116,6 +117,7 @@ def compile_ir(
                 dsl_registry or DEFAULT_DSL_REGISTRY,
                 {name: index for index, name in enumerate(column_names or ())},
                 input_value_types or {},
+                n_instruments,
             )
             roots = tuple(builder.build(expression) for expression in expressions)
         finally:

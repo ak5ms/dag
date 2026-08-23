@@ -4,7 +4,10 @@ __pycache__/
 *.egg-info/
 .venv/
 .pip-cache/
+.cache/
 build/
 
 *.so
 _*.build.json
+
+.generated/

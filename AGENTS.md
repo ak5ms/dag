@@ -78,6 +78,17 @@ Priorities, in order:
 
 - Do not add Python-level per-timestep loops in runtime hot paths.
 - For native hot-path work, prefer fixed-size Eigen types and compile Eigen single-threaded when the runtime owns outer parallelism. Use syscall tools such as `strace` only as supporting evidence for mmap/open/read behavior; verify one-pass generated loops and use allocator-aware tooling for heap claims.
+- Generated `@cvxpy_program` factories declare their named `cp.Parameter`
+  objects and attributes inside the factory. Treat `previous_solution(...)` as
+  an explicit delayed state edge: infer ordered row execution, preserve its
+  first-row scalar-broadcast or exact-shape initialization, and never override
+  a real DAG dependency with an independent-program parallel hint.
+- Keep the decorated factory as the only public optimizer binding/generation
+  path. Do not restore manual generated-artifact binding shims or legacy
+  CVXPYgen-named modules, stage kinds, headers, manifests, or cache variables.
+- Native optimizer generation uses CVXPY only for DPP cone canonicalization,
+  compiles parameters in bounded sparse shards, and calls Clarabel directly;
+  do not reintroduce CVXPYgen or a full dense parameter/variable tensor.
 - Prefer compiled loops in jitclass methods.
 - Minimize extra array copies/materialization in batch mode.
 - Prefer clear NumPy/Numba slice and vectorized operations over unnecessary scalar loops, especially nested loops that only copy or assign contiguous rows, columns, or blocks (for example, use `dst[:] = src`, `dst[:, i:j] = block`, or `out[t, :] = values` where supported).

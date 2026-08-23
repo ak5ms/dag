@@ -100,6 +100,17 @@ class EwmOp:
 
 
 @dataclass(frozen=True, slots=True)
+class PsdFactorOp:
+    """Lower-triangular factor of a symmetric PSD matrix."""
+
+    eigenvalue_floor: float = 1e-10
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.eigenvalue_floor) or self.eigenvalue_floor <= 0.0:
+            raise ValueError("psd_factor eigenvalue_floor must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
 class XsRankOp:
     pass
 
@@ -386,6 +397,23 @@ class RidgeProjectionOp:
 
 
 @dataclass(frozen=True, slots=True)
+class CvxpyProgramOp:
+    """Object-valued generated convex program with named parameter bindings."""
+
+    program: object
+    parameter_names: tuple[str, ...]
+    feedback_fields: tuple[object | None, ...] = ()
+    sequential: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CvxpyProjectionOp:
+    """One compile-time projection from a generated convex-program result."""
+
+    field: object
+
+
+@dataclass(frozen=True, slots=True)
 class GroupKeySpec:
     num_keys: int | None = None
     offset: int = 0
@@ -419,6 +447,7 @@ OpSpec: TypeAlias = (
     | FFillOp
     | ShiftOp
     | EwmOp
+    | PsdFactorOp
     | XsRankOp
     | XsPctRankOp
     | XsAggregateOp
@@ -446,6 +475,8 @@ OpSpec: TypeAlias = (
     | InstrumentBasisProjectionOp
     | RidgeOp
     | RidgeProjectionOp
+    | CvxpyProgramOp
+    | CvxpyProjectionOp
     | GroupByOp
 )
 
@@ -462,6 +493,7 @@ __all__ = [
     "FFillOp",
     "ShiftOp",
     "EwmOp",
+    "PsdFactorOp",
     "XsRankOp",
     "XsPctRankOp",
     "XsAggregateOp",
@@ -489,6 +521,8 @@ __all__ = [
     "InstrumentBasisProjectionOp",
     "RidgeOp",
     "RidgeProjectionOp",
+    "CvxpyProgramOp",
+    "CvxpyProjectionOp",
     "GroupKeySpec",
     "GroupByOp",
     "OpSpec",

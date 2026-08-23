@@ -90,6 +90,57 @@ This backend must remain independent of `jax_flat`.
   active-set-aware inference implementation is added; do not silently report
   unconstrained OLS uncertainty.
 
+## Generated convex optimizer programs
+
+- CVXPY is a compile-time tool only. Native per-row execution must not invoke
+  Python, pybind, or CVXPY; the optimizer package has no CVXPYgen dependency.
+- Compile DPP parameters in bounded sparse shards (512 scalars by default),
+  merge CVXPY's compact affine maps, and apply cone formatting as a signed row
+  permutation. Never restore the full parameter/variable DPP tensor or densify
+  a map to discover sparsity.
+- Generated Clarabel programs use one persistent solver per generated object.
+  The first solve constructs it; later solves update dirty fixed-sparsity
+  `P/A/q/b` blocks; destruction must call `clarabel_DefaultSolver_free`.
+- Mutable generated parameter, canonical, result, and solver state is
+  instance-owned. Read-only sparse maps, CSC indices, and cone descriptors may
+  be shared. Never restore one generated global mutable workspace.
+- Independent optimizer rows may run in parallel only through separate generated
+  objects owned by separate native workers. Do not serialize workers around one
+  solver lock or permit nested solver thread pools.
+- Native build-cache fingerprints must include generated public headers,
+  manifests, and the linked solver archive. A changed CVXPY ABI or Clarabel
+  binary must invalidate the compiled formula.
+- `@cvxpy_program` is the low-boilerplate formula boundary. Each factory
+  argument must be replaced by an explicitly named `cp.Parameter` inside the
+  function; CVXPY attributes belong on that declaration, not in a parallel
+  decorator options dictionary. Keep the Clarabel sub-program cache independent
+  of the complete outer-DAG native cache: key it by factory/problem structure,
+  declared parameter shapes/attributes, and solver settings. Outer source
+  dtype/layout belongs to the complete native-runner cache. Different ordinary
+  primal/dual/info projections and direct versus feedback bindings must reuse
+  the same sub-program; requested constraint-value auxiliaries may require a
+  distinct problem artifact.
+- The decorated factory is the sole public binding/generation route. Keep
+  compile-time artifact emission internal and do not add manual bind helpers,
+  compatibility aliases, or CVXPYgen-named cache/header/stage paths.
+- `previous_solution(field, initial=...)` is a delayed optimizer-state edge.
+  The first row accepts a scalar broadcast or exact-shape initializer; later
+  rows copy the selected prior primal directly into the parameter buffer before
+  solving. Such a binding forces ordered row execution and must be rejected
+  with `sequential=False`. With `sequential=None`, infer this dependency and
+  still let whole-DAG analysis find other temporal state; `sequential=True`
+  forces ordering, while an independent complete DAG remains row-parallel with
+  one solver instance per worker.
+- `get_field` names are compile-time contracts. Preserve named primals,
+  indexed/labeled constraint duals (`dual` and `lagrangian`), requested-only
+  constraint numeric values, and objective/iteration/status/residual info.
+  Reject unknown names during IR construction and retrieve only projected
+  result structures in the row loop.
+- Before writing a generated parameter buffer, compare its current bytes with
+  the bound DAG value. Do not mark unchanged canonical blocks dirty. Preserve
+  fixed/instance-owned storage and the patched Clarabel timer reset so allocator
+  wrapping remains exactly zero after solver warm-up.
+
 ## Streaming statistics
 
 - Public lookbacks are named `periods` and count input rows. Use `ewm_*` names for
@@ -150,3 +201,11 @@ This backend must remain independent of `jax_flat`.
 - Use fixed-size accumulators only. `std` uses Welford state and no hot-path allocation.
 - Benchmarks must compare the fused native reduction with full materialization and
   post-hoc reduction, validate output checksums, and report output byte counts.
+
+- Generated optimizer object nodes are physical cpp_stream stages. Keep bound
+  parameters as
+  DAG sources, collect sibling `get_field` projections into one solve, and run
+  upstream formulas, solve, projections, and descendants inside the same runner
+  row loop. Do not reintroduce a post-batch optimizer pass or historical input
+  materialization. Render generated adapter C++ through the optimizer Jinja
+  templates rather than handwritten source-string assembly.

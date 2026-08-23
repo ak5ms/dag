@@ -14,6 +14,7 @@ from trading_dsl_engine.ir.ops import (
     EmitOp,
     EinsumOp,
     EwmOp,
+    PsdFactorOp,
     FFillOp,
     FutureRbfBasisSumOp,
     HumpOp,
@@ -29,6 +30,8 @@ from trading_dsl_engine.ir.ops import (
     PeriodsSinceChangeOp,
     RidgeOp,
     RidgeProjectionOp,
+    CvxpyProgramOp,
+    CvxpyProjectionOp,
     RollingDecayOp,
     RollingEntropyOp,
     RollingKthOp,
@@ -310,6 +313,7 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         FFillOp,
         ShiftOp,
         EwmOp,
+        PsdFactorOp,
         PeriodsSinceChangeOp,
         HumpOp,
         TradeWhenOp,
@@ -336,6 +340,8 @@ def infer_node_dtypes(program: Program, input_dtypes: tuple[str, ...]) -> tuple[
         InstrumentBasisProjectionOp,
         RidgeOp,
         RidgeProjectionOp,
+        CvxpyProgramOp,
+        CvxpyProjectionOp,
         GroupByOp,
     )
     for node_id, node in enumerate(program.nodes):

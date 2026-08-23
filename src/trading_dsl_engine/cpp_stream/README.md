@@ -294,6 +294,23 @@ half-life in rows, and `rettype` accepts descriptive values such as `"residual"`
 `"prediction"`, `"intercept"`, `"beta"`, `"r2"`, `"beta_stderr"`, and
 `"beta_tstat"`; numeric selectors are rejected.
 
+## Generated convex programs
+
+`@cpp_stream.optimizer.cvxpy_program` is the normal DSL boundary. The decorated
+function declares its explicitly named `cp.Parameter` objects and attributes,
+then the same function binds DAG expressions. `previous_solution("weights[0]",
+initial=...)` carries an actual prior primal into the next solve and is inferred
+as temporal state; independent programs remain row-parallel with one generated
+instance per worker.
+
+At compile time the decorator canonicalizes the DPP problem in bounded parameter
+shards and emits an instance-owned direct-Clarabel C++ class. The generator
+merges compact parameter-to-`P/A/q/b` maps without building the full DPP tensor.
+Every independent native worker owns a separate generated instance; mutable
+parameter, canonical, result, and solver state is never shared. See
+[`docs/cvxpy_program_cpp_stream.md`](../../../docs/cvxpy_program_cpp_stream.md)
+for the compile-time interface and cache boundary.
+
 ## Execution model
 
 Every operator has one native implementation and receives its execution scope as
@@ -363,3 +380,11 @@ compile/link flags, platform/machine, and Python ABI. The default cache is:
 ```
 
 Override it with `TRADING_DSL_ENGINE_CPP_STREAM_CACHE`.
+
+### Generated convex-program stages
+
+Calling a `@cvxpy_program` factory with normal formula expressions creates the
+object stage; `get_field(...)` adds typed projections. Upstream Ridge/risk-model
+values, the Clarabel solve, sibling result projections, and downstream formulas
+all execute in the runner's single row loop. See
+`examples/cpp_stream_mpo_one_pass.py`.

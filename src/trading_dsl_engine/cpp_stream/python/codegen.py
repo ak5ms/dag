@@ -26,12 +26,14 @@ from trading_dsl_engine.ir.ops import (
     InstrumentBasisMeanOp,
     LinearFilterOp,
     PeriodsSinceChangeOp,
+    PsdFactorOp,
     RbfBasisOp,
     ReductionOp,
     RollingDecayOp,
     RollingEntropyOp,
     RollingKthOp,
     RidgeOp,
+    CvxpyProgramOp,
     RollingOp,
     RollingPrevDiffOp,
     RollingProductOp,
@@ -557,6 +559,16 @@ def _tensor_stage_type(
     *,
     input_types: tuple[InputTypeSpec, ...] | None,
 ) -> CppType | None:
+    if stage.kind == "psd_factor":
+        assert isinstance(stage.op, PsdFactorOp)
+        return tmpl(
+            "stackdsl::PsdFactorNode",
+            _tensor_source_type(stage.inputs[0], n=n, input_types=input_types),
+            _dest_type(stage),
+            _tensor_shape(stage.out.shape),
+            UInt64Arg(double_bits(stage.op.eigenvalue_floor)),
+            execution,
+        )
     if stage.kind not in {
         "tensor_copy",
         "tensor_unary",
@@ -670,6 +682,77 @@ def _stage_type(
 
     stage_n: CppType = IntArg(1) if stage.lane_count == 1 else n
     out = _dest_type(stage)
+    if stage.kind in {"clarabel", "clarabel_bundle"}:
+        physical = stage if stage.kind == "clarabel" else stage.members[0]
+        assert isinstance(physical.op, CvxpyProgramOp)
+        program = physical.op.program
+        if len(physical.inputs) != len(program.parameters):
+            raise ValueError("generated optimizer parameter/source count mismatch")
+        feedback_fields = physical.op.feedback_fields or (
+            (None,) * len(physical.inputs)
+        )
+        if len(feedback_fields) != len(physical.inputs):
+            raise ValueError("generated optimizer feedback/source count mismatch")
+        bindings = []
+        for index, (source, feedback) in enumerate(
+            zip(physical.inputs, feedback_fields)
+        ):
+            source_type = _tensor_source_type(
+                source, n=n, input_types=input_types
+            )
+            if feedback is None:
+                bindings.append(
+                    tmpl(
+                        "stackdsl::ClarabelParameterBinding",
+                        IntArg(index),
+                        source_type,
+                    )
+                )
+                continue
+            if feedback.kind != "primal":
+                raise ValueError(
+                    "optimizer feedback currently requires a primal field"
+                )
+            bindings.append(
+                tmpl(
+                    "stackdsl::ClarabelPreviousPrimalBinding",
+                    IntArg(index),
+                    IntArg(feedback.source_index),
+                    IntArg(feedback.offset),
+                    IntArg(feedback.count),
+                    IntArg(feedback.stride),
+                    source_type,
+                )
+            )
+        members = stage.members if stage.kind == "clarabel_bundle" else (stage,)
+        projections = []
+        for member in members:
+            if member.projection is None:
+                raise ValueError("optimizer stage is missing a field projection")
+            field = program.resolve_field(member.projection)
+            projections.append(
+                tmpl(
+                    "stackdsl::ClarabelProjection",
+                    Name(
+                        {
+                            "primal": "stackdsl::ClarabelResultKind::Primal",
+                            "dual": "stackdsl::ClarabelResultKind::Dual",
+                            "info": "stackdsl::ClarabelResultKind::Info",
+                        }[field.kind]
+                    ),
+                    IntArg(field.source_index),
+                    IntArg(field.offset),
+                    IntArg(field.count),
+                    IntArg(field.stride),
+                    _dest_type(member),
+                )
+            )
+        return tmpl(
+            "stackdsl::ClarabelNode",
+            Name(program.class_name),
+            tmpl("stackdsl::ClarabelParameterList", *bindings),
+            tmpl("stackdsl::ClarabelProjectionList", *projections),
+        )
     if stage.kind == "copy_bundle":
         assert len(stage.members) > 1
         bindings = tuple(
@@ -1440,6 +1523,7 @@ def render_translation_unit(
     prefetch_rows: int,
     input_types: tuple[InputTypeSpec, ...] | None = None,
     output_layout: OutputLayout,
+    native_headers: tuple[str, ...] = (),
 ) -> GeneratedSource:
     """Render one runner with exact public-output and scratch geometry."""
 
@@ -1514,5 +1598,6 @@ def render_translation_unit(
             ),
             stages=tuple(stages),
             inners=tuple(inners),
+            native_headers=native_headers,
         )
     )
