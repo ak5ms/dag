@@ -1,156 +1,156 @@
 state=tests_failed
 target_branch=agent/strongly-typed-gp
-original_sha=ecc72b1205714be3b2ada2d0dc60c478bc821004
-rebased_sha=ef706769f74240f734183770f2614b2a8c856027
-main_sha=0c956aa1304448f24abf92811ded693bcd7b02ed
+original_sha=07c01022bfde1dd6ff140e14f106daf77e30d45a
+rebased_sha=37e481046a3f3e4bb8c9a712c8c30dbe99093255
+main_sha=8b1ee9857056d781ee4d91e1cda122c4ebbb2ca8
 details:
-                id(node.fn),
-                node.lookback,
-                node.min_periods,
-                node.output_kind,
-                node.output_width,
-                node.name,
-                tuple(_expr_key(a) for a in node.args),
-            )
-        if isinstance(node, StatelessJaxCall):
-            return (
-                "jax_stateless",
-                id(node.fn),
-                node.output_kind,
-                node.output_width,
-                node.name,
-                node.cpp_name,
-                tuple(_expr_key(a) for a in node.args),
-            )
-        if isinstance(node, KeyTuple):
-            return ("tuple", tuple(_expr_key(item) for item in node.items))
-        if isinstance(node, Universe):
-            return ("univ", node.groups)
->       raise ValueError(f"Unsupported expression: {node}")
-E       ValueError: Unsupported expression: Key(expr=Identifier(name='session_start0'), num_keys=None, offset=0, row_scalar=True, dtype='float64', monotonic=True)
-
-src/trading_dsl_engine/jax_flat/compile.py:213: ValueError
------------------------------ Captured stdout call -----------------------------
-running build_ext
-building 'trading_dsl_engine.jax_flat._cpp_flat' extension
-creating build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat
-clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Isrc -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/includeigen/include/eigen -I/usr/include/eigen3 -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/pybind11/include -I/opt/hostedtoolcache/Python/3.11.16/x64/include/python3.11 -c src/trading_dsl_engine/jax_flat/engine.cpp -o build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat/engine.o -fvisibility=hidden -g0 -std=c++23 -O3 -DNDEBUG -DEIGEN_NO_DEBUG -fvisibility=hidden -fno-math-errno -funroll-loops -march=native -mtune=native -flto
-creating build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat
-clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -shared build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_flat/engine.o -L/opt/hostedtoolcache/Python/3.11.16/x64/lib -o build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat/_cpp_flat.cpython-311-x86_64-linux-gnu.so -Wl,-O3 -flto
-building 'trading_dsl_engine.jax_ffi.nnqp._eigen_nnqp' extension
-creating build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp
-clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Isrc -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/includeigen/include/eigen -I/usr/include/eigen3 -I/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/pybind11/include -I/opt/hostedtoolcache/Python/3.11.16/x64/include/python3.11 -c src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc -o build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.o -fvisibility=hidden -g0 -std=c++17 -O3 -DNDEBUG -DEIGEN_NO_DEBUG -fvisibility=hidden -fno-math-errno -funroll-loops -march=native -mtune=native -flto -DEIGEN_MPL2_ONLY
-creating build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp
-clang++ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -shared build/temp.linux-x86_64-cpython-311/src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.o -L/opt/hostedtoolcache/Python/3.11.16/x64/lib -o build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp/_eigen_nnqp.cpython-311-x86_64-linux-gnu.so -Wl,-O3 -flto
-copying build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_flat/_cpp_flat.cpython-311-x86_64-linux-gnu.so -> src/trading_dsl_engine/jax_flat
-copying build/lib.linux-x86_64-cpython-311/trading_dsl_engine/jax_ffi/nnqp/_eigen_nnqp.cpython-311-x86_64-linux-gnu.so -> src/trading_dsl_engine/jax_ffi/nnqp
------------------------------ Captured stderr call -----------------------------
-In file included from src/trading_dsl_engine/jax_flat/engine.cpp:1:
-src/trading_dsl_engine/jax_flat/ops.cpp:583:33: warning: braces around scalar initializer [-Wbraced-scalar-init]
-  583 |         py::array_t<double> out({static_cast<int64_t>(output_size(state))});
-      |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-src/trading_dsl_engine/jax_flat/ops.cpp:1033:21: warning: enumeration value 'Count' not handled in switch [-Wswitch]
- 1033 |             switch (spec.opcode) {
-      |                     ^~~~~~~~~~~
-src/trading_dsl_engine/jax_flat/ops.cpp:648:9: warning: private field 'n_states_' is not used [-Wunused-private-field]
-  648 |     int n_states_;
-      |         ^
-3 warnings generated.
-In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:461:67: warning: comparison of integers of different signs: '__int_type' (aka 'long') and 'size_t' (aka 'unsigned long') [-Wsign-compare]
-  461 |         state_->count.fetch_sub(count, std::memory_order_acq_rel) == count;
-      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ^  ~~~~~
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:893:35: warning: comparison of integers of different signs: 'size_t' (aka 'unsigned long') and 'const int64_t' (aka 'const long') [-Wsign-compare]
-  893 |     if (XLA_FFI_PREDICT_FALSE(idx >= args()->size)) {
-      |                               ~~~ ^  ~~~~~~~~~~~~
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:87:62: note: expanded from macro 'XLA_FFI_PREDICT_FALSE'
-   87 | #define XLA_FFI_PREDICT_FALSE(x) (__builtin_expect(false || (x), false))
-      |                                                              ^
-In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:981:35: warning: comparison of integers of different signs: 'size_t' (aka 'unsigned long') and 'const int64_t' (aka 'const long') [-Wsign-compare]
-  981 |     if (XLA_FFI_PREDICT_FALSE(idx >= rets()->size)) {
-      |                               ~~~ ^  ~~~~~~~~~~~~
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:87:62: note: expanded from macro 'XLA_FFI_PREDICT_FALSE'
-   87 | #define XLA_FFI_PREDICT_FALSE(x) (__builtin_expect(false || (x), false))
-      |                                                              ^
-src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:33:27: warning: braces around scalar initializer [-Wbraced-scalar-init]
-   33 |   py::array_t<double> out({p});
-      |                           ^~~
-In file included from src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:11:
-In file included from /opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/ffi.h:49:
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1810:12: note: in instantiation of function template specialization 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call<0UL, 1UL, 2UL>' requested here
- 1810 |     return Call(call_frame, Is{});
-      |            ^
-src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:110:1: note: in instantiation of member function 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call' requested here
-  110 | XLA_FFI_DEFINE_HANDLER_SYMBOL(
-      | ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2292:5: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_SYMBOL'
- 2292 |     XLA_FFI_DEFINE_HANDLER(handler, impl, ##__VA_ARGS__);                      \
-      |     ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2256:7: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER'
- 2256 |       XLA_FFI_DEFINE_HANDLER_EXPLICIT(fn, impl, ##__VA_ARGS__),             \
-      |       ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2235:21: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_EXPLICIT'
- 2235 |     return handler->Call(call_frame);                                         \
-      |                     ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1810:12: note: in instantiation of function template specialization 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call<0UL, 1UL, 2UL, 3UL, 4UL, 5UL>' requested here
- 1810 |     return Call(call_frame, Is{});
-      |            ^
-src/trading_dsl_engine/jax_ffi/nnqp/eigen_nnqp.cc:118:1: note: in instantiation of member function 'xla::ffi::Handler<xla::ffi::ExecutionStage::kExecute, xla::ffi::Error (*)(xla::ffi::Buffer<xla::ffi::DataType::F64, 2>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Buffer<xla::ffi::DataType::F64, 1>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::Result<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>), xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::ArgTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 2>>, xla::ffi::internal::RetTag<xla::ffi::Buffer<xla::ffi::DataType::F64, 1>>>::Call' requested here
-  118 | XLA_FFI_DEFINE_HANDLER_SYMBOL(
-      | ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2292:5: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_SYMBOL'
- 2292 |     XLA_FFI_DEFINE_HANDLER(handler, impl, ##__VA_ARGS__);                      \
-      |     ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2256:7: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER'
- 2256 |       XLA_FFI_DEFINE_HANDLER_EXPLICIT(fn, impl, ##__VA_ARGS__),             \
-      |       ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:2235:21: note: expanded from macro 'XLA_FFI_DEFINE_HANDLER_EXPLICIT'
- 2235 |     return handler->Call(call_frame);                                         \
-      |                     ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: warning: use of bitwise '&' with boolean operands [-Wbitwise-instead-of-logical]
- 1878 |       bool all_decoded = (std::get<Is>(args).has_value() & ...);
-      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ~~~
-      |                                                            &&
-/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/jaxlib/include/xla/ffi/api/api.h:1878:27: note: cast one or both operands to int to silence this warning
-11 warnings generated.
-=========================== short test summary info ============================
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[14] - Failed: seed=14
+depth=3
+tree=ts_decay_linear_QuantityRow_period(xs_median_quantity(xs_vector_projection_quantity(field_volume_b8_out0, field_ap4_out0)), __gp_generation_passthrough_PeriodAtLeastTwo(__gp_generation_passthrough_PeriodAtLeastTwo(period_ge_2_120)))
+alpha=Call(fn='rolling_decay_linear', args=(Call(fn='xs_median', args=(Call(fn='xs_vector_projection', args=(Identifier(name='volume_b8_out0'), Identifier(name='ap4_out0')), kwargs=()),), kwargs=()), Number(value=120)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[15] - Failed: seed=15
+depth=1
+tree=ts_min_TradingDayHorizonRow_period(field_wdte_out0, positive_int_5)
+alpha=Call(fn='rolling_min', args=(Identifier(name='wdte_out0'), Number(value=5)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[16] - Failed: seed=16
+depth=2
+tree=group_sum_DerivedNumericRow_GroupKeyInput(purify_bool(field_is_tradable_out0), __gp_generation_passthrough_GroupKeyInput(group_key_input_is_tradable_out0))
+alpha=Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Call(fn='purify', args=(Identifier(name='is_tradable_out0'),), kwargs=()), Call(fn='xs_sum', args=(Identifier(name='self_'),), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[17] - Failed: seed=17
+depth=2
+tree=nan_out_DurationRow_upper(xs_demean_duration(__gp_leaf_witness_DurationRow), __gp_generation_passthrough_PositiveFloat(positive_float_v_0p5))
+alpha=Call(fn='where', args=(Call(fn='gt', args=(Call(fn='xs_demean', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()),), kwargs=()), Number(value=0.5)), kwargs=()), Number(value=nan), Call(fn='xs_demean', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()),), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[18] - Failed: seed=18
+depth=1
+tree=group_vector_proj_TimestampRow_GroupKeyInput(field_next_session_start0, group_vector_input_bp1_out0, group_key_input_is_tradable_out0)
+alpha=Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='next_session_start0'), Call(fn='xs_vector_projection', args=(Identifier(name='self_'), Identifier(name='bp1_out0')), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[19] - Failed: seed=19
+depth=3
+tree=add_duration_scalar(nan_mask_DurationRow(group_sum_DurationRow_GroupKeyInput(__gp_leaf_witness_DurationRow, group_key_input_is_tradable_out0), purify_dimensionless(field_trade_cross_pct_out0pcount)), __gp_generation_passthrough_PeriodAtLeastTwo(__gp_generation_passthrough_PeriodAtLeastTwo(period_ge_2_20)))
+alpha=Call(fn='add', args=(Call(fn='where', args=(Call(fn='lt', args=(Call(fn='purify', args=(Identifier(name='trade_cross_pct_out0.count'),), kwargs=()), Number(value=0.0)), kwargs=()), Number(value=nan), Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Call(fn='xs_sum', args=(Identifier(name='self_'),), kwargs=())), kwargs=())), kwargs=()), Number(value=20)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[20] - Failed: seed=20
+depth=2
+tree=floordiv_quantity_quantity(keep_QuantityRow_period(field_volume_a0_out0, field_session_end0, positive_int_120), mul_scalar_quantity(period_ge_2_5, field_trade_cross_pct_out0psum))
+alpha=Call(fn='floor', args=(Call(fn='div', args=(Call(fn='where', args=(Call(fn='lt', args=(Call(fn='periods_since_last_change', args=(Identifier(name='session_end0'),), kwargs=()), Number(value=120)), kwargs=()), Identifier(name='volume_a0_out0'), Number(value=nan)), kwargs=()), Call(fn='mul', args=(Number(value=5), Identifier(name='trade_cross_pct_out0.sum')), kwargs=())), kwargs=()),), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[21] - Failed: seed=21
+depth=2
+tree=xs_prob_density_uniform_default(group_normalize_CountRow_GroupKeyInput_full(field_trade_cross_pct_out0pcount, group_key_input_is_tradable_out0, bool_param_false, positive_float_v_0p25, positive_float_v_0p01))
+alpha=Call(fn='mul', args=(Call(fn='sub', args=(Call(fn='xs_pct_rank', args=(Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='trade_cross_pct_out0.count'), Call(fn='mul', args=(Call(fn='where', args=(Call(fn='and_', args=(Call(fn='gt', args=(Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=()), Number(value=0.0)), kwargs=()), Call(fn='isfinite', args=(Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=()),), kwargs=())), kwargs=()), Call(fn='div', args=(Identifier(name='self_'), Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=())), kwargs=()), Number(value=nan)), kwargs=()), Number(value=0.01)), kwargs=())), kwargs=()),), kwargs=()), Call(fn='xs_mean', args=(Call(fn='xs_pct_rank', args=(Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='trade_cross_pct_out0.count'), Call(fn='mul', args=(Call(fn='where', args=(Call(fn='and_', args=(Call(fn='gt', args=(Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=()), Number(value=0.0)), kwargs=()), Call(fn='isfinite', args=(Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=()),), kwargs=())), kwargs=()), Call(fn='div', args=(Identifier(name='self_'), Call(fn='xs_sum', args=(Call(fn='abs', args=(Identifier(name='self_'),), kwargs=()),), kwargs=())), kwargs=()), Number(value=nan)), kwargs=()), Number(value=0.01)), kwargs=())), kwargs=()),), kwargs=()),), kwargs=())), kwargs=()), Number(value=1.0)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[22] - Failed: seed=22
+depth=1
+tree=ne_duration(__gp_leaf_witness_DurationRow, __gp_leaf_witness_DurationRow)
+alpha=Call(fn='ne', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[23] - Failed: seed=23
+depth=1
+tree=mul_dimensionless_price(field_vw_halfspread_out0, field_bp5_out0)
+alpha=Call(fn='mul', args=(Identifier(name='vw_halfspread_out0'), Identifier(name='bp5_out0')), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[24] - Failed: seed=24
+depth=3
+tree=div_count_quantity(hump_decay_count_full(rolling_decay_linear_count(field_trade_cross_pct_out0pcount, positive_int_5), __gp_generation_passthrough_PositiveFloat(positive_float_v_0p1), __gp_generation_passthrough_BoolParam(bool_param_false)), tail_QuantityRow_default(xs_one_side_QuantityRow_long(field_volume_b8_out0)))
+alpha=Call(fn='div', args=(Call(fn='hump_decay', args=(Call(fn='rolling_decay_linear', args=(Identifier(name='trade_cross_pct_out0.count'), Number(value=5)), kwargs=(('min_periods', Number(value=5)),)), Number(value=0.1), Number(value=0.0)), kwargs=()), Call(fn='where', args=(Call(fn='and_', args=(Call(fn='gt', args=(Call(fn='sub', args=(Identifier(name='volume_b8_out0'), Call(fn='xs_min', args=(Identifier(name='volume_b8_out0'),), kwargs=())), kwargs=()), Number(value=0.0)), kwargs=()), Call(fn='lt', args=(Call(fn='sub', args=(Identifier(name='volume_b8_out0'), Call(fn='xs_min', args=(Identifier(name='volume_b8_out0'),), kwargs=())), kwargs=()), Number(value=0.0)), kwargs=())), kwargs=()), Number(value=0.0), Call(fn='sub', args=(Identifier(name='volume_b8_out0'), Call(fn='xs_min', args=(Identifier(name='volume_b8_out0'),), kwargs=())), kwargs=())), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[25] - Failed: seed=25
+depth=1
+tree=ewm_co_kurtosis_numeric(field_is_tradable_out0, field_volume_b4_out0, positive_int_2)
+alpha=Call(fn='ewm_co_kurtosis', args=(Identifier(name='is_tradable_out0'), Identifier(name='volume_b4_out0'), Number(value=2)), kwargs=(('min_periods', Number(value=2)), ('ignore_na', Number(value=1.0)), ('adjust', Number(value=0.0))))
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[26] - Failed: seed=26
+depth=3
+tree=ewm_moment_duration(xs_group_neutralize_DurationRow_GroupKeyInput(__gp_leaf_witness_DurationRow, group_key_input_is_tradable_out0), __gp_generation_passthrough_PositiveInt(__gp_generation_passthrough_PeriodAtLeastTwo(period_ge_2_10)))
+alpha=Call(fn='ewm_moment', args=(Call(fn='sub', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Call(fn='xs_mean', args=(Identifier(name='self_'),), kwargs=())), kwargs=())), kwargs=()), Number(value=10)), kwargs=(('min_periods', Number(value=10)), ('ignore_na', Number(value=1.0)), ('adjust', Number(value=0.0)), ('k', Number(value=2))))
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[27] - Failed: seed=27
+depth=3
+tree=xs_mean_duration(vec_quantile_duration(rolling_product_duration(__gp_leaf_witness_DurationRow, period_ge_2_2), __gp_generation_passthrough_QuantileParam(quantile_v_0p9)))
+alpha=Call(fn='xs_mean', args=(Call(fn='where', args=(Call(fn='isfinite', args=(Call(fn='rolling_product', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Number(value=2)), kwargs=(('min_periods', Number(value=2)),)),), kwargs=()), Call(fn='vec_quantile', args=(Call(fn='rolling_product', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Number(value=2)), kwargs=(('min_periods', Number(value=2)),)), Number(value=0.9)), kwargs=()), Call(fn='vec_quantile', args=(Call(fn='rolling_product', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Number(value=2)), kwargs=(('min_periods', Number(value=2)),)), Number(value=0.9)), kwargs=())), kwargs=()),), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[28] - Failed: seed=28
+depth=3
+tree=div_scalar_price(__gp_generation_passthrough_PositiveFloat(__gp_generation_passthrough_PositiveFloat(positive_float_v_3)), rolling_quantile_price(nan_out_PriceRow_both(field_ap_out0pclose, positive_float_v_3, period_ge_2_3), __gp_generation_passthrough_PositiveInt(positive_int_1), __gp_generation_passthrough_QuantileParam(quantile_v_0p1)))
+alpha=Call(fn='div', args=(Number(value=3.0), Call(fn='rolling_quantile', args=(Call(fn='where', args=(Call(fn='gt', args=(Identifier(name='ap_out0.close'), Number(value=3)), kwargs=()), Number(value=nan), Call(fn='where', args=(Call(fn='lt', args=(Identifier(name='ap_out0.close'), Number(value=3.0)), kwargs=()), Number(value=nan), Identifier(name='ap_out0.close')), kwargs=())), kwargs=()), Number(value=1)), kwargs=(('q', Number(value=0.1)), ('min_periods', Number(value=1))))), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[29] - Failed: seed=29
+depth=2
+tree=xs_scale_dimensionless_scale(vec_min_tensor_booltensor2(__gp_leaf_witness_BoolTensor2), __gp_generation_passthrough_PositiveFloat(positive_float_v_0p01))
+alpha=Call(fn='xs_scale', args=(Call(fn='reduce_min', args=(Call(fn='eq', args=(Call(fn='mod', args=(Number(value=1), Call(fn='cat', args=(Identifier(name='ap0_out0'), Identifier(name='ap1_out0'), Identifier(name='ap2_out0'), Identifier(name='ap3_out0'), Identifier(name='ap4_out0'), Identifier(name='ap5_out0'), Identifier(name='ap6_out0'), Identifier(name='ap7_out0'), Identifier(name='ap8_out0'), Identifier(name='ap9_out0'), Identifier(name='bp0_out0'), Identifier(name='bp1_out0'), Identifier(name='bp2_out0'), Identifier(name='bp3_out0'), Identifier(name='bp4_out0'), Identifier(name='bp5_out0'), Identifier(name='bp6_out0'), Identifier(name='bp7_out0'), Identifier(name='bp8_out0'), Identifier(name='bp9_out0')), kwargs=())), kwargs=()), Call(fn='mod', args=(Number(value=1), Call(fn='cat', args=(Identifier(name='ap0_out0'), Identifier(name='ap1_out0'), Identifier(name='ap2_out0'), Identifier(name='ap3_out0'), Identifier(name='ap4_out0'), Identifier(name='ap5_out0'), Identifier(name='ap6_out0'), Identifier(name='ap7_out0'), Identifier(name='ap8_out0'), Identifier(name='ap9_out0'), Identifier(name='bp0_out0'), Identifier(name='bp1_out0'), Identifier(name='bp2_out0'), Identifier(name='bp3_out0'), Identifier(name='bp4_out0'), Identifier(name='bp5_out0'), Identifier(name='bp6_out0'), Identifier(name='bp7_out0'), Identifier(name='bp8_out0'), Identifier(name='bp9_out0')), kwargs=())), kwargs=())), kwargs=()),), kwargs=(('axis', Number(value=-1)),)), Number(value=0.01)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[30] - Failed: seed=30
+depth=3
+tree=ge_bool(xs_truncate_BoolRow_param(group_percentage_BoolRow_GroupKeyInput(field_is_tradable_out0, group_key_input_is_tradable_out0, quantile_v_0p1), __gp_generation_passthrough_PositiveFloat(positive_float_v_2)), group_vector_proj_BoolRow_GroupKeyInput(gt_scalar_price(positive_int_5, field_mp_out0phigh), __gp_generation_passthrough_GroupVectorInput(group_vector_input_trade_cross_pct_out0pcount), __gp_generation_passthrough_GroupKeyInput(group_key_input_is_tradable_out0)))
+alpha=Call(fn='ge', args=(Call(fn='minimum', args=(Call(fn='maximum', args=(Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='is_tradable_out0'), Call(fn='xs_quantile_value', args=(Identifier(name='self_'), Number(value=0.1)), kwargs=())), kwargs=()), Call(fn='mul', args=(Number(value=-1.0), Call(fn='mul', args=(Number(value=2.0), Call(fn='xs_sum', args=(Call(fn='abs', args=(Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='is_tradable_out0'), Call(fn='xs_quantile_value', args=(Identifier(name='self_'), Number(value=0.1)), kwargs=())), kwargs=()),), kwargs=()),), kwargs=())), kwargs=())), kwargs=())), kwargs=()), Call(fn='mul', args=(Number(value=2.0), Call(fn='xs_sum', args=(Call(fn='abs', args=(Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='is_tradable_out0'), Call(fn='xs_quantile_value', args=(Identifier(name='self_'), Number(value=0.1)), kwargs=())), kwargs=()),), kwargs=()),), kwargs=())), kwargs=())), kwargs=()), Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Call(fn='gt', args=(Number(value=5), Identifier(name='mp_out0.high')), kwargs=()), Call(fn='xs_vector_projection', args=(Identifier(name='self_'), Identifier(name='trade_cross_pct_out0.count')), kwargs=())), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[31] - Failed: seed=31
+depth=2
+tree=clip_trading_day_horizon_scalar_bounds(abs_trading_day_horizon(field_wdte_out0), __gp_generation_passthrough_PositiveInt(positive_int_1440), __gp_generation_passthrough_PositiveInt(period_ge_2_3))
+alpha=Call(fn='minimum', args=(Call(fn='maximum', args=(Call(fn='abs', args=(Identifier(name='wdte_out0'),), kwargs=()), Number(value=1440)), kwargs=()), Number(value=3)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[32] - Failed: seed=32
+depth=1
+tree=div_price_trading_day_horizon(field_bp5_out0, field_wdte_out0)
+alpha=Call(fn='div', args=(Identifier(name='bp5_out0'), Identifier(name='wdte_out0')), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[33] - Failed: seed=33
+depth=3
+tree=rolling_sum_dimensionless(div_count_count(xs_one_side_CountRow_short(field_trade_cross_pct_out0pcount), group_extra_CountRow_GroupKeyInput(field_trade_cross_pct_out0pcount, group_key_input_is_tradable_out0)), __gp_generation_passthrough_PositiveInt(__gp_generation_passthrough_PeriodAtLeastTwo(period_ge_2_1440)))
+alpha=Call(fn='rolling_sum', args=(Call(fn='div', args=(Call(fn='sub', args=(Identifier(name='trade_cross_pct_out0.count'), Call(fn='xs_max', args=(Identifier(name='trade_cross_pct_out0.count'),), kwargs=())), kwargs=()), Call(fn='where', args=(Call(fn='isnan', args=(Identifier(name='trade_cross_pct_out0.count'),), kwargs=()), Call(fn='groupby', args=(Key(expr=Identifier(name='is_tradable_out0'), num_keys=2, offset=0, row_scalar=False, dtype=None, monotonic=False), Identifier(name='trade_cross_pct_out0.count'), Call(fn='xs_mean', args=(Identifier(name='self_'),), kwargs=())), kwargs=()), Identifier(name='trade_cross_pct_out0.count')), kwargs=())), kwargs=()), Number(value=1440)), kwargs=(('min_periods', Number(value=1440)),))
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[34] - Failed: seed=34
+depth=3
+tree=add_bool(le_trading_day_horizon_scalar(add_trading_day_horizon_scalar(field_wdte_out0, positive_float_v_0p5), __gp_generation_passthrough_PositiveInt(positive_int_120)), mul_bool_scalar(eq_scalar_derived_numeric(period_ge_2_5, field_vw_halfspread_out0), __gp_generation_passthrough_PositiveFloat(positive_float_v_0p1)))
+alpha=Call(fn='add', args=(Call(fn='le', args=(Call(fn='add', args=(Identifier(name='wdte_out0'), Number(value=0.5)), kwargs=()), Number(value=120)), kwargs=()), Call(fn='mul', args=(Call(fn='eq', args=(Number(value=5), Identifier(name='vw_halfspread_out0')), kwargs=()), Number(value=0.1)), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[35] - Failed: seed=35
+depth=1
+tree=arc_cos_numeric(field_bp0_out0)
+alpha=Call(fn='acos', args=(Identifier(name='bp0_out0'),), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[36] - Failed: seed=36
+depth=1
+tree=lt_quantity(field_volume_out0, field_volume_out0)
+alpha=Call(fn='lt', args=(Identifier(name='volume_out0'), Identifier(name='volume_out0')), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[37] - Failed: seed=37
+depth=3
+tree=ts_product_DimensionlessRow_period(field_trade_cross_pct_out0pcount, __gp_generation_passthrough_PositiveInt(__gp_generation_passthrough_PeriodAtLeastTwo(period_ge_2_20)))
+alpha=Call(fn='rolling_product', args=(Identifier(name='trade_cross_pct_out0.count'), Number(value=20)), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[38] - Failed: seed=38
+depth=2
+tree=div_duration_duration(clip_duration_scalar_bounds(__gp_leaf_witness_DurationRow, -0.5, positive_float_v_0p5), minimum_duration_scalar(__gp_leaf_witness_DurationRow, positive_float_v_0p25))
+alpha=Call(fn='div', args=(Call(fn='minimum', args=(Call(fn='maximum', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Number(value=-0.5)), kwargs=()), Number(value=0.5)), kwargs=()), Call(fn='minimum', args=(Call(fn='sub', args=(Identifier(name='_ev_ts'), Identifier(name='_ev_ts')), kwargs=()), Number(value=0.25)), kwargs=())), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively[39] - Failed: seed=39
+depth=2
+tree=left_tail_PriceRow_bound(field_bp0_out0, __gp_generation_passthrough_PositiveFloat(positive_float_v_0p01))
+alpha=Call(fn='where', args=(Call(fn='gt', args=(Identifier(name='bp0_out0'), Number(value=0.01)), kwargs=()), Number(value=nan), Identifier(name='bp0_out0')), kwargs=())
+error=TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_compile_fuzz.py::test_all_row_regression_composites_compile_natively - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_pset.py::test_scalar_terminals_do_not_masquerade_as_rows - StopIteration
+FAILED tests/flows/gp/test_search_runtime_optimizations.py::test_cost_balanced_batches_are_bounded_and_cover_every_candidate - AttributeError: <module '_run_gp_alpha_search_test_module' from '/home/runner/work/dag/dag/scripts/run_gp_alpha_search.py'> has no attribute 'FITNESS_BATCH_SIZE'
+FAILED tests/flows/gp/test_search_runtime_optimizations.py::test_interval_union_counts_parallel_compile_wall_once - AttributeError: module '_run_gp_alpha_search_test_module' has no attribute '_interval_union_seconds'
+FAILED tests/flows/gp/test_search_runtime_optimizations.py::test_pool_batch_loader_removes_only_verified_lane_broadcast - AttributeError: module '_run_gp_alpha_search_test_module' has no attribute '_pool_batch_values'
+FAILED tests/flows/gp/test_search_runtime_optimizations.py::test_materialized_fitness_invariants_preserve_alpha_pnl - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_gp.py::test_tensor_runtime_suite - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_higher_rank_runtime.py::test_rank3_temporal_shift_and_reductions_match_numpy - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_higher_rank_runtime.py::test_rank4_elementwise_and_repeated_vec_reduction_match_numpy - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_runtime.py::test_matrix_vec_average_matches_numpy - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_runtime.py::test_rank3_tensor_reduces_one_final_axis_per_vec_call - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_runtime.py::test_rank3_elementwise_broadcasting_matches_numpy - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_runtime.py::test_matrix_temporal_diff_then_vec_sum_matches_numpy - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
+FAILED tests/flows/gp/test_tensor_runtime.py::test_matrix_regression_composite_compiles_and_runs - TypeError: build_shared() got an unexpected keyword argument 'extra_include_dirs'
 FAILED tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py::test_known_instrument_count_uses_one_ir_build - AssertionError: assert 2 == 1
- +  where 2 = len([<trading_dsl_engine.cpp_stream.python.compiler_support.ReferencedSourceTypes object at 0x7f1ebdf92fd0>, {'x': ValueType(kind='vector', width=1, dtype='float64', shape=(None,))}])
-FAILED tests/trading_dsl_engine/cpp_stream/test_compile_optimizations.py::test_header_digest_cache_invalidates_after_header_edit - AttributeError: module 'trading_dsl_engine.cpp_stream.python.compile' has no attribute '_header_digest'
-FAILED tests/trading_dsl_engine/cpp_stream/test_roll_rets.py::test_roll_rets_native_matches_jax_flat - ValueError: Unsupported expression: Key(expr=Identifier(name='session_start0'), num_keys=None, offset=0, row_scalar=True, dtype='float64', monotonic=True)
-3 failed, 89 passed in 448.51s (0:07:28)
+ +  where 2 = len([<trading_dsl_engine.cpp_stream.python.compiler_support.ReferencedSourceTypes object at 0x7f66f51b7690>, {'x': ValueType(kind='vector', width=1, dtype='float64', shape=(None,))}])
+FAILED tests/trading_dsl_engine/cpp_stream/test_roll_rets.py::test_roll_rets_uses_monotonic_session_key - KeyError: "source mismatch: missing=['vwap_mp_out0', 'vwap_mp_out1']"
+FAILED tests/trading_dsl_engine/cpp_stream/test_roll_rets.py::test_roll_rets_native_matches_jax_flat - KeyError: "source mismatch: missing=['vwap_mp_out0', 'vwap_mp_out1']"
+59 failed, 34 passed in 103.42s (0:01:43)
