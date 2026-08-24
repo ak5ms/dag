@@ -4,10 +4,11 @@ from pathlib import Path
 import re
 
 import numpy as np
+import pytest
 
 from trading_dsl_engine.base.dsl import cumsum, groupby, self_, var
 from trading_dsl_engine.base.keys import Key
-from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream import compile_formula, run_many
 
 
 def test_promoted_row_output_remains_readable_by_final_projection(tmp_path: Path):
@@ -207,3 +208,244 @@ def test_grouped_ewm_epilogue_uses_no_inner_scalar_scratch(tmp_path: Path):
     generated = runtime.generated_cpp.read_text()
     assert "stackdsl::EwmDiscardDst" in generated
     assert "stackdsl::EwmEpilogueBinding" in generated
+
+
+def test_native_batch_matches_serial_mixed_output_runtimes(tmp_path: Path):
+    rows, cols = 512, 5
+    rng = np.random.default_rng(42)
+    data = {"x": rng.normal(size=(rows, cols))}
+    x = var("x")
+    runtimes = (
+        compile_formula(
+            [x + 1.0, (x + 1.0).mean(axis=0)],
+            data,
+            n_instruments=cols,
+        ),
+        compile_formula(
+            [x * 2.0, (x * 2.0).std(axis=0)],
+            data,
+            n_instruments=cols,
+        ),
+    )
+    serial = tuple(
+        runtime.run(out_path=tmp_path / f"serial-{index}.npy", threads=1)
+        for index, runtime in enumerate(runtimes)
+    )
+    native = run_many(
+        runtimes,
+        out_paths=(tmp_path / "native-0.npy", tmp_path / "native-1.npy"),
+        workers=2,
+        threads_per_runtime=1,
+    )
+
+    assert 1 <= native.workers <= 2
+    for expected_result, actual_result in zip(serial, native.results):
+        expected = expected_result.load(mmap_mode=None)
+        actual = actual_result.load(mmap_mode=None)
+        assert isinstance(expected, tuple)
+        assert isinstance(actual, tuple)
+        for expected_value, actual_value in zip(expected, actual):
+            np.testing.assert_allclose(
+                actual_value,
+                expected_value,
+                rtol=1e-13,
+                atol=1e-13,
+                equal_nan=True,
+            )
+
+
+def test_native_batch_rejects_duplicate_output_paths(tmp_path: Path):
+    data = {"x": np.arange(16, dtype=np.float64).reshape(8, 2)}
+    runtime = compile_formula(var("x") + 1.0, data, n_instruments=2)
+    shared = tmp_path / "shared.npy"
+    with pytest.raises(ValueError, match="out_paths must be distinct"):
+        run_many(
+            (runtime, runtime),
+            out_paths=(shared, shared),
+            workers=2,
+        )
+
+
+def test_gp_search_pure_walk_forward_and_batching_contracts():
+    import ast
+    import math
+    import sys
+    import types
+    from dataclasses import dataclass
+    from statistics import NormalDist
+
+    script = Path(__file__).resolve().parents[3] / "scripts" / "run_gp_alpha_search.py"
+    source = script.read_text()
+    compile(source, str(script), "exec")
+    assert "ThreadPoolExecutor" not in source
+    assert "sources_all" not in source
+    assert "run_many(" in source
+    assert "train_end=(folds[-1].train_end if folds else None)" in source
+
+    tree = ast.parse(source)
+    wanted_classes = {"WalkForwardFold", "SharpeComparison", "_CandidateSpec"}
+    wanted_functions = {
+        "build_anchored_walk_forward",
+        "_sharpe_standard_error",
+        "compare_sharpes",
+        "_make_microbatches",
+        "_portfolio_cumulative",
+    }
+    nodes = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name in wanted_classes:
+            nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in wanted_functions:
+            nodes.append(node)
+    selected = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(selected)
+
+    module_name = "_gp_search_pure_contracts"
+    module = types.ModuleType(module_name)
+    module.__dict__.update(
+        {
+            "__name__": module_name,
+            "dataclass": dataclass,
+            "math": math,
+            "NormalDist": NormalDist,
+            "np": np,
+            "_NORMAL": NormalDist(),
+            "FITNESS_BATCH_SIZE": 8,
+            "FITNESS_TASKS_PER_WORKER": 1,
+        }
+    )
+    sys.modules[module_name] = module
+    try:
+        exec(compile(selected, str(script), "exec"), module.__dict__)
+        folds = module.build_anchored_walk_forward(
+            1_000,
+            folds=3,
+            validation_fraction=0.10,
+        )
+        assert [
+            (fold.train_end, fold.validation_start, fold.validation_end)
+            for fold in folds
+        ] == [
+            (700, 700, 800),
+            (800, 800, 900),
+            (900, 900, 1_000),
+        ]
+        comparable = module.compare_sharpes(
+            1.0,
+            0.8,
+            in_sample_rows=1_000,
+            out_of_sample_rows=1_000,
+            min_ratio=0.5,
+            alpha=0.05,
+            require_positive=True,
+        )
+        decayed = module.compare_sharpes(
+            1.0,
+            0.3,
+            in_sample_rows=1_000,
+            out_of_sample_rows=1_000,
+            min_ratio=0.5,
+            alpha=0.05,
+            require_positive=True,
+        )
+        assert comparable.passed
+        assert not decayed.passed
+        items = [
+            module._CandidateSpec(str(index), object(), float(index + 1))
+            for index in range(64)
+        ]
+        batches = module._make_microbatches(items, workers=64)
+        assert len(batches) == 8
+        assert all(len(batch) == 8 for batch in batches)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_gp_fitness_path_uses_native_cpp_batches_and_anchored_folds(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import importlib.util
+    import sys
+
+    from deap import base as deap_base
+
+    script = Path(__file__).resolve().parents[3] / "scripts" / "run_gp_alpha_search.py"
+    module_name = "_gp_search_native_path"
+    spec = importlib.util.spec_from_file_location(module_name, script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(module, "N_INSTRUMENTS", 3)
+        monkeypatch.setattr(module, "NATIVE_WORKERS", 2)
+        monkeypatch.setattr(module, "FITNESS_BATCH_SIZE", 2)
+        monkeypatch.setattr(module, "FITNESS_TASKS_PER_WORKER", 1)
+        monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(module, "OOS_FILTER_FITNESS", False)
+        monkeypatch.setattr(module, "OOS_REQUIRE_POSITIVE", False)
+        monkeypatch.setattr(
+            module,
+            "alpha_expr",
+            lambda individual, _pset: var(str(individual)),
+        )
+
+        class Fitness(deap_base.Fitness):
+            weights = (1.0,)
+
+        class Individual(list):
+            def __init__(self, name: str):
+                super().__init__([name])
+                self.name = name
+                self.fitness = Fitness()
+
+            def __str__(self) -> str:
+                return self.name
+
+        rows, cols = 4096, 3
+        rng = np.random.default_rng(20260821)
+        source = {
+            "clean_rets": rng.normal(0.0, 5.0e-4, size=(rows, cols)),
+            "volatility": np.full((rows, cols), 0.01, dtype=np.float64),
+            "is_tradable_out0": np.ones((rows, cols), dtype=np.float64),
+            "gp_row_index": np.arange(rows, dtype=np.int64),
+        }
+        individuals = [Individual(f"alpha_{index}") for index in range(4)]
+        for index, individual in enumerate(individuals):
+            source[str(individual)] = rng.normal(
+                loc=0.01 * index,
+                scale=1.0,
+                size=(rows, cols),
+            )
+
+        folds = module.build_anchored_walk_forward(
+            rows,
+            folds=2,
+            validation_fraction=0.20,
+        )
+        assessments = {}
+        metrics = module.evaluate_individuals(
+            individuals,
+            None,
+            source,
+            folds,
+            1,
+            assessments,
+        )
+
+        assert metrics["unique_evaluated"] == 4
+        assert metrics["microbatches"] == 2
+        assert metrics["native_workers"] >= 1
+        if module._available_cpus() >= 2:
+            assert metrics["native_workers"] == 2
+        assert metrics["fallback_serial"] is False
+        assert metrics["native_seconds_sum"] >= 0.0
+        assert metrics["cpu_seconds_sum"] >= 0.0
+        assert all(individual.fitness.valid for individual in individuals)
+        assert set(assessments) == {str(individual) for individual in individuals}
+        assert folds[-1].validation_end == rows
+    finally:
+        sys.modules.pop(module_name, None)
