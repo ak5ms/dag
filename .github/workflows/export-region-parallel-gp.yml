@@ -1,12 +1,13 @@
 name: Export region-parallel GP source
-# export revision: 2
+# export revision: 3
 
 on:
   push:
     branches:
       - agent/region-parallel-gp
-    paths:
-      - ".github/workflows/export-region-parallel-gp.yml"
+  pull_request:
+    branches:
+      - agent/strongly-typed-gp
   workflow_dispatch:
 
 permissions:
