@@ -1,0 +1,32 @@
+name: Export local validation runtime
+
+on:
+  push:
+    branches:
+      - agent/region-parallel-gp
+    paths:
+      - ".github/workflows/export-local-validation-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install missing validation dependencies
+        run: |
+          python -m pip install --target /tmp/dag-validation-runtime \
+            deap==1.4.3 astropy equinox pybind11 includeigen unxt pytest-xdist
+          tar -C /tmp/dag-validation-runtime -czf /tmp/dag-validation-runtime.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-validation-runtime-${{ github.sha }}
+          path: /tmp/dag-validation-runtime.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
