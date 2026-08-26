@@ -1,0 +1,30 @@
+name: Export DEAP runtime
+
+on:
+  push:
+    branches:
+      - agent/region-parallel-gp
+    paths:
+      - ".github/workflows/export-deap-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install DEAP into an isolated target
+        run: |
+          python -m pip install --target /tmp/deap-runtime deap==1.4.3
+          tar -C /tmp/deap-runtime -czf /tmp/deap-runtime.tar.gz deap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deap-runtime-${{ github.sha }}
+          path: /tmp/deap-runtime.tar.gz
+          if-no-files-found: error
+          retention-days: 1
