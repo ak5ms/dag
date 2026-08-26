@@ -1,0 +1,27 @@
+name: Fetch DEAP wheel
+
+on:
+  push:
+    branches:
+      - agent/region-parallel-gp
+    paths:
+      - ".github/workflows/fetch-deap-artifact.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheel
+        run: |
+          mkdir -p /tmp/deap
+          python -m pip download --no-deps deap==1.4.4 -d /tmp/deap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deap-wheel
+          path: /tmp/deap/*.whl
+          if-no-files-found: error
+          retention-days: 1
