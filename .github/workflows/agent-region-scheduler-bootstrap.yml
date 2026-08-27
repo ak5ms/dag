@@ -16,9 +16,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Package repository checkout
-        run: tar --exclude='./dag-checkout.tar.gz' -czf dag-checkout.tar.gz .
+        run: tar -C "$GITHUB_WORKSPACE" -czf "$RUNNER_TEMP/dag-checkout.tar.gz" .
       - uses: actions/upload-artifact@v4
         with:
           name: dag-checkout
-          path: dag-checkout.tar.gz
+          path: ${{ runner.temp }}/dag-checkout.tar.gz
           retention-days: 1
