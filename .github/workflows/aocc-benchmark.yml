@@ -1,0 +1,172 @@
+name: AOCC compiler benchmark
+
+on:
+  push:
+    branches:
+      - agent/compiler-optimizer-benchmark
+    paths:
+      - ".github/workflows/aocc-benchmark.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/compiler-optimizer-benchmark
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project, ICX, and AOCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            wget gnupg ca-certificates libncurses-dev zlib1g libxml2 libquadmath0
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp
+
+          AOCC_DEB=/tmp/aocc-compiler-5.2.0_1_amd64.deb
+          wget -q \
+            https://download.amd.com/developer/eula/aocc/aocc-5-2/aocc-compiler-5.2.0_1_amd64.deb \
+            -O "$AOCC_DEB"
+          echo "10e8287be61d0181caf6bf00603a15b143ec79a5010f3fb7642036cc08763cb3  $AOCC_DEB" \
+            | sha256sum -c -
+          sudo apt-get install -y "$AOCC_DEB"
+
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Resolve compilers and generate 5M x 9 input
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/aocc-bench-results
+          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 -print -quit)"
+          AOCC_CXX="$(dpkg -L aocc-compiler-5.2.0 | grep '/bin/clang++$' | head -n 1)"
+          test -x "$ICPX"
+          test -x "$AOCC_CXX"
+          echo "$ICPX" > /tmp/icpx-path
+          echo "$AOCC_CXX" > /tmp/aocc-cxx-path
+          {
+            lscpu
+            g++ --version
+            "$ICPX" --version
+            "$AOCC_CXX" --version
+          } | tee /tmp/aocc-bench-results/machine.txt
+          python - <<'PY'
+          import numpy as np
+          rows, lanes = 5_000_000, 9
+          path = "/tmp/compiler-bench-x.npy"
+          x = np.lib.format.open_memmap(path, mode="w+", dtype=np.float64, shape=(rows, lanes))
+          rng = np.random.default_rng(20260827)
+          for start in range(0, rows, 100_000):
+              end = min(rows, start + 100_000)
+              x[start:end] = rng.normal(scale=0.01, size=(end - start, lanes))
+          x[::4096, 0] = np.nan
+          x[::8191, 1] = np.nan
+          x.flush()
+          PY
+
+      - name: Benchmark GCC, ICX, and AOCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          ICPX="$(cat /tmp/icpx-path)"
+          AOCC_CXX="$(cat /tmp/aocc-cxx-path)"
+          SVML="$(find /opt/intel/oneapi/compiler -type f -name libsvml.so -print -quit)"
+          export LD_LIBRARY_PATH="$(dirname "$SVML"):${LD_LIBRARY_PATH:-}"
+
+          run_cfg() {
+            local name="$1" compiler="$2" extra_flags="$3"
+            local cache="/tmp/aocc-bench-cache/${name}"
+            rm -rf "$cache" "/tmp/aocc-bench-results/${name}"
+            mkdir -p "$cache" "/tmp/aocc-bench-results/${name}"
+            env \
+              CXX="$compiler" \
+              TRADING_DSL_ENGINE_CPP_NATIVE=1 \
+              TRADING_DSL_ENGINE_CPP_LTO=1 \
+              TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS="$extra_flags" \
+              TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS="" \
+              TRADING_DSL_ENGINE_CPP_STREAM_CACHE="$cache" \
+              python scripts/benchmark_cpp_compiler_optimizations.py \
+                --name "$name" \
+                --input /tmp/compiler-bench-x.npy \
+                --output-dir "/tmp/aocc-bench-results/${name}" \
+                --runs 10 --warmups 1
+          }
+
+          run_cfg gcc_current g++ ""
+          run_cfg icx_lto "$ICPX" "-fno-semantic-interposition"
+          run_cfg aocc_lto "$AOCC_CXX" "-fno-semantic-interposition"
+
+      - name: Verify and summarize
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+
+          root = Path('/tmp/aocc-bench-results')
+          names = ('gcc_current', 'icx_lto', 'aocc_lto')
+          payloads = {n: json.loads((root / n / 'result.json').read_text()) for n in names}
+          base = payloads['gcc_current']
+          base_cases = {c['case']: c for c in base['cases']}
+          lines = [
+              '# AOCC compiler benchmark', '',
+              f"Rows: {base['rows']:,}; lanes: {base['lanes']}; runs: {base['runs']}; warmups: {base['warmups']}", '',
+              '| Config | Case | Median native s | Speedup vs GCC | Compile s |',
+              '|---|---|---:|---:|---:|',
+          ]
+          summary = []
+          for name in names:
+              cases = {c['case']: c for c in payloads[name]['cases']}
+              for case_name, base_case in base_cases.items():
+                  case = cases[case_name]
+                  np.testing.assert_allclose(case['output'], base_case['output'], rtol=2e-11, atol=2e-12, equal_nan=True)
+                  assert case['generated_cpp_sha256'] == base_case['generated_cpp_sha256']
+                  speedup = base_case['median_native_seconds'] / case['median_native_seconds']
+                  summary.append({
+                      'config': name,
+                      'case': case_name,
+                      'median_native_seconds': case['median_native_seconds'],
+                      'speedup_vs_gcc': speedup,
+                      'compile_seconds': case['compile_seconds'],
+                      'compiler_version': payloads[name]['compiler_version'],
+                  })
+                  lines.append(
+                      f"| {name} | {case_name} | {case['median_native_seconds']:.6f} | {speedup:.3f}x | {case['compile_seconds']:.3f} |"
+                  )
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          (root / 'summary.md').write_text('\n'.join(lines) + '\n')
+          print((root / 'summary.md').read_text())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aocc-compiler-benchmark
+          path: /tmp/aocc-bench-results
+          if-no-files-found: warn
