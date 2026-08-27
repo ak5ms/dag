@@ -1,4 +1,5 @@
 name: GP native region scheduler
+# Final validation runs on the current agent/strongly-typed-gp-derived head.
 
 on:
   push:
