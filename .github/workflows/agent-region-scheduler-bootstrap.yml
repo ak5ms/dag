@@ -1,0 +1,24 @@
+name: agent region scheduler bootstrap
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-region-scheduler
+
+permissions:
+  contents: read
+
+jobs:
+  package-checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Package repository checkout
+        run: tar --exclude='./dag-checkout.tar.gz' -czf dag-checkout.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-checkout
+          path: dag-checkout.tar.gz
+          retention-days: 1
