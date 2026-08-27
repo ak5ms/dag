@@ -55,9 +55,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/compiler-bench-results
-          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 | head -n 1)"
+          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 -print -quit)"
+          SVML="$(find /opt/intel/oneapi/compiler -type f -name libsvml.so -print -quit)"
           test -n "$ICPX"
+          test -n "$SVML"
           echo "icpx_path=$ICPX"
+          echo "svml_path=$SVML"
           {
             echo "date_utc=$(date -u --iso-8601=seconds)"
             echo "sha=$(git rev-parse HEAD)"
@@ -99,8 +102,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 | head -n 1)"
+          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 -print -quit)"
+          SVML="$(find /opt/intel/oneapi/compiler -type f -name libsvml.so -print -quit)"
           test -n "$ICPX"
+          test -n "$SVML"
+          INTEL_LIB_DIR="$(dirname "$SVML")"
+          export LD_LIBRARY_PATH="$INTEL_LIB_DIR:${LD_LIBRARY_PATH:-}"
+          echo "intel_runtime_lib_dir=$INTEL_LIB_DIR"
 
           cat >/tmp/icx-probe.cpp <<'CPP'
           int f(const double* x, double* y, int n) {
