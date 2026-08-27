@@ -42,6 +42,8 @@ def _data(rows: int) -> dict[str, np.ndarray]:
         "is_tradable_out0": tradable0,
         "is_tradable_out1": tradable1,
         "wdte_out0": wdte,
+        "vwap_mp_out0": close0,
+        "vwap_mp_out1": close1,
         "mp_out0.close": close0,
         "mp_out1.close": close1,
     }
