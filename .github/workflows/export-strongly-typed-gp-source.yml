@@ -1,5 +1,5 @@
 name: Export strongly typed GP source
-# export revision: 5 (source plus full Git history)
+# export revision: local-debug-all-refs
 
 on:
   push:
@@ -14,23 +14,20 @@ permissions:
 
 jobs:
   export:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: agent/strongly-typed-gp
           fetch-depth: 0
-      - name: Package source and repository history
+      - name: Fetch all branches and package history
         shell: bash
         run: |
-          tar --exclude=.git -czf /tmp/dag-strongly-typed-gp-source.tar.gz .
-          git bundle create /tmp/dag-strongly-typed-gp.bundle --all
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+          git bundle create /tmp/dag-all-refs.bundle --all
       - uses: actions/upload-artifact@v4
         with:
-          name: dag-strongly-typed-gp-source-${{ github.sha }}
-          path: |
-            /tmp/dag-strongly-typed-gp-source.tar.gz
-            /tmp/dag-strongly-typed-gp.bundle
+          name: dag-all-refs-${{ github.sha }}
+          path: /tmp/dag-all-refs.bundle
           if-no-files-found: error
-          compression-level: 0
           retention-days: 1
