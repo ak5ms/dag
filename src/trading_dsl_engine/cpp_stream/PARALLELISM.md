@@ -50,3 +50,13 @@ Cat does not create a nested task pool. A root Cat is row-sharded at the whole-p
 - Benchmarks validate checksums, NaN placement, finite output fractions, actual thread counts, and output byte counts.
 
 See `REDUCTIONS_PARALLEL_BENCHMARK.md` for the reduction, Cat, Ridge, einsum, and `roll_rets` measurements from the final validation run.
+
+<!-- native-gp-region-scheduler -->
+## Independent runtime regions
+
+`run_many(runtimes, ...)` is the native scheduling boundary for independent compiled DAG regions. It prepares all source pointers and outputs once, then submits tasks to one C++ worker pool. The pool uses an atomic task index for load balancing, optionally pins workers, and invokes each generated runner through its stable C ABI. Python performs orchestration and result construction only; it does not own worker threads during execution.
+
+This path is particularly important for GP fitness graphs whose temporal reductions make each individual runtime sequential. The search groups related candidates into bounded multi-output programs for CSE, estimates formula cost, balances those programs across native tasks, and runs each task with one inner thread. This provides population-level parallelism without oversubscribing the machine.
+
+`run_many` is component scheduling, not a claim that arbitrary temporal/cross-sectional boundaries inside one runtime are cache-tiled. Whole-plan row/lane scheduling remains the intra-runtime mechanism; independent-root scheduling covers the GP workload where graph-level dependencies otherwise force a serial final accumulator.
+

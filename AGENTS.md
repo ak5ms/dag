@@ -155,3 +155,13 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ## Future roadmap hints
 
 Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+
+<!-- native-gp-region-scheduler -->
+## Native GP scheduler invariants
+
+- Evaluate independent GP fitness batches with `trading_dsl_engine.cpp_stream.run_many`; do not reintroduce a Python `ThreadPoolExecutor` in the search hot path.
+- Keep each native batch bounded and cost-balanced. Preserve CSE by compiling related candidate outputs together, but do not emit one unbounded translation unit for a full population or one translation unit per candidate on high-core hosts.
+- The outer native scheduler owns CPU parallelism. Use one thread per final-reduction runtime unless the planner proves a profitable inner partition, and never create nested native/Eigen/OpenMP worker pools.
+- Preserve serial equivalence for every batched result, output ordering, NaN mask, and walk-forward fold. Scheduler diagnostics and benchmark timing must stay outside row hot loops.
+- Use `scripts/benchmark_gp_native_scheduler.py` after changing GP batching, multi-output lowering, `run_many`, CPU affinity, or final-reduction execution.
+
