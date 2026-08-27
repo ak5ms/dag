@@ -1,0 +1,94 @@
+name: GP native region scheduler
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-region-scheduler-final
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: src
+      CXX: clang++
+      TRADING_DSL_ENGINE_CPP_LTO: "0"
+      TRADING_DSL_ENGINE_CPP_NATIVE: "0"
+      TRADING_DSL_ENGINE_CPP_PCH: "1"
+      TRADING_DSL_ENGINE_CPP_STREAM_CACHE: /tmp/gp-region-cache
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Record host
+        run: |
+          python --version | tee /tmp/host.txt
+          clang++ --version | head -1 | tee -a /tmp/host.txt
+          nproc | tee -a /tmp/host.txt
+          lscpu | tee -a /tmp/host.txt
+      - name: Compile-check scheduler paths
+        run: |
+          python -m py_compile \
+            scripts/run_gp_alpha_search.py \
+            scripts/benchmark_gp_native_scheduler.py \
+            src/trading_dsl_engine/cpp_stream/python/native_batch.py
+      - name: Run focused correctness tests
+        shell: bash
+        env:
+          TRADING_DSL_ENGINE_CPP_PCH: "0"
+          GP_IR_FUZZ_SAMPLES: "200"
+          GP_NATIVE_FUZZ_SAMPLES: "8"
+        run: |
+          set +e
+          python -m pytest -q -o addopts="" \
+            tests/trading_dsl_engine/cpp_stream/test_native_batch.py \
+            tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py \
+            tests/flows/gp/test_search_runtime_optimizations.py \
+            tests/trading_dsl_engine/cpp_stream/test_roll_rets.py::test_roll_rets_uses_monotonic_session_key \
+            tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_to_cpp_stream_ir \
+            tests/flows/gp/test_compile_fuzz.py::test_random_gp_formulas_compile_natively \
+            2>&1 | tee /tmp/gp-region-tests.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      - name: Benchmark random GP fitness regions
+        shell: bash
+        env:
+          GP_SCHEDULER_BENCH_ROWS: "150000"
+          GP_SCHEDULER_BENCH_CANDIDATES: "12"
+          GP_SCHEDULER_BENCH_BATCH_SIZE: "2"
+          GP_SCHEDULER_BENCH_RUNS: "3"
+          GP_SCHEDULER_BENCH_WARMUPS: "1"
+          GP_SCHEDULER_BENCH_WORKERS: "0"
+          GP_SCHEDULER_BENCH_JSON: /tmp/gp-region-benchmark.json
+        run: |
+          set +e
+          python scripts/benchmark_gp_native_scheduler.py \
+            2>&1 | tee /tmp/gp-region-benchmark.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gp-native-region-scheduler-results
+          path: |
+            /tmp/host.txt
+            /tmp/gp-region-tests.log
+            /tmp/gp-region-benchmark.log
+            /tmp/gp-region-benchmark.json
+            /tmp/gp-region-cache/_pch/**/pch-build-failure.txt
+          if-no-files-found: warn
+          retention-days: 14
