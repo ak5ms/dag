@@ -55,7 +55,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/compiler-bench-results
-          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 | head -n 1)"
+          test -n "$ICPX"
+          echo "icpx_path=$ICPX"
           {
             echo "date_utc=$(date -u --iso-8601=seconds)"
             echo "sha=$(git rev-parse HEAD)"
@@ -68,7 +70,7 @@ jobs:
             df -h
             g++ --version
             clang++ --version
-            icpx --version
+            "$ICPX" --version
             ld.lld --version
             python --version
           } | tee /tmp/compiler-bench-results/machine.txt
@@ -97,7 +99,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+          ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 | head -n 1)"
+          test -n "$ICPX"
 
           cat >/tmp/icx-probe.cpp <<'CPP'
           int f(const double* x, double* y, int n) {
@@ -106,7 +109,7 @@ jobs:
               return n;
           }
           CPP
-          icpx -O3 -floop-fusion -floop-predicate-optimization=aggressive \
+          "$ICPX" -O3 -floop-fusion -floop-predicate-optimization=aggressive \
             -c /tmp/icx-probe.cpp -o /tmp/icx-probe.o
 
           run_cfg() {
@@ -140,10 +143,10 @@ jobs:
           run_cfg clang_full_lto clang++ \
             "-fno-semantic-interposition" \
             "-fuse-ld=lld"
-          run_cfg icx_lto icpx \
+          run_cfg icx_lto "$ICPX" \
             "-fno-semantic-interposition" \
             ""
-          run_cfg icx_loop_fusion icpx \
+          run_cfg icx_loop_fusion "$ICPX" \
             "-fno-semantic-interposition -floop-fusion -floop-predicate-optimization=aggressive" \
             ""
 
