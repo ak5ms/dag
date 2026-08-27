@@ -1,5 +1,5 @@
 name: Export strongly typed GP source
-# export revision: 3
+# export revision: 4 (source plus portable Python 3.11 test runtime)
 
 on:
   push:
@@ -14,19 +14,39 @@ permissions:
 
 jobs:
   export:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           ref: agent/strongly-typed-gp
           fetch-depth: 1
-      - name: Package source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test runtime dependencies
+        shell: bash
+        env:
+          TRADING_DSL_ENGINE_CPP_LTO: "0"
+          TRADING_DSL_ENGINE_CPP_NATIVE: "0"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            numpy pandas numba scipy "jax[cpu]" equinox pytest pytest-xdist \
+            "pybind11>=2.12" includeigen "Jinja2>=3.1" "unxt>=1.11" \
+            deap pydot matplotlib plotly
+      - name: Package source and portable test runtime
         shell: bash
         run: |
           tar --exclude=.git -czf /tmp/dag-strongly-typed-gp-source.tar.gz .
+          find "$pythonLocation/lib/python3.11" -type d -name __pycache__ -prune -exec rm -rf {} +
+          tar -C "$pythonLocation" -czf /tmp/dag-python311-runtime.tar.gz bin lib
       - uses: actions/upload-artifact@v4
         with:
           name: dag-strongly-typed-gp-source-${{ github.sha }}
-          path: /tmp/dag-strongly-typed-gp-source.tar.gz
+          path: |
+            /tmp/dag-strongly-typed-gp-source.tar.gz
+            /tmp/dag-python311-runtime.tar.gz
           if-no-files-found: error
+          compression-level: 0
           retention-days: 1
