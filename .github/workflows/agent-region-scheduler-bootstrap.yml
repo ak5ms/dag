@@ -22,3 +22,18 @@ jobs:
           name: dag-checkout
           path: ${{ runner.temp }}/dag-checkout.tar.gz
           retention-days: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install local validation dependencies
+        run: |
+          python -m pip install --target "$RUNNER_TEMP/dag-validation-runtime" \
+            deap==1.4.3 astropy equinox pybind11 includeigen unxt pytest-xdist
+          tar -C "$RUNNER_TEMP/dag-validation-runtime" \
+            -czf "$RUNNER_TEMP/dag-validation-runtime.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-validation-runtime
+          path: ${{ runner.temp }}/dag-validation-runtime.tar.gz
+          compression-level: 0
+          retention-days: 1
