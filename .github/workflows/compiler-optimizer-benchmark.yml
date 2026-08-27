@@ -39,7 +39,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends lld wget gnupg ca-certificates
+          sudo apt-get install -y --no-install-recommends \
+            lld wget gnupg ca-certificates libncurses-dev zlib1g libxml2 libquadmath0
+
           wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
             | gpg --dearmor \
             | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
@@ -47,6 +49,15 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp
+
+          AOCC_DEB=/tmp/aocc-compiler-5.2.0_1_amd64.deb
+          wget -q \
+            https://download.amd.com/developer/eula/aocc/aocc-5-2/aocc-compiler-5.2.0_1_amd64.deb \
+            -O "$AOCC_DEB"
+          echo "10e8287be61d0181caf6bf00603a15b143ec79a5010f3fb7642036cc08763cb3  $AOCC_DEB" \
+            | sha256sum -c -
+          sudo apt-get install -y "$AOCC_DEB"
+
           python -m pip install --upgrade pip
           python -m pip install -e .
 
@@ -57,10 +68,13 @@ jobs:
           mkdir -p /tmp/compiler-bench-results
           ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 -print -quit)"
           SVML="$(find /opt/intel/oneapi/compiler -type f -name libsvml.so -print -quit)"
+          AOCC_CXX="$(find /opt/AMD -type f -name clang++ -perm -111 -print -quit)"
           test -n "$ICPX"
           test -n "$SVML"
+          test -n "$AOCC_CXX"
           echo "icpx_path=$ICPX"
           echo "svml_path=$SVML"
+          echo "aocc_cxx_path=$AOCC_CXX"
           {
             echo "date_utc=$(date -u --iso-8601=seconds)"
             echo "sha=$(git rev-parse HEAD)"
@@ -74,6 +88,7 @@ jobs:
             g++ --version
             clang++ --version
             "$ICPX" --version
+            "$AOCC_CXX" --version
             ld.lld --version
             python --version
           } | tee /tmp/compiler-bench-results/machine.txt
@@ -90,22 +105,22 @@ jobs:
           for start in range(0, rows, chunk):
               end = min(rows, start + chunk)
               x[start:end] = rng.normal(scale=0.01, size=(end - start, lanes))
-          # Sparse NaNs exercise the real finite/non-finite branches without
-          # making the benchmark a pathological missing-data workload.
           x[::4096, 0] = np.nan
           x[::8191, 1] = np.nan
           x.flush()
           print(path, x.shape, x.dtype)
           PY
 
-      - name: Run five compiler configurations
+      - name: Run compiler configurations
         shell: bash
         run: |
           set -euo pipefail
           ICPX="$(find /opt/intel/oneapi -type f -name icpx -perm -111 -print -quit)"
           SVML="$(find /opt/intel/oneapi/compiler -type f -name libsvml.so -print -quit)"
+          AOCC_CXX="$(find /opt/AMD -type f -name clang++ -perm -111 -print -quit)"
           test -n "$ICPX"
           test -n "$SVML"
+          test -n "$AOCC_CXX"
           INTEL_LIB_DIR="$(dirname "$SVML")"
           export LD_LIBRARY_PATH="$INTEL_LIB_DIR:${LD_LIBRARY_PATH:-}"
           echo "intel_runtime_lib_dir=$INTEL_LIB_DIR"
@@ -157,6 +172,9 @@ jobs:
           run_cfg icx_loop_fusion "$ICPX" \
             "-fno-semantic-interposition -floop-fusion -floop-predicate-optimization=aggressive" \
             ""
+          run_cfg aocc_lto "$AOCC_CXX" \
+            "-fno-semantic-interposition" \
+            ""
 
       - name: Verify outputs and assemble before-after comparison
         shell: bash
@@ -174,6 +192,7 @@ jobs:
               "clang_full_lto",
               "icx_lto",
               "icx_loop_fusion",
+              "aocc_lto",
           )
           results = {
               name: json.loads((root / name / "result.json").read_text())
