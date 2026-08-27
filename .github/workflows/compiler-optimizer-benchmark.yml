@@ -1,0 +1,264 @@
+name: Compiler optimizer benchmark spike
+
+on:
+  push:
+    branches:
+      - agent/compiler-optimizer-benchmark
+    paths:
+      - ".github/workflows/compiler-optimizer-benchmark.yml"
+      - "scripts/benchmark_cpp_compiler_optimizations.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: src
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/compiler-optimizer-benchmark
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lld wget gnupg ca-certificates
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends intel-oneapi-compiler-dpcpp-cpp
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Record machine and generate deterministic 5M x 9 input
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/compiler-bench-results
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "nproc=$(nproc)"
+            echo "affinity=$(taskset -pc $$ 2>/dev/null || true)"
+            echo "cpu.max=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || true)"
+            echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+            lscpu
+            free -h
+            df -h
+            g++ --version
+            clang++ --version
+            icpx --version
+            ld.lld --version
+            python --version
+          } | tee /tmp/compiler-bench-results/machine.txt
+          python - <<'PY'
+          import numpy as np
+
+          rows, lanes = 5_000_000, 9
+          path = "/tmp/compiler-bench-x.npy"
+          x = np.lib.format.open_memmap(
+              path, mode="w+", dtype=np.float64, shape=(rows, lanes)
+          )
+          rng = np.random.default_rng(20260827)
+          chunk = 100_000
+          for start in range(0, rows, chunk):
+              end = min(rows, start + chunk)
+              x[start:end] = rng.normal(scale=0.01, size=(end - start, lanes))
+          # Sparse NaNs exercise the real finite/non-finite branches without
+          # making the benchmark a pathological missing-data workload.
+          x[::4096, 0] = np.nan
+          x[::8191, 1] = np.nan
+          x.flush()
+          print(path, x.shape, x.dtype)
+          PY
+
+      - name: Run five compiler configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+
+          cat >/tmp/icx-probe.cpp <<'CPP'
+          int f(const double* x, double* y, int n) {
+              for (int i = 0; i < n; ++i) y[i] = x[i] + 1.0;
+              for (int i = 0; i < n; ++i) y[i] *= 2.0;
+              return n;
+          }
+          CPP
+          icpx -O3 -floop-fusion -floop-predicate-optimization=aggressive \
+            -c /tmp/icx-probe.cpp -o /tmp/icx-probe.o
+
+          run_cfg() {
+            local name="$1"
+            local compiler="$2"
+            local extra_flags="$3"
+            local link_flags="$4"
+            local cache="/tmp/compiler-bench-cache/${name}"
+            rm -rf "$cache" "/tmp/compiler-bench-results/${name}"
+            mkdir -p "$cache" "/tmp/compiler-bench-results/${name}"
+            echo "CONFIG_START name=${name} compiler=${compiler} extra=${extra_flags} link=${link_flags}"
+            env \
+              CXX="$compiler" \
+              TRADING_DSL_ENGINE_CPP_NATIVE=1 \
+              TRADING_DSL_ENGINE_CPP_LTO=1 \
+              TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS="$extra_flags" \
+              TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS="$link_flags" \
+              TRADING_DSL_ENGINE_CPP_STREAM_CACHE="$cache" \
+              python scripts/benchmark_cpp_compiler_optimizations.py \
+                --name "$name" \
+                --input /tmp/compiler-bench-x.npy \
+                --output-dir "/tmp/compiler-bench-results/${name}" \
+                --runs 10 \
+                --warmups 1
+          }
+
+          run_cfg gcc_current g++ "" ""
+          run_cfg gcc_aggressive g++ \
+            "-fipa-pta -fno-semantic-interposition -flto-partition=one -fno-plt" \
+            ""
+          run_cfg clang_full_lto clang++ \
+            "-fno-semantic-interposition" \
+            "-fuse-ld=lld"
+          run_cfg icx_lto icpx \
+            "-fno-semantic-interposition" \
+            ""
+          run_cfg icx_loop_fusion icpx \
+            "-fno-semantic-interposition -floop-fusion -floop-predicate-optimization=aggressive" \
+            ""
+
+      - name: Verify outputs and assemble before-after comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+
+          root = Path("/tmp/compiler-bench-results")
+          names = (
+              "gcc_current",
+              "gcc_aggressive",
+              "clang_full_lto",
+              "icx_lto",
+              "icx_loop_fusion",
+          )
+          results = {
+              name: json.loads((root / name / "result.json").read_text())
+              for name in names
+          }
+          baseline = results["gcc_current"]
+          baseline_cases = {case["case"]: case for case in baseline["cases"]}
+          rows = []
+          for name in names:
+              payload = results[name]
+              cases = {case["case"]: case for case in payload["cases"]}
+              for case_name, base_case in baseline_cases.items():
+                  case = cases[case_name]
+                  np.testing.assert_allclose(
+                      np.asarray(case["output"], dtype=float),
+                      np.asarray(base_case["output"], dtype=float),
+                      rtol=2e-11,
+                      atol=2e-12,
+                      equal_nan=True,
+                  )
+                  if case["generated_cpp_sha256"] != base_case["generated_cpp_sha256"]:
+                      raise RuntimeError(
+                          f"generated C++ differs for {name}/{case_name}: "
+                          f"{case['generated_cpp_sha256']} != "
+                          f"{base_case['generated_cpp_sha256']}"
+                      )
+                  rows.append({
+                      "config": name,
+                      "compiler_version": payload["compiler_version"],
+                      "case": case_name,
+                      "median_native_seconds": case["median_native_seconds"],
+                      "mean_native_seconds": case["mean_native_seconds"],
+                      "min_native_seconds": case["min_native_seconds"],
+                      "compile_seconds": case["compile_seconds"],
+                      "library_bytes": case["library_bytes"],
+                      "speedup_vs_gcc_current": (
+                          base_case["median_native_seconds"]
+                          / case["median_native_seconds"]
+                      ),
+                      "compile_ratio_vs_gcc_current": (
+                          case["compile_seconds"] / base_case["compile_seconds"]
+                      ),
+                      "correct": True,
+                  })
+
+          best = {}
+          for case_name in baseline_cases:
+              eligible = [row for row in rows if row["case"] == case_name]
+              best[case_name] = min(
+                  eligible, key=lambda row: row["median_native_seconds"]
+              )
+          summary = {
+              "baseline": "gcc_current",
+              "rows": baseline["rows"],
+              "lanes": baseline["lanes"],
+              "runs": baseline["runs"],
+              "warmups": baseline["warmups"],
+              "results": rows,
+              "best": best,
+          }
+          (root / "summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n"
+          )
+
+          lines = [
+              "# Compiler optimizer benchmark",
+              "",
+              f"Rows: {baseline['rows']:,}; lanes: {baseline['lanes']}; "
+              f"runs: {baseline['runs']}; warmups: {baseline['warmups']}",
+              "",
+              "| Config | Case | Median native s | Speedup | Compile s | Compile ratio | Library bytes |",
+              "|---|---|---:|---:|---:|---:|---:|",
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['config']} | {row['case']} | "
+                  f"{row['median_native_seconds']:.6f} | "
+                  f"{row['speedup_vs_gcc_current']:.3f}x | "
+                  f"{row['compile_seconds']:.3f} | "
+                  f"{row['compile_ratio_vs_gcc_current']:.2f}x | "
+                  f"{row['library_bytes']} |"
+              )
+          lines.extend(["", "## Best", ""])
+          for case_name, row in best.items():
+              lines.append(
+                  f"- {case_name}: {row['config']} at "
+                  f"{row['median_native_seconds']:.6f}s "
+                  f"({row['speedup_vs_gcc_current']:.3f}x vs current GCC)"
+              )
+          (root / "summary.md").write_text("\n".join(lines) + "\n")
+          print((root / "summary.md").read_text())
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compiler-optimizer-benchmark
+          path: /tmp/compiler-bench-results
+          if-no-files-found: warn
