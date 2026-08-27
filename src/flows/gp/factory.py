@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+import math
 
 import flows.gp.pset as row_pset
 from flows.gp.regression import REGRESSION_PROJECTIONS
@@ -37,11 +38,40 @@ TENSOR_CPP_STREAM_UTIL_NAMES = (
 
 @dataclass(frozen=True)
 class GPConfig(row_pset.GPConfig):
+    # A denser default terminal grid makes static-parameter search and local
+    # phenotypic shocks meaningfully local instead of jumping 2x-10x at a time.
+    positive_ints: tuple[int, ...] = (
+        1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 30, 32, 48, 60, 64,
+        90, 120, 128, 180, 240, 256, 360, 480, 720, 960, 1440, 2880,
+    )
+    positive_floats: tuple[float, ...] = (
+        0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.25,
+        0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0,
+    )
+    negative_floats: tuple[float, ...] = (
+        -20.0, -10.0, -5.0, -3.0, -2.0, -1.5, -1.0, -0.75, -0.5,
+        -0.25, -0.2, -0.1, -0.05, -0.025, -0.01, -0.005, -0.001,
+        -0.0001,
+    )
+    quantiles: tuple[float, ...] = (
+        0.01, 0.05, 0.1, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 0.8,
+        0.9, 0.95, 0.99,
+    )
+    # Exact ScalarNumber terminals supplement the typed positive/negative grids;
+    # zero is especially useful for offsets, clipping and robustness shocks.
+    scalar_numbers: tuple[float, ...] = (0.0,)
     tensor_fields: tuple[TensorFieldSpec, ...] = DEFAULT_TENSOR_FIELDS
     tensor_indices: tuple[int, ...] = (0, 1, 2)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        scalars = tuple(float(value) for value in self.scalar_numbers)
+        if any(not math.isfinite(value) for value in scalars):
+            raise ValueError("scalar_numbers must contain only finite values")
+        if len(scalars) != len(set(scalars)):
+            raise ValueError("scalar_numbers must be unique")
+        object.__setattr__(self, "scalar_numbers", scalars)
+
         fields = tuple(self.tensor_fields)
         names = [field.name for field in fields]
         if len(names) != len(set(names)):
@@ -83,6 +113,22 @@ def _register_tensor_terminals(pset, config: GPConfig) -> dict[str, str]:
         names[field.name] = terminal_name
     for value in config.tensor_indices:
         pset.addTerminal(TensorIndex(value), TensorIndex, name=f"tensor_index_{value}")
+    return names
+
+
+def _register_scalar_terminals(pset, config: GPConfig) -> dict[float, str]:
+    names: dict[float, str] = {}
+    for value in config.scalar_numbers:
+        literal = f"{value:g}"
+        name = f"scalar_number_{row_pset._safe_name(literal)}"
+        if name not in pset.mapping:
+            row_pset._add_terminal(
+                pset,
+                row_pset.ScalarNumber(value),
+                row_pset.ScalarNumber,
+                name,
+            )
+        names[value] = name
     return names
 
 
@@ -136,6 +182,7 @@ def _register_matrix_regression(reg) -> frozenset[str]:
 def make_pset(config: GPConfig | None = None):
     config = config or GPConfig()
     pset = row_pset.make_pset(config)
+    scalar_terminals = _register_scalar_terminals(pset, config)
     reg = row_pset._Registrar(pset, policy=config.grammar)
     reg.families = set(pset.gp_operator_families)
     reg.primitive_family = dict(pset.gp_primitive_family)
@@ -174,6 +221,7 @@ def make_pset(config: GPConfig | None = None):
     pset.gp_sections = frozenset(reg.primitive_section.values())
     pset.gp_tensor_operator_families = frozenset(tensor_families & reg.families)
     pset.gp_tensor_field_terminals = terminals
+    pset.gp_scalar_terminals = scalar_terminals
     pset.gp_tensor_ranks = ranks
     pset.gp_tensor_feature_shapes = {
         rank: next(

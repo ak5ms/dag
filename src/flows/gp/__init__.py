@@ -45,6 +45,30 @@ from flows.gp.tensor_types import (
     tensor_type,
     tensor_types_for_rank,
 )
+from flows.gp.testing import (
+    CheckResult,
+    DynamicShock,
+    GenoContext,
+    GenoReport,
+    GenoTest,
+    NoiseSpec,
+    PhenoContext,
+    PhenoReport,
+    PhenoTest,
+    PhenoTrial,
+    StaticShock,
+    geno_context,
+    geno_forbid_families,
+    geno_max_depth,
+    geno_max_nodes,
+    geno_require_families,
+    pheno_finite,
+    pheno_stability,
+    run_geno_tests,
+    run_pheno_tests,
+    shock_dynamic_leaves,
+    shock_static_terminals,
+)
 from flows.gp.types import (
     AxisSpec,
     BoolParam,
@@ -75,6 +99,16 @@ from flows.gp.types import (
     TimestampRow,
     TradingDayHorizonRow,
     VALUE_TYPES,
+)
+from flows.gp.visualization import (
+    GPGraphEdge,
+    GPGraphModel,
+    GPGraphNode,
+    GPTypeRelation,
+    build_gp_graph,
+    explore_gp,
+    filter_gp_graph,
+    gp_explorer_html,
 )
 
 __all__ = [name for name in globals() if not name.startswith("_")]

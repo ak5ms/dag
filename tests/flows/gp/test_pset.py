@@ -17,7 +17,9 @@ from flows.gp import (
     EXPECTED_DSL_OPERATOR_NAMES,
     EXPECTED_GP_OPERATOR_NAMES,
     ExprValue,
+    GenoTest,
     GPConfig,
+    NoiseSpec,
     NumericRow,
     NumericTensor,
     PeriodAtLeastTwo,
@@ -26,11 +28,22 @@ from flows.gp import (
     PriceRow,
     QuantileParam,
     REGRESSION_PROJECTIONS,
+    ScalarNumber,
     TimestampRow,
+    build_gp_graph,
+    filter_gp_graph,
+    geno_max_depth,
+    geno_max_nodes,
+    gp_explorer_html,
     make_pset,
     make_toolbox,
+    pheno_finite,
     primitive_names_for_operator,
     random_formula,
+    run_geno_tests,
+    run_pheno_tests,
+    shock_dynamic_leaves,
+    shock_static_terminals,
 )
 from trading_dsl_engine.base import dsl
 from trading_dsl_engine.base.parser import Call, Expr, Number
@@ -43,6 +56,13 @@ def _primitives(pset, family):
 
 def _primitive(pset, family, args):
     return next(value for value in _primitives(pset, family) if tuple(value.args) == args)
+
+
+def _terminal_value(pset, terminal):
+    value = terminal.value
+    if isinstance(value, str) and value in pset.context:
+        return pset.context[value]
+    return value
 
 
 def test_complete_family_coverage_and_exclusions():
@@ -110,6 +130,19 @@ def test_parameter_constraints_and_derived_windows():
     assert dict(pset.context[ewm.name](price, period).expr.kwargs)["min_periods"].value == 20.0
 
 
+def test_default_static_terminal_grid_is_dense_and_includes_zero():
+    config = GPConfig()
+    assert {4, 8, 16, 32, 64, 128, 256, 720, 2880} <= set(config.positive_ints)
+    assert {0.0001, 0.025, 0.2, 0.75, 1.5, 5.0, 20.0} <= set(config.positive_floats)
+    assert {-20.0, -1.5, -0.2, -0.025, -0.0001} <= set(config.negative_floats)
+    assert {0.01, 0.33, 0.67, 0.99} <= set(config.quantiles)
+
+    pset = make_pset(config)
+    zero_name = pset.gp_scalar_terminals[0.0]
+    zero = _terminal_value(pset, pset.mapping[zero_name])
+    assert zero == ScalarNumber(0.0)
+
+
 def test_timestamp_diff_returns_duration():
     pset = make_pset()
     primitive = _primitive(pset, "diff", (TimestampRow, PositiveInt))
@@ -156,6 +189,124 @@ def test_generation_uses_standard_deap_toolbox():
         tree, expr = random_formula(pset, min_depth=1, max_depth=4, seed=seed)
         assert isinstance(tree, gp.PrimitiveTree)
         assert isinstance(expr, Expr)
+
+
+def test_geno_tests_are_structural_and_composable():
+    pset = make_pset()
+    tree, _ = random_formula(pset, min_depth=1, max_depth=3, seed=7)
+    report = run_geno_tests(
+        tree,
+        pset,
+        tests=(
+            geno_max_depth(6),
+            geno_max_nodes(200),
+            GenoTest("has_terminal", lambda ctx: ctx.terminal_count > 0),
+        ),
+    )
+    assert report.passed
+    assert report.outcomes[0].name == "well_typed"
+    assert report.context.primitive_count + report.context.terminal_count == len(tree)
+
+
+def test_static_pheno_shock_moves_only_within_k_sorted_terminal_neighbors():
+    pset = make_pset()
+    terminals = [
+        terminal
+        for terminal in pset.terminals[PositiveInt]
+        if terminal.ret is PositiveInt
+        and _terminal_value(pset, terminal).value == 20
+    ]
+    assert terminals
+    tree = gp.PrimitiveTree([terminals[0]])
+    shocked, changes = shock_static_terminals(tree, pset, k=2, seed=13)
+    assert len(changes) == 1
+
+    values = sorted({
+        _terminal_value(pset, terminal).value
+        for terminal in pset.terminals[PositiveInt]
+        if terminal.ret is PositiveInt
+    })
+    change = changes[0]
+    assert abs(values.index(change.after) - values.index(change.before)) <= 2
+    assert change.after != change.before
+    assert _terminal_value(pset, shocked[0]).value == change.after
+
+
+def test_dynamic_field_shocks_accept_dynamic_distribution_parameters_and_lower():
+    leaf = dsl.var("ap0_out0")
+    expr = dsl.add(leaf, dsl.var("bp0_out0"))
+    shocked, changes = shock_dynamic_leaves(
+        expr,
+        {
+            "ap0_out0": NoiseSpec(
+                "normal",
+                params={
+                    "mu": 0.0,
+                    "sigma": lambda x: dsl.maximum(dsl.ewm_std(x, 20), 1e-8),
+                },
+                mode="add",
+            )
+        },
+        seed=11,
+    )
+    assert len(changes) == 1
+    assert changes[0].field == "ap0_out0"
+    assert "sin" in str(shocked) and "ln" in str(shocked)
+    compile_ir(shocked)
+
+
+def test_random_distribution_dsl_helpers_are_pure_compositions():
+    x = dsl.var("ap0_out0")
+    draws = (
+        dsl.uniform(-1.0, 1.0, key=x, seed=1),
+        dsl.normal(mu=dsl.ewm(x, 20), sigma=1.0, key=x, seed=2),
+        dsl.lognormal(mu=0.0, sigma=dsl.ewm_std(x, 20), key=x, seed=3),
+        dsl.exponential(scale=dsl.maximum(dsl.abs(x), 1e-8), key=x, seed=4),
+    )
+    for draw in draws:
+        program = compile_ir(draw)
+        assert program.nodes[-1].value_type.kind == "vector"
+        assert "random" not in str(draw).lower()
+
+
+def test_pheno_tests_execute_baseline_and_each_shocked_trial():
+    pset = make_pset()
+    tree, _ = random_formula(pset, min_depth=1, max_depth=2, seed=3)
+    calls = []
+
+    def evaluator(expr):
+        calls.append(expr)
+        return float(len(compile_ir(expr).nodes))
+
+    report = run_pheno_tests(
+        tree,
+        pset,
+        evaluator,
+        tests=(pheno_finite(),),
+        n_trials=3,
+        static_k=2,
+        seed=19,
+    )
+    assert len(calls) == 4
+    assert len(report.trials) == 3
+    assert report.passed
+    assert all(trial.outcomes[0].name == "execution" for trial in report.trials)
+
+
+def test_gp_graph_explorer_drills_from_types_and_searches_all_node_kinds():
+    pset = make_pset()
+    model = build_gp_graph(pset)
+    assert {node.kind for node in model.nodes} == {"type", "operator", "terminal"}
+    assert model.type_relations
+
+    filtered = filter_gp_graph(model, "PriceRow")
+    assert any(node.kind == "type" and node.label == "PriceRow" for node in filtered.nodes)
+    assert any(node.kind in {"operator", "terminal"} for node in filtered.nodes)
+
+    page = gp_explorer_html(pset, include_plotlyjs=False)
+    assert 'id="gp-search"' in page
+    assert "plotly_click" in page
+    assert "GP type relations" in page
 
 
 def test_gp_package_uses_only_absolute_imports():

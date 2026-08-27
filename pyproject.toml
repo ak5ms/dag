@@ -23,6 +23,7 @@ dependencies = [
     "deap",
     "pydot",
     "matplotlib",
+    "plotly",
 ]
 
 [project.optional-dependencies]
