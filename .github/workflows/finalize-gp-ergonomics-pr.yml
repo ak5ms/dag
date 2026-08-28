@@ -1,0 +1,153 @@
+name: Finalize GP ergonomics PR
+
+on:
+  push:
+    branches:
+      - agent/gp-graph-runtime-ergonomics
+    paths:
+      - .github/workflows/finalize-gp-ergonomics-pr.yml
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: finalize-gp-ergonomics-pr
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      candidate_sha: ${{ steps.candidate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-graph-runtime-ergonomics
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - id: candidate
+        name: Validate branch shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin agent/strongly-typed-gp
+          base=origin/agent/strongly-typed-gp
+          changed=$(git diff --name-only "$base...HEAD")
+          grep -q '^src/' <<<"$changed"
+          grep -q '^tests/' <<<"$changed"
+          grep -q '^README.md$' <<<"$changed"
+          grep -q '^AGENTS.md$' <<<"$changed"
+          ! grep -Eq 'apply-verified-gp-ergonomics|export-agent-gp|dag-agent-workspace' <<<"$changed"
+          git diff --check "$base...HEAD"
+          grep -RqsE 'def pipe\(' src/trading_dsl_engine
+          grep -RqsE 'def flatten\(' src/trading_dsl_engine
+          grep -RqsE 'Plotly|plotly' src/flows/gp
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install project
+        run: python -m pip install -e .
+
+      - name: Run every changed regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(git diff --name-only origin/agent/strongly-typed-gp...HEAD | grep -E '^tests/.*\.py$' | sort -u)
+          test "${#tests[@]}" -gt 0
+          python -m pytest -n 0 -q "${tests[@]}"
+
+      - name: Run full GP suite
+        run: python -m pytest -n 0 -q tests/flows/gp
+
+      - name: Run affected DSL/runtime suites and compile checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(grep -RIlE 'xs_weighted_mean|register_dsl_function|\.pipe\(|nested.*formula|flatten\(|ResultTree|ResultMapping|method.chain|method_chain' tests --include='test_*.py' | sort -u || true)
+          if ((${#tests[@]})); then
+            python -m pytest -n 0 -q "${tests[@]}"
+          fi
+          python -m compileall -q src tests
+
+  finalize:
+    needs: verify
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-graph-runtime-ergonomics
+          fetch-depth: 0
+
+      - name: Remove handoff scaffolding and publish verified head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f \
+            .github/workflows/finalize-gp-ergonomics-pr.yml \
+            .github/workflows/apply-verified-gp-ergonomics.yml \
+            .github/workflows/export-agent-gp-runtime-workspace.yml \
+            .github/workflows/export-agent-gp-graph-runtime-workspace.yml \
+            .github/workflows/export-gp-graph-runtime-workspace.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: remove temporary PR verification workflow'
+          fi
+          final_sha=$(git rev-parse HEAD)
+          git push --force-with-lease=refs/heads/agent/gp-graph-runtime-ergonomics:${{ github.sha }} \
+            origin HEAD:refs/heads/agent/gp-graph-runtime-ergonomics
+          gh pr ready 192 --repo ak5ms/dag || true
+          gh pr edit 192 --repo ak5ms/dag \
+            --title 'Add interactive GP exploration and DSL/runtime ergonomics' \
+            --body "## Summary
+
+- interactive Plotly GP type explorer with search and click-through operator/terminal drill-down
+- richer default strongly typed static numeric terminals
+- arbitrary nested formula mappings compiled in one multi-output runtime, returning ordered result trees with \`.map()\` and tuple-path \`.flatten()\`
+- pandas-style \`Expr.pipe\` and dynamic method chaining for registered DSL functions
+- scalar broadcasting for \`xs_weighted_mean\` and analogous naturally broadcastable operators
+- updated docs plus focused grammar, DSL, runtime, and native regression coverage
+
+## Validation
+
+The exact remote candidate passed every changed test file, the complete \`tests/flows/gp\` suite, affected DSL/runtime behavior tests, \`compileall\`, and \`git diff --check\` on GitHub Actions.
+
+Final commit: \`$final_sha\`
+
+Temporary export/handoff workflows and generated artifacts are absent from the final branch."
+
+  draft-on-failure:
+    needs: verify
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-graph-runtime-ergonomics
+          fetch-depth: 0
+      - name: Remove finalizer and return incomplete PR to draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/finalize-gp-ergonomics-pr.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: remove failed temporary PR finalizer'
+            git push --force-with-lease=refs/heads/agent/gp-graph-runtime-ergonomics:${{ github.sha }} \
+              origin HEAD:refs/heads/agent/gp-graph-runtime-ergonomics
+          fi
+          gh pr ready --undo 192 --repo ak5ms/dag || true
