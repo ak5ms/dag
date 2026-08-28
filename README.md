@@ -282,3 +282,19 @@ and 4.46 GiB peak RSS to a 1.001-second median and 395.6 MiB absolute peak RSS
 in the full project environment. Generation itself added only 39.2 MiB above
 the already-loaded CVXPY/JAX baseline, and the header shrank from 26.28 MiB to
 5.20 MiB.
+
+<!-- native-gp-region-scheduler -->
+## Native GP region scheduling
+
+Strongly typed GP fitness evaluation compiles related candidates into bounded multi-output `cpp_stream` programs, preserving CSE within each batch. Independent batches are then submitted through `run_many(...)`, which owns one native C++ worker pool. Each inner runtime is single-threaded, preventing nested pools and oversubscription while allowing independent final-reduction DAGs to saturate available cores.
+
+`GP_FITNESS_BATCH_SIZE` bounds translation-unit size, `GP_FITNESS_TASKS_PER_WORKER` controls task granularity, `GP_NATIVE_WORKERS=0` uses the available CPU affinity, and `GP_PIN_NATIVE_WORKERS=1` enables worker pinning. The hot search loop does not create Python worker threads.
+
+Run the deterministic random-formula benchmark with:
+
+```bash
+python scripts/benchmark_gp_native_scheduler.py
+```
+
+The benchmark compiles random strongly typed GP formulas once, compares serial execution, the former Python thread-pool orchestration, and native scheduling, verifies identical fitness outputs, and reports effective busy-core utilization.
+
