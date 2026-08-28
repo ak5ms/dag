@@ -13,8 +13,16 @@ from trading_dsl_engine.cpp_stream import compile_formula
 _NORMAL = NormalDist()
 
 
+def _bounded_location(values: np.ndarray) -> float:
+    mean = float(np.mean(values))
+    rms = float(np.sqrt(np.mean(values * values)))
+    if not rms > 0.0 or not np.isfinite(rms):
+        return 0.0
+    return float(np.clip(mean / rms, -1.0, 1.0))
+
+
 def _reference(row: np.ndarray) -> np.ndarray:
-    """Spacing-derived Gaussian shape plus the original standardized location."""
+    """Spacing-derived Gaussian shape plus bounded mean/RMS location."""
 
     row = np.asarray(row, dtype=np.float64)
     result = np.full_like(row, np.nan)
@@ -23,10 +31,10 @@ def _reference(row: np.ndarray) -> np.ndarray:
     if values.size == 0:
         return result
 
-    input_std = float(np.std(values, ddof=0))
+    location = _bounded_location(values)
     spread = float(np.max(values) - np.min(values))
-    if values.size < 2 or not input_std > 0.0 or not spread > 0.0:
-        result[valid] = 0.0
+    if values.size < 2 or not spread > 0.0:
+        result[valid] = location
         return result
 
     count = float(values.size)
@@ -37,7 +45,6 @@ def _reference(row: np.ndarray) -> np.ndarray:
         [_NORMAL.inv_cdf(float(probability)) for probability in probabilities]
     )
     raw_std = float(np.std(raw, ddof=0))
-    location = float(np.mean(values)) / input_std
     result[valid] = (raw - float(np.mean(raw))) / raw_std + location
     return result
 
@@ -48,7 +55,7 @@ def _run(tmp_path: Path, x: np.ndarray, name: str) -> np.ndarray:
     return np.fromfile(run.output_path, dtype=np.float64).reshape(run.output_shape)
 
 
-def _assert_reference_location_and_unit_std(
+def _assert_reference_location_and_scale(
     actual: np.ndarray,
     expected: np.ndarray,
     inputs: np.ndarray,
@@ -59,20 +66,29 @@ def _assert_reference_location_and_unit_std(
     for output_row, input_row in zip(actual, inputs):
         finite_output = output_row[np.isfinite(output_row)]
         finite_input = input_row[np.isfinite(input_row)]
-        input_std = float(np.std(finite_input, ddof=0))
-        if finite_output.size > 1 and input_std > 0.0:
+        if finite_input.size == 0:
+            continue
+
+        location = _bounded_location(finite_input)
+        np.testing.assert_allclose(
+            np.mean(finite_output), location, rtol=2e-12, atol=2e-12
+        )
+        if finite_output.size > 1 and np.ptp(finite_input) > 0.0:
             np.testing.assert_allclose(
                 np.std(finite_output, ddof=0), 1.0, rtol=2e-12, atol=2e-12
             )
+        else:
             np.testing.assert_allclose(
-                np.mean(finite_output),
-                np.mean(finite_input) / input_std,
+                finite_output,
+                np.full_like(finite_output, location),
                 rtol=2e-12,
                 atol=2e-12,
             )
 
 
-def test_xs_gauss_matches_spacing_and_location_reference(tmp_path: Path) -> None:
+def test_xs_gauss_matches_spacing_and_bounded_location_reference(
+    tmp_path: Path,
+) -> None:
     assert DEFAULT_DSL_REGISTRY.get("xs_gauss") is not None
     assert hasattr(cpp_stream, "xs_gauss")
 
@@ -83,22 +99,26 @@ def test_xs_gauss_matches_spacing_and_location_reference(tmp_path: Path) -> None
             [-1.25, -0.25, 0.75, 1.75, 2.75],
             [-2.0, 0.0, 0.0, 1.0, 5.0],
             [3.0, 3.0, 3.0, 3.0, 3.0],
+            [-3.0, -3.0, -3.0, -3.0, -3.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
         ],
         dtype=np.float64,
     )
     actual = _run(tmp_path, x, "xs_gauss.bin")
     expected = np.vstack([_reference(row) for row in x])
 
-    _assert_reference_location_and_unit_std(actual, expected, x)
+    _assert_reference_location_and_scale(actual, expected, x)
+    np.testing.assert_array_equal(actual[-3], np.ones(x.shape[1]))
+    np.testing.assert_array_equal(actual[-2], -np.ones(x.shape[1]))
     np.testing.assert_array_equal(actual[-1], np.zeros(x.shape[1]))
 
 
-def test_xs_gauss_equal_spacing_is_scaled_xs_rank_and_shift_is_added_once(
+def test_xs_gauss_equal_spacing_is_scaled_xs_rank_and_shift_is_bounded(
     tmp_path: Path,
 ) -> None:
     centered = np.arange(-4.0, 5.0)
-    shift = 0.75
-    x = np.vstack((centered, centered + shift))
+    shifted = centered + 0.75
+    x = np.vstack((centered, shifted))
     actual = _run(tmp_path, x, "xs_gauss_equal_spacing.bin")
 
     rank_scores = np.array(
@@ -107,16 +127,35 @@ def test_xs_gauss_equal_spacing_is_scaled_xs_rank_and_shift_is_added_once(
     scaled_rank = rank_scores / np.std(rank_scores, ddof=0)
     np.testing.assert_allclose(actual[0], scaled_rank, rtol=2e-12, atol=2e-12)
 
-    expected_location_shift = shift / np.std(centered, ddof=0)
+    expected_location = _bounded_location(shifted)
     np.testing.assert_allclose(
         actual[1] - actual[0],
-        expected_location_shift,
+        expected_location,
         rtol=2e-12,
         atol=2e-12,
     )
     np.testing.assert_allclose(
-        np.mean(actual[1]), expected_location_shift, rtol=2e-12, atol=2e-12
+        np.mean(actual[1]), expected_location, rtol=2e-12, atol=2e-12
     )
+
+
+def test_xs_gauss_nearly_constant_rows_remain_bounded(tmp_path: Path) -> None:
+    offsets = np.arange(-4.0, 5.0)
+    x = np.vstack(
+        (
+            1.0 + 1e-12 * offsets,
+            -1.0 + 1e-12 * offsets,
+            1e-12 * offsets,
+        )
+    )
+    actual = _run(tmp_path, x, "xs_gauss_nearly_constant.bin")
+    expected = np.vstack([_reference(row) for row in x])
+
+    _assert_reference_location_and_scale(actual, expected, x)
+    assert np.all(np.isfinite(actual))
+    assert np.max(np.abs(actual)) < 3.0
+    np.testing.assert_allclose(np.mean(actual[0]), 1.0, atol=2e-12)
+    np.testing.assert_allclose(np.mean(actual[1]), -1.0, atol=2e-12)
 
 
 def test_xs_gauss_wide_cross_sections_match_reference(tmp_path: Path) -> None:
@@ -134,4 +173,4 @@ def test_xs_gauss_wide_cross_sections_match_reference(tmp_path: Path) -> None:
             f"xs_gauss_wide_{index}.bin",
         )
         expected = _reference(values)[None, :]
-        _assert_reference_location_and_unit_std(actual, expected, values[None, :])
+        _assert_reference_location_and_scale(actual, expected, values[None, :])
