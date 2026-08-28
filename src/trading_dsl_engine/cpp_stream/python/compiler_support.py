@@ -9,7 +9,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Mapping
+import urllib.request
+import warnings
 
 import includeigen
 
@@ -34,6 +37,16 @@ from trading_dsl_engine.ir.types import SCALAR, ValueType, tensor
 
 
 _LANE_STATE_OPS = (CumsumOp, FFillOp, ShiftOp, EwmOp, RollingOp)
+_ICPX_MACHINES = frozenset({"x86_64", "amd64"})
+_ONEAPI_COMPILER_ROOT = Path("/opt/intel/oneapi/compiler")
+_COMPILER_WATERFALL_ENV = "TRADING_DSL_ENGINE_CPP_COMPILER_WATERFALL"
+_DEFAULT_COMPILER_WATERFALL = ("icpx", "g++")
+_MINIFORGE_URL = (
+    "https://github.com/conda-forge/miniforge/releases/latest/download/"
+    "Miniforge3-Linux-x86_64.sh"
+)
+_INTEL_CONDA_CHANNEL = "https://software.repos.intel.com/python/conda/"
+_warned_missing_icpx = False
 
 
 def _cpp_root() -> Path:
@@ -53,14 +66,216 @@ def _cache_root() -> Path:
     )
 
 
+def _user_oneapi_root() -> Path:
+    return Path.home() / "intel" / "oneapi"
+
+
+def _user_miniforge_root() -> Path:
+    return Path.home() / ".cache" / "trading_dsl_engine" / "miniforge"
+
+
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _find_icpx_under(root: Path) -> str | None:
+    direct = root / "bin" / "icpx"
+    if _executable(direct):
+        return str(direct)
+
+    latest = root / "compiler" / "latest" / "bin" / "icpx"
+    if _executable(latest):
+        return str(latest)
+
+    compiler_root = root / "compiler"
+    if compiler_root.is_dir():
+        candidates = sorted(
+            compiler_root.glob("*/bin/icpx"),
+            key=lambda path: path.parent.parent.name,
+            reverse=True,
+        )
+        for candidate in candidates:
+            if _executable(candidate):
+                return str(candidate)
+    return None
+
+
+def _installed_icpx() -> str | None:
+    compiler = shutil.which("icpx")
+    if compiler is not None:
+        return compiler
+
+    compiler = _find_icpx_under(_user_oneapi_root())
+    if compiler is not None:
+        return compiler
+
+    # System oneAPI has /opt/intel/oneapi/compiler as the version root rather
+    # than /opt/intel/oneapi, so preserve direct handling of that layout.
+    latest = _ONEAPI_COMPILER_ROOT / "latest" / "bin" / "icpx"
+    if _executable(latest):
+        return str(latest)
+    if not _ONEAPI_COMPILER_ROOT.is_dir():
+        return None
+    candidates = sorted(
+        _ONEAPI_COMPILER_ROOT.glob("*/bin/icpx"),
+        key=lambda path: path.parent.parent.name,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if _executable(candidate):
+            return str(candidate)
+    return None
+
+
+def _compiler_waterfall() -> tuple[str, ...]:
+    configured = os.environ.get(_COMPILER_WATERFALL_ENV)
+    if configured is None:
+        return _DEFAULT_COMPILER_WATERFALL
+    waterfall = tuple(item.strip() for item in configured.split(",") if item.strip())
+    if not waterfall:
+        raise RuntimeError(f"{_COMPILER_WATERFALL_ENV} must name at least one compiler")
+    return waterfall
+
+
+def _resolve_compiler_candidate(candidate: str) -> str | None:
+    if candidate == "icpx":
+        if platform.machine().lower() not in _ICPX_MACHINES:
+            return None
+        return _installed_icpx()
+
+    expanded = Path(candidate).expanduser()
+    if "/" in candidate or candidate.startswith(".") or candidate.startswith("~"):
+        return str(expanded) if _executable(expanded) else None
+    return shutil.which(candidate)
+
+
+def _warn_missing_icpx(fallback: str) -> None:
+    global _warned_missing_icpx
+    if _warned_missing_icpx:
+        return
+    _warned_missing_icpx = True
+    warnings.warn(
+        "ICX (icpx) is not available; cpp_stream is using "
+        f"{Path(fallback).name} instead. Run "
+        "trading_dsl_engine.cpp_stream.install_icx() to install ICX under "
+        "~/intel/oneapi without sudo.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def _compiler() -> str:
-    requested = os.environ.get("CXX", "g++")
-    compiler = shutil.which(requested)
+    requested = os.environ.get("CXX")
+    if requested:
+        compiler = shutil.which(requested)
+        if compiler is None:
+            raise RuntimeError(
+                f"cpp_stream requires a C++20 compiler; could not find {requested!r}"
+            )
+        return compiler
+
+    missed_preferred_icpx = False
+    waterfall = _compiler_waterfall()
+    for candidate in waterfall:
+        compiler = _resolve_compiler_candidate(candidate)
+        if compiler is not None:
+            if missed_preferred_icpx:
+                _warn_missing_icpx(compiler)
+            return compiler
+        if candidate == "icpx" and platform.machine().lower() in _ICPX_MACHINES:
+            missed_preferred_icpx = True
+
+    raise RuntimeError(
+        "cpp_stream requires a C++20 compiler; none of the configured compiler "
+        f"waterfall entries were found: {waterfall!r}"
+    )
+
+
+def _run_install_command(command: list[str], *, what: str) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"{what} failed with exit code {result.returncode}: {detail}")
+
+
+def install_icx(install_dir: str | os.PathLike[str] | None = None) -> str:
+    """Install Intel's C++ compiler into the current user's home directory.
+
+    The default target is ``~/intel/oneapi``. Installation never invokes sudo:
+    a private Miniforge bootstrap is cached under ``~/.cache`` and Intel's
+    ``dpcpp_linux-64`` compiler package is installed into the target prefix.
+    """
+
+    if platform.system() != "Linux" or platform.machine().lower() not in _ICPX_MACHINES:
+        raise RuntimeError("install_icx() currently supports Linux x86-64 only")
+
+    target = (
+        Path(install_dir).expanduser()
+        if install_dir is not None
+        else _user_oneapi_root()
+    )
+    existing = _find_icpx_under(target)
+    if existing is not None:
+        return existing
+
+    miniforge_root = _user_miniforge_root()
+    conda = miniforge_root / "bin" / "conda"
+    if not _executable(conda):
+        miniforge_root.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cpp_stream_icx_") as temporary:
+            installer = Path(temporary) / "miniforge.sh"
+            urllib.request.urlretrieve(_MINIFORGE_URL, installer)
+            _run_install_command(
+                ["bash", str(installer), "-b", "-p", str(miniforge_root)],
+                what="Miniforge bootstrap",
+            )
+        if not _executable(conda):
+            raise RuntimeError(
+                f"Miniforge completed but {conda} was not created"
+            )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _run_install_command(
+        [
+            str(conda),
+            "create",
+            "-y",
+            "-p",
+            str(target),
+            "--override-channels",
+            "-c",
+            _INTEL_CONDA_CHANNEL,
+            "-c",
+            "conda-forge",
+            "dpcpp_linux-64",
+        ],
+        what="ICX user installation",
+    )
+    compiler = _find_icpx_under(target)
     if compiler is None:
         raise RuntimeError(
-            f"cpp_stream requires a C++20 compiler; could not find {requested!r}"
+            f"Intel compiler installation completed but icpx was not found under {target}"
         )
     return compiler
+
+
+def _compiler_runtime_link_flags(compiler: str) -> list[str]:
+    """Embed ICX's runtime directory so cached shared objects load standalone."""
+
+    if Path(compiler).name != "icpx":
+        return []
+    result = subprocess.run(
+        [compiler, "-print-file-name=libsvml.so"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return []
+    runtime = Path(result.stdout.strip())
+    if runtime.name != "libsvml.so" or runtime.parent == Path("."):
+        return []
+    return [f"-Wl,-rpath,{runtime.parent}"]
 
 
 def _flags() -> tuple[list[str], list[str]]:
@@ -125,6 +340,7 @@ def build_shared(
 
     compiler = _compiler()
     compile_flags, link_flags = _flags()
+    link_flags += _compiler_runtime_link_flags(compiler)
     digest = hashlib.sha256(source.encode())
     for header in sorted(_cpp_root().rglob("*.hpp")):
         digest.update(header.relative_to(_cpp_root()).as_posix().encode())
@@ -413,6 +629,7 @@ __all__ = [
     "build_shared",
     "infer_n",
     "input_value_type",
+    "install_icx",
     "repair_value_types",
     "row_scalar_analysis",
     "validate_names",
