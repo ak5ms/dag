@@ -1187,15 +1187,21 @@ class _BaseBuilder:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError("xs_weighted_mean expects x, weight")
             children = tuple(self.build(arg) for arg in node.args)
-            if any(self.nodes[child].value_type.kind != "vector" for child in children):
-                raise FormulaIRCompileError("xs_weighted_mean requires vectors")
+            kinds = tuple(self.nodes[child].value_type.kind for child in children)
+            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
+                raise FormulaIRCompileError(
+                    "xs_weighted_mean requires vector x and scalar or vector weight"
+                )
             return self._append(XsWeightedMeanOp(), children, VECTOR)
         if node.fn in {"xs_vector_projection", "xs_regression_projection"}:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError(f"{node.fn} expects target, regressor")
             children = tuple(self.build(arg) for arg in node.args)
-            if any(self.nodes[child].value_type.kind != "vector" for child in children):
-                raise FormulaIRCompileError(f"{node.fn} requires vectors")
+            kinds = tuple(self.nodes[child].value_type.kind for child in children)
+            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
+                raise FormulaIRCompileError(
+                    f"{node.fn} requires vector target and scalar or vector regressor"
+                )
             return self._append(
                 XsProjectionOp(node.fn == "xs_regression_projection"),
                 children,

@@ -38,6 +38,23 @@ def test_expr_method_chaining_lowers_ops_and_inline_groupby_apply():
     assert lhs.fn == "add"
 
 
+def test_expr_pipe_and_registered_function_method_chaining():
+    name = "test_center_then_scale"
+    try:
+        @tde.register_dsl_function(name)
+        def center_then_scale(x, scale=1.0):
+            return (x - x.xs_mean()) * scale
+
+        source = tde.var("x")
+        piped = source.pipe(center_then_scale, scale=2.0)
+        chained = source.test_center_then_scale(scale=2.0)
+        assert repr(piped) == repr(chained)
+        assert chained.fn == "mul"
+    finally:
+        tde.DEFAULT_DSL_REGISTRY._fns.pop(name, None)
+        tde._DSL_OP_SIGNATURES.pop(name, None)
+
+
 def test_jax_flat_rejects_noncanonical_groupby_arity():
     with pytest.raises(ValueError, match="canonical form"):
         compile_formula("groupby(ts, x)")

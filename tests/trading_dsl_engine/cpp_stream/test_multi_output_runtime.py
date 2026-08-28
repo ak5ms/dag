@@ -8,6 +8,33 @@ import numpy as np
 from trading_dsl_engine.base.dsl import cumsum, groupby, self_, var
 from trading_dsl_engine.base.keys import Key
 from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream.python.runtime import FormulaResults
+
+
+def test_nested_formula_mapping_load_map_and_flatten(tmp_path: Path):
+    rows, cols = 8, 3
+    x = np.arange(rows * cols, dtype=np.float64).reshape(rows, cols)
+    runtime = compile_formula(
+        {"signals": {"raw": "x", "twice": "x * 2"}, "summary": "sum(x, axis=0)"},
+        {"x": x},
+        n_instruments=cols,
+    )
+
+    loaded = runtime.run(out_path=tmp_path / "nested.npy").load(mmap_mode=None)
+    assert isinstance(loaded, FormulaResults)
+    assert isinstance(loaded["signals"], FormulaResults)
+    np.testing.assert_array_equal(loaded["signals"]["raw"], x)
+    np.testing.assert_array_equal(loaded["signals"]["twice"], x * 2)
+    np.testing.assert_array_equal(loaded["summary"], x.sum(axis=0))
+
+    shapes = loaded.map(np.shape)
+    assert shapes["signals"]["raw"] == (rows, cols)
+    assert shapes["summary"] == (cols,)
+    assert list(loaded.flatten()) == [
+        ("signals", "raw"),
+        ("signals", "twice"),
+        ("summary",),
+    ]
 
 
 def test_promoted_row_output_remains_readable_by_final_projection(tmp_path: Path):

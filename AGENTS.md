@@ -49,6 +49,9 @@ Priorities, in order:
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
 - When adding new active `jax_flat` operators, implement both the pure JAX-flat operator and corresponding native C++ lowering/runtime support unless the task explicitly scopes C++ out; document and test any intentional C++ fallback.
 - Ridge weights may be omitted in supported forms and must default to unit per-instrument weights without changing explicit-weight semantics.
+- Runtime formula mappings may be nested arbitrarily; loaded `FormulaResults` must preserve insertion order and structure, and its `map`/`flatten` helpers operate on leaves without copying array data themselves.
+- Registered default-registry DSL functions must remain available both as free functions and through expression method chaining; `Expr.pipe` follows pandas' expression-first calling convention.
+- Cross-sectional binary operators must accept scalar secondary operands wherever lane broadcasting is meaningful (for example unit weights for `xs_weighted_mean`) while retaining vector primary inputs.
 
 ## Where to change what
 
