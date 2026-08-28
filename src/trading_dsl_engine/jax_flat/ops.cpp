@@ -9,12 +9,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <thread>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -604,15 +607,15 @@ public:
         }
     }
 
-    py::array_t<double> run_batch(State& state, py::args arrays) const {
+    py::array_t<double> run_batch(State& state, int workers, py::args arrays) const {
         int64_t rows = -1;
         validate_batch(state, arrays, rows);
         py::array_t<double> out({rows, static_cast<int64_t>(output_size(state))});
-        run_batch_into(state, out, arrays);
+        run_batch_into(state, out, workers, arrays);
         return out;
     }
 
-    void run_batch_into(State& state, py::array_t<double> out, py::args arrays) const {
+    void run_batch_into(State& state, py::array_t<double> out, int workers, py::args arrays) const {
         int64_t rows = -1;
         auto input_arrays = validate_batch(state, arrays, rows);
         auto out_info = out.request();
@@ -629,19 +632,99 @@ public:
         }
         {
             py::gil_scoped_release release;
-            for (int64_t t = 0; t < rows; ++t) {
-                for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
-                    state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
-#if defined(__GNUC__) || defined(__clang__)
-                    if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
-#endif
+            const int thread_count = std::max(1, std::min(workers, static_cast<int>(nodes_.size())));
+            const int64_t estimated_element_work = rows * static_cast<int64_t>(n) * static_cast<int64_t>(nodes_.size());
+            if (thread_count == 1 || estimated_element_work < 1'000'000) {
+                for (int64_t t = 0; t < rows; ++t) {
+                    bind_batch_row(state, t, rows, n);
+                    eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
                 }
-                eval_row(state, state.row_ptrs_, output_ptr + t * row_width);
+            } else {
+                eval_batch_atomic_dag(state, output_ptr, rows, row_width, n, thread_count);
             }
         }
     }
 
 private:
+    void bind_batch_row(State& state, int64_t t, int64_t rows, int n) const {
+        for (size_t i = 0; i < state.batch_base_ptrs_.size(); ++i) {
+            state.row_ptrs_[i] = state.batch_base_ptrs_[i] + t * n;
+#if defined(__GNUC__) || defined(__clang__)
+            if (t + 2 < rows) __builtin_prefetch(state.batch_base_ptrs_[i] + (t + 2) * n, 0, 1);
+#endif
+        }
+    }
+
+    static void cpu_relax() {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield" ::: "memory");
+#else
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+
+    void eval_batch_atomic_dag(
+        State& state, double* output, int64_t rows, int row_size, int n, int workers) const {
+        if (rows == 0) return;
+        const int node_count = static_cast<int>(nodes_.size());
+        auto status = std::make_unique<std::atomic<uint64_t>[]>(static_cast<size_t>(node_count));
+        for (int node = 0; node < node_count; ++node) status[static_cast<size_t>(node)].store(0, std::memory_order_relaxed);
+        std::atomic<int> completed{0};
+        std::atomic<int64_t> current_row{0};
+        std::atomic<bool> done{false};
+        bind_batch_row(state, 0, rows, n);
+
+        auto worker = [&](int worker_id) {
+            int cursor = worker_id % node_count;
+            while (!done.load(std::memory_order_acquire)) {
+                const int64_t row = current_row.load(std::memory_order_acquire);
+                const uint64_t epoch = static_cast<uint64_t>(row) * 3;
+                bool claimed = false;
+                for (int searched = 0; searched < node_count; ++searched) {
+                    const int node_i = (cursor + searched) % node_count;
+                    uint64_t observed = status[static_cast<size_t>(node_i)].load(std::memory_order_relaxed);
+                    if (observed > epoch) continue;
+                    bool ready = true;
+                    for (int child_id : nodes_[static_cast<size_t>(node_i)].children) {
+                        if (status[static_cast<size_t>(child_id)].load(std::memory_order_acquire) != epoch + 2) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                    if (!ready) continue;
+                    if (!status[static_cast<size_t>(node_i)].compare_exchange_strong(
+                            observed, epoch + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) continue;
+                    eval_node(state, state.row_ptrs_, output + row * row_size, static_cast<size_t>(node_i));
+                    status[static_cast<size_t>(node_i)].store(epoch + 2, std::memory_order_release);
+                    cursor = (node_i + 1) % node_count;
+                    claimed = true;
+                    if (completed.fetch_add(1, std::memory_order_acq_rel) + 1 == node_count) {
+                        if (!supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode)) {
+                            const auto& root = state.values_[static_cast<size_t>(output_id_)];
+                            std::copy(root.data.begin(), root.data.begin() + root.size(n), output + row * row_size);
+                        }
+                        const int64_t next_row = row + 1;
+                        if (next_row == rows) {
+                            done.store(true, std::memory_order_release);
+                        } else {
+                            completed.store(0, std::memory_order_relaxed);
+                            bind_batch_row(state, next_row, rows, n);
+                            current_row.store(next_row, std::memory_order_release);
+                        }
+                    }
+                    break;
+                }
+                if (!claimed) cpu_relax();
+            }
+        };
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<size_t>(workers));
+        for (int worker_id = 0; worker_id < workers; ++worker_id) threads.emplace_back(worker, worker_id);
+        for (auto& thread : threads) thread.join();
+    }
+
     friend class State;
     std::vector<NodeSpec> nodes_;
     int output_id_;
@@ -1428,8 +1511,13 @@ private:
                 case OpCode::Group:
                     eval_group(state, spec, dst_v);
                     break;
-            }
         }
+    }
+
+    void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        const int n = state.n_instruments_;
+        const bool direct_root = supports_direct_root_write(nodes_[static_cast<size_t>(output_id_)].opcode);
+        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) eval_node(state, input_ptrs, out_ptr, node_i);
         if (!direct_root) {
             const auto& root = state.values_[static_cast<size_t>(output_id_)];
             std::copy(root.data.begin(), root.data.begin() + root.size(n), out_ptr);
