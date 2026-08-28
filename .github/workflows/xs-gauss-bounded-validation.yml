@@ -7,9 +7,38 @@ on:
       - "src/trading_dsl_engine/cpp_stream/**"
       - "tests/trading_dsl_engine/cpp_stream/test_xs_gauss.py"
       - "scripts/benchmark_cpp_stream_xs_gauss.py"
+      - "scripts/apply_xs_gauss_bounded.py"
       - ".github/workflows/xs-gauss-bounded-validation.yml"
 
+permissions:
+  contents: write
+
 jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - name: Apply one-shot native edit
+        run: |
+          if [ ! -f scripts/apply_xs_gauss_bounded.py ]; then
+            echo "bounded xs_gauss edit already applied"
+            exit 0
+          fi
+          python scripts/apply_xs_gauss_bounded.py
+          rm scripts/apply_xs_gauss_bounded.py
+          rm -f scripts/xs_gauss_bounded_location.patch
+          rm -f .github/workflows/apply-xs-gauss-bounded-patch.yml
+          rm -f .github/workflows/apply-xs-gauss-bounded-patch-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: bound xs_gauss location by RMS"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
   behavior:
     runs-on: ubuntu-latest
     timeout-minutes: 20
