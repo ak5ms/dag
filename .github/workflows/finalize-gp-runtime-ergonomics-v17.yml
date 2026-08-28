@@ -1,0 +1,218 @@
+name: Finalize GP graph and runtime ergonomics v17
+
+on:
+  push:
+    branches:
+      - agent/gp-runtime-ergonomics-finalizer-v17
+    paths:
+      - ".github/workflows/finalize-gp-runtime-ergonomics-v17.yml"
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: read
+
+env:
+  TARGET_BRANCH: agent/gp-graph-runtime-ergonomics
+  BASE_BRANCH: agent/strongly-typed-gp
+  PR_NUMBER: "192"
+  MPLBACKEND: Agg
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine whether the target is already fully verified
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "$TARGET_BRANCH" "$BASE_BRANCH"
+          target_sha=$(git rev-parse "origin/$TARGET_BRANCH")
+          verified=$(gh api "repos/$GITHUB_REPOSITORY/commits/$target_sha/status" \
+            --jq '[.statuses[] | select(.context == "finalizer/verified" and .state == "success")] | length' 2>/dev/null || echo 0)
+          draft=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          base_contained=false
+          if git merge-base --is-ancestor "origin/$BASE_BRANCH" "origin/$TARGET_BRANCH"; then
+            base_contained=true
+          fi
+          if [[ "$verified" != 0 && "$draft" == false && "$base_contained" == true ]]; then
+            echo 'Target already has verified status, is ready, and contains latest base.'
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            gh pr ready "$PR_NUMBER" --undo --repo "$GITHUB_REPOSITORY" || true
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Preserve payload and update target with latest base
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gp-runtime-finalizer-v14
+          cp -R .github/finalizer_payload_v14 /tmp/gp-runtime-finalizer-v14
+          git checkout -B gp-runtime-finalized "origin/$TARGET_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "origin/$BASE_BRANCH"
+          git status --short
+
+      - uses: actions/setup-python@v5
+        if: steps.preflight.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and required test dependencies
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e . astropy
+
+      - name: Apply implementation and static checks
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/gp-runtime-finalizer-v14/apply.py
+          git diff --check
+          python -m compileall -q src tests/trading_dsl_engine/test_result_mapping.py tests/trading_dsl_engine/test_expr_ergonomics.py tests/flows/gp/test_visualization.py
+          git status --short
+
+      - name: Run focused feature tests
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pytest -n 0 -q \
+            tests/trading_dsl_engine/test_result_mapping.py \
+            tests/trading_dsl_engine/test_expr_ergonomics.py \
+            tests/flows/gp/test_visualization.py
+
+      - name: Run complete GP suite
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pytest -n 0 -q tests/flows/gp
+
+      - name: Run repository-scoped affected active tests
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t selected < <(
+            find tests -type f -name 'test_*.py' \
+              \( -iname '*dsl*' \
+                 -o -iname '*parser*' \
+                 -o -iname '*multi*output*' \
+                 -o -iname '*multiple*formula*' \
+                 -o -iname '*compiler*' \
+                 -o -iname '*visualization*' \
+                 -o -iname '*weighted*' \) \
+              ! -path 'tests/numba/*' \
+              ! -path 'tests/jax/*' \
+              ! -path 'tests/trading_dsl_engine/numba/*' \
+              ! -path 'tests/trading_dsl_engine/jax/*' \
+              ! -path 'tests/flows/gp/*' \
+              ! -path 'tests/trading_dsl_engine/test_result_mapping.py' \
+              ! -path 'tests/trading_dsl_engine/test_expr_ergonomics.py' \
+              -print | sort -u
+          )
+          for candidate in \
+            tests/trading_dsl_engine/test_visualization.py \
+            tests/jax_flat \
+            tests/trading_dsl_engine/jax_flat; do
+            if [[ -e "$candidate" ]]; then selected+=("$candidate"); fi
+          done
+          if ((${#selected[@]})); then
+            printf 'Selected affected tests:\n%s\n' "${selected[*]}"
+            pytest -n 0 -q "${selected[@]}"
+          fi
+
+      - name: Commit exact verified tree
+        if: steps.preflight.outputs.skip != 'true'
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python -m compileall -q src
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'Target already contains the implementation changes.'
+          else
+            git commit -m 'feat: add GP graph and runtime ergonomics'
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push verified commit without force
+        if: steps.preflight.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+
+      - name: Verify remote, publish status, and mark PR ready
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED_SHA: ${{ steps.commit.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$TARGET_BRANCH" --jq .object.sha)
+          test "$remote_sha" = "$VERIFIED_SHA"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$VERIFIED_SHA" \
+            -f state=success \
+            -f context='finalizer/verified' \
+            -f description='All GP and affected active DSL/runtime tests passed' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat > /tmp/pr-body.md <<'EOF'
+          Implements all requested GP/runtime ergonomics:
+
+          - Interactive Plotly GP grammar explorer with terminal/type/operator relations, live search/filtering, and click-to-drill-down.
+          - Broader typed static terminal grids for integers, nonnegative integers/floats, positive values, negative values, and general scalar literals.
+          - Arbitrarily nested formula mappings compiled through the existing fused multi-output path; `result.load()` reconstructs a `ResultMapping` with recursive `.map()` and tuple-key `.flatten()` helpers.
+          - Pandas-style `Expr.pipe`.
+          - Lazy method chaining for built-in and `register_dsl_function` operators.
+          - Generic scalar-to-vector broadcasting for cross-sectional weight/projection-style operands, including `x.xs_weighted_mean(w=1)`.
+
+          Validation on the exact pushed tree follows repository policy:
+
+          - Focused tests for all six requested behaviors.
+          - Complete `tests/flows/gp` suite.
+          - Affected shared DSL/parser/compiler, nested multi-output, visualization, weighted-operand, active JAX-flat, and cpp-stream tests.
+          - `python -m compileall -q src` and `git diff --check`.
+          - Latest `agent/strongly-typed-gp` is contained in the feature branch.
+          EOF
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --title 'Add GP graph exploration and DSL/runtime ergonomics' \
+            --body-file /tmp/pr-body.md
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Verification passed for commit \`$VERIFIED_SHA\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          test "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          test "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)" = "$VERIFIED_SHA"
+          git fetch --force origin "$BASE_BRANCH" "$TARGET_BRANCH"
+          git merge-base --is-ancestor "origin/$BASE_BRANCH" "origin/$TARGET_BRANCH"
+
+      - name: Report finalizer failure on draft PR
+        if: failure() && steps.preflight.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh pr ready "$PR_NUMBER" --undo --repo "$GITHUB_REPOSITORY" || true
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Finalizer failed before certification. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
