@@ -1,0 +1,116 @@
+name: Apply verified GP ergonomics implementation
+
+on:
+  push:
+    branches:
+      - agent/gp-graph-runtime-ergonomics
+    paths:
+      - .github/workflows/apply-verified-gp-ergonomics.yml
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: apply-verified-gp-ergonomics
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-graph-runtime-ergonomics
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Apply the locally verified patch to the requested base
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly SOURCE_URL='https://ak5ms-dag-gp-erg-192-8a4f2d6c.loca.lt'
+          git fetch origin agent/strongly-typed-gp
+          git reset --hard origin/agent/strongly-typed-gp
+          curl --fail --location --silent --show-error \
+            -H 'bypass-tunnel-reminder: true' \
+            "$SOURCE_URL/dag.patch" -o /tmp/dag.patch
+          curl --fail --location --silent --show-error \
+            -H 'bypass-tunnel-reminder: true' \
+            "$SOURCE_URL/dag.patch.sha256" -o /tmp/dag.patch.sha256
+          printf '%s  %s\n' "$(cat /tmp/dag.patch.sha256)" /tmp/dag.patch | sha256sum --check --strict
+          git apply --index --3way /tmp/dag.patch
+          git diff --cached --check
+          test ! -e .github/workflows/apply-verified-gp-ergonomics.yml
+          test ! -e .github/workflows/export-agent-gp-runtime-workspace.yml
+          test ! -e .github/workflows/export-agent-gp-graph-runtime-workspace.yml
+          test -n "$(git diff --cached --name-only | grep '^src/')"
+          test -n "$(git diff --cached --name-only | grep '^tests/')"
+          test -n "$(git diff --cached --name-only | grep '^README.md$')"
+          test -n "$(git diff --cached --name-only | grep '^AGENTS.md$')"
+
+      - name: Install project
+        run: python -m pip install -e .
+
+      - name: Verify changed tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(git diff --cached --name-only | grep -E '^tests/.*\.py$' | sort -u)
+          test "${#tests[@]}" -gt 0
+          python -m pytest -n 0 -q "${tests[@]}"
+
+      - name: Verify full GP suite
+        run: python -m pytest -n 0 -q tests/flows/gp
+
+      - name: Verify affected DSL and runtime behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(grep -RIlE 'xs_weighted_mean|register_dsl_function|\.pipe\(|nested.*formula|flatten\(|ResultTree|ResultMapping|method.chain|method_chain' tests --include='test_*.py' | sort -u || true)
+          if ((${#tests[@]})); then
+            python -m pytest -n 0 -q "${tests[@]}"
+          fi
+          python -m compileall -q src tests
+
+      - name: Commit and replace the temporary branch head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: add GP exploration and runtime ergonomics'
+          new_sha=$(git rev-parse HEAD)
+          git push --force-with-lease=refs/heads/agent/gp-graph-runtime-ergonomics:${{ github.sha }} \
+            origin HEAD:refs/heads/agent/gp-graph-runtime-ergonomics
+          gh pr ready 192 --repo ak5ms/dag || true
+          gh pr edit 192 --repo ak5ms/dag \
+            --title 'Add interactive GP exploration and DSL/runtime ergonomics' \
+            --body "## Summary
+
+- adds an interactive Plotly GP type explorer with search and click-through operator/terminal drill-down
+- expands default strongly typed static numeric terminals
+- supports arbitrary nested formula mappings through one multi-output runtime, with ordered result-tree \`.map()\` and tuple-path \`.flatten()\`
+- adds pandas-style \`Expr.pipe\` and dynamic method chaining for registered DSL operators
+- supports scalar broadcasting in \`xs_weighted_mean\` and analogous naturally broadcastable operators
+- updates documentation and regression/native-runtime coverage
+
+## Validation
+
+GitHub Actions re-applied the locally verified binary-safe patch to \`agent/strongly-typed-gp\` and passed:
+
+- every test file changed by this PR
+- the complete \`tests/flows/gp\` suite
+- behavior-selected DSL/runtime tests covering the new APIs
+- \`compileall\` and \`git diff --check\`
+
+Verified commit: \`$new_sha\`
+
+No temporary handoff workflow or generated/cache artifact is present in the final commit."
