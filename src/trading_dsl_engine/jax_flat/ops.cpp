@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#define EIGEN_DONT_PARALLELIZE
 #include <Eigen/Dense>
 #include <unsupported/Eigen/SpecialFunctions>
 
@@ -14,8 +15,14 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <exception>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numeric>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -107,6 +114,10 @@ struct OpMetadata {
     StateKind state = StateKind::Value;
     bool direct_root_write = false;
     bool needs_rank_scratch = false;
+    // Scheduler traits live beside all other execution traits. A false value
+    // means that the kernel touches runtime-wide scratch and must own its level.
+    bool dag_parallel_safe = true;
+    uint16_t estimated_cost = 1;
 };
 
 constexpr auto make_op_metadata() {
@@ -123,12 +134,27 @@ constexpr auto make_op_metadata() {
         set_direct(opcode);
     }
     metadata[static_cast<size_t>(OpCode::Literal)].output_rows = OutputRows::Fixed;
+    // Source copies/fills are deliberately kept on the caller: dispatch costs
+    // dominate them and bundling these roots avoids thread-pool startup for a
+    // narrow expression such as add(input, input).
+    metadata[static_cast<size_t>(OpCode::Input)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::Literal)].dag_parallel_safe = false;
     metadata[static_cast<size_t>(OpCode::Mean)].output_rows = OutputRows::Fixed;
     metadata[static_cast<size_t>(OpCode::GetBeta)].output_rows = OutputRows::ModelProjection;
     metadata[static_cast<size_t>(OpCode::Einsum)].output_rows = OutputRows::EinsumDerived;
     metadata[static_cast<size_t>(OpCode::Einsum)].prepare = PrepareKind::Einsum;
     metadata[static_cast<size_t>(OpCode::FutureRbfBasisSum)].prepare = PrepareKind::FutureBasis;
     metadata[static_cast<size_t>(OpCode::XsRank)].needs_rank_scratch = true;
+    metadata[static_cast<size_t>(OpCode::XsRank)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::XsSort)].dag_parallel_safe = false;
+    metadata[static_cast<size_t>(OpCode::Exp)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Ln)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::NormInv)].estimated_cost = 16;
+    metadata[static_cast<size_t>(OpCode::Pow)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Ridge)].estimated_cost = 16;
+    metadata[static_cast<size_t>(OpCode::Einsum)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Outer)].estimated_cost = 8;
+    metadata[static_cast<size_t>(OpCode::Group)].estimated_cost = 8;
     metadata[static_cast<size_t>(OpCode::RollMean)].state = StateKind::RollingMean;
     metadata[static_cast<size_t>(OpCode::Shift)].state = StateKind::Shift;
     metadata[static_cast<size_t>(OpCode::Ridge)].state = StateKind::Ridge;
@@ -529,6 +555,82 @@ int count_inner_states(const std::vector<NodeSpec>& nodes) {
 class Runtime;
 size_t count_inputs(const std::vector<NodeSpec>& nodes);
 
+class TaskArena {
+public:
+    explicit TaskArena(int workers) : workers_(workers) {
+        threads_.reserve(static_cast<size_t>(workers_ - 1));
+        for (int id = 1; id < workers_; ++id) threads_.emplace_back([this, id] { worker_loop(id); });
+    }
+    TaskArena(const TaskArena&) = delete;
+    TaskArena& operator=(const TaskArena&) = delete;
+    ~TaskArena() {
+        stopping_.store(true, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+        generation_.notify_all();
+        for (auto& thread : threads_) thread.join();
+    }
+
+    void run(int tasks, const std::function<void(int)>& fn) {
+        if (tasks <= 1) { fn(0); return; }
+        fn_ = &fn;
+        task_count_ = tasks;
+        active_workers_ = std::min(workers_, tasks);
+        finished_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(exception_mutex_);
+            exception_ = nullptr;
+        }
+        generation_.fetch_add(1, std::memory_order_release);
+        generation_.notify_all();
+        execute_lane(0, fn, tasks);
+        const int target = active_workers_ - 1;
+        int observed = finished_.load(std::memory_order_acquire);
+        while (observed != target) {
+            finished_.wait(observed, std::memory_order_acquire);
+            observed = finished_.load(std::memory_order_acquire);
+        }
+        fn_ = nullptr;
+        std::lock_guard lock(exception_mutex_);
+        if (exception_) std::rethrow_exception(exception_);
+    }
+
+private:
+    void execute_lane(int id, const std::function<void(int)>& fn, int tasks) noexcept {
+        try {
+            for (int task = id; task < tasks; task += workers_) fn(task);
+        } catch (...) {
+            std::lock_guard lock(exception_mutex_);
+            if (!exception_) exception_ = std::current_exception();
+        }
+    }
+    void worker_loop(int id) {
+        uint64_t seen = 0;
+        for (;;) {
+            generation_.wait(seen, std::memory_order_acquire);
+            if (stopping_.load(std::memory_order_acquire)) return;
+            seen = generation_.load(std::memory_order_acquire);
+            const std::function<void(int)>* fn = fn_;
+            const int tasks = task_count_;
+            const int active_workers = active_workers_;
+            if (id >= active_workers) continue;
+            execute_lane(id, *fn, tasks);
+            if (finished_.fetch_add(1, std::memory_order_release) + 1 == active_workers - 1)
+                finished_.notify_one();
+        }
+    }
+
+    int workers_;
+    std::vector<std::thread> threads_;
+    alignas(64) std::atomic<uint64_t> generation_{0};
+    alignas(64) std::atomic<int> finished_{0};
+    const std::function<void(int)>* fn_ = nullptr;
+    int task_count_ = 0;
+    int active_workers_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::mutex exception_mutex_;
+    std::exception_ptr exception_;
+};
+
 class State {
 public:
     State(const Runtime* runtime, int n_instruments);
@@ -550,9 +652,11 @@ private:
     std::vector<const double*> row_ptrs_;
     std::vector<const double*> batch_base_ptrs_;
     std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> tick_input_owners_;
+    std::shared_ptr<TaskArena> arena_;
 };
 
 class Runtime {
+    static constexpr int64_t MinimumParallelWork = 8 * 1024 * 1024;
     struct PreparedNode {
         // PreparedNode is deliberately generic and parallel to nodes_. Only the
         // field selected by OpMetadata::prepare is populated. This moves parsing
@@ -562,9 +666,16 @@ class Runtime {
         std::vector<double> table;
     };
 
+    struct ScheduleLevel {
+        std::vector<int> caller_nodes;
+        std::vector<int> parallel_nodes;
+        int estimated_cost = 0;
+    };
+
 public:
-    Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states)
-        : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states) {
+    Runtime(std::vector<NodeSpec> nodes, int output_id, int n_states, int workers)
+        : nodes_(std::move(nodes)), output_id_(output_id), n_states_(n_states), workers_(workers) {
+        if (workers_ <= 0) throw std::invalid_argument("workers must be a positive integer");
         if (output_id_ < 0 || output_id_ >= static_cast<int>(nodes_.size())) {
             throw std::invalid_argument("invalid C++ jax_flat output id");
         }
@@ -575,6 +686,7 @@ public:
             has_rank_scratch_ = has_rank_scratch_ || metadata.needs_rank_scratch;
             prepared_nodes_.push_back(prepare_node(spec, metadata.prepare));
         }
+        build_schedule();
     }
 
     State init_state(int n_instruments) const { return State(this, n_instruments); }
@@ -648,6 +760,46 @@ private:
     int n_states_;
     std::vector<PreparedNode> prepared_nodes_;
     bool has_rank_scratch_ = false;
+    int workers_;
+    std::vector<ScheduleLevel> schedule_;
+    int max_parallel_width_ = 0;
+    mutable std::shared_ptr<TaskArena> arena_;
+    mutable std::unique_ptr<std::mutex> arena_mutex_ = std::make_unique<std::mutex>();
+
+    std::shared_ptr<TaskArena> ensure_arena(int n_instruments) const {
+        if (workers_ <= 1 || max_parallel_width_ <= 1) return {};
+        bool worthwhile = false;
+        for (const auto& level : schedule_) {
+            worthwhile = worthwhile ||
+                static_cast<int64_t>(level.estimated_cost) * n_instruments >= MinimumParallelWork;
+        }
+        if (!worthwhile) return {};
+        std::lock_guard lock(*arena_mutex_);
+        if (!arena_) arena_ = std::make_shared<TaskArena>(std::min(workers_, max_parallel_width_));
+        return arena_;
+    }
+
+    void build_schedule() {
+        std::vector<int> depth(nodes_.size(), 0);
+        std::vector<std::vector<int>> levels;
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            for (int child_id : nodes_[i].children) depth[i] = std::max(depth[i], depth[static_cast<size_t>(child_id)] + 1);
+            if (levels.size() <= static_cast<size_t>(depth[i])) levels.resize(static_cast<size_t>(depth[i] + 1));
+            levels[static_cast<size_t>(depth[i])].push_back(static_cast<int>(i));
+        }
+        schedule_.reserve(levels.size());
+        for (const auto& level : levels) {
+            ScheduleLevel scheduled;
+            for (int id : level) {
+                const auto& metadata = op_metadata(nodes_[static_cast<size_t>(id)].opcode);
+                auto& destination = metadata.dag_parallel_safe ? scheduled.parallel_nodes : scheduled.caller_nodes;
+                destination.push_back(id);
+                if (metadata.dag_parallel_safe) scheduled.estimated_cost += metadata.estimated_cost;
+            }
+            max_parallel_width_ = std::max(max_parallel_width_, static_cast<int>(scheduled.parallel_nodes.size()));
+            schedule_.push_back(std::move(scheduled));
+        }
+    }
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
 
@@ -1024,9 +1176,43 @@ private:
     }
 
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        // Preserve the zero-scheduler serial fast path for small rows and DAGs
+        // without a useful frontier. Levels are immutable and every level is a
+        // completion barrier, so timestep state cannot leak into the next row.
+        if (!state.arena_) {
+            eval_node_range(state, input_ptrs, out_ptr, 0, nodes_.size());
+            return;
+        }
+        for (const auto& level : schedule_) {
+            for (int node_id : level.caller_nodes)
+                eval_node_range(state, input_ptrs, out_ptr, static_cast<size_t>(node_id), static_cast<size_t>(node_id + 1));
+            const auto& nodes = level.parallel_nodes;
+            // Profiling wide cat(...) graphs showed that waking workers for
+            // sub-megabyte frontiers loses to the serial loop: dispatch plus
+            // transferring producer buffers back to a serial consumer dwarfs
+            // the arithmetic. Keep those frontiers serial. Cost weights let a
+            // genuinely compute-heavy level cross this conservative boundary.
+            if (nodes.size() <= 1 || static_cast<int64_t>(level.estimated_cost) * state.n_instruments_ < MinimumParallelWork) {
+                for (int node_id : nodes)
+                    eval_node_range(state, input_ptrs, out_ptr, static_cast<size_t>(node_id), static_cast<size_t>(node_id + 1));
+                continue;
+            }
+            const int task_count = std::min<int>(workers_, static_cast<int>(nodes.size()));
+            state.arena_->run(task_count, [&](int task) {
+                // Static bundles avoid queue traffic and atomics in instrument loops.
+                for (size_t i = static_cast<size_t>(task); i < nodes.size(); i += static_cast<size_t>(task_count)) {
+                    const size_t node_id = static_cast<size_t>(nodes[i]);
+                    eval_node_range(state, input_ptrs, out_ptr, node_id, node_id + 1);
+                }
+            });
+        }
+    }
+
+    void eval_node_range(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr,
+                         size_t begin, size_t end) const {
         const int n = state.n_instruments_;
         const bool direct_root = op_metadata(nodes_[static_cast<size_t>(output_id_)].opcode).direct_root_write;
-        for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
+        for (size_t node_i = begin; node_i < end; ++node_i) {
             const NodeSpec& spec = nodes_[node_i];
             NodeValue& dst_v = state.values_[node_i];
             double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
@@ -1854,6 +2040,7 @@ State::State(const Runtime* runtime, int n_instruments)
       rank_items_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0),
       full_rank_scores_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
+    arena_ = runtime->ensure_arena(n_instruments);
     if (runtime->has_rank_scratch_) {
         for (int rank = 1; rank <= n_instruments; ++rank) {
             full_rank_scores_[static_cast<size_t>(rank - 1)] =
@@ -1941,9 +2128,9 @@ NodeSpec parse_node(py::handle item) {
     return spec;
 }
 
-Runtime make_runtime(py::iterable specs, int output_id, int n_states) {
+Runtime make_runtime(py::iterable specs, int output_id, int n_states, int workers) {
     std::vector<NodeSpec> nodes;
     for (py::handle item : specs) nodes.push_back(parse_node(item));
-    return Runtime(std::move(nodes), output_id, n_states);
+    return Runtime(std::move(nodes), output_id, n_states, workers);
 }
 }  // namespace
