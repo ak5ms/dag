@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import OrderedDict
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -18,6 +19,46 @@ from trading_dsl_engine.ir.program import Program
 
 
 _PARALLEL_MODES = {"serial": 0, "rows": 1, "lanes": 2}
+
+
+class FormulaResults(OrderedDict):
+    """Ordered nested formula results with functional traversal helpers."""
+
+    def map(self, function):
+        return FormulaResults(
+            (
+                key,
+                value.map(function)
+                if isinstance(value, FormulaResults)
+                else function(value),
+            )
+            for key, value in self.items()
+        )
+
+    def flatten(self):
+        flattened = FormulaResults()
+
+        def visit(value, path):
+            if isinstance(value, FormulaResults):
+                for key, child in value.items():
+                    visit(child, path + (key,))
+            else:
+                flattened[path] = value
+
+        visit(self, ())
+        return flattened
+
+
+def _restore_formula_results(structure, values):
+    return FormulaResults(
+        (
+            key,
+            _restore_formula_results(child, values)
+            if isinstance(child, OrderedDict)
+            else values[child],
+        )
+        for key, child in structure.items()
+    )
 
 
 def _close_memmap(array: np.memmap) -> None:
@@ -44,6 +85,7 @@ class RunResult:
     return_multiple: bool
     output_dtype: str = "float64"
     data_offset: int = 0
+    result_structure: OrderedDict | None = None
 
     @property
     def rows_per_second(self) -> float:
@@ -104,6 +146,8 @@ class RunResult:
                     output.offset : output.offset + output.size
                 ].reshape(output.shape or ())
             values.append(value)
+        if self.result_structure is not None:
+            return _restore_formula_results(self.result_structure, values)
         return tuple(values)
 
 
@@ -122,6 +166,7 @@ class CppStreamRuntime:
         parallel_plan: ParallelPlan,
         output_layout: OutputLayout,
         return_multiple: bool,
+        result_structure=None,
         bound_sources: Mapping[str, SourceValue] | None = None,
     ) -> None:
         self.program = program
@@ -133,6 +178,7 @@ class CppStreamRuntime:
         self.parallel_plan = parallel_plan
         self.output_layout = output_layout
         self.return_multiple = bool(return_multiple)
+        self.result_structure = result_structure
         self.bound_sources = (
             None if bound_sources is None else dict(bound_sources)
         )
@@ -373,6 +419,7 @@ class CppStreamRuntime:
                 row_output_width=self.output_layout.row_width,
                 final_output_width=self.output_layout.final_width,
                 return_multiple=self.return_multiple,
+                result_structure=self.result_structure,
                 output_dtype="float64",
                 data_offset=output_offset,
             )
