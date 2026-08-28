@@ -107,6 +107,7 @@ struct OpMetadata {
     StateKind state = StateKind::Value;
     bool direct_root_write = false;
     bool needs_rank_scratch = false;
+    bool scalar_tick = false;
 };
 
 constexpr auto make_op_metadata() {
@@ -115,12 +116,23 @@ constexpr auto make_op_metadata() {
     // the compiler keep this array aligned when new enum values are appended.
     std::array<OpMetadata, static_cast<size_t>(OpCode::Count)> metadata{};
     const auto set_direct = [&](OpCode opcode) { metadata[static_cast<size_t>(opcode)].direct_root_write = true; };
+    const auto set_scalar_tick = [&](OpCode opcode) { metadata[static_cast<size_t>(opcode)].scalar_tick = true; };
     for (OpCode opcode : std::array{
              OpCode::Input, OpCode::Literal, OpCode::Add, OpCode::Sub, OpCode::Mul, OpCode::Div,
              OpCode::Abs, OpCode::Ln, OpCode::Ceil, OpCode::Floor, OpCode::Round, OpCode::Exp,
              OpCode::Sign, OpCode::Arctan, OpCode::IsNan, OpCode::Purify, OpCode::Fraction,
              OpCode::NormInv}) {
         set_direct(opcode);
+    }
+    for (OpCode opcode : std::array{
+             OpCode::Input, OpCode::Literal, OpCode::Add, OpCode::Sub, OpCode::Mul, OpCode::Div,
+             OpCode::Mod, OpCode::Pow, OpCode::FloorDiv, OpCode::Abs, OpCode::Ln, OpCode::Ceil,
+             OpCode::Floor, OpCode::Round, OpCode::Exp, OpCode::Sign, OpCode::Arctan,
+             OpCode::IsNan, OpCode::Purify, OpCode::Fraction, OpCode::NormInv, OpCode::Cache,
+             OpCode::Clip, OpCode::Eq, OpCode::Ne, OpCode::Lt, OpCode::Gt, OpCode::Le,
+             OpCode::Ge, OpCode::And, OpCode::Or, OpCode::Xor, OpCode::FillNa, OpCode::Where,
+             OpCode::Cumsum, OpCode::Ewm, OpCode::Cat}) {
+        set_scalar_tick(opcode);
     }
     metadata[static_cast<size_t>(OpCode::Literal)].output_rows = OutputRows::Fixed;
     metadata[static_cast<size_t>(OpCode::Mean)].output_rows = OutputRows::Fixed;
@@ -549,6 +561,7 @@ private:
     std::vector<double> output_;
     std::vector<const double*> row_ptrs_;
     std::vector<const double*> batch_base_ptrs_;
+    std::vector<double> tick_scalars_;
     std::vector<py::array_t<double, py::array::c_style | py::array::forcecast>> tick_input_owners_;
 };
 
@@ -575,6 +588,36 @@ public:
             has_rank_scratch_ = has_rank_scratch_ || metadata.needs_rank_scratch;
             prepared_nodes_.push_back(prepare_node(spec, metadata.prepare));
         }
+        ewm_fanout_end_.resize(nodes_.size());
+        std::iota(ewm_fanout_end_.begin(), ewm_fanout_end_.end(), 0);
+        for (size_t begin = 0; begin < nodes_.size();) {
+            size_t end = begin + 1;
+            if (nodes_[begin].opcode == OpCode::Ewm && nodes_[begin].children.size() == 1) {
+                while (end < nodes_.size()
+                       && nodes_[end].opcode == OpCode::Ewm
+                       && nodes_[end].children == nodes_[begin].children) {
+                    ++end;
+                }
+            }
+            if (end - begin > 1) ewm_fanout_end_[begin] = static_cast<int>(end);
+            begin = end;
+        }
+        const NodeSpec& root = nodes_[static_cast<size_t>(output_id_)];
+        scalar_cat_root_ = root.opcode == OpCode::Cat;
+        for (size_t node_i = 0; scalar_cat_root_ && node_i < nodes_.size(); ++node_i) {
+            const NodeSpec& spec = nodes_[node_i];
+            scalar_cat_root_ = op_metadata(spec.opcode).scalar_tick
+                && (static_cast<int>(node_i) == output_id_ || spec.width <= 1);
+        }
+        const bool homogeneous_ewm_root = !root.children.empty()
+            && std::all_of(root.children.begin(), root.children.end(), [&](int child_id) {
+                return nodes_[static_cast<size_t>(child_id)].opcode == OpCode::Ewm
+                    && nodes_[static_cast<size_t>(child_id)].children
+                        == nodes_[static_cast<size_t>(root.children[0])].children;
+            });
+        // The specialized homogeneous stateful fanout keeps each EWM state
+        // array contiguous and benchmarks faster than the general scalar DAG.
+        scalar_cat_root_ = scalar_cat_root_ && !homogeneous_ewm_root;
     }
 
     State init_state(int n_instruments) const { return State(this, n_instruments); }
@@ -647,6 +690,12 @@ private:
     int output_id_;
     int n_states_;
     std::vector<PreparedNode> prepared_nodes_;
+    // A compiler-produced fanout such as cat(ewm(x, 2), ewm(x, 4), ...) places
+    // its EWM nodes consecutively. Evaluate each such run with the instrument
+    // loop outside the node loop, so the shared child row is fetched once.
+    // Singleton/non-consecutive nodes retain the regular kernel and its layout.
+    std::vector<int> ewm_fanout_end_;
+    bool scalar_cat_root_ = false;
     bool has_rank_scratch_ = false;
 
     int output_size(const State& state) const { return state.values_[static_cast<size_t>(output_id_)].size(state.n_instruments_); }
@@ -752,6 +801,47 @@ private:
         for (NodeSpec& spec : nodes_) {
             if (spec.state_index < 0) continue;
             spec.state_index = next[static_cast<size_t>(op_metadata(spec.opcode).state)]++;
+        }
+    }
+
+    static double eval_ewm_value(ValueState& s, const NodeSpec& spec, int i, double v) {
+        const double alpha = 2.0 / (spec.param + 1.0);
+        const double old_wt_factor = 1.0 - alpha;
+        const int min_periods = spec.int_param / 4 - 1;
+        const bool ignore_na = (spec.int_param & 1) != 0;
+        const bool adjust = (spec.int_param & 2) != 0;
+        const bool is_observation = finite(v);
+        double old_wt = s.weight[i];
+        if (s.initialized[i] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
+        if (is_observation) {
+            if (s.initialized[i]) {
+                double new_wt = adjust ? 1.0 : alpha;
+                if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
+                if (s.value[i] != v) s.value[i] = (old_wt * s.value[i] + new_wt * v) / (old_wt + new_wt);
+                old_wt = adjust ? old_wt + new_wt : 1.0;
+            } else {
+                s.value[i] = v;
+                s.initialized[i] = 1;
+                old_wt = 1.0;
+            }
+            s.streak[i] += 1;
+        }
+        s.weight[i] = old_wt;
+        const bool enough = min_periods < 0 || s.streak[i] >= min_periods;
+        return (s.initialized[i] && enough) ? s.value[i] : NaN;
+    }
+
+    void eval_ewm_fanout(State& state, size_t begin, size_t end) const {
+        const int size = state.values_[begin].size(state.n_instruments_);
+        const auto& x = child(state, nodes_[begin], 0);
+        for (int i = 0; i < size; ++i) {
+            const double v = x.data[static_cast<size_t>(i)];
+            for (size_t node_i = begin; node_i < end; ++node_i) {
+                const NodeSpec& spec = nodes_[node_i];
+                auto& s = value_state(state, spec);
+                double* dst = state.values_[node_i].data.data();
+                dst[i] = eval_ewm_value(s, spec, i, v);
+            }
         }
     }
     static const NodeValue& child(const State& state, const NodeSpec& spec, size_t i) { return state.values_.at(static_cast<size_t>(spec.children.at(i))); }
@@ -1023,11 +1113,61 @@ private:
         }
     }
 
+    void eval_scalar_cat_root(
+        State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        const int n = state.n_instruments_;
+        auto& values = state.tick_scalars_;
+        const NodeSpec& root = nodes_[static_cast<size_t>(output_id_)];
+        for (int row = 0; row < n; ++row) {
+            for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
+                const NodeSpec& spec = nodes_[node_i];
+                if (spec.opcode == OpCode::Input) {
+                    values[node_i] = input_ptrs[static_cast<size_t>(spec.input_index)][row];
+                } else if (spec.opcode == OpCode::Literal) {
+                    values[node_i] = spec.literal;
+                } else if (spec.opcode == OpCode::Cumsum) {
+                    auto& s = value_state(state, spec);
+                    const double v = values[static_cast<size_t>(spec.children[0])];
+                    if (finite(v)) {
+                        s.value[row] += v;
+                        s.initialized[row] = 1;
+                        values[node_i] = s.value[row];
+                    } else {
+                        values[node_i] = NaN;
+                    }
+                } else if (spec.opcode == OpCode::Ewm) {
+                    auto& s = value_state(state, spec);
+                    values[node_i] = eval_ewm_value(
+                        s, spec, row, values[static_cast<size_t>(spec.children[0])]);
+                } else if (spec.opcode != OpCode::Cat) {
+                    const double a = spec.children.empty() ? NaN : values[static_cast<size_t>(spec.children[0])];
+                    const double b = spec.children.size() < 2 ? NaN : values[static_cast<size_t>(spec.children[1])];
+                    const double c = spec.children.size() < 3 ? NaN : values[static_cast<size_t>(spec.children[2])];
+                    values[node_i] = eval_scalar_opcode(spec.opcode, a, b, c);
+                }
+            }
+            size_t column = 0;
+            for (int child_id : root.children) {
+                out_ptr[static_cast<size_t>(row * root.width) + column++] = values[static_cast<size_t>(child_id)];
+            }
+        }
+    }
+
     void eval_row(State& state, const std::vector<const double*>& input_ptrs, double* __restrict out_ptr) const {
+        if (scalar_cat_root_) {
+            eval_scalar_cat_root(state, input_ptrs, out_ptr);
+            return;
+        }
         const int n = state.n_instruments_;
         const bool direct_root = op_metadata(nodes_[static_cast<size_t>(output_id_)].opcode).direct_root_write;
         for (size_t node_i = 0; node_i < nodes_.size(); ++node_i) {
             const NodeSpec& spec = nodes_[node_i];
+            const int fanout_end = ewm_fanout_end_[node_i];
+            if (fanout_end > static_cast<int>(node_i)) {
+                eval_ewm_fanout(state, node_i, static_cast<size_t>(fanout_end));
+                node_i = static_cast<size_t>(fanout_end - 1);
+                continue;
+            }
             NodeValue& dst_v = state.values_[node_i];
             double* __restrict dst = direct_root && static_cast<int>(node_i) == output_id_ ? out_ptr : dst_v.data.data();
             switch (spec.opcode) {
@@ -1285,32 +1425,9 @@ private:
                 case OpCode::Ewm: {
                     auto& s = value_state(state, spec);
                     const auto& x = child(state, spec, 0);
-                    const double alpha = 2.0 / (spec.param + 1.0);
-                    const double old_wt_factor = 1.0 - alpha;
-                    const int min_periods = spec.int_param / 4 - 1;
-                    const bool ignore_na = (spec.int_param & 1) != 0;
-                    const bool adjust = (spec.int_param & 2) != 0;
                     for (int i = 0; i < dst_v.size(n); ++i) {
                         const double v = x.data[static_cast<size_t>(i)];
-                        const bool is_observation = finite(v);
-                        double old_wt = s.weight[i];
-                        if (s.initialized[i] && (is_observation || !ignore_na)) old_wt *= old_wt_factor;
-                        if (is_observation) {
-                            if (s.initialized[i]) {
-                                double new_wt = adjust ? 1.0 : alpha;
-                                if (!adjust && std::abs(alpha - 0.5) <= 1e-12) new_wt = 1.0 - old_wt;
-                                if (s.value[i] != v) s.value[i] = (old_wt * s.value[i] + new_wt * v) / (old_wt + new_wt);
-                                old_wt = adjust ? old_wt + new_wt : 1.0;
-                            } else {
-                                s.value[i] = v;
-                                s.initialized[i] = 1;
-                                old_wt = 1.0;
-                            }
-                            s.streak[i] += 1;
-                        }
-                        s.weight[i] = old_wt;
-                        const bool enough = min_periods < 0 || s.streak[i] >= min_periods;
-                        dst[i] = (s.initialized[i] && enough) ? s.value[i] : NaN;
+                        dst[i] = eval_ewm_value(s, spec, i, v);
                     }
                     break;
                 }
@@ -1852,7 +1969,8 @@ void configure_group_universe(GroupState& group, const NodeSpec& spec, int n_ins
 State::State(const Runtime* runtime, int n_instruments)
     : n_instruments_(n_instruments),
       rank_items_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0),
-      full_rank_scores_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0) {
+      full_rank_scores_(runtime->has_rank_scratch_ ? static_cast<size_t>(n_instruments) : 0),
+      tick_scalars_(runtime->scalar_cat_root_ ? runtime->nodes_.size() : 0, NaN) {
     if (n_instruments <= 0) throw std::invalid_argument("n_instruments must be positive");
     if (runtime->has_rank_scratch_) {
         for (int rank = 1; rank <= n_instruments; ++rank) {
