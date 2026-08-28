@@ -13,7 +13,7 @@ _XS_GAUSS_POWER_TAG = -0.0
 
 @register_dsl_function("xs_gauss")
 def xs_gauss(x: Expr) -> Expr:
-    """Magnitude-spaced Gaussian cross-sectional scores scaled to unit std."""
+    """Spacing-aware Gaussian shape plus the original standardized location."""
 
     return xs_generalized_rank(x, _XS_GAUSS_POWER_TAG)
 
