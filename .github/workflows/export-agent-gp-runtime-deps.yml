@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --target /tmp/gp-runtime \
-            deap==1.4.2 includeigen pybind11
+            deap==1.4.2 includeigen pybind11 astropy
           tar -C /tmp -czf /tmp/gp-runtime.tar.gz gp-runtime
       - uses: actions/upload-artifact@v4
         with:
