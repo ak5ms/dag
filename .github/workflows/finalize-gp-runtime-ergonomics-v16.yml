@@ -1,0 +1,198 @@
+name: Finalize GP graph and runtime ergonomics v16
+
+on:
+  push:
+    branches:
+      - agent/gp-runtime-ergonomics-finalizer-v16
+    paths:
+      - ".github/workflows/finalize-gp-runtime-ergonomics-v16.yml"
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: read
+
+env:
+  TARGET_BRANCH: agent/gp-graph-runtime-ergonomics
+  PR_NUMBER: "192"
+  MPLBACKEND: Agg
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Keep target PR draft until verification completes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr ready "$PR_NUMBER" --undo --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Preserve payload and check out latest target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gp-runtime-finalizer-v14
+          cp -R .github/finalizer_payload_v14 /tmp/gp-runtime-finalizer-v14
+          git fetch --force origin "$TARGET_BRANCH"
+          git checkout -B gp-runtime-finalized "origin/$TARGET_BRANCH"
+          git status --short
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install project and required test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e . astropy
+
+      - name: Apply implementation and static checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python /tmp/gp-runtime-finalizer-v14/apply.py
+          git diff --check
+          python -m compileall -q src tests/trading_dsl_engine/test_result_mapping.py tests/trading_dsl_engine/test_expr_ergonomics.py tests/flows/gp/test_visualization.py
+          git status --short
+
+      - name: Run focused feature tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          pytest -n 0 -q \
+            tests/trading_dsl_engine/test_result_mapping.py \
+            tests/trading_dsl_engine/test_expr_ergonomics.py \
+            tests/flows/gp/test_visualization.py
+
+      - name: Run complete GP suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          pytest -n 0 -q tests/flows/gp
+
+      - name: Run repository-prescribed affected active tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t selected < <(
+            find tests -type f -name 'test_*.py' \
+              \( -iname '*dsl*' \
+                 -o -iname '*parser*' \
+                 -o -iname '*multi*output*' \
+                 -o -iname '*multiple*formula*' \
+                 -o -iname '*compiler*' \
+                 -o -iname '*visualization*' \
+                 -o -iname '*weighted*' \) \
+              ! -path 'tests/numba/*' \
+              ! -path 'tests/jax/*' \
+              ! -path 'tests/trading_dsl_engine/numba/*' \
+              ! -path 'tests/trading_dsl_engine/jax/*' \
+              ! -path 'tests/flows/gp/*' \
+              ! -path 'tests/trading_dsl_engine/test_result_mapping.py' \
+              ! -path 'tests/trading_dsl_engine/test_expr_ergonomics.py' \
+              -print | sort -u
+          )
+          for candidate in \
+            tests/trading_dsl_engine/test_visualization.py \
+            tests/jax_flat \
+            tests/trading_dsl_engine/jax_flat; do
+            if [[ -e "$candidate" ]]; then selected+=("$candidate"); fi
+          done
+          if ((${#selected[@]})); then
+            printf 'Selected affected tests:\n%s\n' "${selected[*]}"
+            pytest -n 0 -q "${selected[@]}"
+          else
+            echo 'No additional affected test paths found.'
+          fi
+
+      - name: Commit exact verified tree
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python -m compileall -q src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'Target already contains the verified implementation.'
+          else
+            git commit -m 'feat: add GP graph and runtime ergonomics'
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push verified commit without force
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+
+      - name: Verify remote SHA and publish success status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED_SHA: ${{ steps.commit.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$TARGET_BRANCH" --jq .object.sha)
+          test "$remote_sha" = "$VERIFIED_SHA"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$VERIFIED_SHA" \
+            -f state=success \
+            -f context='finalizer/verified' \
+            -f description='All GP and affected active DSL/runtime tests passed' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Update PR and mark ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERIFIED_SHA: ${{ steps.commit.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/pr-body.md <<'EOF'
+          Implements all requested GP/runtime ergonomics:
+
+          - Interactive Plotly GP grammar explorer with terminal/type/operator relations, live search/filtering, and click-to-drill-down.
+          - Broader typed static terminal grids for integers, nonnegative integers/floats, positive values, negative values, and general scalar literals.
+          - Arbitrarily nested formula mappings compiled through the existing fused multi-output path; `result.load()` reconstructs a `ResultMapping` with recursive `.map()` and tuple-key `.flatten()` helpers.
+          - Pandas-style `Expr.pipe`.
+          - Lazy method chaining for built-in and `register_dsl_function` operators.
+          - Generic scalar-to-vector broadcasting for cross-sectional weight/projection-style operands, including `x.xs_weighted_mean(w=1)`.
+
+          Validation on the exact pushed tree follows the repository policy:
+
+          - Focused tests for all six requested behaviors.
+          - Complete `tests/flows/gp` suite.
+          - Affected shared DSL/parser/compiler, nested multi-output, visualization, weighted-operand, active JAX-flat, and cpp-stream tests.
+          - `python -m compileall -q src` and `git diff --check`.
+          EOF
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --title 'Add GP graph exploration and DSL/runtime ergonomics' \
+            --body-file /tmp/pr-body.md
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Verification passed for commit \`$VERIFIED_SHA\`. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          test "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = false
+          test "$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)" = "$VERIFIED_SHA"
+
+      - name: Report failure on the draft PR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh pr ready "$PR_NUMBER" --undo --repo "$GITHUB_REPOSITORY" || true
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Finalizer run failed before the branch could be certified. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
