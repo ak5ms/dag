@@ -1,0 +1,35 @@
+name: Export full region scheduler workspace
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp-native-regions
+    paths:
+      - ".github/workflows/export-full-region-scheduler-source.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp-native-regions
+          fetch-depth: 0
+      - name: Package source and repository history
+        shell: bash
+        run: |
+          tar --exclude=.git -czf /tmp/dag-native-regions-source.tar.gz .
+          git bundle create /tmp/dag-native-regions.bundle --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-native-regions-source-${{ github.sha }}
+          path: |
+            /tmp/dag-native-regions-source.tar.gz
+            /tmp/dag-native-regions.bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
