@@ -1,0 +1,54 @@
+name: xs_gauss bounded validation
+
+on:
+  pull_request:
+    branches: [agent/strongly-typed-gp]
+    paths:
+      - "src/trading_dsl_engine/cpp_stream/**"
+      - "tests/trading_dsl_engine/cpp_stream/test_xs_gauss.py"
+      - "scripts/benchmark_cpp_stream_xs_gauss.py"
+      - ".github/workflows/xs-gauss-bounded-validation.yml"
+
+jobs:
+  behavior:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy pytest jinja2 includeigen pybind11
+      - name: Run xs_gauss behavior tests
+        env:
+          PYTHONPATH: src
+          CXX: g++
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_xs_gauss.py
+
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade
+          pip numpy jinja2 includeigen pybind11
+      - name: Benchmark xs_gauss
+        env:
+          PYTHONPATH: src
+          CXX: g++
+          CPP_STREAM_XS_GAUSS_ROWS: "2000000"
+          CPP_STREAM_XS_GAUSS_INSTRUMENTS: "9"
+          CPP_STREAM_XS_GAUSS_RUNS: "7"
+          CPP_STREAM_XS_GAUSS_WARMUPS: "1"
+          CPP_STREAM_BENCH_OUTPUT_DIR: /dev/shm
+        run: python scripts/benchmark_cpp_stream_xs_gauss.py
