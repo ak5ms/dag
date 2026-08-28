@@ -121,19 +121,13 @@ def test_xs_gauss_equal_spacing_is_scaled_xs_rank_and_shift_is_added_once(
 
 def test_xs_gauss_wide_cross_sections_match_reference(tmp_path: Path) -> None:
     rng = np.random.default_rng(12345)
-    x = np.vstack(
-        (
-            rng.standard_t(df=2.0, size=17) + 0.4,
-            rng.normal(loc=-0.35, size=150),
-        )
-    ).astype(object)
-    # Preserve two different compile-time widths while exercising NaNs and ties.
-    cases = []
-    for index, row in enumerate(x):
-        values = np.asarray(row, dtype=np.float64)
+    cases = [
+        rng.standard_t(df=2.0, size=17) + 0.4,
+        rng.normal(loc=-0.35, size=150),
+    ]
+    for index, values in enumerate(cases):
         values[3] = np.nan
         values[7:9] = 1.25
-        cases.append(values)
         actual = _run(
             tmp_path,
             values[None, :],
