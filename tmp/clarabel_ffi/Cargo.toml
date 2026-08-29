@@ -1,0 +1,19 @@
+[package]
+name = "cpp_stream_clarabel"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+clarabel = "=0.11.1"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"

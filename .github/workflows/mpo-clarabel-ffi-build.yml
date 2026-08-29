@@ -1,0 +1,42 @@
+name: mpo-clarabel-ffi-build
+
+on:
+  push:
+    branches: [mpo-agent-export]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/mpo-clarabel-ffi-build.yml
+      - tmp/clarabel_ffi/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build current Clarabel FFI
+        run: |
+          sed -i 's/use clarabel::{algebra::CscMatrix, solver::\*};/use clarabel::{algebra::{CscMatrix, SparseFormatError}, solver::*};/' tmp/clarabel_ffi/src/lib.rs
+          cargo build --release --manifest-path tmp/clarabel_ffi/Cargo.toml
+      - name: Inspect exported ABI
+        run: |
+          nm -D --defined-only tmp/clarabel_ffi/target/release/libcpp_stream_clarabel.so | sort
+          file tmp/clarabel_ffi/target/release/libcpp_stream_clarabel.so
+      - name: Package native library
+        run: |
+          mkdir -p /tmp/artifact
+          cp tmp/clarabel_ffi/target/release/libcpp_stream_clarabel.so /tmp/artifact/
+          cp tmp/clarabel_ffi/include/cpp_stream_clarabel.h /tmp/artifact/
+          cp tmp/clarabel_ffi/Cargo.toml /tmp/artifact/
+          cp tmp/clarabel_ffi/src/lib.rs /tmp/artifact/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpp-stream-clarabel-ffi
+          path: /tmp/artifact
+          if-no-files-found: error
+          retention-days: 1
