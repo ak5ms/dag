@@ -105,6 +105,7 @@ def MPO(
     constraints = [
         turnover >= delta,
         turnover >= -delta,
+        cp.sum(delta, axis=1) == 0,
         weights[0] - current_weights <= TRADE_BIG_M * is_tradable,
         weights[0] - current_weights >= -TRADE_BIG_M * is_tradable,
     ]
