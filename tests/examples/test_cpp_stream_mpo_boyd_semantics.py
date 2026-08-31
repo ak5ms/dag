@@ -93,6 +93,30 @@ def test_planned_trade_mask_uses_current_and_next_sessions(tmp_path: Path) -> No
     np.testing.assert_array_equal(actual, np.array([1, 1, 0, 1, 1, 1, 1, 1], dtype=float))
 
 
+def test_planned_trade_mask_advances_sparse_event_time(tmp_path: Path) -> None:
+    minute = 60_000_000.0
+    ts = 1_800_000_000_000_000.0
+    data = {
+        "_ev_ts": np.array([[ts], [np.nan]]),
+        "is_tradable_out0": np.array([[1.0], [0.0]]),
+        "session_start0": np.array([[ts - minute], [ts - minute]]),
+        "session_end0": np.array([[ts + 1.5 * minute], [ts + 1.5 * minute]]),
+        "next_session_start0": np.array([[ts + 3.0 * minute], [ts + 3.0 * minute]]),
+        "next_session_end0": np.array([[ts + 70.0 * minute], [ts + 70.0 * minute]]),
+    }
+    runtime = compile_formula(
+        example._planned_trade_allowed(var("is_tradable_out0")),
+        data,
+        n_instruments=1,
+    )
+    result = runtime.run(out_path=tmp_path / "sparse_mask.npy")
+    actual = np.asarray(result.load()).reshape(2, len(example.HORIZONS))
+    np.testing.assert_array_equal(
+        actual[1],
+        np.array([0, 0, 1, 1, 1, 1, 1, 1], dtype=float),
+    )
+
+
 def test_mpo_uses_total_block_returns_without_elapsed_normalization() -> None:
     source = inspect.getsource(example._formula)
     assert "block_return / block_elapsed" not in source
