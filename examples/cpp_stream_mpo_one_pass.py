@@ -88,7 +88,6 @@ def MPO(
     expected_returns,
     half_spread,
     current_weights,
-    current_half_spread_weights,
     risk_factor_0,
     risk_factor_1,
     risk_factor_2,
@@ -104,9 +103,6 @@ def MPO(
     expected_returns = cp.Parameter(expected_returns.shape, name="expected_returns")
     half_spread = cp.Parameter(half_spread.shape, name="half_spread", nonneg=True)
     current_weights = cp.Parameter((n_assets,), name="current_weights")
-    current_half_spread_weights = cp.Parameter(
-        (n_assets,), name="current_half_spread_weights"
-    )
     risk_factors = tuple(
         cp.Parameter(arg.shape, name=f"risk_factor_{h}")
         for h, arg in enumerate(
@@ -128,9 +124,11 @@ def MPO(
     risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
-    delta = weights - cp.vstack([current_weights, weights[:-1]])
+    previous_weights = cp.Variable((n_assets,), name="previous_weights")
+    delta = weights - cp.vstack([previous_weights, weights[:-1]])
     abs_delta = cp.abs(delta)
     constraints = [
+        previous_weights == current_weights,
         cp.sum(delta, axis=1) == 0,
         abs_delta <= TRADE_BIG_M * trade_allowed,
     ]
@@ -138,18 +136,10 @@ def MPO(
         risk = cp.SOC(risk_radius, risk_factor @ weights[h])
         risk.set_label(f"risk_{h}")
         constraints.append(risk)
-
-    first_trade_cost = cp.sum(
-        cp.abs(cp.multiply(half_spread, weights[0]) - current_half_spread_weights)
-    )
-    future_trade_cost = cp.sum(
-        cp.abs(cp.multiply(half_spread, weights[1:] - weights[:-1]))
-    )
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
-            + first_trade_cost
-            + future_trade_cost
+            + cp.sum(cp.multiply(half_spread, abs_delta))
         ),
         constraints,
     )
@@ -231,13 +221,10 @@ def _formula(returns=None):
             psd_factor(fillna(covariance, 0.0), eigenvalue_floor=1e-8)
         )
 
-    half_spread = fillna(purify(hs), 0.0)
-    current_weights = previous_solution("weights[0]", initial=0.0)
     mpo = MPO(
         expected_returns=cat(*forecasts),
-        half_spread=half_spread,
-        current_weights=current_weights,
-        current_half_spread_weights=half_spread * current_weights,
+        half_spread=fillna(purify(hs), 0.0),
+        current_weights=previous_solution("weights[0]", initial=0.0),
         risk_factor_0=factors[0],
         risk_factor_1=factors[1],
         risk_factor_2=factors[2],
