@@ -22,6 +22,7 @@ def _mpo_problem(n_assets: int = 3):
         expected_returns=_shape((n_horizons, n_assets)),
         half_spread=_shape((n_assets,)),
         current_weights=_shape((n_assets,)),
+        current_half_spread_weights=_shape((n_assets,)),
         risk_factor_0=_shape((n_assets, n_assets)),
         risk_factor_1=_shape((n_assets, n_assets)),
         risk_factor_2=_shape((n_assets, n_assets)),
@@ -30,17 +31,9 @@ def _mpo_problem(n_assets: int = 3):
         risk_factor_5=_shape((n_assets, n_assets)),
         risk_factor_6=_shape((n_assets, n_assets)),
         risk_factor_7=_shape((n_assets, n_assets)),
+        trade_allowed=_shape((n_horizons, n_assets)),
     )
-    try:
-        return example.MPO.factory(
-            **common,
-            trade_allowed=_shape((n_horizons, n_assets)),
-        )
-    except TypeError:
-        return example.MPO.factory(
-            **common,
-            is_tradable=_shape((n_assets,)),
-        )
+    return example.MPO.factory(**common)
 
 
 def test_mpo_uses_abs_and_future_trade_mask() -> None:
@@ -61,9 +54,12 @@ def test_mpo_uses_abs_and_future_trade_mask() -> None:
     expected = np.empty((n_horizons, n_assets))
     for h in range(n_horizons):
         expected[h] = [1.0, -1.0, 0.0] if h % 2 == 0 else [-1.0, 1.0, 0.0]
+    spread = np.full(n_assets, 1e-5)
+    current = np.array([0.2, -0.2, 0.0])
     params["expected_returns"].value = expected
-    params["half_spread"].value = np.full(n_assets, 1e-5)
-    params["current_weights"].value = np.zeros(n_assets)
+    params["half_spread"].value = spread
+    params["current_weights"].value = current
+    params["current_half_spread_weights"].value = spread * current
     for h in range(n_horizons):
         params[f"risk_factor_{h}"].value = np.eye(n_assets)
     params["risk_radius"].value = 1.0
@@ -76,7 +72,7 @@ def test_mpo_uses_abs_and_future_trade_mask() -> None:
     assert problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
     weights = next(v for v in problem.variables() if v.name() == "weights").value
     np.testing.assert_allclose(weights[3], weights[2], rtol=0.0, atol=1e-8)
-    np.testing.assert_allclose(weights.sum(axis=1), 0.0, rtol=0.0, atol=1e-8)
+    np.testing.assert_allclose(weights.sum(axis=1), current.sum(), rtol=0.0, atol=1e-8)
 
 
 def test_planned_trade_mask_uses_current_and_next_sessions(tmp_path: Path) -> None:
