@@ -34,7 +34,7 @@ from trading_dsl_engine.cpp_stream.optimizer import (
 )
 
 HORIZONS = (1, 2, 4, 8, 16, 32, 64, 128)
-FEATURE_SPANS = (8, 32, 128, 512)
+FEATURE_HLS = (4, 16, 64, 256)
 RIDGE_HL = 1440 * 21
 RISK_SPAN = 1440 * 21
 RISK_RADIUS = 0.08
@@ -100,7 +100,12 @@ def _formula():
     tradable = fillna(var("is_tradable_out0"), 0.0)
     hs = var("vw_halfspread_out0")
     fit_weights = purify(1 / hs**2)
-    features = cat(*(ts_zscore(returns, span) for span in FEATURE_SPANS))
+    features = cat(
+        *(
+            ts_zscore(returns, 2 / (1 - 0.5 ** (1 / hl)) - 1)
+            for hl in FEATURE_HLS
+        )
+    )
 
     # A return after k closed rows spans k+1 bars of elapsed risk time.
     elapsed = where(
