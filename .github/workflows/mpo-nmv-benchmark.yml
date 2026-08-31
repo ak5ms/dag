@@ -23,7 +23,7 @@ jobs:
       - name: Run MPO benchmark
         if: success()
         env:
-          PYTHONPATH: src
+          PYTHONPATH: src:.
           MPLBACKEND: Agg
           MPO_BENCH_ROWS: "5000"
           MPO_BENCH_RUNS: "5"
