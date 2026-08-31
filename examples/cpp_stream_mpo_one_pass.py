@@ -13,11 +13,12 @@ import pandas as pd
 from flows.load import InputData
 from flows.pov import RollRets
 from flows.riskmodel import risk_covariance
-from flows.utils import ewm_std, streak, ts_zscore
+from flows.utils import ewm_std, ts_zscore
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
     einsum,
+    ffill,
     fillna,
     get_beta,
     psd_factor,
@@ -37,6 +38,7 @@ from trading_dsl_engine.cpp_stream.optimizer import (
 )
 
 HORIZONS = (1, 2, 4, 8, 16, 32, 64, 128)
+TRADE_STARTS = (0,) + HORIZONS[:-1]
 FEATURE_HLS = (4, 16, 64, 256)
 RIDGE_HL = 1440 * 21
 RISK_SPAN = 1440 * 21
@@ -45,6 +47,7 @@ YHAT_VOL_SPAN = 1440 * 21
 YHAT_VOL_MIN_PERIODS = 64
 RISK_RADIUS = 0.08
 TRADE_BIG_M = 1e3
+MINUTE_US = 60_000_000.0
 ROWS = int(os.environ.get("MPO_EXAMPLE_ROWS", "20000"))
 CACHE = Path(".generated/cpp_stream_mpo_one_pass")
 
@@ -61,6 +64,25 @@ def _feature_span(hl: float) -> float:
     return 2 / (1 - 0.5 ** (1 / hl)) - 1
 
 
+def _planned_trade_allowed(tradable):
+    """Current tradability plus scheduled current/next-session availability."""
+    ts = ffill(var("_ev_ts"))
+    session_start = ffill(var("session_start0"))
+    session_end = ffill(var("session_end0"))
+    next_session_start = ffill(var("next_session_start0"))
+    next_session_end = ffill(var("next_session_end0"))
+
+    allowed = [tradable]
+    for start in TRADE_STARTS[1:]:
+        trade_ts = ts + start * MINUTE_US
+        in_session = (trade_ts >= session_start) & (trade_ts < session_end)
+        in_next_session = (trade_ts >= next_session_start) & (trade_ts < next_session_end)
+        allowed.append(
+            fillna(where(in_session | in_next_session, 1.0, 0.0), 0.0)
+        )
+    return cat(*allowed)
+
+
 @cvxpy_program(cache_dir=CACHE / "clarabel", clarabel=_clarabel, sequential=None)
 def MPO(
     expected_returns,
@@ -74,7 +96,7 @@ def MPO(
     risk_factor_5,
     risk_factor_6,
     risk_factor_7,
-    is_tradable,
+    trade_allowed,
     risk_radius=RISK_RADIUS,
 ):
     n_horizons, n_assets = expected_returns.shape
@@ -96,18 +118,17 @@ def MPO(
             )
         )
     )
-    is_tradable = cp.Parameter((n_assets,), name="is_tradable", nonneg=True)
+    trade_allowed = cp.Parameter(
+        trade_allowed.shape, name="trade_allowed", nonneg=True
+    )
     risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
-    turnover = cp.Variable((n_horizons, n_assets), name="turnover")
     delta = weights - cp.vstack([current_weights, weights[:-1]])
+    abs_delta = cp.abs(delta)
     constraints = [
-        turnover >= delta,
-        turnover >= -delta,
         cp.sum(delta, axis=1) == 0,
-        weights[0] - current_weights <= TRADE_BIG_M * is_tradable,
-        weights[0] - current_weights >= -TRADE_BIG_M * is_tradable,
+        abs_delta <= TRADE_BIG_M * trade_allowed,
     ]
     for h, risk_factor in enumerate(risk_factors):
         risk = cp.SOC(risk_radius, risk_factor @ weights[h])
@@ -116,7 +137,7 @@ def MPO(
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
-            + cp.sum(cp.multiply(half_spread, turnover))
+            + cp.sum(cp.multiply(half_spread, abs_delta))
         ),
         constraints,
     )
@@ -137,27 +158,19 @@ def _formula(returns=None):
     )
     features = cat(*feature_list)
 
-    # A return after k closed rows spans k+1 bars of elapsed risk time.
-    elapsed = where(
-        tradable != 0,
-        fillna(shift(streak(tradable == 0)), 0.0) + 1.0,
-        0.0,
-    )
+    # Closed rows contribute zero; RollRets puts the close-to-open gap move on
+    # the first tradable row after reopening.
     clean_returns = where(tradable != 0, fillna(returns, 0.0), 0.0)
 
     forecasts, yhat_signals, factors = [], [], []
-    for start, end in zip((0,) + HORIZONS[:-1], HORIZONS):
+    for start, end in zip(TRADE_STARTS, HORIZONS):
         width = end - start
         block_return = rolling_sum(clean_returns, width, min_periods=width)
-        block_elapsed = rolling_sum(elapsed, width, min_periods=width)
+        block_observed = rolling_sum(tradable, width, min_periods=width)
 
-        # ic1 alignment for block (start, end]: lag=start, hz=width,
-        # hence the fit feature is shifted by lag+hz=end.
-        target = where(
-            block_elapsed > 0,
-            block_return / block_elapsed,
-            float("nan"),
-        )
+        # Ridge predicts the total return of block (start, end] directly.
+        # ic1 alignment implies feature time t-end for a target ending at t.
+        target = where(block_observed > 0, block_return, float("nan"))
         fit_x = cat(
             *(
                 where(
@@ -178,7 +191,7 @@ def _formula(returns=None):
             )
         )
         yhat = einsum(features, beta, "if,f->i")
-        forecasts.append(fillna(yhat, 0.0) * width)
+        forecasts.append(fillna(yhat, 0.0))
         yhat_signals.append(
             purify(
                 yhat
@@ -190,14 +203,11 @@ def _formula(returns=None):
             )
         )
 
-        # Disjoint historical risk blocks: (0,1], (1,2], (2,4], ... .
+        # Risk uses the total return of the same disjoint block, with no
+        # elapsed-time normalization.
         risk_block = shift(block_return, start)
-        risk_elapsed = shift(block_elapsed, start)
-        risk_sample = where(
-            risk_elapsed > 0,
-            risk_block / risk_elapsed**0.5,
-            float("nan"),
-        )
+        risk_observed = shift(block_observed, start)
+        risk_sample = where(risk_observed > 0, risk_block, float("nan"))
         covariance = risk_covariance(
             risk_sample,
             span=RISK_SPAN,
@@ -221,7 +231,7 @@ def _formula(returns=None):
         risk_factor_5=factors[5],
         risk_factor_6=factors[6],
         risk_factor_7=factors[7],
-        is_tradable=tradable,
+        trade_allowed=_planned_trade_allowed(tradable),
         risk_radius=RISK_RADIUS,
     )
     weights = get_field(mpo, "weights[0]")
@@ -310,7 +320,7 @@ def _plot_diagnostics(
     alpha_w = _purified_inverse_square(hs)
     paths = []
 
-    for h, (start, end) in enumerate(zip((0,) + HORIZONS[:-1], HORIZONS)):
+    for h, (start, end) in enumerate(zip(TRADE_STARTS, HORIZONS)):
         hz = end - start
 
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -372,9 +382,7 @@ def _plot_diagnostics(
     paths.append(path)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    for (start, end), value in zip(
-        zip((0,) + HORIZONS[:-1], HORIZONS), risk_values
-    ):
+    for (start, end), value in zip(zip(TRADE_STARTS, HORIZONS), risk_values):
         value = np.asarray(value, dtype=float)
         ax.plot(index, np.linalg.norm(value[:, 1:], axis=1), label=f"({start}, {end}]")
     ax.axhline(RISK_RADIUS, linestyle="--", label="constraint")
