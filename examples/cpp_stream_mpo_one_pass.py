@@ -66,7 +66,14 @@ def MPO(
     expected_returns,
     half_spread,
     current_weights,
-    risk_factors,
+    risk_factor_0,
+    risk_factor_1,
+    risk_factor_2,
+    risk_factor_3,
+    risk_factor_4,
+    risk_factor_5,
+    risk_factor_6,
+    risk_factor_7,
     is_tradable,
     risk_radius=RISK_RADIUS,
 ):
@@ -74,7 +81,21 @@ def MPO(
     expected_returns = cp.Parameter(expected_returns.shape, name="expected_returns")
     half_spread = cp.Parameter(half_spread.shape, name="half_spread", nonneg=True)
     current_weights = cp.Parameter((n_assets,), name="current_weights")
-    risk_factors = cp.Parameter(risk_factors.shape, name="risk_factors")
+    risk_factors = tuple(
+        cp.Parameter(arg.shape, name=f"risk_factor_{h}")
+        for h, arg in enumerate(
+            (
+                risk_factor_0,
+                risk_factor_1,
+                risk_factor_2,
+                risk_factor_3,
+                risk_factor_4,
+                risk_factor_5,
+                risk_factor_6,
+                risk_factor_7,
+            )
+        )
+    )
     is_tradable = cp.Parameter((n_assets,), name="is_tradable", nonneg=True)
     risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
 
@@ -87,11 +108,8 @@ def MPO(
         weights[0] - current_weights <= TRADE_BIG_M * is_tradable,
         weights[0] - current_weights >= -TRADE_BIG_M * is_tradable,
     ]
-    for h in range(n_horizons):
-        risk = cp.SOC(
-            risk_radius,
-            risk_factors[h * n_assets : (h + 1) * n_assets] @ weights[h],
-        )
+    for h, risk_factor in enumerate(risk_factors):
+        risk = cp.SOC(risk_radius, risk_factor @ weights[h])
         risk.set_label(f"risk_{h}")
         constraints.append(risk)
     return cp.Problem(
@@ -194,8 +212,14 @@ def _formula(returns=None):
         expected_returns=cat(*forecasts),
         half_spread=fillna(purify(hs), 0.0),
         current_weights=previous_solution("weights[0]", initial=0.0),
-        # cat(NxN, ...) is logical (N,H*N); CVXPY sees (H*N,N).
-        risk_factors=cat(*factors),
+        risk_factor_0=factors[0],
+        risk_factor_1=factors[1],
+        risk_factor_2=factors[2],
+        risk_factor_3=factors[3],
+        risk_factor_4=factors[4],
+        risk_factor_5=factors[5],
+        risk_factor_6=factors[6],
+        risk_factor_7=factors[7],
         is_tradable=tradable,
         risk_radius=RISK_RADIUS,
     )
