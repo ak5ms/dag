@@ -108,16 +108,15 @@ def _formula(returns=None):
     tradable = fillna(var("is_tradable_out0"), 0.0)
     hs = var("vw_halfspread_out0")
     fit_weights = purify(1 / hs**2)
-    features = cat(
-        *(
-            ts_zscore(
-                returns,
-                _feature_span(hl),
-                min_periods=max(2, round(_feature_span(hl))),
-            )
-            for hl in FEATURE_HLS
+    feature_list = tuple(
+        ts_zscore(
+            returns,
+            _feature_span(hl),
+            min_periods=max(2, round(_feature_span(hl))),
         )
+        for hl in FEATURE_HLS
     )
+    features = cat(*feature_list)
 
     # A return after k closed rows spans k+1 bars of elapsed risk time.
     elapsed = where(
@@ -140,10 +139,15 @@ def _formula(returns=None):
             block_return / block_elapsed,
             float("nan"),
         )
-        fit_x = where(
-            shift(tradable, end) != 0,
-            shift(features, end),
-            float("nan"),
+        fit_x = cat(
+            *(
+                where(
+                    shift(tradable, end) != 0,
+                    shift(feature, end),
+                    float("nan"),
+                )
+                for feature in feature_list
+            )
         )
         beta = get_beta(
             Ridge(
