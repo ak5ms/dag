@@ -50,7 +50,11 @@ def test_mpo_uses_abs_and_future_trade_mask() -> None:
 
     assert "turnover" not in variable_names
     assert "trade_allowed" in params
-    assert problem.is_dpp()
+    dpp_parts = {
+        "objective": problem.objective.expr.is_dcp(dpp=True),
+        "constraints": [constraint.is_dcp(dpp=True) for constraint in problem.constraints],
+    }
+    assert problem.is_dpp(), dpp_parts
 
     n_horizons = len(example.HORIZONS)
     n_assets = 3
