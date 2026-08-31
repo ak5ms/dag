@@ -237,10 +237,10 @@ def main() -> None:
         data,
         collect=True,
     )
-    expected_returns = upstream_values[0]
-    half_spread = upstream_values[1]
-    risk_factors = upstream_values[2:10]
-    trade_allowed = upstream_values[10]
+    expected_returns = np.ascontiguousarray(upstream_values[0])
+    half_spread = np.ascontiguousarray(upstream_values[1])
+    risk_factors = tuple(np.ascontiguousarray(x) for x in upstream_values[2:10])
+    trade_allowed = np.ascontiguousarray(upstream_values[10])
     optimizer_data = {
         "expected_returns": expected_returns,
         "half_spread": half_spread,
