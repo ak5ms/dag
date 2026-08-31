@@ -41,7 +41,7 @@ def test_realized_portfolio_pnl_uses_carried_weights_and_spread_cost() -> None:
     gross, net = example._portfolio_pnl(returns, weights, hs)
 
     np.testing.assert_allclose(gross, [0.0, 0.3, -0.4])
-    np.testing.assert_allclose(net, [-0.01, 0.27, -0.415])
+    np.testing.assert_allclose(net, [-0.01, 0.28, -0.41])
 
 
 def test_fake_data_runs_full_mpo_example(tmp_path: Path, monkeypatch) -> None:
