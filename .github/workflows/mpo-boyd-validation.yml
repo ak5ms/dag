@@ -1,0 +1,30 @@
+name: MPO Boyd validation
+
+on:
+  push:
+    branches: [agent/mpo-inputdata-example]
+
+jobs:
+  test-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
+      - name: Run Boyd semantics tests
+        env:
+          PYTHONPATH: src:.
+          MPLBACKEND: Agg
+        run: python -m pytest -q -o addopts="" tests/examples/test_cpp_stream_mpo_boyd_semantics.py
+      - name: Run MPO benchmark
+        if: success()
+        env:
+          PYTHONPATH: src:.
+          MPLBACKEND: Agg
+          MPO_BENCH_ROWS: "5000"
+          MPO_BENCH_RUNS: "5"
+        run: python scripts/benchmark_cpp_stream_mpo_boyd.py
