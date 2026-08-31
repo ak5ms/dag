@@ -13,7 +13,7 @@ import pandas as pd
 from flows.load import InputData
 from flows.pov import RollRets
 from flows.riskmodel import risk_covariance
-from flows.utils import ewm_std, ts_zscore
+from flows.utils import ewm_std, streak, ts_zscore
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
@@ -21,6 +21,7 @@ from trading_dsl_engine.base.dsl import (
     ffill,
     fillna,
     get_beta,
+    isnan,
     psd_factor,
     purify,
     rolling_sum,
@@ -66,7 +67,8 @@ def _feature_span(hl: float) -> float:
 
 def _planned_trade_allowed(tradable):
     """Current tradability plus scheduled current/next-session availability."""
-    ts = ffill(var("_ev_ts"))
+    raw_ts = var("_ev_ts")
+    ts = ffill(raw_ts) + streak(isnan(raw_ts)) * MINUTE_US
     session_start = ffill(var("session_start0"))
     session_end = ffill(var("session_end0"))
     next_session_start = ffill(var("next_session_start0"))
