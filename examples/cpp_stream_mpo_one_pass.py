@@ -137,7 +137,7 @@ def MPO(
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
-            + cp.sum(cp.multiply(half_spread, abs_delta))
+            + cp.sum(cp.abs(cp.multiply(half_spread, delta)))
         ),
         constraints,
     )
