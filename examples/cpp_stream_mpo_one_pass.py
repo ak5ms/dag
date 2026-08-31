@@ -38,6 +38,7 @@ FEATURE_SPANS = (8, 32, 128, 512)
 RIDGE_HL = 1440 * 21
 RISK_SPAN = 1440 * 21
 RISK_RADIUS = 0.08
+TRADE_BIG_M = 1e3
 ROWS = int(os.environ.get("MPO_EXAMPLE_ROWS", "20000"))
 CACHE = Path(".generated/cpp_stream_mpo_one_pass")
 
@@ -75,7 +76,8 @@ def MPO(
     constraints = [
         turnover >= delta,
         turnover >= -delta,
-        cp.multiply(1 - is_tradable, weights[0] - current_weights) == 0,
+        weights[0] - current_weights <= TRADE_BIG_M * is_tradable,
+        weights[0] - current_weights >= -TRADE_BIG_M * is_tradable,
     ]
     constraints += [
         cp.SOC(
