@@ -3,6 +3,12 @@ name: MPO example smoke
 on:
   push:
     branches: [agent/mpo-inputdata-example]
+  pull_request:
+    branches: [main]
+    paths:
+      - "examples/cpp_stream_mpo_one_pass.py"
+      - "tests/examples/test_cpp_stream_mpo_one_pass.py"
+      - ".github/workflows/mpo-example-smoke.yml"
 
 jobs:
   smoke:
