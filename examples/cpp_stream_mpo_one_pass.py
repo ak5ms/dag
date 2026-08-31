@@ -57,6 +57,10 @@ def _clarabel() -> ClarabelNativePaths:
     return build_current_clarabel()
 
 
+def _feature_span(hl: float) -> float:
+    return 2 / (1 - 0.5 ** (1 / hl)) - 1
+
+
 @cvxpy_program(cache_dir=CACHE / "clarabel", clarabel=_clarabel, sequential=None)
 def MPO(
     expected_returns,
@@ -106,7 +110,11 @@ def _formula(returns=None):
     fit_weights = purify(1 / hs**2)
     features = cat(
         *(
-            ts_zscore(returns, 2 / (1 - 0.5 ** (1 / hl)) - 1)
+            ts_zscore(
+                returns,
+                _feature_span(hl),
+                min_periods=max(2, round(_feature_span(hl))),
+            )
             for hl in FEATURE_HLS
         )
     )
