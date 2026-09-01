@@ -1,0 +1,24 @@
+name: MPO Clarabel final validation
+
+on:
+  push:
+    branches: [agent/mpo-clarabel-speed-final]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
+      - name: Run focused speed and correctness validation
+        env:
+          PYTHONPATH: src:.
+          MPLBACKEND: Agg
+          MPO_FINAL_ROWS: "5000"
+          MPO_FINAL_RUNS: "10"
+        run: python scripts/spike_mpo_clarabel_final_validation.py
