@@ -686,16 +686,26 @@ def _stage_type(
         physical = stage if stage.kind == "clarabel" else stage.members[0]
         assert isinstance(physical.op, CvxpyProgramOp)
         program = physical.op.program
-        if len(physical.inputs) != len(program.parameters):
-            raise ValueError("generated optimizer parameter/source count mismatch")
-        feedback_fields = physical.op.feedback_fields or (
-            (None,) * len(physical.inputs)
+        parameter_count = len(program.parameters)
+        if len(physical.inputs) not in {parameter_count, parameter_count + 1}:
+            raise ValueError(
+                "generated optimizer expects parameter sources and an "
+                "optional scalar guard"
+            )
+        parameter_sources = physical.inputs[:parameter_count]
+        guard_source = (
+            physical.inputs[-1]
+            if len(physical.inputs) == parameter_count + 1
+            else None
         )
-        if len(feedback_fields) != len(physical.inputs):
+        feedback_fields = physical.op.feedback_fields or (
+            (None,) * parameter_count
+        )
+        if len(feedback_fields) != parameter_count:
             raise ValueError("generated optimizer feedback/source count mismatch")
         bindings = []
         for index, (source, feedback) in enumerate(
-            zip(physical.inputs, feedback_fields)
+            zip(parameter_sources, feedback_fields)
         ):
             source_type = _tensor_source_type(
                 source, n=n, input_types=input_types
@@ -748,11 +758,17 @@ def _stage_type(
                     _dest_type(member),
                 )
             )
+        guard_type = (
+            Name("stackdsl::ClarabelAlwaysEnabled")
+            if guard_source is None
+            else _source_type(guard_source, n=n, input_types=input_types)
+        )
         return tmpl(
             "stackdsl::ClarabelNode",
             Name(program.class_name),
             tmpl("stackdsl::ClarabelParameterList", *bindings),
             tmpl("stackdsl::ClarabelProjectionList", *projections),
+            guard_type,
         )
     if stage.kind == "copy_bundle":
         assert len(stage.members) > 1

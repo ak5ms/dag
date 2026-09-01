@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -80,14 +81,34 @@ using ClarabelPrimalProjection = ClarabelProjection<
 template <class... Projections>
 struct ClarabelProjectionList {};
 
-template <class Program, class Parameters, class Projections>
+struct ClarabelAlwaysEnabled {
+    template <class Context>
+    STACKDSL_HOT static double read_flat(
+        const Context&, std::size_t
+    ) noexcept {
+        return 1.0;
+    }
+};
+
+template <
+    class Program,
+    class Parameters,
+    class Projections,
+    class Guard = ClarabelAlwaysEnabled
+>
 class ClarabelNode;
 
-template <class Program, class... Bindings, class... Projections>
+template <
+    class Program,
+    class... Bindings,
+    class... Projections,
+    class Guard
+>
 class ClarabelNode<
     Program,
     ClarabelParameterList<Bindings...>,
-    ClarabelProjectionList<Projections...>
+    ClarabelProjectionList<Projections...>,
+    Guard
 > {
     alignas(64) Program program_{};
     bool has_solution_{false};
@@ -204,6 +225,15 @@ class ClarabelNode<
     }
 
     template <class Projection, class Context>
+    STACKDSL_HOT void project_nan(Context& ctx) noexcept {
+        auto* STACKDSL_RESTRICT out =
+            ctx.template write_ptr<typename Projection::output_type>();
+        for (std::size_t index = 0; index < Projection::count; ++index) {
+            out[index] = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    template <class Projection, class Context>
     STACKDSL_HOT void project(Context& ctx) noexcept {
         auto* STACKDSL_RESTRICT out =
             ctx.template write_ptr<typename Projection::output_type>();
@@ -242,6 +272,12 @@ public:
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) {
+        if constexpr (!std::is_same_v<Guard, ClarabelAlwaysEnabled>) {
+            if (ctx.template read<Guard>(0) == 0.0) {
+                (project_nan<Projections>(ctx), ...);
+                return;
+            }
+        }
         bool changed = false;
         ((changed = load_parameter<Bindings>(ctx) || changed), ...);
         // Generated settings are fixed for this node, so bitwise-identical
