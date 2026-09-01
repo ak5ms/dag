@@ -1,0 +1,36 @@
+name: MPO constraint-output benchmark
+
+on:
+  push:
+    branches: [agent/mpo-constraint-output-benchmark]
+    paths:
+      - .github/workflows/mpo-constraint-output-benchmark.yml
+      - scripts/benchmark_mpo_constraint_output_paths.py
+      - src/trading_dsl_engine/cpp_stream/optimizer/**
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
+      - src/trading_dsl_engine/cpp_stream/python/**
+      - src/trading_dsl_engine/ir/**
+
+concurrency:
+  group: mpo-constraint-output-benchmark
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade pip &&
+          python -m pip install -e '.[optimizer]'
+      - name: Benchmark returned constraint paths and inspect gap output
+        env:
+          PYTHONPATH: src:.
+          MPO_CONSTRAINT_ROWS: "5000"
+          MPO_CONSTRAINT_RUNS: "10"
+        run: python scripts/benchmark_mpo_constraint_output_paths.py
