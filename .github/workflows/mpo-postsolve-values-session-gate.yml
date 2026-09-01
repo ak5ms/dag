@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/mpo-postsolve-values-session-gate.yml
       - scripts/apply_mpo_postsolve_prototype_patch.py
+      - scripts/apply_mpo_postsolve_native_patch.py
       - src/trading_dsl_engine/cpp_stream/optimizer/**
       - src/trading_dsl_engine/cpp_stream/python/**
       - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
@@ -30,8 +31,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Apply prototype implementation
-        run: python scripts/apply_mpo_postsolve_prototype_patch.py
+      - name: Apply implementation patches
+        run: |
+          python scripts/apply_mpo_postsolve_prototype_patch.py
+          python scripts/apply_mpo_postsolve_native_patch.py
       - name: Install focused dependencies
         run: >-
           python -m pip install --upgrade pip &&
@@ -52,6 +55,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py \
-                  src/trading_dsl_engine/cpp_stream/optimizer/factory.py
-          git commit -m "Compile constraint values outside solver prototype"
+                  src/trading_dsl_engine/cpp_stream/optimizer/factory.py \
+                  src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py \
+                  src/trading_dsl_engine/cpp_stream/optimizer/templates/direct_clarabel_instance.hpp.j2 \
+                  src/trading_dsl_engine/cpp_stream/python/codegen.py \
+                  src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
+          git commit -m "Evaluate requested constraint values after solve"
           git push
