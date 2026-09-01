@@ -8,6 +8,7 @@ on:
       - scripts/apply_mpo_postsolve_prototype_patch.py
       - scripts/apply_mpo_postsolve_native_patch.py
       - scripts/fix_mpo_postsolve_native_patch_script.py
+      - scripts/apply_mpo_session_guard_patch.py
       - src/trading_dsl_engine/cpp_stream/optimizer/**
       - src/trading_dsl_engine/cpp_stream/python/**
       - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
@@ -37,6 +38,7 @@ jobs:
           python scripts/apply_mpo_postsolve_prototype_patch.py
           python scripts/fix_mpo_postsolve_native_patch_script.py
           python scripts/apply_mpo_postsolve_native_patch.py
+          python scripts/apply_mpo_session_guard_patch.py
       - name: Install focused dependencies
         run: >-
           python -m pip install --upgrade pip &&
@@ -56,11 +58,13 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py \
+          git add src/trading_dsl_engine/ir/frontend.py \
+                  src/trading_dsl_engine/cpp_stream/python/lowering_full.py \
+                  src/trading_dsl_engine/cpp_stream/python/codegen.py \
+                  src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp \
+                  src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py \
                   src/trading_dsl_engine/cpp_stream/optimizer/factory.py \
                   src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py \
-                  src/trading_dsl_engine/cpp_stream/optimizer/templates/direct_clarabel_instance.hpp.j2 \
-                  src/trading_dsl_engine/cpp_stream/python/codegen.py \
-                  src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
-          git commit -m "Evaluate requested constraint values after solve"
+                  src/trading_dsl_engine/cpp_stream/optimizer/templates/direct_clarabel_instance.hpp.j2
+          git commit -m "Skip guarded optimizer rows without advancing state"
           git push
