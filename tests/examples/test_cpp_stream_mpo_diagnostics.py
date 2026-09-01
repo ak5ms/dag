@@ -61,6 +61,7 @@ def test_formula_returns_alpha_search_diagnostics_and_optimizer_cost():
         "alpha_pnl",
         "yhat_pnl",
     }
+    assert "objective" in repr(formula["mpo_spread_cost"])
     assert len(formula["alpha_pnl"]) == len(example.HORIZONS)
     assert len(formula["yhat_pnl"]) == len(example.HORIZONS)
     for horizon in formula["alpha_pnl"].values():
@@ -71,7 +72,7 @@ def test_formula_returns_alpha_search_diagnostics_and_optimizer_cost():
         assert set(horizon) == {"ic", "ic1"}
 
 
-def test_mpo_spread_cost_primal_matches_the_objective_cost_term():
+def test_mpo_objective_decomposition_recovers_spread_cost_without_new_primal():
     n_horizons = len(example.HORIZONS)
     n_assets = 3
     zeros = np.zeros((n_horizons, n_assets))
@@ -84,6 +85,7 @@ def test_mpo_spread_cost_primal_matches_the_objective_cost_term():
         np.ones((n_horizons, n_assets)),
         example.RISK_RADIUS,
     )
+    assert problem.is_dpp()
 
     rng = np.random.default_rng(51)
     parameter_values = {
@@ -107,14 +109,17 @@ def test_mpo_spread_cost_primal_matches_the_objective_cost_term():
     assert problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 
     variables = {variable.name(): variable for variable in problem.variables()}
-    assert "spread_cost" in variables
+    assert set(variables) == {"weights", "previous_weights"}
     weights = np.asarray(variables["weights"].value)
     current = parameter_values["current_weights"]
     delta = weights - np.vstack([current, weights[:-1]])
-    expected_cost = np.sum(parameter_values["half_spread"] * np.abs(delta))
+    direct_cost = np.sum(parameter_values["half_spread"] * np.abs(delta))
+    decomposed_cost = problem.value + np.sum(
+        parameter_values["expected_returns"] * weights
+    )
     np.testing.assert_allclose(
-        float(variables["spread_cost"].value),
-        expected_cost,
+        decomposed_cost,
+        direct_cost,
         rtol=2e-7,
         atol=2e-10,
     )
