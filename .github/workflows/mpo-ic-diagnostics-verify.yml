@@ -4,13 +4,10 @@ on:
   push:
     branches: [agent/mpo-ic-diagnostics-verify]
 
-permissions:
-  contents: write
-
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,83 +16,83 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Implement IC diagnostics and direct MPO cost extraction
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
+      - name: Run diagnostic and alpha-search regressions
+        env:
+          PYTHONPATH: src:.
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/examples/test_cpp_stream_mpo_diagnostics.py
+          tests/flows/test_alpha_search.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+      - name: Run full native MPO smoke
+        env:
+          PYTHONPATH: src:.
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import tempfile
 
-          path = Path("examples/cpp_stream_mpo_one_pass.py")
-          text = path.read_text()
+          import numpy as np
+          import examples.cpp_stream_mpo_one_pass as example
 
-          replacements = [
-              (
-                  "from flows.load import InputData\n",
-                  "from flows.alpha_search import ic, ic1\nfrom flows.load import InputData\n",
-              ),
-              (
-                  "from flows.utils import ewm_std, streak, ts_zscore\n",
-                  "from flows.utils import streak, ts_zscore\n",
-              ),
-              (
-                  "    where,\n)\n",
-                  "    where,\n    xs_sum,\n)\n",
-              ),
-              (
-                  "FEATURE_HLS = (4, 16, 64, 256)\nRIDGE_HL = 1440 * 21\n",
-                  "FEATURE_HLS = (4, 16, 64, 256)\nIC_VOL_SPAN = 1440 * 21\nRIDGE_HL = 1440 * 21\n",
-              ),
-              (
-                  '''def _feature_span(hl: float) -> float:\n    return 2 / (1 - 0.5 ** (1 / hl)) - 1\n\n\n''',
-                  '''def _feature_span(hl: float) -> float:\n    return 2 / (1 - 0.5 ** (1 / hl)) - 1\n\n\ndef _diagnostic_pnls(\n    signal,\n    *,\n    roll_rets,\n    is_tradable,\n    w,\n    lag: int,\n    hz: int,\n):\n    kwargs = dict(\n        roll_rets=roll_rets,\n        is_tradable=is_tradable,\n        hl=IC_VOL_SPAN,\n        lag=lag,\n        hz=hz,\n        w=w,\n    )\n    return {\"ic\": ic(signal, **kwargs), \"ic1\": ic1(signal, **kwargs)}\n\n\n''',
-              ),
-              (
-                  "    forecasts, yhat_signals, factors = [], [], []\n",
-                  "    forecasts, factors = [], []\n    alpha_pnl, yhat_pnl = {}, {}\n",
-              ),
-              (
-                  '''        yhat = einsum(features, beta, "if,f->i")\n        forecasts.append(fillna(yhat, 0.0))\n        yhat_signals.append(\n            purify(\n                yhat\n                / ewm_std(\n                    yhat,\n                    YHAT_VOL_SPAN,\n                    min_periods=YHAT_VOL_MIN_PERIODS,\n                )\n            )\n        )\n\n        # Risk uses the total return of the same disjoint block, with no\n''',
-                  '''        yhat = einsum(features, beta, "if,f->i")\n        forecasts.append(fillna(yhat, 0.0))\n\n        horizon_key = f"{start}_{end}"\n        alpha_diagnostics = [\n            _diagnostic_pnls(\n                feature,\n                roll_rets=returns,\n                is_tradable=tradable,\n                w=fit_weights,\n                lag=start,\n                hz=width,\n            )\n            for feature in feature_list\n        ]\n        alpha_pnl[horizon_key] = {\n            "ic": {\n                f"hl_{hl}": diagnostic["ic"]\n                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)\n            },\n            "ic1": {\n                f"hl_{hl}": diagnostic["ic1"]\n                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)\n            },\n        }\n        yhat_pnl[horizon_key] = _diagnostic_pnls(\n            yhat,\n            roll_rets=returns,\n            is_tradable=tradable,\n            w=fit_weights,\n            lag=start,\n            hz=width,\n        )\n\n        # Risk uses the total return of the same disjoint block, with no\n''',
-              ),
-              (
-                  '''    mpo = MPO(\n        expected_returns=cat(*forecasts),\n''',
-                  '''    forecast_matrix = cat(*forecasts)\n    mpo = MPO(\n        expected_returns=forecast_matrix,\n''',
-              ),
-              (
-                  '''    weights = where(\n        session_open,\n        get_field(mpo, "weights[0]"),\n        float("nan"),\n    )\n    status = where(\n        session_open,\n        get_field(mpo, "status"),\n        float("nan"),\n    )\n    risks = tuple(\n        where(\n            session_open,\n            get_field(mpo, f"risk_{h}.value"),\n            float("nan"),\n        )\n        for h in range(len(HORIZONS))\n    )\n    return (returns, features, cat(*yhat_signals), weights, status, *risks)\n\n\ndef _purified_inverse_square(hs):\n    with np.errstate(divide="ignore", invalid="ignore"):\n        w = 1.0 / np.asarray(hs, dtype=float) ** 2\n    return np.where(np.isfinite(w), w, np.nan)\n\n\ndef _normalize_rows(w, valid=None):\n    w = np.asarray(w, dtype=float)\n    if valid is not None:\n        w = np.where(valid, w, 0.0)\n    w = np.where(np.isfinite(w), w, 0.0)\n    total = w.sum(axis=1, keepdims=True)\n    return np.divide(w, total, out=np.zeros_like(w), where=total != 0.0)\n\n\ndef _ic1_pnl(returns, signal, w, tradable, hs, *, lag, hz):\n    """Exact ic1 gross PnL plus aligned half-spread turnover cost."""\n    r = np.asarray(returns, dtype=float)\n    s = np.asarray(signal, dtype=float)\n    w = np.asarray(w, dtype=float)\n    if w.ndim == 0:\n        w = np.broadcast_to(w, r.shape).copy()\n    mask = pd.DataFrame(np.asarray(tradable, dtype=float)).fillna(0.0).ne(0.0)\n    position = pd.DataFrame(s).shift(lag).where(mask).ffill().fillna(0.0)\n\n    valid = np.isfinite(r)\n    weighted_return = np.where(valid, r, 0.0) * _normalize_rows(w, valid)\n    gross = (\n        pd.DataFrame(weighted_return)\n        .rolling(hz, min_periods=hz)\n        .mean()\n        .mul(position.shift(hz))\n        .sum(axis=1, min_count=1)\n        .to_numpy()\n    )\n\n    held_w = pd.DataFrame(w).where(mask).ffill().fillna(0.0).to_numpy()\n    holdings = position.to_numpy() * _normalize_rows(held_w)\n    previous = np.vstack([np.zeros((1, holdings.shape[1])), holdings[:-1]])\n    cost = np.sum(\n        np.abs(holdings - previous) * np.nan_to_num(hs, nan=0.0), axis=1\n    )\n    net = gross - pd.Series(cost).shift(hz).to_numpy() / hz\n    return gross, net\n\n\ndef _portfolio_pnl(returns, weights, hs):\n    """Realized PnL of the actually implemented first-stage MPO portfolio."""\n    r = np.nan_to_num(np.asarray(returns, dtype=float), nan=0.0)\n    w = np.nan_to_num(np.asarray(weights, dtype=float), nan=0.0)\n    hs = np.nan_to_num(np.asarray(hs, dtype=float), nan=0.0)\n    carried = np.vstack([np.zeros((1, w.shape[1])), w[:-1]])\n    gross = np.sum(carried * r, axis=1)\n    cost = np.sum(np.abs(w - carried) * hs, axis=1)\n    return gross, gross - cost\n\n\n''',
-                  '''    weights = where(\n        session_open,\n        get_field(mpo, "weights[0]"),\n        float("nan"),\n    )\n    full_weights = where(\n        session_open,\n        get_field(mpo, "weights"),\n        float("nan"),\n    )\n    objective = where(\n        session_open,\n        get_field(mpo, "objective"),\n        float("nan"),\n    )\n    status = where(\n        session_open,\n        get_field(mpo, "status"),\n        float("nan"),\n    )\n    risk_values = {\n        f"{start}_{end}": where(\n            session_open,\n            get_field(mpo, f"risk_{h}.value"),\n            float("nan"),\n        )\n        for h, (start, end) in enumerate(zip(TRADE_STARTS, HORIZONS))\n    }\n\n    # The Clarabel objective is -mu'w + spread_cost. Recover the exact\n    # optimizer spread-cost term without reconstructing turnover outside CVXPY.\n    mpo_spread_cost = objective + einsum(\n        forecast_matrix, full_weights, "if,if->"\n    )\n    mpo_gross_pnl = xs_sum(\n        fillna(shift(ffill(weights), 1), 0.0) * clean_returns\n    )\n\n    return {\n        "returns": returns,\n        "features": features,\n        "weights": weights,\n        "status": status,\n        "mpo_spread_cost": mpo_spread_cost,\n        "mpo_gross_pnl": mpo_gross_pnl,\n        "risk": risk_values,\n        "alpha_pnl": alpha_pnl,\n        "yhat_pnl": yhat_pnl,\n    }\n\n\n''',
-              ),
-          ]
+          rows, assets = 320, 3
+          rng = np.random.default_rng(73)
+          returns = rng.normal(scale=2e-4, size=(rows, assets))
+          tradable = np.ones((rows, assets), dtype=float)
+          tradable[140:150] = 0.0
+          returns[140:150] = 0.0
+          hs = np.full((rows, assets), 8e-5)
+          ts = np.arange(rows, dtype=float) * example.MINUTE_US + 1_800_000_000_000_000.0
+          broad_start = np.full((rows, assets), ts[0] - 10 * example.MINUTE_US)
+          broad_end = np.full((rows, assets), ts[-1] + 500 * example.MINUTE_US)
+          data = {
+              "returns": returns,
+              "is_tradable_out0": tradable,
+              "vw_halfspread_out0": hs,
+              "_ev_ts": ts,
+              "session_start0": broad_start,
+              "session_end0": broad_end,
+              "next_session_start0": broad_start,
+              "next_session_end0": broad_end,
+          }
 
-          for old, new in replacements:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"expected one anchor, found {count}: {old[:80]!r}")
-              text = text.replace(old, new, 1)
+          example.FEATURE_HLS = (2, 4, 8, 16)
+          example.IC_VOL_SPAN = 32
+          example.RIDGE_HL = 64
+          example.RISK_SPAN = 32
+          example.RISK_MIN_PERIODS = 8
 
-          start = text.index("def _plot_diagnostics(")
-          end = text.index("\ndef _run(", start)
-          new_plot = '''def _plot_diagnostics(data, values, *, plot_dir):\n    plot_dir = Path(plot_dir)\n    plot_dir.mkdir(parents=True, exist_ok=True)\n    ts = np.asarray(data["_ev_ts"])\n    ts = ts[:, 0] if ts.ndim > 1 else ts\n    index = pd.to_datetime(pd.Series(ts).interpolate(), unit="us")\n    paths = []\n\n    for start, end in zip(TRADE_STARTS, HORIZONS):\n        horizon_key = f"{start}_{end}"\n        diagnostics = values["alpha_pnl"][horizon_key]\n        fig, ax = plt.subplots(figsize=(10, 5))\n        for label, pnl in diagnostics["ic"].items():\n            ax.plot(index, _cum(pnl), label=f"{label} ic")\n        for label, pnl in diagnostics["ic1"].items():\n            ax.plot(index, _cum(pnl), "--", label=f"{label} ic1")\n        ax.set_title(f"Alpha PnL: horizon ({start}, {end}] — ic vs ic1")\n        ax.set_ylabel("Cumulative PnL")\n        ax.legend(ncol=2, fontsize=8)\n        ax.grid(alpha=0.2)\n        fig.tight_layout()\n        path = plot_dir / f"alphas_horizon_{start}_{end}.png"\n        fig.savefig(path, dpi=150)\n        plt.close(fig)\n        paths.append(path)\n\n        yhat = values["yhat_pnl"][horizon_key]\n        fig, ax = plt.subplots(figsize=(10, 5))\n        ax.plot(index, _cum(yhat["ic"]), label="ic")\n        ax.plot(index, _cum(yhat["ic1"]), "--", label="ic1")\n        ax.set_title(f"Aggregated Ridge yhat PnL: horizon ({start}, {end}]")\n        ax.set_ylabel("Cumulative PnL")\n        ax.legend()\n        ax.grid(alpha=0.2)\n        fig.tight_layout()\n        path = plot_dir / f"yhat_horizon_{start}_{end}.png"\n        fig.savefig(path, dpi=150)\n        plt.close(fig)\n        paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    ax.plot(index, _cum(values["mpo_gross_pnl"]), label="gross")\n    ax.set_title("Implemented MPO portfolio gross PnL")\n    ax.set_ylabel("Cumulative realized PnL")\n    ax.legend()\n    ax.grid(alpha=0.2)\n    fig.tight_layout()\n    path = plot_dir / "portfolio_pnl.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    ax.plot(index, _cum(values["mpo_spread_cost"]), label="planned spread cost")\n    ax.set_title("MPO objective spread cost")\n    ax.set_ylabel("Cumulative planned cost")\n    ax.legend()\n    ax.grid(alpha=0.2)\n    fig.tight_layout()\n    path = plot_dir / "mpo_spread_cost.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    for start, end in zip(TRADE_STARTS, HORIZONS):\n        value = np.asarray(values["risk"][f"{start}_{end}"], dtype=float)\n        ax.plot(index, np.linalg.norm(value[:, 1:], axis=1), label=f"({start}, {end}]")\n    ax.axhline(RISK_RADIUS, linestyle="--", label="constraint")\n    ax.set_title("MPO risk constraint")\n    ax.set_ylabel("sqrt(w' S w)")\n    ax.legend(ncol=2, fontsize=8)\n    ax.grid(alpha=0.2)\n    fig.tight_layout()\n    path = plot_dir / "risk_constraint.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n    return paths\n'''
-          text = text[:start] + new_plot + text[end:]
-
-          start = text.index("def _run(")
-          end = text.index("\ndef main()", start)
-          new_run = '''def _run(data, *, returns=None, output_dir=CACHE):\n    output_dir = Path(output_dir)\n    output_dir.mkdir(parents=True, exist_ok=True)\n    n_assets = data["is_tradable_out0"].shape[1]\n    runtime = compile_formula(\n        _formula(returns),\n        data,\n        n_instruments=n_assets,\n    )\n\n    generated = runtime.generated_cpp.read_text()\n    row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"\n    assert generated.count(row_loop) == 1\n    assert generated.count("stackdsl::ClarabelNode<") == 1\n\n    result = runtime.run(out_path=output_dir / "result.npy")\n    values = result.load()\n    paths = _plot_diagnostics(data, values, plot_dir=output_dir / "plots")\n    return result, paths\n'''
-          text = text[:start] + new_run + text[end:]
-
-          path.write_text(text)
+          with tempfile.TemporaryDirectory() as directory:
+              result, paths = example._run(
+                  data,
+                  returns=example.var("returns"),
+                  output_dir=Path(directory),
+              )
+              values = result.load(mmap_mode=None)
+              assert result.rows == rows
+              assert len(paths) == 19, len(paths)
+              assert all(path.is_file() for path in paths)
+              assert values["weights"].shape == (rows, assets)
+              assert values["status"].shape == (rows,)
+              assert values["mpo_spread_cost"].shape == (rows,)
+              assert values["mpo_gross_pnl"].shape == (rows,)
+              assert np.isnan(values["weights"][140:150]).all()
+              assert np.isnan(values["status"][140:150]).all()
+              assert np.isnan(values["mpo_spread_cost"][140:150]).all()
+              assert len(values["risk"]) == 8
+              assert len(values["alpha_pnl"]) == 8
+              assert len(values["yhat_pnl"]) == 8
+              generated = result.output_path.parent / "unused"
+              print("rows", result.rows, "seconds", result.seconds, "plots", len(paths))
           PY
-          python -m compileall -q examples/cpp_stream_mpo_one_pass.py
-          git diff --check
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add examples/cpp_stream_mpo_one_pass.py
-          git commit -m "Use canonical IC diagnostics for MPO example"
-          git push origin HEAD:agent/mpo-postsolve-values-session-gate-clean
-      - name: Install optimizer dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]'
-      - name: Run diagnostic regression tests
-        env:
-          PYTHONPATH: src:.
-        run: python -m pytest -q -o addopts="" tests/examples/test_cpp_stream_mpo_diagnostics.py
+      - name: Verify clean feature diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin agent/strongly-typed-gp
+          git diff --check origin/agent/strongly-typed-gp...HEAD
+          git diff --name-only origin/agent/strongly-typed-gp...HEAD
