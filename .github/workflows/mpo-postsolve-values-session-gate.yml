@@ -7,6 +7,7 @@ on:
       - .github/workflows/mpo-postsolve-values-session-gate.yml
       - scripts/apply_mpo_postsolve_prototype_patch.py
       - scripts/apply_mpo_postsolve_native_patch.py
+      - scripts/fix_mpo_postsolve_native_patch_script.py
       - src/trading_dsl_engine/cpp_stream/optimizer/**
       - src/trading_dsl_engine/cpp_stream/python/**
       - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
@@ -34,6 +35,7 @@ jobs:
       - name: Apply implementation patches
         run: |
           python scripts/apply_mpo_postsolve_prototype_patch.py
+          python scripts/fix_mpo_postsolve_native_patch_script.py
           python scripts/apply_mpo_postsolve_native_patch.py
       - name: Install focused dependencies
         run: >-
