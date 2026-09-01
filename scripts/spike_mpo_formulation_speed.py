@@ -84,7 +84,7 @@ def upstream_exprs():
 def common_parameters(expected_returns, half_spread, current_weights, risks, trade_allowed, risk_radius):
     er = cp.Parameter(expected_returns.shape, name="expected_returns")
     hs = cp.Parameter(half_spread.shape, name="half_spread", nonneg=True)
-    cw = cp.Parameter(current_weights.shape, name="current_weights")
+    cw = cp.Parameter((expected_returns.shape[1],), name="current_weights")
     rf = tuple(cp.Parameter(r.shape, name=f"risk_factor_{i}") for i, r in enumerate(risks))
     ta = cp.Parameter(trade_allowed.shape, name="trade_allowed", nonneg=True)
     rr = cp.Parameter(name="risk_radius", nonneg=True)
