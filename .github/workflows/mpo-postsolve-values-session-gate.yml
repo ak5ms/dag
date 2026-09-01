@@ -1,0 +1,38 @@
+name: MPO post-solve values and session gate
+
+on:
+  push:
+    branches: [agent/mpo-postsolve-values-session-gate]
+    paths:
+      - .github/workflows/mpo-postsolve-values-session-gate.yml
+      - src/trading_dsl_engine/cpp_stream/optimizer/**
+      - src/trading_dsl_engine/cpp_stream/python/**
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
+      - src/trading_dsl_engine/ir/**
+      - tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+      - examples/cpp_stream_mpo_one_pass.py
+      - docs/cvxpy_program_cpp_stream.md
+
+concurrency:
+  group: mpo-postsolve-values-session-gate
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install focused dependencies
+        run: >-
+          python -m pip install --upgrade pip &&
+          python -m pip install -e '.[optimizer]'
+      - name: Run focused tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m pytest -q -n 0
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
