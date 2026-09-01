@@ -15,6 +15,7 @@ from trading_dsl_engine.base.dsl import add, arctan, ceil, div, ewm, exp, floor,
 from trading_dsl_engine.base.metadata import analyze_formula_metadata
 from trading_dsl_engine.base.parser import Expr
 from flows.utils import ewm_std
+from trading_dsl_engine.cpp_stream import replace
 
 Objective = Callable[[Expr, Sequence[Expr]], float]
 ExprPredicate = Callable[[Expr], bool]
@@ -50,9 +51,161 @@ class SemanticSearchConfig:
     require_known_types: bool = False
 
 
-def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float, lag: int = 0) -> Expr:
-    w = alpha / ewm_std(roll_rets, span=hl)
-    return shift(ffill(where(is_tradable, shift(w, lag), float("nan")))) * roll_rets
+def xs_weighted_correl(x: Expr, y: Expr, w: Expr) -> Expr:
+    """Cross-sectional weighted correlation without mean centering."""
+    finite_mask = isfinite(x) & isfinite(y)
+    x_ = where(finite_mask, x, float("nan"))
+    y_ = where(finite_mask, y, float("nan"))
+    covariance = xs_weighted_mean(x_ * y_, w)
+    x_variance = xs_weighted_mean(x_ * x_, w)
+    y_variance = xs_weighted_mean(y_ * y_, w)
+    denominator = sqrt(mul(x_variance, y_variance))
+    rho = purify(div(covariance, denominator))
+    return rho
+
+def xs_weighted_cov(x: Expr, y: Expr, w: Expr) -> Expr:
+    """Cross-sectional weighted correlation without mean centering."""
+    finite_mask = isfinite(x) & isfinite(y)
+    x_ = where(finite_mask, x, float("nan"))
+    y_ = where(finite_mask, y, float("nan"))
+    covariance = xs_weighted_mean(x_ * y_, w)
+    return purify(covariance)
+
+
+# def ic(alpha, *, roll_rets, is_tradable, hl, lag: int = 0, w = 1):
+#     return xs_weighted_mean(
+#         shift(ffill(where(is_tradable, shift(alpha / ewm_std(roll_rets, span=hl), lag), float("nan")))) * roll_rets,
+#         w,
+#     )
+def _ic_terms(
+    s,
+    *,
+    roll_rets,
+    is_tradable,
+    w=1,
+    lag: int = 0,
+):
+    is_open = fillna(is_tradable, 0.0) != 0.0
+
+    # Signal/position state: update while tradable, otherwise hold.
+    candidate_position = shift(s, lag)
+
+    position = fillna(
+        ffill(
+            where(
+                is_open & isfinite(candidate_position),
+                candidate_position,
+                float("nan"),
+            )
+        ),
+        0.0,
+    )
+
+    # Make scalar w=1 broadcast to vector shape as well.
+    raw_weight = where(
+        isfinite(roll_rets),
+        w,
+        w,
+    )
+
+    weight_sum = xs_sum(raw_weight)
+
+    # An all-zero weight row means "no new weight observation",
+    # so ffill below holds the previous normalized weight.
+    normalized_weight = where(
+        weight_sum != 0.0,
+        raw_weight / weight_sum,
+        float("nan"),
+    )
+
+    # Weight state: same session-gap semantics as position.
+    weight = fillna(
+        ffill(
+            where(
+                is_open & isfinite(normalized_weight),
+                normalized_weight,
+                float("nan"),
+            )
+        ),
+        0.0,
+    )
+
+    # Missing realized return contributes zero PnL.
+    clean_rets = where(
+        isfinite(roll_rets),
+        roll_rets,
+        0.0,
+    )
+
+    return position, clean_rets, weight
+
+
+def ic(
+    s,
+    *,
+    roll_rets,
+    is_tradable,
+    hl,
+    lag: int = 0,
+    hz: int = 1,
+    w=1,
+):
+    position, clean_rets, weight = _ic_terms(
+        s=s / ewm_std(roll_rets, span=hl),
+        roll_rets=roll_rets,
+        is_tradable=is_tradable,
+        w=w,
+        lag=lag,
+    )
+
+    # Attribute PnL to each realized-return timestamp.
+    #
+    # The weight belongs to the position observation, so position * weight
+    # must be inside the position-side rolling mean.
+    return xs_sum(
+        clean_rets
+        * shift(
+            rolling_mean(
+                position * weight,
+                hz,
+                min_periods=hz,
+            ),
+            1,
+        )
+    )
+
+
+def ic1(
+    s,
+    *,
+    roll_rets,
+    is_tradable,
+    hl,
+    lag: int = 0,
+    hz: int = 1,
+    w=1,
+):
+    position, clean_rets, weight = _ic_terms(
+        s=s / ewm_std(roll_rets, span=hl),
+        roll_rets=roll_rets,
+        is_tradable=is_tradable,
+        w=w,
+        lag=lag,
+    )
+
+    return xs_sum(
+        rolling_mean(
+            clean_rets,
+            hz,
+            min_periods=hz,
+        )
+        * shift(position, hz)
+        * shift(weight, hz)
+    )
+
+def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float, lag: int = 0, hz: Expr | int = 1) -> Expr:
+    alpha_scaled = alpha / ewm_std(roll_rets, span=hl)
+    return shift(ffill(where(is_tradable, shift(alpha_scaled.rolling_mean(hz), lag), float("nan")))) * roll_rets
 
 
 def default_sharpe_objective(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float) -> Expr:
