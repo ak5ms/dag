@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import subprocess
+import sys
 
-from trading_dsl_engine.cpp_stream.optimizer import clarabel_native
+
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py"
+)
+_SPEC = spec_from_file_location("clarabel_native_under_test", _MODULE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+clarabel_native = module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = clarabel_native
+_SPEC.loader.exec_module(clarabel_native)
 
 
 def test_build_current_clarabel_targets_host_cpu_and_preserves_rustflags(
