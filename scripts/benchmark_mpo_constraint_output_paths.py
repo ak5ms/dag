@@ -67,6 +67,7 @@ def _data() -> dict[str, np.ndarray]:
     data: dict[str, np.ndarray] = {
         "expected_returns": np.ascontiguousarray(expected_returns),
         "half_spread": np.ascontiguousarray(half_spread),
+        "initial_weights": np.zeros((ROWS, N_ASSETS), dtype=float),
         "trade_allowed": np.ascontiguousarray(trade_allowed),
     }
     for horizon in range(N_HORIZONS):
@@ -164,7 +165,9 @@ def _bound_program(setting: str, mode: str):
     mpo = program(
         expected_returns=var("expected_returns"),
         half_spread=var("half_spread"),
-        current_weights=previous_solution("weights[0]", initial=0.0),
+        current_weights=previous_solution(
+            "weights[0]", initial=var("initial_weights")
+        ),
         risk_factor_0=var("risk_factor_0"),
         risk_factor_1=var("risk_factor_1"),
         risk_factor_2=var("risk_factor_2"),
@@ -231,7 +234,9 @@ def _checksum(values) -> float:
     total = 0.0
     for value in values:
         array = np.asarray(value, dtype=float)
-        total += float(np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0).sum())
+        total += float(
+            np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0).sum()
+        )
     return total
 
 
@@ -278,7 +283,9 @@ def _child() -> None:
         maximum = 0.0
         for horizon in range(N_HORIZONS):
             augmented = np.asarray(last_values[1 + horizon], dtype=float)
-            manual = np.asarray(last_values[1 + N_HORIZONS + horizon], dtype=float)
+            manual = np.asarray(
+                last_values[1 + N_HORIZONS + horizon], dtype=float
+            )
             if np.any(good):
                 maximum = max(
                     maximum,
@@ -340,7 +347,9 @@ def _patched_template(original: str, setting: str) -> str:
     if setting != "no_refine":
         raise ValueError(setting)
     anchor = "    settings_.presolve_enable = false;\n"
-    replacement = anchor + "    settings_.iterative_refinement_enable = false;\n"
+    replacement = (
+        anchor + "    settings_.iterative_refinement_enable = false;\n"
+    )
     if anchor not in original:
         raise RuntimeError("Clarabel settings template anchor changed")
     return original.replace(anchor, replacement, 1)
@@ -383,11 +392,15 @@ def _print_comparison(setting: str) -> None:
             augmented["mean_run_plus_load_s"]
             / post["mean_run_plus_load_s"]
         ),
-        "post_over_none_native": post["mean_native_s"] / none["mean_native_s"],
+        "post_over_none_native": (
+            post["mean_native_s"] / none["mean_native_s"]
+        ),
         "augmented_over_none_native": (
             augmented["mean_native_s"] / none["mean_native_s"]
         ),
-        "same_output_bytes": augmented["output_bytes"] == post["output_bytes"],
+        "same_output_bytes": (
+            augmented["output_bytes"] == post["output_bytes"]
+        ),
     }
     print("COMPARISON " + json.dumps(comparison, sort_keys=True), flush=True)
 
@@ -398,7 +411,13 @@ def _print_gap_rows() -> None:
     statuses = np.asarray(values["status"], dtype=float).reshape(-1)
     objectives = np.asarray(values["objective"], dtype=float).reshape(-1)
     risk = np.asarray(values["risk_0"], dtype=float)
-    for row in (GAP_START - 1, GAP_START, GAP_START + 1, GAP_END - 1, GAP_END):
+    for row in (
+        GAP_START - 1,
+        GAP_START,
+        GAP_START + 1,
+        GAP_END - 1,
+        GAP_END,
+    ):
         previous = np.zeros(N_ASSETS) if row == 0 else weights[row - 1]
         record = {
             "row": row,
