@@ -150,6 +150,19 @@ example, an MPO fed by stateful Ridge/EWM nodes still runs in temporal order.
 An entirely independent DAG is row-parallel and gives each native worker its
 own persistent generated object and Clarabel solver.
 
+Fixed Clarabel settings can be supplied with `solver_settings={...}` on
+`@cvxpy_program`. They are validated during generation, included in the solver
+artifact cache key, and do not change the problem-factory interface. For example,
+`{"iterative_refinement_enable": False}` disables KKT iterative refinement for
+a program whose numerical behavior has been validated without changing the
+global Clarabel default.
+
+A scalar `where(condition, get_field(program, ...), NaN)` can act as a lazy
+execution guard when all projections from that program use the same condition.
+On a false row cpp_stream skips parameter loading, the Clarabel solve, and
+`previous_solution()` state advancement, while emitting NaN for the guarded
+outputs. Other `where` expressions retain normal eager elementwise semantics.
+
 ### Result fields
 
 `get_field()` resolves fields at compile time. Unknown names fail compilation;
@@ -167,9 +180,10 @@ projected by the formula.
 | `iterations`, `status` | solver iteration count and status code |
 | `primal_residual`, `dual_residual` | solver residual diagnostics |
 
-Constraint-value projections add a requested-only auxiliary primal to the
-sub-program. Merely requesting a dual or solver diagnostic does not change the
-optimization problem.
+Constraint-value projections are evaluated after the original Clarabel solve
+from the solved cone/slack state. Requesting `.value` therefore does not add an
+auxiliary primal or equality to the optimization problem; dual and info
+projections likewise leave the cone program unchanged.
 
 ### Cache boundary
 
@@ -179,9 +193,8 @@ and attributes, resulting problem structure, and enabled solver settings. Direct
 bindings and prior-solution bindings therefore reuse the same solver artifact;
 their source dtype/layout remains part of the surrounding native-runner cache.
 The same MPO can be reused in another outer formula without regenerating its
-native parameter maps. A requested constraint value gets a distinct entry only
-because it changes the generated problem by adding the auxiliary projection
-variable.
+native parameter maps. Constraint-value requests are projection metadata and do
+not create a distinct optimization problem or solver artifact.
 
 Compiling the complete outer DAG still matters for CSE, scheduling, native
 link-cache invalidation, and placing upstream formulas, the solve, and downstream
