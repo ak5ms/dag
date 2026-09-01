@@ -95,3 +95,4 @@ jobs:
           git diff --check origin/agent/strongly-typed-gp...HEAD
           test "$(git diff --name-only origin/agent/strongly-typed-gp...HEAD | wc -l)" -eq 2
           git diff --name-only origin/agent/strongly-typed-gp...HEAD
+# red scalarization check
