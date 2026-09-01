@@ -20,6 +20,7 @@ _SETTING_TYPES = {
     "tol_gap_rel": "double",
     "tol_feas": "double",
     "presolve_enable": "bool",
+    "iterative_refinement_enable": "bool",
 }
 
 
@@ -51,6 +52,30 @@ class _DualView:
     name: str
     size: int
     offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ConstraintValueView:
+    name: str
+    constraint_index: int
+    label: str | None
+    shape: tuple[int, ...]
+    size: int
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ConstraintValueProgram:
+    values: tuple[_ConstraintValueView, ...]
+    rhs_map: _SparseMap
+    denominator_map: _SparseMap
+    coefficient_map: _SparseMap
+    term_row_ptr: np.ndarray
+    term_primal_columns: np.ndarray
+
+    @property
+    def scalar_count(self) -> int:
+        return sum(value.size for value in self.values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,6 +734,291 @@ def compile_sharded_canonical_program(
     )
 
 
+def _constraint_value_expression(cp: Any, constraint: Any):
+    try:
+        return constraint.expr
+    except (AttributeError, ValueError):
+        pass
+    parts = tuple(
+        cp.reshape(argument, (argument.size,), order="F")
+        for argument in constraint.args
+    )
+    if not parts:
+        raise ValueError(
+            f"constraint {type(constraint).__name__} exposes no numeric arguments"
+        )
+    return parts[0] if len(parts) == 1 else cp.hstack(parts)
+
+
+def _select_sparse_map_rows(
+    mapping: _SparseMap,
+    rows: Iterable[int],
+) -> _SparseMap:
+    values: list[np.ndarray] = []
+    columns: list[np.ndarray] = []
+    row_ptr = [0]
+    for raw_row in rows:
+        row = int(raw_row)
+        if row < 0 or row >= mapping.rows:
+            raise IndexError(f"sparse-map row {row} outside [0, {mapping.rows})")
+        begin = int(mapping.row_ptr[row])
+        end = int(mapping.row_ptr[row + 1])
+        values.append(mapping.values[begin:end])
+        columns.append(mapping.columns[begin:end])
+        row_ptr.append(row_ptr[-1] + end - begin)
+    return _SparseMap(
+        len(row_ptr) - 1,
+        np.concatenate(values) if values else np.empty(0, dtype=np.float64),
+        np.concatenate(columns) if columns else np.empty(0, dtype=np.uint32),
+        np.asarray(row_ptr, dtype=np.uint32),
+    )
+
+
+def _remap_sparse_map_columns(
+    mapping: _SparseMap,
+    column_map: np.ndarray,
+) -> _SparseMap:
+    if mapping.columns.size:
+        mapped = column_map[np.asarray(mapping.columns, dtype=np.int64)]
+        if np.any(mapped < 0):
+            missing = np.unique(mapping.columns[mapped < 0]).tolist()
+            raise ValueError(
+                f"constraint evaluator references unmapped parameter columns {missing}"
+            )
+        columns = np.asarray(mapped, dtype=np.uint32)
+    else:
+        columns = np.empty(0, dtype=np.uint32)
+    return _SparseMap(
+        mapping.rows,
+        np.asarray(mapping.values, dtype=np.float64),
+        columns,
+        np.asarray(mapping.row_ptr, dtype=np.uint32),
+    )
+
+
+def _matrix_entries_by_row(
+    structure: _MatrixStructure,
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    rows: list[list[tuple[int, int]]] = [
+        [] for _ in range(structure.rows)
+    ]
+    for column in range(structure.columns):
+        begin = int(structure.column_ptr[column])
+        end = int(structure.column_ptr[column + 1])
+        for entry in range(begin, end):
+            row = int(structure.row_indices[entry])
+            rows[row].append((column, entry))
+    return tuple(tuple(items) for items in rows)
+
+
+def _empty_constraint_value_program() -> _ConstraintValueProgram:
+    return _ConstraintValueProgram(
+        (),
+        _SparseMap(
+            0,
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.uint32),
+            np.zeros(1, dtype=np.uint32),
+        ),
+        _SparseMap(
+            0,
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.uint32),
+            np.zeros(1, dtype=np.uint32),
+        ),
+        _SparseMap(
+            0,
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.uint32),
+            np.zeros(1, dtype=np.uint32),
+        ),
+        np.zeros(1, dtype=np.uint32),
+        np.empty(0, dtype=np.uint32),
+    )
+
+
+def _compile_constraint_value_program(
+    problem: Any,
+    compiled: _CompiledCanonicalProgram,
+    constraint_value_indices: Iterable[int],
+    *,
+    parameter_shard_size: int,
+    canon_backend: str = "COO",
+) -> _ConstraintValueProgram:
+    import cvxpy as cp
+
+    indices = tuple(dict.fromkeys(int(index) for index in constraint_value_indices))
+    if not indices:
+        return _empty_constraint_value_program()
+
+    variable_names = {variable.name() for variable in problem.variables()}
+    evaluator_constraints = []
+    requested: list[tuple[str, int, str | None, tuple[int, ...], int]] = []
+    for index in indices:
+        if index < 0 or index >= len(problem.constraints):
+            raise IndexError(
+                f"constraint value index {index} outside "
+                f"[0, {len(problem.constraints)})"
+            )
+        constraint = problem.constraints[index]
+        expression = _constraint_value_expression(cp, constraint)
+        if not expression.is_affine():
+            raise ValueError(
+                f"constraint value {index} must be affine for native "
+                "post-solve evaluation"
+            )
+        base_name = f"cpp_stream_constraint_eval_{index}"
+        name = base_name
+        suffix = 1
+        while name in variable_names:
+            suffix += 1
+            name = f"{base_name}_{suffix}"
+        variable_names.add(name)
+        value = cp.Variable(expression.shape, name=name)
+        evaluator_constraints.append(value == expression)
+        requested.append(
+            (
+                name,
+                index,
+                getattr(constraint, "label", None),
+                tuple(int(extent) for extent in expression.shape),
+                int(expression.size),
+            )
+        )
+
+    evaluator_problem = cp.Problem(cp.Minimize(0.0), evaluator_constraints)
+    evaluator = compile_sharded_canonical_program(
+        evaluator_problem,
+        parameter_shard_size=parameter_shard_size,
+        canon_backend=canon_backend,
+    )
+
+    main_parameters = {parameter.name(): parameter for parameter in problem.parameters()}
+    main_offsets = {
+        parameter.name(): int(offset)
+        for parameter, offset in zip(problem.parameters(), compiled.parameter_offsets)
+    }
+    main_parameter_count = sum(int(parameter.size) for parameter in problem.parameters())
+    evaluator_parameter_count = sum(
+        int(parameter.size) for parameter in evaluator_problem.parameters()
+    )
+    parameter_column_map = np.full(
+        evaluator_parameter_count + 1, -1, dtype=np.int64
+    )
+    for parameter, offset in zip(
+        evaluator_problem.parameters(), evaluator.parameter_offsets
+    ):
+        name = parameter.name()
+        main = main_parameters.get(name)
+        if main is None:
+            raise ValueError(
+                f"constraint evaluator introduced unknown parameter {name!r}"
+            )
+        if tuple(main.shape) != tuple(parameter.shape):
+            raise ValueError(
+                f"constraint evaluator changed shape of parameter {name!r}"
+            )
+        start = int(offset)
+        stop = start + int(parameter.size)
+        main_start = main_offsets[name]
+        parameter_column_map[start:stop] = np.arange(
+            main_start, main_start + int(parameter.size), dtype=np.int64
+        )
+    parameter_column_map[evaluator_parameter_count] = main_parameter_count
+
+    evaluator_A_map = _remap_sparse_map_columns(
+        evaluator.parameter_maps["A"], parameter_column_map
+    )
+    evaluator_b_map = _remap_sparse_map_columns(
+        evaluator.parameter_maps["b"], parameter_column_map
+    )
+
+    main_primal_by_name = {view.name: view for view in compiled.primals}
+    evaluator_primal_by_name = {view.name: view for view in evaluator.primals}
+    auxiliary_names = {item[0] for item in requested}
+    evaluator_to_main_column: dict[int, int] = {}
+    for view in evaluator.primals:
+        if view.name in auxiliary_names:
+            continue
+        main = main_primal_by_name.get(view.name)
+        if main is None or main.size != view.size:
+            raise ValueError(
+                f"constraint evaluator cannot map primal {view.name!r} "
+                "back to the original solver"
+            )
+        for local in range(view.size):
+            evaluator_to_main_column[view.offset + local] = main.offset + local
+
+    dual_by_name = {view.name: view for view in evaluator.duals}
+    A_entries = _matrix_entries_by_row(evaluator.A)
+    rhs_rows: list[int] = []
+    denominator_entries: list[int] = []
+    coefficient_entries: list[int] = []
+    term_primal_columns: list[int] = []
+    term_row_ptr = [0]
+    value_views: list[_ConstraintValueView] = []
+    output_offset = 0
+
+    for position, (name, index, label, shape, size) in enumerate(requested):
+        value_view = evaluator_primal_by_name.get(name)
+        dual_view = dual_by_name.get(f"d{position}")
+        if value_view is None or dual_view is None:
+            raise ValueError(
+                f"constraint evaluator lost requested constraint {index}"
+            )
+        if value_view.size != size or dual_view.size != size:
+            raise ValueError(
+                f"constraint evaluator changed size of constraint {index}"
+            )
+        value_views.append(
+            _ConstraintValueView(
+                f"v{index}", index, label, shape, size, output_offset
+            )
+        )
+        output_offset += size
+        value_columns = set(range(value_view.offset, value_view.offset + size))
+        for local in range(size):
+            row = dual_view.offset + local
+            expected_value_column = value_view.offset + local
+            denominator = None
+            terms: list[tuple[int, int]] = []
+            for column, entry in A_entries[row]:
+                if column == expected_value_column:
+                    denominator = entry
+                    continue
+                if column in value_columns:
+                    raise ValueError(
+                        f"constraint evaluator couples output rows for constraint {index}"
+                    )
+                main_column = evaluator_to_main_column.get(column)
+                if main_column is None:
+                    raise ValueError(
+                        f"constraint evaluator row {row} references unmapped "
+                        f"canonical variable column {column}"
+                    )
+                terms.append((main_column, entry))
+            if denominator is None:
+                raise ValueError(
+                    f"constraint evaluator has no output coefficient for "
+                    f"constraint {index}, scalar {local}"
+                )
+            rhs_rows.append(row)
+            denominator_entries.append(denominator)
+            for main_column, entry in terms:
+                term_primal_columns.append(main_column)
+                coefficient_entries.append(entry)
+            term_row_ptr.append(len(coefficient_entries))
+
+    return _ConstraintValueProgram(
+        tuple(value_views),
+        _select_sparse_map_rows(evaluator_b_map, rhs_rows),
+        _select_sparse_map_rows(evaluator_A_map, denominator_entries),
+        _select_sparse_map_rows(evaluator_A_map, coefficient_entries),
+        np.asarray(term_row_ptr, dtype=np.uint32),
+        np.asarray(term_primal_columns, dtype=np.uint32),
+    )
+
+
 def _cpp_float(value: float) -> str:
     if np.isnan(value) or np.isinf(value):
         raise ValueError("generated canonical map contains a non-finite value")
@@ -731,6 +1041,24 @@ def _cpp_array(values: np.ndarray, formatter, *, per_line: int = 12) -> str:
     return "{\n      " + ",\n      ".join(lines) + "\n  }"
 
 
+def _parameter_affects_constraint_values(
+    program: _ConstraintValueProgram,
+    offset: int,
+    size: int,
+) -> bool:
+    return any(
+        np.any(
+            (mapping.columns >= offset)
+            & (mapping.columns < offset + size)
+        )
+        for mapping in (
+            program.rhs_map,
+            program.denominator_map,
+            program.coefficient_map,
+        )
+    )
+
+
 def _parameter_dirty_blocks(
     mapping_by_block: Mapping[str, _SparseMap],
     offset: int,
@@ -751,7 +1079,9 @@ def _emit_direct_header(
     prefix: str,
     problem: Any,
     compiled: _CompiledCanonicalProgram,
+    constraint_program: _ConstraintValueProgram,
     enable_settings: Iterable[str],
+    clarabel_settings: Mapping[str, Any],
 ) -> Path:
     from .clarabel_native import _safe_identifier, _template_environment
 
@@ -770,6 +1100,9 @@ def _emit_direct_header(
                     compiled.parameter_maps,
                     offset,
                     int(parameter.size),
+                ),
+                "constraint_value_dirty": _parameter_affects_constraint_values(
+                    constraint_program, offset, int(parameter.size)
                 ),
             }
         )
@@ -814,6 +1147,53 @@ def _emit_direct_header(
         }
         for name, mapping in compiled.parameter_maps.items()
     }
+    constraint_maps = {
+        name: {
+            "name": name,
+            "rows": mapping.rows,
+            "nnz": int(mapping.values.size),
+            "values": _cpp_array(mapping.values, _cpp_float, per_line=6),
+            "columns": _cpp_array(
+                mapping.columns, lambda value: str(int(value))
+            ),
+            "row_ptr": _cpp_array(
+                mapping.row_ptr, lambda value: str(int(value))
+            ),
+        }
+        for name, mapping in {
+            "rhs": constraint_program.rhs_map,
+            "denominator": constraint_program.denominator_map,
+            "coefficient": constraint_program.coefficient_map,
+        }.items()
+    }
+    constraint_values = [
+        {
+            "name": value.name,
+            "index": index,
+            "offset": value.offset,
+            "size": value.size,
+        }
+        for index, value in enumerate(constraint_program.values)
+    ]
+    fixed_settings = []
+    for name, value in sorted(clarabel_settings.items()):
+        setting_type = _SETTING_TYPES.get(name)
+        if setting_type is None:
+            raise ValueError(f"unsupported Clarabel setting {name!r}")
+        if setting_type == "bool":
+            if not isinstance(value, bool):
+                raise TypeError(f"Clarabel setting {name!r} must be bool")
+            literal = "true" if value else "false"
+        elif setting_type == "std::uint32_t":
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(
+                    f"Clarabel setting {name!r} must be a nonnegative int"
+                )
+            literal = str(value)
+        else:
+            literal = _cpp_float(float(value))
+        fixed_settings.append({"name": name, "value": literal})
+
     matrices = {
         "P": {
             "rows": compiled.P.rows,
@@ -855,9 +1235,24 @@ def _emit_direct_header(
             primals=primal_specs,
             duals=dual_specs,
             maps=maps,
+            constraint_maps=constraint_maps,
+            constraint_values=constraint_values,
+            constraint_value_scalar_count=constraint_program.scalar_count,
+            constraint_value_term_count=int(
+                constraint_program.term_primal_columns.size
+            ),
+            constraint_value_term_row_ptr=_cpp_array(
+                constraint_program.term_row_ptr,
+                lambda value: str(int(value)),
+            ),
+            constraint_value_term_primal_columns=_cpp_array(
+                constraint_program.term_primal_columns,
+                lambda value: str(int(value)),
+            ),
             matrices=matrices,
             cones=compiled.cone_initializers,
             settings=settings,
+            fixed_settings=fixed_settings,
             info_fields=(
                 ("objective", "obj_val"),
                 ("iterations", "iterations"),
@@ -886,11 +1281,15 @@ def generate_clarabel_artifact(
         "tol_feas",
         "presolve_enable",
     ),
+    constraint_value_indices: Iterable[int] = (),
+    clarabel_settings: Mapping[str, Any] | None = None,
     field_aliases: Mapping[str, str] | None = None,
     force: bool = False,
     parameter_shard_size: int = 512,
 ):
     from .clarabel_native import (
+        ConstraintValueLayout,
+        ConstraintValueLayout,
         DualLayout,
         FieldAlias,
         GeneratedClarabelProgram,
@@ -926,13 +1325,21 @@ def generate_clarabel_artifact(
         problem,
         parameter_shard_size=parameter_shard_size,
     )
+    constraint_program = _compile_constraint_value_program(
+        problem,
+        compiled,
+        constraint_value_indices,
+        parameter_shard_size=parameter_shard_size,
+    )
     header = _emit_direct_header(
         root,
         class_name=class_name,
         prefix=prefix,
         problem=problem,
         compiled=compiled,
+        constraint_program=constraint_program,
         enable_settings=enable_settings,
+        clarabel_settings=dict(clarabel_settings or {}),
     )
     clarabel = clarabel.normalized()
     parameters = tuple(problem.parameters())
@@ -986,8 +1393,18 @@ def generate_clarabel_artifact(
         FieldAlias(name, primal_name)
         for name, primal_name in sorted(alias_mapping.items())
     )
+    public_constraint_values = tuple(
+        ConstraintValueLayout(
+            value.name,
+            value.constraint_index,
+            value.label,
+            value.shape,
+            value.size,
+        )
+        for value in constraint_program.values
+    )
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "backend": "cvxpy-direct-clarabel",
         "class_name": class_name,
         "prefix": prefix,
@@ -1029,6 +1446,17 @@ def generate_clarabel_artifact(
             {"name": item.name, "primal_name": item.primal_name}
             for item in aliases
         ],
+        "constraint_values": [
+            {
+                "name": item.name,
+                "constraint_index": item.constraint_index,
+                "label": item.label,
+                "shape": list(item.shape),
+                "size": item.size,
+            }
+            for item in public_constraint_values
+        ],
+        "clarabel_settings": dict(clarabel_settings or {}),
     }
     manifest_path = root / "cpp" / "clarabel_program_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -1044,6 +1472,7 @@ def generate_clarabel_artifact(
         aliases,
         clarabel,
         instrument_count,
+        public_constraint_values,
     )
 
 
@@ -1053,6 +1482,8 @@ def load_clarabel_artifact(
     clarabel: Any,
 ):
     from .clarabel_native import (
+        ConstraintValueLayout,
+        ConstraintValueLayout,
         DualLayout,
         FieldAlias,
         GeneratedClarabelProgram,
@@ -1064,7 +1495,7 @@ def load_clarabel_artifact(
     root = Path(code_dir).expanduser().resolve()
     manifest_path = root / "cpp" / "clarabel_program_manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema_version") != 4:
+    if manifest.get("schema_version") != 5:
         raise ValueError(
             f"unsupported generated-program manifest schema in {manifest_path}"
         )
@@ -1121,6 +1552,16 @@ def load_clarabel_artifact(
         FieldAlias(str(item["name"]), str(item["primal_name"]))
         for item in manifest.get("aliases", ())
     )
+    constraint_values = tuple(
+        ConstraintValueLayout(
+            str(item["name"]),
+            int(item["constraint_index"]),
+            None if item.get("label") is None else str(item["label"]),
+            tuple(int(extent) for extent in item["shape"]),
+            int(item["size"]),
+        )
+        for item in manifest.get("constraint_values", ())
+    )
     instrument_count = manifest.get("instrument_count")
     return GeneratedClarabelProgram(
         root,
@@ -1134,6 +1575,7 @@ def load_clarabel_artifact(
         aliases,
         clarabel,
         None if instrument_count is None else int(instrument_count),
+        constraint_values,
     )
 
 

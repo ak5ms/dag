@@ -895,6 +895,42 @@ class _BaseBuilder:
         return self._build_terminal_or_capture(node)
 
     def _build_call(self, node: Call) -> int:
+        # A scalar `where(open, optimizer_field, NaN)` is a control-flow
+        # guard for the generated optimizer, not an eager elementwise mask.
+        # Encode the guard as a second projection child so cpp_stream can
+        # skip parameter loading, solving, and feedback-state advancement.
+        if (
+            node.fn == "where"
+            and not node.kwargs
+            and len(node.args) == 3
+            and isinstance(node.args[1], CvxpyFieldExpr)
+            and isinstance(node.args[2], Number)
+            and isinstance(node.args[2].value, float)
+            and math.isnan(node.args[2].value)
+        ):
+            condition = self.build(node.args[0])
+            condition_type = self.nodes[condition].value_type
+            try:
+                condition_shape = condition_type.logical_shape
+            except ValueError:
+                condition_shape = None
+            if condition_shape == ():
+                projection = node.args[1]
+                child = self.build(projection.program_expr)
+                child_op = self.nodes[child].op
+                if not isinstance(child_op, CvxpyProgramOp):
+                    raise FormulaIRCompileError(
+                        "optimizer field projection lost its generated "
+                        "program object"
+                    )
+                field = child_op.program.resolve_field(projection.field)
+                return self._append(
+                    CvxpyProjectionOp(field),
+                    (child, condition),
+                    _generated_field_value_type(
+                        child_op.program, field.logical_shape
+                    ),
+                )
         if node.fn in _NARY_ARITY:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
@@ -1187,21 +1223,15 @@ class _BaseBuilder:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError("xs_weighted_mean expects x, weight")
             children = tuple(self.build(arg) for arg in node.args)
-            kinds = tuple(self.nodes[child].value_type.kind for child in children)
-            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
-                raise FormulaIRCompileError(
-                    "xs_weighted_mean requires vector x and scalar or vector weight"
-                )
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError("xs_weighted_mean requires vectors")
             return self._append(XsWeightedMeanOp(), children, VECTOR)
         if node.fn in {"xs_vector_projection", "xs_regression_projection"}:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError(f"{node.fn} expects target, regressor")
             children = tuple(self.build(arg) for arg in node.args)
-            kinds = tuple(self.nodes[child].value_type.kind for child in children)
-            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
-                raise FormulaIRCompileError(
-                    f"{node.fn} requires vector target and scalar or vector regressor"
-                )
+            if any(self.nodes[child].value_type.kind != "vector" for child in children):
+                raise FormulaIRCompileError(f"{node.fn} requires vectors")
             return self._append(
                 XsProjectionOp(node.fn == "xs_regression_projection"),
                 children,
