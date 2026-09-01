@@ -1,0 +1,31 @@
+name: MPO Clarabel native-build TDD
+
+on:
+  push:
+    branches: [agent/mpo-clarabel-native-build]
+    paths:
+      - .github/workflows/mpo-clarabel-native-build-tdd.yml
+      - src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py
+      - tests/trading_dsl_engine/cpp_stream/test_clarabel_native_builder.py
+
+concurrency:
+  group: mpo-clarabel-native-build-tdd
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install focused test dependencies
+        run: python -m pip install pytest Jinja2
+      - name: Run focused builder test
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m pytest -q
+          tests/trading_dsl_engine/cpp_stream/test_clarabel_native_builder.py
