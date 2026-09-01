@@ -15,6 +15,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 _DEFAULT_CLARABEL_CPP_COMMIT = "0de6259a3edfd5cc041ec42b2148599ce63e73cb"
 _DEFAULT_CLARABEL_RS_TAG = "v0.11.1"
+_CLARABEL_NATIVE_RUSTFLAG = "-C target-cpu=native"
 _INFO_FIELDS = (
     ("objective", "obj_val"),
     ("iterations", "iterations"),
@@ -73,6 +74,15 @@ class DualLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class ConstraintValueLayout:
+    name: str
+    constraint_index: int
+    label: str | None
+    shape: tuple[int, ...]
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
 class FieldAlias:
     name: str
     primal_name: str
@@ -105,6 +115,7 @@ class GeneratedClarabelProgram:
     aliases: tuple[FieldAlias, ...]
     clarabel: ClarabelNativePaths
     instrument_count: int | None = None
+    constraint_values: tuple[ConstraintValueLayout, ...] = ()
 
     @property
     def include_dirs(self) -> tuple[Path, ...]:
@@ -141,6 +152,7 @@ class GeneratedClarabelProgram:
             primals=self.primals,
             duals=self.duals,
             aliases=self.aliases,
+            constraint_values=self.constraint_values,
         )
 
 _NO_FIELD_MATCH = object()
@@ -201,6 +213,7 @@ def _resolve_result_field(
     primals: tuple[PrimalLayout, ...],
     duals: tuple[DualLayout, ...],
     aliases: tuple[FieldAlias, ...],
+    constraint_values: tuple[ConstraintValueLayout, ...] = (),
 ) -> FieldLayout:
     alias_by_name = {alias.name: alias.primal_name for alias in aliases}
     primal_by_name = {primal.name: primal for primal in primals}
@@ -236,6 +249,26 @@ def _resolve_result_field(
             size=primal.size,
             index_text=index_text,
         )
+    for value_index, value in enumerate(constraint_values):
+        bases = [
+            value.name,
+            f"constraint[{value.constraint_index}].value",
+        ]
+        if value.label is not None:
+            bases.append(f"{value.label}.value")
+        for base in bases:
+            index_text = _match_base_field(name, base)
+            if index_text is _NO_FIELD_MATCH:
+                continue
+            return _indexed_result_layout(
+                name,
+                kind="constraint_value",
+                source_name=value.name,
+                source_index=value_index,
+                shape=value.shape,
+                size=value.size,
+                index_text=index_text,
+            )
     for dual_index, dual in enumerate(duals):
         bases = [
             dual.name,
@@ -280,6 +313,10 @@ def _resolve_result_field(
     available = [primal.name for primal in primals]
     available.extend(alias.name for alias in aliases)
     available.extend(("dual[index]", "constraint[index].dual"))
+    available.extend(
+        f"constraint[{value.constraint_index}].value"
+        for value in constraint_values
+    )
     available.extend(name for name, _ in _INFO_FIELDS)
     raise KeyError(
         f"unknown generated field {name!r}; available fields include {available}"
@@ -356,6 +393,11 @@ def _patch_clarabel_allocation_free_timers(source_root: Path) -> None:
     )
 
 
+def _host_native_rustflags() -> str:
+    existing = os.environ.get("RUSTFLAGS", "").strip()
+    return " ".join(flag for flag in (existing, _CLARABEL_NATIVE_RUSTFLAG) if flag)
+
+
 def build_current_clarabel(
     *,
     cache_dir: str | os.PathLike[str] | None = None,
@@ -363,9 +405,13 @@ def build_current_clarabel(
     rs_tag: str = _DEFAULT_CLARABEL_RS_TAG,
     force: bool = False,
 ) -> ClarabelNativePaths:
-    """Build and cache the pinned allocation-free Clarabel C static library."""
+    """Build and cache host-optimized, allocation-free Clarabel C code."""
 
-    build_id = f"Clarabel.rs {rs_tag} + allocation-free timer reset v1\n"
+    rustflags = _host_native_rustflags()
+    build_id = (
+        f"Clarabel.rs {rs_tag} + allocation-free timer reset v1 "
+        f"+ RUSTFLAGS={rustflags}\n"
+    )
     root = (
         Path(cache_dir).expanduser()
         if cache_dir is not None
@@ -373,7 +419,7 @@ def build_current_clarabel(
         / ".cache"
         / "trading_dsl_engine"
         / "clarabel"
-        / f"{rs_tag}-noalloc1"
+        / f"{rs_tag}-noalloc1-native"
     ).resolve()
     include = root / "native" / "include"
     library = root / "native" / "lib" / "libclarabel_c.a"
@@ -432,6 +478,8 @@ def build_current_clarabel(
         shutil.rmtree(target_rs)
     shutil.copytree(rs, target_rs, ignore=shutil.ignore_patterns(".git"))
     _patch_clarabel_allocation_free_timers(target_rs)
+    cargo_env = os.environ.copy()
+    cargo_env["RUSTFLAGS"] = rustflags
     subprocess.run(
         [
             "cargo",
@@ -441,6 +489,7 @@ def build_current_clarabel(
             str(cpp / "rust_wrapper" / "Cargo.toml"),
         ],
         check=True,
+        env=cargo_env,
     )
     include.mkdir(parents=True, exist_ok=True)
     library.parent.mkdir(parents=True, exist_ok=True)
@@ -455,6 +504,7 @@ def build_current_clarabel(
 __all__ = [
     "ClarabelNativePaths",
     "DualLayout",
+    "ConstraintValueLayout",
     "FieldAlias",
     "FieldLayout",
     "GeneratedClarabelProgram",

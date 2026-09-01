@@ -895,6 +895,42 @@ class _BaseBuilder:
         return self._build_terminal_or_capture(node)
 
     def _build_call(self, node: Call) -> int:
+        # A scalar `where(open, optimizer_field, NaN)` is a control-flow
+        # guard for the generated optimizer, not an eager elementwise mask.
+        # Encode the guard as a second projection child so cpp_stream can
+        # skip parameter loading, solving, and feedback-state advancement.
+        if (
+            node.fn == "where"
+            and not node.kwargs
+            and len(node.args) == 3
+            and isinstance(node.args[1], CvxpyFieldExpr)
+            and isinstance(node.args[2], Number)
+            and isinstance(node.args[2].value, float)
+            and math.isnan(node.args[2].value)
+        ):
+            condition = self.build(node.args[0])
+            condition_type = self.nodes[condition].value_type
+            try:
+                condition_shape = condition_type.logical_shape
+            except ValueError:
+                condition_shape = None
+            if condition_shape == ():
+                projection = node.args[1]
+                child = self.build(projection.program_expr)
+                child_op = self.nodes[child].op
+                if not isinstance(child_op, CvxpyProgramOp):
+                    raise FormulaIRCompileError(
+                        "optimizer field projection lost its generated "
+                        "program object"
+                    )
+                field = child_op.program.resolve_field(projection.field)
+                return self._append(
+                    CvxpyProjectionOp(field),
+                    (child, condition),
+                    _generated_field_value_type(
+                        child_op.program, field.logical_shape
+                    ),
+                )
         if node.fn in _NARY_ARITY:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
