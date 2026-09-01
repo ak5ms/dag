@@ -22,10 +22,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install focused test dependencies
-        run: python -m pip install pytest Jinja2
+        run: python -m pip install pytest pytest-xdist Jinja2
       - name: Run focused builder test
         env:
           PYTHONPATH: src
         run: >-
-          python -m pytest -q
+          python -m pytest -q -n 0
           tests/trading_dsl_engine/cpp_stream/test_clarabel_native_builder.py
