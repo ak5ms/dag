@@ -29,8 +29,15 @@ jobs:
           python -m pip install --upgrade pip &&
           python -m pip install -e '.[optimizer]'
       - name: Benchmark returned constraint paths and inspect gap output
+        shell: bash
         env:
           PYTHONPATH: src:.
           MPO_CONSTRAINT_ROWS: "5000"
           MPO_CONSTRAINT_RUNS: "10"
-        run: python scripts/benchmark_mpo_constraint_output_paths.py
+        run: |
+          set -o pipefail
+          if ! python scripts/benchmark_mpo_constraint_output_paths.py > benchmark.log 2>&1; then
+            tail -n 220 benchmark.log
+            exit 1
+          fi
+          grep -E '^(CLARABEL|RESULT|COMPARISON|VERIFY|GAP) ' benchmark.log
