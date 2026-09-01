@@ -85,9 +85,12 @@ def _program_expressions(mode: str):
             )
             for h in range(HORIZONS)
         ]
-        # Keep the output payload exactly equal to augmented mode: eight
-        # three-vectors plus eight scalar cone radii = 32 doubles per row.
-        return roots + projected + [RISK_RADIUS] * HORIZONS
+        # A raw Python scalar cannot be a top-level cpp_stream root. Derive a
+        # row scalar from finite input data; CSE computes this once and eight
+        # roots return it. The payload remains exactly equal to augmented mode:
+        # eight three-vectors plus eight scalar radii = 32 doubles per row.
+        radius = var("half_spread").sum(axis=0) * 0.0 + RISK_RADIUS
+        return roots + projected + [radius] * HORIZONS
     raise ValueError(mode)
 
 
