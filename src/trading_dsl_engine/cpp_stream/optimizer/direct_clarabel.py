@@ -1289,7 +1289,6 @@ def generate_clarabel_artifact(
 ):
     from .clarabel_native import (
         ConstraintValueLayout,
-        ConstraintValueLayout,
         DualLayout,
         FieldAlias,
         GeneratedClarabelProgram,
@@ -1482,7 +1481,6 @@ def load_clarabel_artifact(
     clarabel: Any,
 ):
     from .clarabel_native import (
-        ConstraintValueLayout,
         ConstraintValueLayout,
         DualLayout,
         FieldAlias,

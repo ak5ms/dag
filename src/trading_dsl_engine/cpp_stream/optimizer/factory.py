@@ -277,6 +277,7 @@ class CvxpyProgramDefinition:
         prefix: str | None = None,
         sequential: bool | None = None,
         enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+        solver_settings: Mapping[str, Any] | None = None,
         parameter_shard_size: int = 512,
     ) -> None:
         self.factory = factory
@@ -297,6 +298,7 @@ class CvxpyProgramDefinition:
             raise TypeError("sequential must be True, False, or None")
         self.sequential = sequential
         self.enable_settings = tuple(enable_settings)
+        self.solver_settings = dict(solver_settings or {})
         if int(parameter_shard_size) <= 0:
             raise ValueError("parameter_shard_size must be positive")
         self.parameter_shard_size = int(parameter_shard_size)
@@ -312,6 +314,7 @@ class CvxpyProgramDefinition:
             self.factory.__qualname__,
             self._factory_hash,
             self.sequential,
+            tuple(sorted(self.solver_settings.items())),
         )
 
     def validate_field_request(self, field: str) -> None:
@@ -515,6 +518,7 @@ class CvxpyProgramDefinition:
                 for constraint in problem.constraints
             ],
             "enable_settings": self.enable_settings,
+            "solver_settings": self.solver_settings,
             "parameter_shard_size": self.parameter_shard_size,
         }
         return hashlib.sha256(
@@ -603,6 +607,7 @@ class CvxpyProgramDefinition:
                     prefix=prefix,
                     instrument_count=int(n_instruments),
                     enable_settings=self.enable_settings,
+                    clarabel_settings=self.solver_settings,
                     parameter_shard_size=self.parameter_shard_size,
                     constraint_value_indices=tuple(
                         value.constraint_index for value in constraint_values
@@ -623,6 +628,7 @@ def cvxpy_program(
     prefix: str | None = None,
     sequential: bool | None = None,
     enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+    solver_settings: Mapping[str, Any] | None = None,
     parameter_shard_size: int = 512,
 ):
     """Decorate a CVXPY problem factory for direct use in the formula DSL."""
@@ -636,6 +642,7 @@ def cvxpy_program(
             prefix=prefix,
             sequential=sequential,
             enable_settings=enable_settings,
+            solver_settings=solver_settings,
             parameter_shard_size=parameter_shard_size,
         )
 

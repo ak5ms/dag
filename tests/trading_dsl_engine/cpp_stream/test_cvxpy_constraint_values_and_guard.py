@@ -177,3 +177,43 @@ def test_scalar_where_skips_closed_solve_and_preserves_feedback_state(
     assert status[0] in (1.0, 4.0)
     assert np.isnan(status[1])
     assert status[2] in (1.0, 4.0)
+
+
+def test_fixed_solver_settings_are_emitted_and_cached(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
+
+    @cvxpy_program(
+        cache_dir=tmp_path / "program-cache",
+        clarabel=native,
+        solver_settings={"iterative_refinement_enable": False},
+    )
+    def Target(target) -> cp.Problem:
+        target = cp.Parameter(target.shape, name="target")
+        weights = cp.Variable(target.shape, name="weights")
+        return cp.Problem(cp.Minimize(cp.sum_squares(weights - target)))
+
+    assert Target.solver_settings == {"iterative_refinement_enable": False}
+    data = {"target": np.asarray([[0.1, -0.2], [0.2, -0.1]])}
+    expression = Target(target=var("target"))
+    monkeypatch.setenv(
+        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE", str(tmp_path / "runner-cache")
+    )
+    runtime = compile_formula(get_field(expression, "weights"), data, n_instruments=2)
+    values = runtime.run(out_path=tmp_path / "settings.npy").load(mmap_mode=None)
+    assert np.isfinite(values).all()
+
+    manifests = tuple(
+        (tmp_path / "program-cache").rglob("clarabel_program_manifest.json")
+    )
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert manifest["clarabel_settings"] == {
+        "iterative_refinement_enable": False
+    }
+    header = (
+        manifests[0].parent / "include" / f"{manifest['prefix']}instance.hpp"
+    ).read_text()
+    assert "settings_.iterative_refinement_enable = false;" in header

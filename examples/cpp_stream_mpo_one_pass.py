@@ -24,6 +24,7 @@ from trading_dsl_engine.base.dsl import (
     isnan,
     psd_factor,
     purify,
+    reduce_max,
     rolling_sum,
     shift,
     var,
@@ -85,7 +86,12 @@ def _planned_trade_allowed(tradable):
     return cat(*allowed)
 
 
-@cvxpy_program(cache_dir=CACHE / "clarabel", clarabel=_clarabel, sequential=None)
+@cvxpy_program(
+    cache_dir=CACHE / "clarabel",
+    clarabel=_clarabel,
+    sequential=None,
+    solver_settings={"iterative_refinement_enable": False},
+)
 def MPO(
     expected_returns,
     half_spread,
@@ -238,9 +244,26 @@ def _formula(returns=None):
         trade_allowed=_planned_trade_allowed(tradable),
         risk_radius=RISK_RADIUS,
     )
-    weights = get_field(mpo, "weights[0]")
-    risks = tuple(get_field(mpo, f"risk_{h}.value") for h in range(len(HORIZONS)))
-    return (returns, features, cat(*yhat_signals), weights, *risks)
+    session_open = reduce_max(tradable, axis=[1]) != 0.0
+    weights = where(
+        session_open,
+        get_field(mpo, "weights[0]"),
+        float("nan"),
+    )
+    status = where(
+        session_open,
+        get_field(mpo, "status"),
+        float("nan"),
+    )
+    risks = tuple(
+        where(
+            session_open,
+            get_field(mpo, f"risk_{h}.value"),
+            float("nan"),
+        )
+        for h in range(len(HORIZONS))
+    )
+    return (returns, features, cat(*yhat_signals), weights, status, *risks)
 
 
 def _purified_inverse_square(hs):
@@ -419,8 +442,9 @@ def _run(data, *, returns=None, output_dir=CACHE):
 
     result = runtime.run(out_path=output_dir / "result.npy")
     values = result.load()
-    realized_returns, features, yhat_signals, weights = values[:4]
-    risk_values = values[4:]
+    realized_returns, features, yhat_signals, weights, status = values[:5]
+    risk_values = values[5:]
+    _ = status  # Returned for audit; plotting uses weights and constraint values.
     paths = _plot_diagnostics(
         data,
         realized_returns,
