@@ -1,0 +1,169 @@
+name: MPO final cleanup verification
+
+on:
+  push:
+    branches: [agent/mpo-cleanup-verify2]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/mpo-postsolve-values-session-gate-clean
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]'
+      - name: RED - fixed solver settings are not wired yet
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/test_solver_settings_red.py <<'PY'
+          import cvxpy as cp
+          from trading_dsl_engine.cpp_stream.optimizer import cvxpy_program
+
+          def test_solver_settings_public_interface_exists():
+              @cvxpy_program(solver_settings={"iterative_refinement_enable": False})
+              def Problem(target):
+                  target = cp.Parameter(target.shape, name="target")
+                  x = cp.Variable(target.shape, name="x")
+                  return cp.Problem(cp.Minimize(cp.sum_squares(x - target)))
+              assert Problem.solver_settings == {"iterative_refinement_enable": False}
+          PY
+          if PYTHONPATH=src python -m pytest -q -o addopts="" /tmp/test_solver_settings_red.py; then
+            echo 'RED test unexpectedly passed before implementation' >&2
+            exit 1
+          fi
+      - name: Implement missing settings wiring and example session gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          factory = Path("src/trading_dsl_engine/cpp_stream/optimizer/factory.py")
+          text = factory.read_text()
+          replacements = [
+              (
+                  '''        enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,\n        parameter_shard_size: int = 512,\n    ) -> None:\n''',
+                  '''        enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,\n        solver_settings: Mapping[str, Any] | None = None,\n        parameter_shard_size: int = 512,\n    ) -> None:\n''',
+              ),
+              (
+                  '''        self.sequential = sequential\n        self.enable_settings = tuple(enable_settings)\n        if int(parameter_shard_size) <= 0:\n''',
+                  '''        self.sequential = sequential\n        self.enable_settings = tuple(enable_settings)\n        self.solver_settings = dict(solver_settings or {})\n        if int(parameter_shard_size) <= 0:\n''',
+              ),
+              (
+                  '''            self._factory_hash,\n            self.sequential,\n        )\n''',
+                  '''            self._factory_hash,\n            self.sequential,\n            tuple(sorted(self.solver_settings.items())),\n        )\n''',
+              ),
+              (
+                  '''            "enable_settings": self.enable_settings,\n            "parameter_shard_size": self.parameter_shard_size,\n''',
+                  '''            "enable_settings": self.enable_settings,\n            "solver_settings": self.solver_settings,\n            "parameter_shard_size": self.parameter_shard_size,\n''',
+              ),
+              (
+                  '''                    enable_settings=self.enable_settings,\n                    parameter_shard_size=self.parameter_shard_size,\n''',
+                  '''                    enable_settings=self.enable_settings,\n                    clarabel_settings=self.solver_settings,\n                    parameter_shard_size=self.parameter_shard_size,\n''',
+              ),
+              (
+                  '''    sequential: bool | None = None,\n    enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,\n    parameter_shard_size: int = 512,\n):\n''',
+                  '''    sequential: bool | None = None,\n    enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,\n    solver_settings: Mapping[str, Any] | None = None,\n    parameter_shard_size: int = 512,\n):\n''',
+              ),
+              (
+                  '''            sequential=sequential,\n            enable_settings=enable_settings,\n            parameter_shard_size=parameter_shard_size,\n''',
+                  '''            sequential=sequential,\n            enable_settings=enable_settings,\n            solver_settings=solver_settings,\n            parameter_shard_size=parameter_shard_size,\n''',
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f"factory anchor count {text.count(old)} for {old[:50]!r}")
+              text = text.replace(old, new, 1)
+          factory.write_text(text)
+
+          direct = Path("src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py")
+          text = direct.read_text()
+          duplicate = "        ConstraintValueLayout,\n        ConstraintValueLayout,\n"
+          if text.count(duplicate) != 2:
+              raise SystemExit(f"expected two duplicate imports, found {text.count(duplicate)}")
+          direct.write_text(text.replace(duplicate, "        ConstraintValueLayout,\n"))
+
+          example = Path("examples/cpp_stream_mpo_one_pass.py")
+          text = example.read_text()
+          old = '''    purify,\n    rolling_sum,\n'''
+          new = '''    purify,\n    reduce_max,\n    rolling_sum,\n'''
+          if text.count(old) != 1:
+              raise SystemExit("example import anchor not found")
+          text = text.replace(old, new, 1)
+          old = '''@cvxpy_program(cache_dir=CACHE / "clarabel", clarabel=_clarabel, sequential=None)\ndef MPO(\n'''
+          new = '''@cvxpy_program(\n    cache_dir=CACHE / "clarabel",\n    clarabel=_clarabel,\n    sequential=None,\n    solver_settings={"iterative_refinement_enable": False},\n)\ndef MPO(\n'''
+          if text.count(old) != 1:
+              raise SystemExit("example decorator anchor not found")
+          text = text.replace(old, new, 1)
+          old = '''    weights = get_field(mpo, "weights[0]")\n    risks = tuple(get_field(mpo, f"risk_{h}.value") for h in range(len(HORIZONS)))\n    return (returns, features, cat(*yhat_signals), weights, *risks)\n'''
+          new = '''    session_open = reduce_max(tradable, axis=[1]) != 0.0\n    weights = where(\n        session_open,\n        get_field(mpo, "weights[0]"),\n        float("nan"),\n    )\n    status = where(\n        session_open,\n        get_field(mpo, "status"),\n        float("nan"),\n    )\n    risks = tuple(\n        where(\n            session_open,\n            get_field(mpo, f"risk_{h}.value"),\n            float("nan"),\n        )\n        for h in range(len(HORIZONS))\n    )\n    return (returns, features, cat(*yhat_signals), weights, status, *risks)\n'''
+          if text.count(old) != 1:
+              raise SystemExit("example result anchor not found")
+          text = text.replace(old, new, 1)
+          old = '''    realized_returns, features, yhat_signals, weights = values[:4]\n    risk_values = values[4:]\n'''
+          new = '''    realized_returns, features, yhat_signals, weights, status = values[:5]\n    risk_values = values[5:]\n    _ = status  # Returned for audit; plotting uses weights and constraint values.\n'''
+          if text.count(old) != 1:
+              raise SystemExit("example unpack anchor not found")
+          example.write_text(text.replace(old, new, 1))
+
+          test_file = Path("tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py")
+          text = test_file.read_text()
+          if "test_fixed_solver_settings_are_emitted_and_cached" in text:
+              raise SystemExit("fixed-setting test already exists")
+          text += '''\n\ndef test_fixed_solver_settings_are_emitted_and_cached(\n    tmp_path: Path,\n    monkeypatch,\n) -> None:\n    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")\n\n    @cvxpy_program(\n        cache_dir=tmp_path / "program-cache",\n        clarabel=native,\n        solver_settings={"iterative_refinement_enable": False},\n    )\n    def Target(target) -> cp.Problem:\n        target = cp.Parameter(target.shape, name="target")\n        weights = cp.Variable(target.shape, name="weights")\n        return cp.Problem(cp.Minimize(cp.sum_squares(weights - target)))\n\n    assert Target.solver_settings == {"iterative_refinement_enable": False}\n    data = {"target": np.asarray([[0.1, -0.2], [0.2, -0.1]])}\n    expression = Target(target=var("target"))\n    monkeypatch.setenv(\n        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE", str(tmp_path / "runner-cache")\n    )\n    runtime = compile_formula(get_field(expression, "weights"), data, n_instruments=2)\n    values = runtime.run(out_path=tmp_path / "settings.npy").load(mmap_mode=None)\n    assert np.isfinite(values).all()\n\n    manifests = tuple(\n        (tmp_path / "program-cache").rglob("clarabel_program_manifest.json")\n    )\n    assert len(manifests) == 1\n    manifest = json.loads(manifests[0].read_text())\n    assert manifest["clarabel_settings"] == {\n        "iterative_refinement_enable": False\n    }\n    header = (\n        manifests[0].parent / "include" / f"{manifest['prefix']}instance.hpp"\n    ).read_text()\n    assert "settings_.iterative_refinement_enable = false;" in header\n'''
+          test_file.write_text(text)
+          PY
+          python -m compileall -q src/trading_dsl_engine examples/cpp_stream_mpo_one_pass.py
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            examples/cpp_stream_mpo_one_pass.py \
+            src/trading_dsl_engine/cpp_stream/optimizer/factory.py \
+            src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py \
+            tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+          git commit -m "Complete MPO session gating and solver settings"
+          git push origin HEAD:agent/mpo-postsolve-values-session-gate-clean
+      - name: GREEN - focused optimizer tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_clarabel_native_builder.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py
+      - name: Run cpp_stream suite
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: python -m pytest -q -o addopts="" tests/trading_dsl_engine/cpp_stream
+      - name: Run GP regression smoke
+        env:
+          PYTHONPATH: src
+          JAX_ENABLE_X64: "1"
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/flows/gp/test_compile_fuzz.py
+          tests/flows/gp/test_tensor_runtime.py
+      - name: Verify example source contract
+        env:
+          PYTHONPATH: src:.
+        run: |
+          python - <<'PY'
+          import examples.cpp_stream_mpo_one_pass as example
+          assert example.MPO.solver_settings == {"iterative_refinement_enable": False}
+          source = open("examples/cpp_stream_mpo_one_pass.py").read()
+          assert 'get_field(mpo, "status")' in source
+          assert 'session_open' in source
+          assert 'float("nan")' in source
+          PY
