@@ -1,0 +1,21 @@
+name: MPO IC diagnostics verify
+
+on:
+  push:
+    branches: [agent/mpo-ic-diagnostics-verify]
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install optimizer dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]'
+      - name: Run diagnostic regression tests
+        env:
+          PYTHONPATH: src:.
+        run: python -m pytest -q -o addopts="" tests/examples/test_cpp_stream_mpo_diagnostics.py
