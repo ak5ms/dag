@@ -23,6 +23,18 @@ class alignas(64) {{ class_name }} final {
   alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.rows + 1 }}>
       {{ name }}_map_row_ptr_{{ mapping.row_ptr }};
 {% endfor %}
+{% for name, mapping in constraint_maps.items() %}
+  alignas(64) inline static constexpr std::array<double, {{ mapping.nnz }}>
+      constraint_{{ name }}_map_values_{{ mapping["values"] }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.nnz }}>
+      constraint_{{ name }}_map_columns_{{ mapping.columns }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.rows + 1 }}>
+      constraint_{{ name }}_map_row_ptr_{{ mapping.row_ptr }};
+{% endfor %}
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_scalar_count + 1 }}>
+      constraint_value_term_row_ptr_{{ constraint_value_term_row_ptr }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_term_count }}>
+      constraint_value_term_primal_columns_{{ constraint_value_term_primal_columns }};
 {% for name, matrix in matrices.items() %}
   alignas(64) inline static constexpr std::array<std::uintptr_t, {{ matrix.nnz }}>
       {{ name }}_row_indices_{{ matrix.row_indices }};
@@ -36,6 +48,10 @@ class alignas(64) {{ class_name }} final {
   alignas(64) std::array<double, {{ matrices.A.nnz }}> A_values_{};
   alignas(64) std::array<double, {{ maps.b.rows }}> b_values_{};
   std::array<double, 1> d_value_{};
+  alignas(64) std::array<double, {{ constraint_value_scalar_count }}> constraint_values_{};
+  alignas(64) std::array<double, {{ constraint_value_scalar_count }}> constraint_rhs_values_{};
+  alignas(64) std::array<double, {{ constraint_value_scalar_count }}> constraint_denominator_values_{};
+  alignas(64) std::array<double, {{ constraint_value_term_count }}> constraint_coefficient_values_{};
   std::array<ClarabelSupportedConeT, {{ cones|length }}> cones_{{ "{{" }}
 {% for cone in cones %}
       {{ cone }}{{ "," if not loop.last else "" }}
@@ -52,6 +68,7 @@ class alignas(64) {{ class_name }} final {
   bool A_dirty_{true};
   bool b_dirty_{true};
   bool d_dirty_{true};
+  bool constraint_values_dirty_{{ "{true}" if constraint_value_scalar_count else "{false}" }};
 
   static bool same_value(double left, double right) noexcept {
     return std::bit_cast<std::uint64_t>(left)
@@ -74,6 +91,42 @@ class alignas(64) {{ class_name }} final {
   }
 
 {% endfor %}
+{% for name, mapping in constraint_maps.items() %}
+  void canonicalize_constraint_{{ name }}() noexcept {
+    auto& output = constraint_{{ name }}_values_;
+    for (std::size_t row = 0; row < {{ mapping.rows }}; ++row) {
+      double value = 0.0;
+      const auto begin = constraint_{{ name }}_map_row_ptr_[row];
+      const auto end = constraint_{{ name }}_map_row_ptr_[row + 1];
+      for (std::uint32_t index = begin; index < end; ++index) {
+        value += constraint_{{ name }}_map_values_[index]
+               * parameters_[constraint_{{ name }}_map_columns_[index]];
+      }
+      output[row] = value;
+    }
+  }
+
+{% endfor %}
+  void evaluate_constraint_values() noexcept {
+{% if constraint_value_scalar_count %}
+    canonicalize_constraint_rhs();
+    canonicalize_constraint_denominator();
+    canonicalize_constraint_coefficient();
+    for (std::size_t row = 0; row < {{ constraint_value_scalar_count }}; ++row) {
+      double value = constraint_rhs_values_[row];
+      const auto begin = constraint_value_term_row_ptr_[row];
+      const auto end = constraint_value_term_row_ptr_[row + 1];
+      for (std::uint32_t term = begin; term < end; ++term) {
+        value -= constraint_coefficient_values_[term]
+               * solution_.x[constraint_value_term_primal_columns_[term]];
+      }
+      constraint_values_[row] =
+          value / constraint_denominator_values_[row];
+    }
+{% endif %}
+    constraint_values_dirty_ = false;
+  }
+
   void initialize_solver() {
     clarabel_CscMatrix_init(
         &P_matrix_, {{ matrices.P.rows }}, {{ matrices.P.columns }},
@@ -98,6 +151,9 @@ class alignas(64) {{ class_name }} final {
     settings_ = clarabel_DefaultSettings_default();
     settings_.verbose = false;
     settings_.presolve_enable = false;
+{% for setting in fixed_settings %}
+    settings_.{{ setting.name }} = {{ setting.value }};
+{% endfor %}
   }
 
   ~{{ class_name }}() { reset_solver(); }
@@ -133,6 +189,7 @@ class alignas(64) {{ class_name }} final {
     if (d_dirty_) canonicalize_d();
     if (solver_ != nullptr && !solver_settings_dirty_
         && !P_changed && !q_changed && !A_changed && !b_changed) {
+      if (constraint_values_dirty_) evaluate_constraint_values();
       d_dirty_ = false;
       return;
     }
@@ -163,6 +220,7 @@ class alignas(64) {{ class_name }} final {
     }
     clarabel_DefaultSolver_solve(solver_);
     solution_ = clarabel_DefaultSolver_solution(solver_);
+    evaluate_constraint_values();
     P_dirty_ = q_dirty_ = A_dirty_ = b_dirty_ = d_dirty_ = false;
   }
 
@@ -180,6 +238,9 @@ class alignas(64) {{ class_name }} final {
 {% for block in parameter.dirty_blocks %}
     {{ block }}_dirty_ = true;
 {% endfor %}
+{% if parameter.constraint_value_dirty %}
+    constraint_values_dirty_ = true;
+{% endif %}
   }
 
 {% endfor %}
@@ -204,6 +265,9 @@ class alignas(64) {{ class_name }} final {
 {% for block in parameter.dirty_blocks %}
       {{ block }}_dirty_ = true;
 {% endfor %}
+{% if parameter.constraint_value_dirty %}
+      constraint_values_dirty_ = true;
+{% endif %}
     } else
 {% endfor %}
     {
@@ -255,6 +319,25 @@ class alignas(64) {{ class_name }} final {
 {% endfor %}
     {
       static_assert(Index < {{ duals|length }}, "invalid optimizer dual index");
+      return {};
+    }
+  }
+
+{% for value in constraint_values %}
+  [[nodiscard]] std::span<const double> constraint_value_{{ value.name }}() noexcept {
+    return std::span<const double>(
+        constraint_values_.data() + {{ value.offset }}, {{ value.size }});
+  }
+
+{% endfor %}
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const double> constraint_value() noexcept {
+{% for value in constraint_values %}
+    if constexpr (Index == {{ value.index }}) return constraint_value_{{ value.name }}();
+    else
+{% endfor %}
+    {
+      static_assert(Index < {{ constraint_values|length }}, "invalid constraint value index");
       return {};
     }
   }

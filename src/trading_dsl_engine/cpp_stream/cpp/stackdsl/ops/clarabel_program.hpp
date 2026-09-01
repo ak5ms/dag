@@ -40,6 +40,7 @@ struct ClarabelParameterList {};
 enum class ClarabelResultKind : std::uint8_t {
     Primal,
     Dual,
+    ConstraintValue,
     Info,
 };
 
@@ -215,8 +216,17 @@ class ClarabelNode<
                     Projection::kind == ClarabelResultKind::Primal
                 ) {
                     return program_.template primal<Projection::source_index>();
-                } else {
+                } else if constexpr (
+                    Projection::kind == ClarabelResultKind::Dual
+                ) {
                     return program_.template dual<Projection::source_index>();
+                } else {
+                    static_assert(
+                        Projection::kind == ClarabelResultKind::ConstraintValue
+                    );
+                    return program_.template constraint_value<
+                        Projection::source_index
+                    >();
                 }
             }();
             for (std::size_t index = 0; index < Projection::count; ++index) {
