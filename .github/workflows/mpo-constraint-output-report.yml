@@ -1,0 +1,74 @@
+name: MPO constraint-output persisted report
+
+on:
+  push:
+    branches: [agent/mpo-constraint-output-benchmark]
+    paths:
+      - .github/workflows/mpo-constraint-output-report.yml
+      - scripts/benchmark_mpo_constraint_output_paths.py
+      - src/trading_dsl_engine/cpp_stream/optimizer/**
+      - src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp
+      - src/trading_dsl_engine/cpp_stream/python/**
+      - src/trading_dsl_engine/ir/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mpo-constraint-output-persisted-report
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade pip &&
+          python -m pip install -e '.[optimizer]'
+      - name: Run benchmark and persist report
+        shell: bash
+        env:
+          PYTHONPATH: src:.
+          MPO_CONSTRAINT_ROWS: "5000"
+          MPO_CONSTRAINT_RUNS: "10"
+        run: |
+          set +e
+          python scripts/benchmark_mpo_constraint_output_paths.py > benchmark.log 2>&1
+          status=$?
+          set -e
+
+          mkdir -p benchmarks
+          report=benchmarks/mpo_constraint_output_spike.md
+          {
+            echo '# MPO constraint-output timing spike'
+            echo
+            echo '- Rows: 5,000'
+            echo '- Assets: 3'
+            echo '- Horizons: 8'
+            echo '- Timed runs per mode: 10 after one warmup'
+            echo '- `run_plus_load` includes native execution, output-file production, and eager `result.load(mmap_mode=None)`.'
+            echo
+            echo '```text'
+            grep -E '^(CLARABEL|RESULT|COMPARISON|VERIFY|GAP) ' benchmark.log || true
+            if [ "$status" -ne 0 ]; then
+              echo
+              echo '--- failure tail ---'
+              tail -n 220 benchmark.log
+            fi
+            echo '```'
+            echo
+            echo "Exit status: $status"
+          } > "$report"
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "$report"
+          git commit -m 'Record MPO constraint-output benchmark result'
+          git push
+          exit "$status"
