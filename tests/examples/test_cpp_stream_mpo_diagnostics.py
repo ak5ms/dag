@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import cvxpy as cp
+import numpy as np
+
+import examples.cpp_stream_mpo_one_pass as example
+from trading_dsl_engine.base.dsl import var
+
+
+def test_diagnostic_pnls_delegate_to_alpha_search_ic_and_ic1(monkeypatch):
+    calls = []
+
+    def fake_ic(signal, **kwargs):
+        calls.append(("ic", signal, kwargs))
+        return var("ic_out")
+
+    def fake_ic1(signal, **kwargs):
+        calls.append(("ic1", signal, kwargs))
+        return var("ic1_out")
+
+    monkeypatch.setattr(example, "ic", fake_ic, raising=False)
+    monkeypatch.setattr(example, "ic1", fake_ic1, raising=False)
+    signal = var("signal")
+    rets = var("returns")
+    tradable = var("tradable")
+    weights = var("weights")
+
+    actual = example._diagnostic_pnls(
+        signal,
+        roll_rets=rets,
+        is_tradable=tradable,
+        w=weights,
+        lag=2,
+        hz=4,
+    )
+
+    assert set(actual) == {"ic", "ic1"}
+    assert [name for name, _, _ in calls] == ["ic", "ic1"]
+    for _, called_signal, kwargs in calls:
+        assert called_signal is signal
+        assert kwargs["roll_rets"] is rets
+        assert kwargs["is_tradable"] is tradable
+        assert kwargs["w"] is weights
+        assert kwargs["lag"] == 2
+        assert kwargs["hz"] == 4
+        assert kwargs["hl"] == example.IC_VOL_SPAN
+
+
+def test_formula_returns_alpha_search_diagnostics_and_optimizer_cost():
+    formula = example._formula(var("returns"))
+
+    assert isinstance(formula, dict)
+    assert set(formula) >= {
+        "returns",
+        "features",
+        "weights",
+        "status",
+        "mpo_spread_cost",
+        "mpo_gross_pnl",
+        "risk",
+        "alpha_pnl",
+        "yhat_pnl",
+    }
+    assert len(formula["alpha_pnl"]) == len(example.HORIZONS)
+    assert len(formula["yhat_pnl"]) == len(example.HORIZONS)
+    for horizon in formula["alpha_pnl"].values():
+        assert set(horizon) == {"ic", "ic1"}
+        assert len(horizon["ic"]) == len(example.FEATURE_HLS)
+        assert len(horizon["ic1"]) == len(example.FEATURE_HLS)
+    for horizon in formula["yhat_pnl"].values():
+        assert set(horizon) == {"ic", "ic1"}
+
+
+def test_mpo_spread_cost_primal_matches_the_objective_cost_term():
+    n_horizons = len(example.HORIZONS)
+    n_assets = 3
+    zeros = np.zeros((n_horizons, n_assets))
+    factors = [np.eye(n_assets) for _ in range(n_horizons)]
+    problem = example.MPO.factory(
+        zeros,
+        np.full(n_assets, 1e-4),
+        np.zeros(n_assets),
+        *factors,
+        np.ones((n_horizons, n_assets)),
+        example.RISK_RADIUS,
+    )
+
+    rng = np.random.default_rng(51)
+    parameter_values = {
+        "expected_returns": rng.normal(scale=2e-4, size=(n_horizons, n_assets)),
+        "half_spread": np.array([4e-5, 6e-5, 8e-5]),
+        "current_weights": np.array([0.01, -0.02, 0.01]),
+        "trade_allowed": np.ones((n_horizons, n_assets)),
+        "risk_radius": example.RISK_RADIUS,
+        **{f"risk_factor_{h}": np.eye(n_assets) for h in range(n_horizons)},
+    }
+    for parameter in problem.parameters():
+        parameter.value = parameter_values[parameter.name()]
+
+    problem.solve(
+        solver=cp.CLARABEL,
+        presolve_enable=False,
+        tol_gap_abs=1e-10,
+        tol_gap_rel=1e-10,
+        tol_feas=1e-10,
+    )
+    assert problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
+
+    variables = {variable.name(): variable for variable in problem.variables()}
+    assert "spread_cost" in variables
+    weights = np.asarray(variables["weights"].value)
+    current = parameter_values["current_weights"]
+    delta = weights - np.vstack([current, weights[:-1]])
+    expected_cost = np.sum(parameter_values["half_spread"] * np.abs(delta))
+    np.testing.assert_allclose(
+        float(variables["spread_cost"].value),
+        expected_cost,
+        rtol=2e-7,
+        atol=2e-10,
+    )
