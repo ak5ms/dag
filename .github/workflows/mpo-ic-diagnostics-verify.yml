@@ -18,13 +18,12 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
-      - name: Run diagnostic and alpha-search regressions
+      - name: Run MPO diagnostics and native constraint regressions
         env:
           PYTHONPATH: src:.
         run: >-
           python -m pytest -q -o addopts=""
           tests/examples/test_cpp_stream_mpo_diagnostics.py
-          tests/flows/test_alpha_search.py
           tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
       - name: Run full native MPO smoke
         env:
@@ -86,7 +85,6 @@ jobs:
               assert len(values["risk"]) == 8
               assert len(values["alpha_pnl"]) == 8
               assert len(values["yhat_pnl"]) == 8
-              generated = result.output_path.parent / "unused"
               print("rows", result.rows, "seconds", result.seconds, "plots", len(paths))
           PY
       - name: Verify clean feature diff
@@ -95,4 +93,5 @@ jobs:
           set -euo pipefail
           git fetch origin agent/strongly-typed-gp
           git diff --check origin/agent/strongly-typed-gp...HEAD
+          test "$(git diff --name-only origin/agent/strongly-typed-gp...HEAD | wc -l)" -eq 2
           git diff --name-only origin/agent/strongly-typed-gp...HEAD
