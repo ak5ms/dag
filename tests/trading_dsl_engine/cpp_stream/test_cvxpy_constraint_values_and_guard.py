@@ -137,11 +137,14 @@ def test_scalar_where_skips_closed_solve_and_preserves_feedback_state(
                 [0.0, 0.0, 0.0],
             ]
         ),
+        "initial_weights": np.zeros((3, assets)),
         "session_open": np.asarray([1.0, 0.0, 1.0]),
     }
     mpo = StickyTarget(
         target=var("target"),
-        current_weights=previous_solution("weights", initial=0.0),
+        current_weights=previous_solution(
+            "weights", initial=var("initial_weights")
+        ),
     )
     guarded_weights = where(
         var("session_open"), get_field(mpo, "weights"), float("nan")
