@@ -6,12 +6,13 @@ from pathlib import Path
 import cvxpy as cp
 import numpy as np
 
-from trading_dsl_engine.base.dsl import var
+from trading_dsl_engine.base.dsl import var, where
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import (
     build_current_clarabel,
     cvxpy_program,
     get_field,
+    previous_solution,
 )
 from trading_dsl_engine.ir.types import SCALAR, VECTOR
 
@@ -101,3 +102,75 @@ def test_native_constraint_value_is_evaluated_after_the_original_solve(
     )
     np.testing.assert_allclose(risk_values, expected, rtol=2e-6, atol=2e-8)
     assert np.isin(np.asarray(statuses).reshape(-1), [1.0, 4.0]).all()
+
+
+def test_scalar_where_skips_closed_solve_and_preserves_feedback_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
+
+    @cvxpy_program(
+        cache_dir=tmp_path / "program-cache",
+        clarabel=native,
+        sequential=None,
+    )
+    def StickyTarget(target, current_weights) -> cp.Problem:
+        target = cp.Parameter(target.shape, name="target")
+        current_weights = cp.Parameter(
+            current_weights.shape, name="current_weights"
+        )
+        weights = cp.Variable(target.shape, name="weights")
+        return cp.Problem(
+            cp.Minimize(
+                cp.sum_squares(weights - target)
+                + cp.sum_squares(weights - current_weights)
+            )
+        )
+
+    assets = 3
+    data = {
+        "target": np.asarray(
+            [
+                [2.0, -2.0, 1.0],
+                [100.0, -100.0, 50.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+        "session_open": np.asarray([1.0, 0.0, 1.0]),
+    }
+    mpo = StickyTarget(
+        target=var("target"),
+        current_weights=previous_solution("weights", initial=0.0),
+    )
+    guarded_weights = where(
+        var("session_open"), get_field(mpo, "weights"), float("nan")
+    )
+    guarded_status = where(
+        var("session_open"), get_field(mpo, "status"), float("nan")
+    )
+    monkeypatch.setenv(
+        "TRADING_DSL_ENGINE_CPP_STREAM_CACHE", str(tmp_path / "runner-cache")
+    )
+    runtime = compile_formula(
+        [guarded_weights, guarded_status], data, n_instruments=assets
+    )
+
+    clarabel_stages = [
+        stage
+        for stage in runtime.plan.stages
+        if stage.kind in {"clarabel", "clarabel_bundle"}
+    ]
+    assert len(clarabel_stages) == 1
+    assert len(clarabel_stages[0].inputs) == 3
+
+    weights, statuses = runtime.run(
+        out_path=tmp_path / "guarded-values.npy"
+    ).load(mmap_mode=None)
+    np.testing.assert_allclose(weights[0], [1.0, -1.0, 0.5], atol=2e-7)
+    assert np.isnan(weights[1]).all()
+    np.testing.assert_allclose(weights[2], [0.5, -0.5, 0.25], atol=2e-7)
+    status = np.asarray(statuses).reshape(-1)
+    assert status[0] in (1.0, 4.0)
+    assert np.isnan(status[1])
+    assert status[2] in (1.0, 4.0)
