@@ -89,7 +89,7 @@ def _program_expressions(mode: str):
         # row scalar from finite input data; CSE computes this once and eight
         # roots return it. The payload remains exactly equal to augmented mode:
         # eight three-vectors plus eight scalar radii = 32 doubles per row.
-        radius = var("half_spread").sum(axis=0) * 0.0 + RISK_RADIUS
+        radius = var("half_spread").sum(axis=1) * 0.0 + RISK_RADIUS
         return roots + projected + [radius] * HORIZONS
     raise ValueError(mode)
 
