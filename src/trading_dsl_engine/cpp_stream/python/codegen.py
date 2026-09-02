@@ -748,6 +748,7 @@ def _stage_type(
                             "primal": "stackdsl::ClarabelResultKind::Primal",
                             "dual": "stackdsl::ClarabelResultKind::Dual",
                             "constraint_value": "stackdsl::ClarabelResultKind::ConstraintValue",
+                            "expression_value": "stackdsl::ClarabelResultKind::ExpressionValue",
                             "info": "stackdsl::ClarabelResultKind::Info",
                         }[field.kind]
                     ),

@@ -79,6 +79,18 @@ class _ConstraintValueProgram:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExpressionValueView:
+    name: str
+    q_map: _SparseMap
+    d_map: _SparseMap
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpressionValueProgram:
+    values: tuple[_ExpressionValueView, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _CompiledCanonicalProgram:
     parameter_offsets: tuple[int, ...]
     parameter_maps: Mapping[str, _SparseMap]
@@ -1019,6 +1031,122 @@ def _compile_constraint_value_program(
     )
 
 
+def _sparse_maps_equal(left: _SparseMap, right: _SparseMap) -> bool:
+    return (
+        left.rows == right.rows
+        and np.array_equal(left.columns, right.columns)
+        and np.array_equal(left.row_ptr, right.row_ptr)
+        and np.allclose(left.values, right.values, rtol=0.0, atol=1e-12)
+    )
+
+
+def _compile_expression_value_program(
+    problem: Any,
+    compiled: _CompiledCanonicalProgram,
+    expressions: Mapping[str, Any],
+    *,
+    parameter_shard_size: int,
+    canon_backend: str = "COO",
+) -> _ExpressionValueProgram:
+    import cvxpy as cp
+
+    if not expressions:
+        return _ExpressionValueProgram(())
+    main_parameters = {parameter.name(): parameter for parameter in problem.parameters()}
+    main_offsets = {
+        parameter.name(): int(offset)
+        for parameter, offset in zip(problem.parameters(), compiled.parameter_offsets)
+    }
+    main_parameter_count = sum(int(parameter.size) for parameter in problem.parameters())
+    main_primal_by_name = {view.name: view for view in compiled.primals}
+    values = []
+    for name, expression in expressions.items():
+        if int(expression.size) != 1:
+            raise ValueError(f"named CVXPY expression {name!r} must be scalar")
+        evaluator_problem = cp.Problem(cp.Minimize(expression), problem.constraints)
+        if not evaluator_problem.is_dcp(dpp=True):
+            raise ValueError(
+                f"named CVXPY expression {name!r} must be DPP when used "
+                "with the original problem constraints"
+            )
+        evaluator = compile_sharded_canonical_program(
+            evaluator_problem,
+            parameter_shard_size=parameter_shard_size,
+            canon_backend=canon_backend,
+        )
+        if evaluator.P.row_indices.size:
+            raise ValueError(
+                f"named CVXPY expression {name!r} has a quadratic canonical "
+                "objective; quadratic expression projections are not yet supported"
+            )
+        if (
+            evaluator.A.rows != compiled.A.rows
+            or evaluator.A.columns != compiled.A.columns
+            or not np.array_equal(evaluator.A.row_indices, compiled.A.row_indices)
+            or not np.array_equal(evaluator.A.column_ptr, compiled.A.column_ptr)
+            or evaluator.cone_initializers != compiled.cone_initializers
+        ):
+            raise ValueError(
+                f"named CVXPY expression {name!r} changes the canonical "
+                "variable/constraint layout; only expressions already represented "
+                "by the original cone program can be projected post-solve"
+            )
+        for view in evaluator.primals:
+            main = main_primal_by_name.get(view.name)
+            if main is not None and (main.size != view.size or main.offset != view.offset):
+                raise ValueError(
+                    f"named CVXPY expression {name!r} changes primal layout for "
+                    f"{view.name!r}"
+                )
+
+        evaluator_parameter_count = sum(
+            int(parameter.size) for parameter in evaluator_problem.parameters()
+        )
+        column_map = np.full(evaluator_parameter_count + 1, -1, dtype=np.int64)
+        for parameter, offset in zip(
+            evaluator_problem.parameters(), evaluator.parameter_offsets
+        ):
+            main = main_parameters.get(parameter.name())
+            if main is None or tuple(main.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"named CVXPY expression {name!r} introduced incompatible "
+                    f"parameter {parameter.name()!r}"
+                )
+            start = int(offset)
+            stop = start + int(parameter.size)
+            main_start = main_offsets[parameter.name()]
+            column_map[start:stop] = np.arange(
+                main_start, main_start + int(parameter.size), dtype=np.int64
+            )
+        column_map[evaluator_parameter_count] = main_parameter_count
+        remapped_A = _remap_sparse_map_columns(
+            evaluator.parameter_maps["A"], column_map
+        )
+        remapped_b = _remap_sparse_map_columns(
+            evaluator.parameter_maps["b"], column_map
+        )
+        if not (
+            _sparse_maps_equal(remapped_A, compiled.parameter_maps["A"])
+            and _sparse_maps_equal(remapped_b, compiled.parameter_maps["b"])
+        ):
+            raise ValueError(
+                f"named CVXPY expression {name!r} does not preserve the "
+                "original canonical constraints"
+            )
+        q_map = _remap_sparse_map_columns(
+            evaluator.parameter_maps["q"], column_map
+        )
+        d_map = _remap_sparse_map_columns(
+            evaluator.parameter_maps["d"], column_map
+        )
+        if q_map.rows != compiled.A.columns or d_map.rows != 1:
+            raise ValueError(
+                f"named CVXPY expression {name!r} has incompatible objective layout"
+            )
+        values.append(_ExpressionValueView(name, q_map, d_map))
+    return _ExpressionValueProgram(tuple(values))
+
+
 def _cpp_float(value: float) -> str:
     if np.isnan(value) or np.isinf(value):
         raise ValueError("generated canonical map contains a non-finite value")
@@ -1080,6 +1208,7 @@ def _emit_direct_header(
     problem: Any,
     compiled: _CompiledCanonicalProgram,
     constraint_program: _ConstraintValueProgram,
+    expression_program: _ExpressionValueProgram,
     enable_settings: Iterable[str],
     clarabel_settings: Mapping[str, Any],
 ) -> Path:
@@ -1175,6 +1304,36 @@ def _emit_direct_header(
         }
         for index, value in enumerate(constraint_program.values)
     ]
+    expression_values = []
+    for index, value in enumerate(expression_program.values):
+        expression_values.append(
+            {
+                "name": _safe_identifier(value.name, label="CVXPY expression name"),
+                "index": index,
+                "q": {
+                    "rows": value.q_map.rows,
+                    "nnz": int(value.q_map.values.size),
+                    "values": _cpp_array(value.q_map.values, _cpp_float, per_line=6),
+                    "columns": _cpp_array(
+                        value.q_map.columns, lambda item: str(int(item))
+                    ),
+                    "row_ptr": _cpp_array(
+                        value.q_map.row_ptr, lambda item: str(int(item))
+                    ),
+                },
+                "d": {
+                    "rows": value.d_map.rows,
+                    "nnz": int(value.d_map.values.size),
+                    "values": _cpp_array(value.d_map.values, _cpp_float, per_line=6),
+                    "columns": _cpp_array(
+                        value.d_map.columns, lambda item: str(int(item))
+                    ),
+                    "row_ptr": _cpp_array(
+                        value.d_map.row_ptr, lambda item: str(int(item))
+                    ),
+                },
+            }
+        )
     fixed_settings = []
     for name, value in sorted(clarabel_settings.items()):
         setting_type = _SETTING_TYPES.get(name)
@@ -1237,6 +1396,7 @@ def _emit_direct_header(
             maps=maps,
             constraint_maps=constraint_maps,
             constraint_values=constraint_values,
+            expression_values=expression_values,
             constraint_value_scalar_count=constraint_program.scalar_count,
             constraint_value_term_count=int(
                 constraint_program.term_primal_columns.size
@@ -1282,6 +1442,7 @@ def generate_clarabel_artifact(
         "presolve_enable",
     ),
     constraint_value_indices: Iterable[int] = (),
+    expression_values: Mapping[str, Any] | None = None,
     clarabel_settings: Mapping[str, Any] | None = None,
     field_aliases: Mapping[str, str] | None = None,
     force: bool = False,
@@ -1289,6 +1450,7 @@ def generate_clarabel_artifact(
 ):
     from .clarabel_native import (
         ConstraintValueLayout,
+        ExpressionValueLayout,
         DualLayout,
         FieldAlias,
         GeneratedClarabelProgram,
@@ -1330,6 +1492,13 @@ def generate_clarabel_artifact(
         constraint_value_indices,
         parameter_shard_size=parameter_shard_size,
     )
+    expression_mapping = dict(expression_values or {})
+    expression_program = _compile_expression_value_program(
+        problem,
+        compiled,
+        expression_mapping,
+        parameter_shard_size=parameter_shard_size,
+    )
     header = _emit_direct_header(
         root,
         class_name=class_name,
@@ -1337,6 +1506,7 @@ def generate_clarabel_artifact(
         problem=problem,
         compiled=compiled,
         constraint_program=constraint_program,
+        expression_program=expression_program,
         enable_settings=enable_settings,
         clarabel_settings=dict(clarabel_settings or {}),
     )
@@ -1402,8 +1572,12 @@ def generate_clarabel_artifact(
         )
         for value in constraint_program.values
     )
+    public_expression_values = tuple(
+        ExpressionValueLayout(name, (), 1)
+        for name in expression_mapping
+    )
     manifest = {
-        "schema_version": 5,
+        "schema_version": 6,
         "backend": "cvxpy-direct-clarabel",
         "class_name": class_name,
         "prefix": prefix,
@@ -1455,6 +1629,10 @@ def generate_clarabel_artifact(
             }
             for item in public_constraint_values
         ],
+        "expression_values": [
+            {"name": item.name, "shape": list(item.shape), "size": item.size}
+            for item in public_expression_values
+        ],
         "clarabel_settings": dict(clarabel_settings or {}),
     }
     manifest_path = root / "cpp" / "clarabel_program_manifest.json"
@@ -1472,6 +1650,7 @@ def generate_clarabel_artifact(
         clarabel,
         instrument_count,
         public_constraint_values,
+        public_expression_values,
     )
 
 
@@ -1482,6 +1661,7 @@ def load_clarabel_artifact(
 ):
     from .clarabel_native import (
         ConstraintValueLayout,
+        ExpressionValueLayout,
         DualLayout,
         FieldAlias,
         GeneratedClarabelProgram,
@@ -1493,7 +1673,7 @@ def load_clarabel_artifact(
     root = Path(code_dir).expanduser().resolve()
     manifest_path = root / "cpp" / "clarabel_program_manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("schema_version") != 5:
+    if manifest.get("schema_version") not in {5, 6}:
         raise ValueError(
             f"unsupported generated-program manifest schema in {manifest_path}"
         )
@@ -1560,6 +1740,14 @@ def load_clarabel_artifact(
         )
         for item in manifest.get("constraint_values", ())
     )
+    expression_values = tuple(
+        ExpressionValueLayout(
+            str(item["name"]),
+            tuple(int(extent) for extent in item.get("shape", ())),
+            int(item.get("size", 1)),
+        )
+        for item in manifest.get("expression_values", ())
+    )
     instrument_count = manifest.get("instrument_count")
     return GeneratedClarabelProgram(
         root,
@@ -1574,6 +1762,7 @@ def load_clarabel_artifact(
         clarabel,
         None if instrument_count is None else int(instrument_count),
         constraint_values,
+        expression_values,
     )
 
 

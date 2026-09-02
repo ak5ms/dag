@@ -83,6 +83,13 @@ class ConstraintValueLayout:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpressionValueLayout:
+    name: str
+    shape: tuple[int, ...]
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
 class FieldAlias:
     name: str
     primal_name: str
@@ -116,6 +123,7 @@ class GeneratedClarabelProgram:
     clarabel: ClarabelNativePaths
     instrument_count: int | None = None
     constraint_values: tuple[ConstraintValueLayout, ...] = ()
+    expression_values: tuple[ExpressionValueLayout, ...] = ()
 
     @property
     def include_dirs(self) -> tuple[Path, ...]:
@@ -153,6 +161,7 @@ class GeneratedClarabelProgram:
             duals=self.duals,
             aliases=self.aliases,
             constraint_values=self.constraint_values,
+            expression_values=self.expression_values,
         )
 
 _NO_FIELD_MATCH = object()
@@ -214,6 +223,7 @@ def _resolve_result_field(
     duals: tuple[DualLayout, ...],
     aliases: tuple[FieldAlias, ...],
     constraint_values: tuple[ConstraintValueLayout, ...] = (),
+    expression_values: tuple[ExpressionValueLayout, ...] = (),
 ) -> FieldLayout:
     alias_by_name = {alias.name: alias.primal_name for alias in aliases}
     primal_by_name = {primal.name: primal for primal in primals}
@@ -247,6 +257,19 @@ def _resolve_result_field(
             source_index=primal_index,
             shape=primal.shape,
             size=primal.size,
+            index_text=index_text,
+        )
+    for value_index, value in enumerate(expression_values):
+        index_text = _match_base_field(name, value.name)
+        if index_text is _NO_FIELD_MATCH:
+            continue
+        return _indexed_result_layout(
+            name,
+            kind="expression_value",
+            source_name=value.name,
+            source_index=value_index,
+            shape=value.shape,
+            size=value.size,
             index_text=index_text,
         )
     for value_index, value in enumerate(constraint_values):
@@ -312,6 +335,7 @@ def _resolve_result_field(
             return FieldLayout(name, "info", public_name, info_index, 0, 1, 1, ())
     available = [primal.name for primal in primals]
     available.extend(alias.name for alias in aliases)
+    available.extend(value.name for value in expression_values)
     available.extend(("dual[index]", "constraint[index].dual"))
     available.extend(
         f"constraint[{value.constraint_index}].value"
@@ -505,6 +529,7 @@ __all__ = [
     "ClarabelNativePaths",
     "DualLayout",
     "ConstraintValueLayout",
+    "ExpressionValueLayout",
     "FieldAlias",
     "FieldLayout",
     "GeneratedClarabelProgram",

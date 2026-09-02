@@ -18,6 +18,7 @@ from trading_dsl_engine.base.dsl import ensure_expr
 from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     ClarabelNativePaths,
     ConstraintValueLayout,
+    ExpressionValueLayout,
     DualLayout,
     FieldAlias,
     GeneratedClarabelProgram,
@@ -37,7 +38,7 @@ from trading_dsl_engine.ir.types import ValueType
 
 
 _SYMBOLIC_INSTRUMENT_COUNT = 113
-_FACTORY_CACHE_SCHEMA = 5
+_FACTORY_CACHE_SCHEMA = 6
 _PROGRAM_CACHE_LOCK = RLock()
 _DEFAULT_ENABLE_SETTINGS = (
     "verbose",
@@ -61,6 +62,7 @@ class CvxpyProgramPrototype:
     aliases: tuple[FieldAlias, ...]
     instrument_count: int
     constraint_values: tuple[ConstraintValueLayout, ...] = ()
+    expression_values: tuple[ExpressionValueLayout, ...] = ()
 
     def parameter_index(self, name: str) -> int:
         for index, parameter in enumerate(self.parameters):
@@ -79,6 +81,7 @@ class CvxpyProgramPrototype:
             duals=self.duals,
             aliases=self.aliases,
             constraint_values=self.constraint_values,
+            expression_values=self.expression_values,
         )
 
 
@@ -264,6 +267,44 @@ def _parameter_attributes(parameter) -> dict[str, str]:
     }
 
 
+def _normalize_factory_result(cp, result):
+    if isinstance(result, cp.Problem):
+        return result, {}
+    if not (
+        isinstance(result, tuple)
+        and len(result) == 2
+        and isinstance(result[0], cp.Problem)
+        and isinstance(result[1], Mapping)
+    ):
+        raise TypeError(
+            "CVXPY program factory must return cp.Problem or "
+            "(cp.Problem, {name: scalar_expression})"
+        )
+    problem, raw_expressions = result
+    expressions = {}
+    reserved_info = {
+        "objective", "objective_value", "obj_val", "iterations", "iter",
+        "status", "primal_residual", "dual_residual", "pri_res", "dua_res",
+    }
+    variable_names = {variable.name() for variable in problem.variables()}
+    for raw_name, expression in raw_expressions.items():
+        name = str(raw_name)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise KeyError(f"invalid named CVXPY expression {name!r}")
+        if name in reserved_info or name in variable_names:
+            raise KeyError(f"named CVXPY expression {name!r} collides with a result field")
+        if not isinstance(expression, cp.Expression):
+            raise TypeError(f"named CVXPY expression {name!r} is not a cp.Expression")
+        if int(expression.size) != 1:
+            raise ValueError(
+                f"named CVXPY expression {name!r} must currently be scalar"
+            )
+        if not expression.is_dcp():
+            raise ValueError(f"named CVXPY expression {name!r} must be DCP")
+        expressions[name] = expression
+    return problem, expressions
+
+
 class CvxpyProgramDefinition:
     """A cached CVXPY problem factory that is callable from the formula DSL."""
 
@@ -392,16 +433,25 @@ class CvxpyProgramDefinition:
                 logical_shape=logical_shape,
                 dtype=value_type.dtype,
             )
-        problem = _call_with_named_values(
+        result = _call_with_named_values(
             self.factory, self.signature, arguments
         )
-        if not isinstance(problem, cp.Problem):
-            raise TypeError(
-                f"{self.factory.__qualname__} must return cvxpy.Problem, "
-                f"got {type(problem).__name__}"
-            )
+        problem, named_expressions = _normalize_factory_result(cp, result)
         constraint_values = _constraint_value_layouts(
             cp, problem, requested_fields
+        )
+        selected_expressions = {
+            name: expression
+            for name, expression in named_expressions.items()
+            if name in requested_fields
+        }
+        expression_values = tuple(
+            ExpressionValueLayout(
+                name,
+                tuple(int(extent) for extent in expression.shape),
+                int(expression.size),
+            )
+            for name, expression in selected_expressions.items()
         )
         parameters = {}
         for parameter in problem.parameters():
@@ -430,9 +480,11 @@ class CvxpyProgramDefinition:
                     f"cp.Parameter {name!r} has shape {parameter_shape}, but "
                     f"its bound DSL argument has CVXPY shape {argument.shape}"
                 )
-        return problem, constraint_values
+        return problem, constraint_values, selected_expressions, expression_values
 
-    def _prototype(self, problem, constraint_values, n_instruments):
+    def _prototype(
+        self, problem, constraint_values, expression_values, n_instruments
+    ):
         offset = 0
         parameters = []
         for parameter in problem.parameters():
@@ -472,6 +524,7 @@ class CvxpyProgramDefinition:
             (),
             n_instruments,
             constraint_values,
+            expression_values,
         )
 
     def _cache_key(
@@ -479,6 +532,7 @@ class CvxpyProgramDefinition:
         problem,
         n_instruments: int,
         constraint_values: tuple[ConstraintValueLayout, ...],
+        expression_values: Mapping[str, Any],
     ) -> str:
         payload = {
             "cache_schema": _FACTORY_CACHE_SCHEMA,
@@ -508,6 +562,10 @@ class CvxpyProgramDefinition:
             "constraint_values": [
                 (value.constraint_index, value.label, value.shape)
                 for value in constraint_values
+            ],
+            "expression_values": [
+                (name, tuple(expression.shape), str(expression))
+                for name, expression in sorted(expression_values.items())
             ],
             "constraints": [
                 (
@@ -561,7 +619,12 @@ class CvxpyProgramDefinition:
             raise KeyError(
                 f"feedback contains unknown CVXPY arguments {unknown_feedback}"
             )
-        problem, constraint_values = self._instantiate_problem(
+        (
+            problem,
+            constraint_values,
+            expression_expressions,
+            expression_values,
+        ) = self._instantiate_problem(
             parameter_types,
             requested_fields=requested_fields
             | frozenset(feedback_fields.values()),
@@ -569,10 +632,15 @@ class CvxpyProgramDefinition:
             feedback_names=frozenset(feedback_fields),
         )
         if n_instruments is None:
-            return self._prototype(problem, constraint_values, resolved_n)
+            return self._prototype(
+                problem, constraint_values, expression_values, resolved_n
+            )
 
         cache_key = self._cache_key(
-            problem, int(n_instruments), constraint_values
+            problem,
+            int(n_instruments),
+            constraint_values,
+            expression_expressions,
         )
         with self._lock, _PROGRAM_CACHE_LOCK:
             cached = self._resolved.get(cache_key)
@@ -612,6 +680,7 @@ class CvxpyProgramDefinition:
                     constraint_value_indices=tuple(
                         value.constraint_index for value in constraint_values
                     ),
+                    expression_values=expression_expressions,
                     field_aliases={},
                     force=force,
                 )

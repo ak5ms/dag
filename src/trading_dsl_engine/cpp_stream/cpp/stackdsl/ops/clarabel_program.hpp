@@ -42,6 +42,7 @@ enum class ClarabelResultKind : std::uint8_t {
     Primal,
     Dual,
     ConstraintValue,
+    ExpressionValue,
     Info,
 };
 
@@ -250,11 +251,17 @@ class ClarabelNode<
                     Projection::kind == ClarabelResultKind::Dual
                 ) {
                     return program_.template dual<Projection::source_index>();
+                } else if constexpr (
+                    Projection::kind == ClarabelResultKind::ConstraintValue
+                ) {
+                    return program_.template constraint_value<
+                        Projection::source_index
+                    >();
                 } else {
                     static_assert(
-                        Projection::kind == ClarabelResultKind::ConstraintValue
+                        Projection::kind == ClarabelResultKind::ExpressionValue
                     );
-                    return program_.template constraint_value<
+                    return program_.template expression_value<
                         Projection::source_index
                     >();
                 }

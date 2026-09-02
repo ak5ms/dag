@@ -31,6 +31,16 @@ class alignas(64) {{ class_name }} final {
   alignas(64) inline static constexpr std::array<std::uint32_t, {{ mapping.rows + 1 }}>
       constraint_{{ name }}_map_row_ptr_{{ mapping.row_ptr }};
 {% endfor %}
+{% for expression in expression_values %}
+{% for map_name in ["q", "d"] %}
+  alignas(64) inline static constexpr std::array<double, {{ expression[map_name].nnz }}>
+      expression_{{ expression.index }}_{{ map_name }}_map_values_{{ expression[map_name]["values"] }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ expression[map_name].nnz }}>
+      expression_{{ expression.index }}_{{ map_name }}_map_columns_{{ expression[map_name].columns }};
+  alignas(64) inline static constexpr std::array<std::uint32_t, {{ expression[map_name].rows + 1 }}>
+      expression_{{ expression.index }}_{{ map_name }}_map_row_ptr_{{ expression[map_name].row_ptr }};
+{% endfor %}
+{% endfor %}
   alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_scalar_count + 1 }}>
       constraint_value_term_row_ptr_{{ constraint_value_term_row_ptr }};
   alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_term_count }}>
@@ -52,6 +62,7 @@ class alignas(64) {{ class_name }} final {
   alignas(64) std::array<double, {{ constraint_value_scalar_count }}> constraint_rhs_values_{};
   alignas(64) std::array<double, {{ constraint_value_scalar_count }}> constraint_denominator_values_{};
   alignas(64) std::array<double, {{ constraint_value_term_count }}> constraint_coefficient_values_{};
+  alignas(64) std::array<double, {{ expression_values|length }}> expression_values_{};
   std::array<ClarabelSupportedConeT, {{ cones|length }}> cones_{{ "{{" }}
 {% for cone in cones %}
       {{ cone }}{{ "," if not loop.last else "" }}
@@ -69,6 +80,7 @@ class alignas(64) {{ class_name }} final {
   bool b_dirty_{true};
   bool d_dirty_{true};
   bool constraint_values_dirty_{{ "{true}" if constraint_value_scalar_count else "{false}" }};
+  bool expression_values_dirty_{{ "{true}" if expression_values else "{false}" }};
 
   static bool same_value(double left, double right) noexcept {
     return std::bit_cast<std::uint64_t>(left)
@@ -125,6 +137,31 @@ class alignas(64) {{ class_name }} final {
     }
 {% endif %}
     constraint_values_dirty_ = false;
+  }
+
+  void evaluate_expression_values() noexcept {
+{% for expression in expression_values %}
+    {
+      double value = 0.0;
+      for (std::size_t index = expression_{{ expression.index }}_d_map_row_ptr_[0];
+           index < expression_{{ expression.index }}_d_map_row_ptr_[1]; ++index) {
+        value += expression_{{ expression.index }}_d_map_values_[index]
+               * parameters_[expression_{{ expression.index }}_d_map_columns_[index]];
+      }
+      for (std::size_t row = 0; row < {{ expression.q.rows }}; ++row) {
+        double coefficient = 0.0;
+        const auto begin = expression_{{ expression.index }}_q_map_row_ptr_[row];
+        const auto end = expression_{{ expression.index }}_q_map_row_ptr_[row + 1];
+        for (std::uint32_t index = begin; index < end; ++index) {
+          coefficient += expression_{{ expression.index }}_q_map_values_[index]
+                       * parameters_[expression_{{ expression.index }}_q_map_columns_[index]];
+        }
+        value += coefficient * solution_.x[row];
+      }
+      expression_values_[{{ expression.index }}] = value;
+    }
+{% endfor %}
+    expression_values_dirty_ = false;
   }
 
   void initialize_solver() {
@@ -190,6 +227,7 @@ class alignas(64) {{ class_name }} final {
     if (solver_ != nullptr && !solver_settings_dirty_
         && !P_changed && !q_changed && !A_changed && !b_changed) {
       if (constraint_values_dirty_) evaluate_constraint_values();
+      if (expression_values_dirty_) evaluate_expression_values();
       d_dirty_ = false;
       return;
     }
@@ -221,6 +259,7 @@ class alignas(64) {{ class_name }} final {
     clarabel_DefaultSolver_solve(solver_);
     solution_ = clarabel_DefaultSolver_solution(solver_);
     evaluate_constraint_values();
+    evaluate_expression_values();
     P_dirty_ = q_dirty_ = A_dirty_ = b_dirty_ = d_dirty_ = false;
   }
 
@@ -235,6 +274,9 @@ class alignas(64) {{ class_name }} final {
     if (std::equal(
             values.begin(), values.end(), target.begin(), same_value)) return;
     std::copy(values.begin(), values.end(), target.begin());
+{% if expression_values %}
+    expression_values_dirty_ = true;
+{% endif %}
 {% for block in parameter.dirty_blocks %}
     {{ block }}_dirty_ = true;
 {% endfor %}
@@ -262,6 +304,9 @@ class alignas(64) {{ class_name }} final {
   void mark_parameter_dirty() noexcept {
 {% for parameter in parameters %}
     if constexpr (Index == {{ parameter.index }}) {
+{% if expression_values %}
+      expression_values_dirty_ = true;
+{% endif %}
 {% for block in parameter.dirty_blocks %}
       {{ block }}_dirty_ = true;
 {% endfor %}
@@ -340,6 +385,12 @@ class alignas(64) {{ class_name }} final {
       static_assert(Index < {{ constraint_values|length }}, "invalid constraint value index");
       return {};
     }
+  }
+
+  template <std::size_t Index>
+  [[nodiscard]] std::span<const double> expression_value() noexcept {
+    static_assert(Index < {{ expression_values|length }}, "invalid expression value index");
+    return std::span<const double>(expression_values_.data() + Index, 1);
   }
 
   template <std::size_t Index>
