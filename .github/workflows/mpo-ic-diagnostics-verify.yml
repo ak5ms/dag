@@ -1,4 +1,4 @@
-name: MPO named spread cost verify
+name: MPO named spread cost green verify
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,7 +18,65 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
-      - name: Run named spread-cost regression
+      - name: Run named spread-cost and optimizer regressions
         env:
           PYTHONPATH: src:.
-        run: python -m pytest -q -o addopts="" tests/examples/test_cpp_stream_mpo_diagnostics.py
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/examples/test_cpp_stream_mpo_diagnostics.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+      - name: Run full native MPO smoke
+        env:
+          PYTHONPATH: src:.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import tempfile
+          import numpy as np
+          import examples.cpp_stream_mpo_one_pass as example
+
+          rows, assets = 320, 3
+          rng = np.random.default_rng(73)
+          returns = rng.normal(scale=2e-4, size=(rows, assets))
+          tradable = np.ones((rows, assets), dtype=float)
+          tradable[140:150] = 0.0
+          returns[140:150] = 0.0
+          hs = np.full((rows, assets), 8e-5)
+          ts = np.arange(rows, dtype=float) * example.MINUTE_US + 1_800_000_000_000_000.0
+          broad_start = np.full((rows, assets), ts[0] - 10 * example.MINUTE_US)
+          broad_end = np.full((rows, assets), ts[-1] + 500 * example.MINUTE_US)
+          data = {
+              "returns": returns,
+              "is_tradable_out0": tradable,
+              "vw_halfspread_out0": hs,
+              "_ev_ts": ts,
+              "session_start0": broad_start,
+              "session_end0": broad_end,
+              "next_session_start0": broad_start,
+              "next_session_end0": broad_end,
+          }
+          example.FEATURE_HLS = (2, 4, 8, 16)
+          example.IC_VOL_SPAN = 32
+          example.RIDGE_HL = 64
+          example.RISK_SPAN = 32
+          example.RISK_MIN_PERIODS = 8
+
+          with tempfile.TemporaryDirectory() as directory:
+              result, paths = example._run(data, returns=example.var("returns"), output_dir=Path(directory))
+              values = result.load(mmap_mode=None)
+              assert result.rows == rows
+              assert len(paths) == 19
+              assert values["mpo_spread_cost"].shape == (rows,)
+              assert np.isnan(values["mpo_spread_cost"][140:150]).all()
+              assert np.isnan(values["status"][140:150]).all()
+              print("rows", result.rows, "seconds", result.seconds, "plots", len(paths))
+          PY
+      - name: Verify branch shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin agent/strongly-typed-gp
+          git diff --check origin/agent/strongly-typed-gp...HEAD
+          git diff --name-only origin/agent/strongly-typed-gp...HEAD
