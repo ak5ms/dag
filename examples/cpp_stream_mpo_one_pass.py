@@ -40,8 +40,8 @@ from trading_dsl_engine.cpp_stream.optimizer import (
     previous_solution,
 )
 
-HORIZONS = (1, 2, 4, 8, 16, 32, 64, 128)
-TRADE_STARTS = (0,) + HORIZONS[:-1]
+HORIZONS = (2, 4, 8, 16, 32, 64, 128)
+TRADE_STARTS = (1,) + HORIZONS[:-1]
 FEATURE_HLS = (4, 16, 64, 256)
 IC_VOL_SPAN = 1440 * 21
 RIDGE_HL = 1440 * 21
@@ -98,8 +98,8 @@ def _planned_trade_allowed(tradable):
     next_session_start = ffill(var("next_session_start0"))
     next_session_end = ffill(var("next_session_end0"))
 
-    allowed = [tradable]
-    for start in TRADE_STARTS[1:]:
+    allowed = []
+    for start in TRADE_STARTS:
         trade_ts = ts + start * MINUTE_US
         in_session = (trade_ts >= session_start) & (trade_ts < session_end)
         in_next_session = (trade_ts >= next_session_start) & (trade_ts < next_session_end)
@@ -126,7 +126,6 @@ def MPO(
     risk_factor_4,
     risk_factor_5,
     risk_factor_6,
-    risk_factor_7,
     trade_allowed,
     risk_radius=RISK_RADIUS,
 ):
@@ -145,8 +144,7 @@ def MPO(
                 risk_factor_4,
                 risk_factor_5,
                 risk_factor_6,
-                risk_factor_7,
-            )
+                        )
         )
     )
     trade_allowed = cp.Parameter(
@@ -156,26 +154,26 @@ def MPO(
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
     previous_weights = cp.Variable((n_assets,), name="previous_weights")
-    spread_cost = cp.Variable(name="spread_cost")
     delta = weights - cp.vstack([previous_weights, weights[:-1]])
     abs_delta = cp.abs(delta)
     constraints = [
         previous_weights == current_weights,
         cp.sum(delta, axis=1) == 0,
         abs_delta <= TRADE_BIG_M * trade_allowed,
-        cp.sum(cp.multiply(half_spread, abs_delta)) <= spread_cost,
     ]
     for h, risk_factor in enumerate(risk_factors):
         risk = cp.SOC(risk_radius, risk_factor @ weights[h])
         risk.set_label(f"risk_{h}")
         constraints.append(risk)
-    return cp.Problem(
+    spread_cost = cp.sum(cp.multiply(half_spread, abs_delta))
+    problem = cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
             + spread_cost
         ),
         constraints,
     )
+    return problem, {"spread_cost": spread_cost}
 
 
 def _formula(returns=None):
@@ -184,7 +182,7 @@ def _formula(returns=None):
     hs = var("vw_halfspread_out0")
     fit_weights = purify(1 / hs**2)
     feature_list = tuple(
-        ts_zscore(
+        -ts_zscore(
             returns,
             _feature_span(hl),
             min_periods=max(2, round(_feature_span(hl))),
@@ -288,7 +286,6 @@ def _formula(returns=None):
         risk_factor_4=factors[4],
         risk_factor_5=factors[5],
         risk_factor_6=factors[6],
-        risk_factor_7=factors[7],
         trade_allowed=_planned_trade_allowed(tradable),
         risk_radius=RISK_RADIUS,
     )
@@ -301,6 +298,11 @@ def _formula(returns=None):
     status = where(
         session_open,
         get_field(mpo, "status"),
+        float("nan"),
+    )
+    mpo_objective = where(
+        session_open,
+        get_field(mpo, "objective"),
         float("nan"),
     )
     risk_values = {
@@ -327,6 +329,7 @@ def _formula(returns=None):
         "weights": weights,
         "status": status,
         "mpo_spread_cost": mpo_spread_cost,
+        "mpo_objective": mpo_objective,
         "mpo_gross_pnl": mpo_gross_pnl,
         "risk": risk_values,
         "alpha_pnl": alpha_pnl,
@@ -359,6 +362,7 @@ def _plot_diagnostics(data, values, *, plot_dir):
         ax.legend(ncol=2, fontsize=8)
         ax.grid(alpha=0.2)
         fig.tight_layout()
+        plt.show()
         path = plot_dir / f"alphas_horizon_{start}_{end}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
@@ -373,6 +377,7 @@ def _plot_diagnostics(data, values, *, plot_dir):
         ax.legend()
         ax.grid(alpha=0.2)
         fig.tight_layout()
+        plt.show()
         path = plot_dir / f"yhat_horizon_{start}_{end}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
@@ -385,6 +390,7 @@ def _plot_diagnostics(data, values, *, plot_dir):
     ax.legend()
     ax.grid(alpha=0.2)
     fig.tight_layout()
+    plt.show()
     path = plot_dir / "portfolio_pnl.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -397,7 +403,21 @@ def _plot_diagnostics(data, values, *, plot_dir):
     ax.legend()
     ax.grid(alpha=0.2)
     fig.tight_layout()
+    plt.show()
     path = plot_dir / "mpo_spread_cost.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(index, _cum(values["mpo_objective"]), label="objective")
+    ax.set_title("MPO objective")
+    ax.set_ylabel("Cumulative objective")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    plt.show()
+    path = plot_dir / "mpo_objective.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     paths.append(path)
@@ -412,6 +432,7 @@ def _plot_diagnostics(data, values, *, plot_dir):
     ax.legend(ncol=2, fontsize=8)
     ax.grid(alpha=0.2)
     fig.tight_layout()
+    plt.show()
     path = plot_dir / "risk_constraint.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
