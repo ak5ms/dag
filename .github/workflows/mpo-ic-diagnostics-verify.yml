@@ -34,4 +34,4 @@ jobs:
         env:
           PYTHONPATH: src:.
           MPLBACKEND: Agg
-        run: python ../verifier/scripts/mpo_objective_term_verify.py
+        run: python ../verifier/scripts/mpo_objective_term_verify_v2.py
