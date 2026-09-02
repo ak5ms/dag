@@ -19,6 +19,193 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Apply generic named-expression implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}: {old[:120]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # --- public generated-program metadata / generic field resolution ---
+          path = "src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py"
+          replace_once(path,
+          '''@dataclass(frozen=True, slots=True)\nclass ConstraintValueLayout:\n    name: str\n    constraint_index: int\n    label: str | None\n    shape: tuple[int, ...]\n    size: int\n\n\n@dataclass(frozen=True, slots=True)\nclass FieldAlias:\n''',
+          '''@dataclass(frozen=True, slots=True)\nclass ConstraintValueLayout:\n    name: str\n    constraint_index: int\n    label: str | None\n    shape: tuple[int, ...]\n    size: int\n\n\n@dataclass(frozen=True, slots=True)\nclass ExpressionValueLayout:\n    name: str\n    shape: tuple[int, ...]\n    size: int\n\n\n@dataclass(frozen=True, slots=True)\nclass FieldAlias:\n''')
+          replace_once(path,
+          '''    instrument_count: int | None = None\n    constraint_values: tuple[ConstraintValueLayout, ...] = ()\n''',
+          '''    instrument_count: int | None = None\n    constraint_values: tuple[ConstraintValueLayout, ...] = ()\n    expression_values: tuple[ExpressionValueLayout, ...] = ()\n''')
+          replace_once(path,
+          '''            aliases=self.aliases,\n            constraint_values=self.constraint_values,\n        )\n''',
+          '''            aliases=self.aliases,\n            constraint_values=self.constraint_values,\n            expression_values=self.expression_values,\n        )\n''')
+          replace_once(path,
+          '''    aliases: tuple[FieldAlias, ...],\n    constraint_values: tuple[ConstraintValueLayout, ...] = (),\n) -> FieldLayout:\n''',
+          '''    aliases: tuple[FieldAlias, ...],\n    constraint_values: tuple[ConstraintValueLayout, ...] = (),\n    expression_values: tuple[ExpressionValueLayout, ...] = (),\n) -> FieldLayout:\n''')
+          replace_once(path,
+          '''    for value_index, value in enumerate(constraint_values):\n''',
+          '''    for value_index, value in enumerate(expression_values):\n        index_text = _match_base_field(name, value.name)\n        if index_text is _NO_FIELD_MATCH:\n            continue\n        return _indexed_result_layout(\n            name,\n            kind="expression_value",\n            source_name=value.name,\n            source_index=value_index,\n            shape=value.shape,\n            size=value.size,\n            index_text=index_text,\n        )\n    for value_index, value in enumerate(constraint_values):\n''')
+          replace_once(path,
+          '''    available = [primal.name for primal in primals]\n    available.extend(alias.name for alias in aliases)\n''',
+          '''    available = [primal.name for primal in primals]\n    available.extend(alias.name for alias in aliases)\n    available.extend(value.name for value in expression_values)\n''')
+          replace_once(path,
+          '''    "ConstraintValueLayout",\n    "FieldAlias",\n''',
+          '''    "ConstraintValueLayout",\n    "ExpressionValueLayout",\n    "FieldAlias",\n''')
+
+          # --- factory return protocol: Problem or (Problem, {name: expression}) ---
+          path = "src/trading_dsl_engine/cpp_stream/optimizer/factory.py"
+          replace_once(path,
+          '''    ConstraintValueLayout,\n    DualLayout,\n''',
+          '''    ConstraintValueLayout,\n    ExpressionValueLayout,\n    DualLayout,\n''')
+          replace_once(path, '_FACTORY_CACHE_SCHEMA = 5\n', '_FACTORY_CACHE_SCHEMA = 6\n')
+          replace_once(path,
+          '''    instrument_count: int\n    constraint_values: tuple[ConstraintValueLayout, ...] = ()\n''',
+          '''    instrument_count: int\n    constraint_values: tuple[ConstraintValueLayout, ...] = ()\n    expression_values: tuple[ExpressionValueLayout, ...] = ()\n''')
+          replace_once(path,
+          '''            aliases=self.aliases,\n            constraint_values=self.constraint_values,\n        )\n''',
+          '''            aliases=self.aliases,\n            constraint_values=self.constraint_values,\n            expression_values=self.expression_values,\n        )\n''')
+          replace_once(path,
+          '''def _parameter_attributes(parameter) -> dict[str, str]:\n    """Return a stable cache representation of CVXPY leaf attributes."""\n\n    return {\n        str(name): repr(value)\n        for name, value in sorted(parameter.attributes.items())\n    }\n\n\nclass CvxpyProgramDefinition:\n''',
+          '''def _parameter_attributes(parameter) -> dict[str, str]:\n    """Return a stable cache representation of CVXPY leaf attributes."""\n\n    return {\n        str(name): repr(value)\n        for name, value in sorted(parameter.attributes.items())\n    }\n\n\ndef _normalize_factory_result(cp, result):\n    if isinstance(result, cp.Problem):\n        return result, {}\n    if not (\n        isinstance(result, tuple)\n        and len(result) == 2\n        and isinstance(result[0], cp.Problem)\n        and isinstance(result[1], Mapping)\n    ):\n        raise TypeError(\n            "CVXPY program factory must return cp.Problem or "\n            "(cp.Problem, {name: scalar_expression})"\n        )\n    problem, raw_expressions = result\n    expressions = {}\n    reserved_info = {\n        "objective", "objective_value", "obj_val", "iterations", "iter",\n        "status", "primal_residual", "dual_residual", "pri_res", "dua_res",\n    }\n    variable_names = {variable.name() for variable in problem.variables()}\n    for raw_name, expression in raw_expressions.items():\n        name = str(raw_name)\n        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):\n            raise KeyError(f"invalid named CVXPY expression {name!r}")\n        if name in reserved_info or name in variable_names:\n            raise KeyError(f"named CVXPY expression {name!r} collides with a result field")\n        if not isinstance(expression, cp.Expression):\n            raise TypeError(f"named CVXPY expression {name!r} is not a cp.Expression")\n        if int(expression.size) != 1:\n            raise ValueError(\n                f"named CVXPY expression {name!r} must currently be scalar"\n            )\n        if not expression.is_dcp():\n            raise ValueError(f"named CVXPY expression {name!r} must be DCP")\n        expressions[name] = expression\n    return problem, expressions\n\n\nclass CvxpyProgramDefinition:\n''')
+          replace_once(path,
+          '''        problem = _call_with_named_values(\n            self.factory, self.signature, arguments\n        )\n        if not isinstance(problem, cp.Problem):\n            raise TypeError(\n                f"{self.factory.__qualname__} must return cvxpy.Problem, "\n                f"got {type(problem).__name__}"\n            )\n        constraint_values = _constraint_value_layouts(\n            cp, problem, requested_fields\n        )\n''',
+          '''        result = _call_with_named_values(\n            self.factory, self.signature, arguments\n        )\n        problem, named_expressions = _normalize_factory_result(cp, result)\n        constraint_values = _constraint_value_layouts(\n            cp, problem, requested_fields\n        )\n        selected_expressions = {\n            name: expression\n            for name, expression in named_expressions.items()\n            if name in requested_fields\n        }\n        expression_values = tuple(\n            ExpressionValueLayout(\n                name,\n                tuple(int(extent) for extent in expression.shape),\n                int(expression.size),\n            )\n            for name, expression in selected_expressions.items()\n        )\n''')
+          replace_once(path,
+          '''        return problem, constraint_values\n\n    def _prototype(self, problem, constraint_values, n_instruments):\n''',
+          '''        return problem, constraint_values, selected_expressions, expression_values\n\n    def _prototype(\n        self, problem, constraint_values, expression_values, n_instruments\n    ):\n''')
+          replace_once(path,
+          '''            n_instruments,\n            constraint_values,\n        )\n''',
+          '''            n_instruments,\n            constraint_values,\n            expression_values,\n        )\n''')
+          replace_once(path,
+          '''        constraint_values: tuple[ConstraintValueLayout, ...],\n    ) -> str:\n''',
+          '''        constraint_values: tuple[ConstraintValueLayout, ...],\n        expression_values: Mapping[str, Any],\n    ) -> str:\n''')
+          replace_once(path,
+          '''            "constraint_values": [\n                (value.constraint_index, value.label, value.shape)\n                for value in constraint_values\n            ],\n''',
+          '''            "constraint_values": [\n                (value.constraint_index, value.label, value.shape)\n                for value in constraint_values\n            ],\n            "expression_values": [\n                (name, tuple(expression.shape), str(expression))\n                for name, expression in sorted(expression_values.items())\n            ],\n''')
+          replace_once(path,
+          '''        problem, constraint_values = self._instantiate_problem(\n''',
+          '''        (\n            problem,\n            constraint_values,\n            expression_expressions,\n            expression_values,\n        ) = self._instantiate_problem(\n''')
+          replace_once(path,
+          '''        if n_instruments is None:\n            return self._prototype(problem, constraint_values, resolved_n)\n\n        cache_key = self._cache_key(\n            problem, int(n_instruments), constraint_values\n        )\n''',
+          '''        if n_instruments is None:\n            return self._prototype(\n                problem, constraint_values, expression_values, resolved_n\n            )\n\n        cache_key = self._cache_key(\n            problem,\n            int(n_instruments),\n            constraint_values,\n            expression_expressions,\n        )\n''')
+          replace_once(path,
+          '''                    constraint_value_indices=tuple(\n                        value.constraint_index for value in constraint_values\n                    ),\n                    field_aliases={},\n''',
+          '''                    constraint_value_indices=tuple(\n                        value.constraint_index for value in constraint_values\n                    ),\n                    expression_values=expression_expressions,\n                    field_aliases={},\n''')
+
+          # --- compile named objective terms against the original canonical solve ---
+          path = "src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py"
+          replace_once(path,
+          '''class _ConstraintValueProgram:\n    values: tuple[_ConstraintValueView, ...]\n    rhs_map: _SparseMap\n    denominator_map: _SparseMap\n    coefficient_map: _SparseMap\n    term_row_ptr: np.ndarray\n    term_primal_columns: np.ndarray\n\n    @property\n    def scalar_count(self) -> int:\n        return sum(value.size for value in self.values)\n\n\n@dataclass(frozen=True, slots=True)\nclass _CompiledCanonicalProgram:\n''',
+          '''class _ConstraintValueProgram:\n    values: tuple[_ConstraintValueView, ...]\n    rhs_map: _SparseMap\n    denominator_map: _SparseMap\n    coefficient_map: _SparseMap\n    term_row_ptr: np.ndarray\n    term_primal_columns: np.ndarray\n\n    @property\n    def scalar_count(self) -> int:\n        return sum(value.size for value in self.values)\n\n\n@dataclass(frozen=True, slots=True)\nclass _ExpressionValueView:\n    name: str\n    q_map: _SparseMap\n    d_map: _SparseMap\n\n\n@dataclass(frozen=True, slots=True)\nclass _ExpressionValueProgram:\n    values: tuple[_ExpressionValueView, ...]\n\n\n@dataclass(frozen=True, slots=True)\nclass _CompiledCanonicalProgram:\n''')
+          replace_once(path,
+          '''def _cpp_float(value: float) -> str:\n''',
+          '''def _sparse_maps_equal(left: _SparseMap, right: _SparseMap) -> bool:\n    return (\n        left.rows == right.rows\n        and np.array_equal(left.columns, right.columns)\n        and np.array_equal(left.row_ptr, right.row_ptr)\n        and np.allclose(left.values, right.values, rtol=0.0, atol=1e-12)\n    )\n\n\ndef _compile_expression_value_program(\n    problem: Any,\n    compiled: _CompiledCanonicalProgram,\n    expressions: Mapping[str, Any],\n    *,\n    parameter_shard_size: int,\n    canon_backend: str = "COO",\n) -> _ExpressionValueProgram:\n    import cvxpy as cp\n\n    if not expressions:\n        return _ExpressionValueProgram(())\n    main_parameters = {parameter.name(): parameter for parameter in problem.parameters()}\n    main_offsets = {\n        parameter.name(): int(offset)\n        for parameter, offset in zip(problem.parameters(), compiled.parameter_offsets)\n    }\n    main_parameter_count = sum(int(parameter.size) for parameter in problem.parameters())\n    main_primal_by_name = {view.name: view for view in compiled.primals}\n    values = []\n    for name, expression in expressions.items():\n        if int(expression.size) != 1:\n            raise ValueError(f"named CVXPY expression {name!r} must be scalar")\n        evaluator_problem = cp.Problem(cp.Minimize(expression), problem.constraints)\n        if not evaluator_problem.is_dcp(dpp=True):\n            raise ValueError(\n                f"named CVXPY expression {name!r} must be DPP when used "\n                "with the original problem constraints"\n            )\n        evaluator = compile_sharded_canonical_program(\n            evaluator_problem,\n            parameter_shard_size=parameter_shard_size,\n            canon_backend=canon_backend,\n        )\n        if evaluator.P.row_indices.size:\n            raise ValueError(\n                f"named CVXPY expression {name!r} has a quadratic canonical "\n                "objective; quadratic expression projections are not yet supported"\n            )\n        if (\n            evaluator.A.rows != compiled.A.rows\n            or evaluator.A.columns != compiled.A.columns\n            or not np.array_equal(evaluator.A.row_indices, compiled.A.row_indices)\n            or not np.array_equal(evaluator.A.column_ptr, compiled.A.column_ptr)\n            or evaluator.cone_initializers != compiled.cone_initializers\n        ):\n            raise ValueError(\n                f"named CVXPY expression {name!r} changes the canonical "\n                "variable/constraint layout; only expressions already represented "\n                "by the original cone program can be projected post-solve"\n            )\n        for view in evaluator.primals:\n            main = main_primal_by_name.get(view.name)\n            if main is not None and (main.size != view.size or main.offset != view.offset):\n                raise ValueError(\n                    f"named CVXPY expression {name!r} changes primal layout for "\n                    f"{view.name!r}"\n                )\n\n        evaluator_parameter_count = sum(\n            int(parameter.size) for parameter in evaluator_problem.parameters()\n        )\n        column_map = np.full(evaluator_parameter_count + 1, -1, dtype=np.int64)\n        for parameter, offset in zip(\n            evaluator_problem.parameters(), evaluator.parameter_offsets\n        ):\n            main = main_parameters.get(parameter.name())\n            if main is None or tuple(main.shape) != tuple(parameter.shape):\n                raise ValueError(\n                    f"named CVXPY expression {name!r} introduced incompatible "\n                    f"parameter {parameter.name()!r}"\n                )\n            start = int(offset)\n            stop = start + int(parameter.size)\n            main_start = main_offsets[parameter.name()]\n            column_map[start:stop] = np.arange(\n                main_start, main_start + int(parameter.size), dtype=np.int64\n            )\n        column_map[evaluator_parameter_count] = main_parameter_count\n        remapped_A = _remap_sparse_map_columns(\n            evaluator.parameter_maps["A"], column_map\n        )\n        remapped_b = _remap_sparse_map_columns(\n            evaluator.parameter_maps["b"], column_map\n        )\n        if not (\n            _sparse_maps_equal(remapped_A, compiled.parameter_maps["A"])\n            and _sparse_maps_equal(remapped_b, compiled.parameter_maps["b"])\n        ):\n            raise ValueError(\n                f"named CVXPY expression {name!r} does not preserve the "\n                "original canonical constraints"\n            )\n        q_map = _remap_sparse_map_columns(\n            evaluator.parameter_maps["q"], column_map\n        )\n        d_map = _remap_sparse_map_columns(\n            evaluator.parameter_maps["d"], column_map\n        )\n        if q_map.rows != compiled.A.columns or d_map.rows != 1:\n            raise ValueError(\n                f"named CVXPY expression {name!r} has incompatible objective layout"\n            )\n        values.append(_ExpressionValueView(name, q_map, d_map))\n    return _ExpressionValueProgram(tuple(values))\n\n\ndef _cpp_float(value: float) -> str:\n''')
+          replace_once(path,
+          '''    constraint_program: _ConstraintValueProgram,\n    enable_settings: Iterable[str],\n''',
+          '''    constraint_program: _ConstraintValueProgram,\n    expression_program: _ExpressionValueProgram,\n    enable_settings: Iterable[str],\n''')
+          replace_once(path,
+          '''    constraint_values = [\n        {\n            "name": value.name,\n            "index": index,\n            "offset": value.offset,\n            "size": value.size,\n        }\n        for index, value in enumerate(constraint_program.values)\n    ]\n    fixed_settings = []\n''',
+          '''    constraint_values = [\n        {\n            "name": value.name,\n            "index": index,\n            "offset": value.offset,\n            "size": value.size,\n        }\n        for index, value in enumerate(constraint_program.values)\n    ]\n    expression_values = []\n    for index, value in enumerate(expression_program.values):\n        expression_values.append(\n            {\n                "name": _safe_identifier(value.name, label="CVXPY expression name"),\n                "index": index,\n                "q": {\n                    "rows": value.q_map.rows,\n                    "nnz": int(value.q_map.values.size),\n                    "values": _cpp_array(value.q_map.values, _cpp_float, per_line=6),\n                    "columns": _cpp_array(\n                        value.q_map.columns, lambda item: str(int(item))\n                    ),\n                    "row_ptr": _cpp_array(\n                        value.q_map.row_ptr, lambda item: str(int(item))\n                    ),\n                },\n                "d": {\n                    "rows": value.d_map.rows,\n                    "nnz": int(value.d_map.values.size),\n                    "values": _cpp_array(value.d_map.values, _cpp_float, per_line=6),\n                    "columns": _cpp_array(\n                        value.d_map.columns, lambda item: str(int(item))\n                    ),\n                    "row_ptr": _cpp_array(\n                        value.d_map.row_ptr, lambda item: str(int(item))\n                    ),\n                },\n            }\n        )\n    fixed_settings = []\n''')
+          replace_once(path,
+          '''            constraint_values=constraint_values,\n            constraint_value_scalar_count=constraint_program.scalar_count,\n''',
+          '''            constraint_values=constraint_values,\n            expression_values=expression_values,\n            constraint_value_scalar_count=constraint_program.scalar_count,\n''')
+          replace_once(path,
+          '''    constraint_value_indices: Iterable[int] = (),\n    clarabel_settings: Mapping[str, Any] | None = None,\n''',
+          '''    constraint_value_indices: Iterable[int] = (),\n    expression_values: Mapping[str, Any] | None = None,\n    clarabel_settings: Mapping[str, Any] | None = None,\n''')
+          replace_once(path,
+          '''    from .clarabel_native import (\n        ConstraintValueLayout,\n        DualLayout,\n''',
+          '''    from .clarabel_native import (\n        ConstraintValueLayout,\n        ExpressionValueLayout,\n        DualLayout,\n''')
+          replace_once(path,
+          '''    constraint_program = _compile_constraint_value_program(\n        problem,\n        compiled,\n        constraint_value_indices,\n        parameter_shard_size=parameter_shard_size,\n    )\n    header = _emit_direct_header(\n''',
+          '''    constraint_program = _compile_constraint_value_program(\n        problem,\n        compiled,\n        constraint_value_indices,\n        parameter_shard_size=parameter_shard_size,\n    )\n    expression_mapping = dict(expression_values or {})\n    expression_program = _compile_expression_value_program(\n        problem,\n        compiled,\n        expression_mapping,\n        parameter_shard_size=parameter_shard_size,\n    )\n    header = _emit_direct_header(\n''')
+          replace_once(path,
+          '''        compiled=compiled,\n        constraint_program=constraint_program,\n        enable_settings=enable_settings,\n''',
+          '''        compiled=compiled,\n        constraint_program=constraint_program,\n        expression_program=expression_program,\n        enable_settings=enable_settings,\n''')
+          replace_once(path,
+          '''    public_constraint_values = tuple(\n        ConstraintValueLayout(\n            value.name,\n            value.constraint_index,\n            value.label,\n            value.shape,\n            value.size,\n        )\n        for value in constraint_program.values\n    )\n    manifest = {\n        "schema_version": 5,\n''',
+          '''    public_constraint_values = tuple(\n        ConstraintValueLayout(\n            value.name,\n            value.constraint_index,\n            value.label,\n            value.shape,\n            value.size,\n        )\n        for value in constraint_program.values\n    )\n    public_expression_values = tuple(\n        ExpressionValueLayout(name, (), 1)\n        for name in expression_mapping\n    )\n    manifest = {\n        "schema_version": 6,\n''')
+          replace_once(path,
+          '''        "constraint_values": [\n            {\n                "name": item.name,\n                "constraint_index": item.constraint_index,\n                "label": item.label,\n                "shape": list(item.shape),\n                "size": item.size,\n            }\n            for item in public_constraint_values\n        ],\n        "clarabel_settings": dict(clarabel_settings or {}),\n''',
+          '''        "constraint_values": [\n            {\n                "name": item.name,\n                "constraint_index": item.constraint_index,\n                "label": item.label,\n                "shape": list(item.shape),\n                "size": item.size,\n            }\n            for item in public_constraint_values\n        ],\n        "expression_values": [\n            {"name": item.name, "shape": list(item.shape), "size": item.size}\n            for item in public_expression_values\n        ],\n        "clarabel_settings": dict(clarabel_settings or {}),\n''')
+          replace_once(path,
+          '''        instrument_count,\n        public_constraint_values,\n    )\n''',
+          '''        instrument_count,\n        public_constraint_values,\n        public_expression_values,\n    )\n''')
+          replace_once(path,
+          '''    from .clarabel_native import (\n        ConstraintValueLayout,\n        DualLayout,\n''',
+          '''    from .clarabel_native import (\n        ConstraintValueLayout,\n        ExpressionValueLayout,\n        DualLayout,\n''')
+          replace_once(path,
+          '''    if manifest.get("schema_version") != 5:\n        raise ValueError(\n            f"unsupported generated-program manifest schema in {manifest_path}"\n        )\n''',
+          '''    if manifest.get("schema_version") not in {5, 6}:\n        raise ValueError(\n            f"unsupported generated-program manifest schema in {manifest_path}"\n        )\n''')
+          replace_once(path,
+          '''    constraint_values = tuple(\n        ConstraintValueLayout(\n            str(item["name"]),\n            int(item["constraint_index"]),\n            None if item.get("label") is None else str(item["label"]),\n            tuple(int(extent) for extent in item["shape"]),\n            int(item["size"]),\n        )\n        for item in manifest.get("constraint_values", ())\n    )\n    instrument_count = manifest.get("instrument_count")\n''',
+          '''    constraint_values = tuple(\n        ConstraintValueLayout(\n            str(item["name"]),\n            int(item["constraint_index"]),\n            None if item.get("label") is None else str(item["label"]),\n            tuple(int(extent) for extent in item["shape"]),\n            int(item["size"]),\n        )\n        for item in manifest.get("constraint_values", ())\n    )\n    expression_values = tuple(\n        ExpressionValueLayout(\n            str(item["name"]),\n            tuple(int(extent) for extent in item.get("shape", ())),\n            int(item.get("size", 1)),\n        )\n        for item in manifest.get("expression_values", ())\n    )\n    instrument_count = manifest.get("instrument_count")\n''')
+          replace_once(path,
+          '''        None if instrument_count is None else int(instrument_count),\n        constraint_values,\n    )\n''',
+          '''        None if instrument_count is None else int(instrument_count),\n        constraint_values,\n        expression_values,\n    )\n''')
+
+          # --- generated C++ expression evaluation ---
+          path = "src/trading_dsl_engine/cpp_stream/optimizer/templates/direct_clarabel_instance.hpp.j2"
+          replace_once(path,
+          '''{% endfor %}\n  alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_scalar_count + 1 }}>\n''',
+          '''{% endfor %}\n{% for expression in expression_values %}\n{% for map_name in ["q", "d"] %}\n  alignas(64) inline static constexpr std::array<double, {{ expression[map_name].nnz }}>\n      expression_{{ expression.index }}_{{ map_name }}_map_values_{{ expression[map_name]["values"] }};\n  alignas(64) inline static constexpr std::array<std::uint32_t, {{ expression[map_name].nnz }}>\n      expression_{{ expression.index }}_{{ map_name }}_map_columns_{{ expression[map_name].columns }};\n  alignas(64) inline static constexpr std::array<std::uint32_t, {{ expression[map_name].rows + 1 }}>\n      expression_{{ expression.index }}_{{ map_name }}_map_row_ptr_{{ expression[map_name].row_ptr }};\n{% endfor %}\n{% endfor %}\n  alignas(64) inline static constexpr std::array<std::uint32_t, {{ constraint_value_scalar_count + 1 }}>\n''')
+          replace_once(path,
+          '''  alignas(64) std::array<double, {{ constraint_value_term_count }}> constraint_coefficient_values_{};\n''',
+          '''  alignas(64) std::array<double, {{ constraint_value_term_count }}> constraint_coefficient_values_{};\n  alignas(64) std::array<double, {{ expression_values|length }}> expression_values_{};\n''')
+          replace_once(path,
+          '''  bool constraint_values_dirty_{{ "{true}" if constraint_value_scalar_count else "{false}" }};\n''',
+          '''  bool constraint_values_dirty_{{ "{true}" if constraint_value_scalar_count else "{false}" }};\n  bool expression_values_dirty_{{ "{true}" if expression_values else "{false}" }};\n''')
+          replace_once(path,
+          '''  void initialize_solver() {\n''',
+          '''  void evaluate_expression_values() noexcept {\n{% for expression in expression_values %}\n    {\n      double value = 0.0;\n      for (std::size_t index = expression_{{ expression.index }}_d_map_row_ptr_[0];\n           index < expression_{{ expression.index }}_d_map_row_ptr_[1]; ++index) {\n        value += expression_{{ expression.index }}_d_map_values_[index]\n               * parameters_[expression_{{ expression.index }}_d_map_columns_[index]];\n      }\n      for (std::size_t row = 0; row < {{ expression.q.rows }}; ++row) {\n        double coefficient = 0.0;\n        const auto begin = expression_{{ expression.index }}_q_map_row_ptr_[row];\n        const auto end = expression_{{ expression.index }}_q_map_row_ptr_[row + 1];\n        for (std::uint32_t index = begin; index < end; ++index) {\n          coefficient += expression_{{ expression.index }}_q_map_values_[index]\n                       * parameters_[expression_{{ expression.index }}_q_map_columns_[index]];\n        }\n        value += coefficient * solution_.x[row];\n      }\n      expression_values_[{{ expression.index }}] = value;\n    }\n{% endfor %}\n    expression_values_dirty_ = false;\n  }\n\n  void initialize_solver() {\n''')
+          replace_once(path,
+          '''      if (constraint_values_dirty_) evaluate_constraint_values();\n      d_dirty_ = false;\n      return;\n''',
+          '''      if (constraint_values_dirty_) evaluate_constraint_values();\n      if (expression_values_dirty_) evaluate_expression_values();\n      d_dirty_ = false;\n      return;\n''')
+          replace_once(path,
+          '''    evaluate_constraint_values();\n    P_dirty_ = q_dirty_ = A_dirty_ = b_dirty_ = d_dirty_ = false;\n''',
+          '''    evaluate_constraint_values();\n    evaluate_expression_values();\n    P_dirty_ = q_dirty_ = A_dirty_ = b_dirty_ = d_dirty_ = false;\n''')
+          replace_once(path,
+          '''    std::copy(values.begin(), values.end(), target.begin());\n{% for block in parameter.dirty_blocks %}\n''',
+          '''    std::copy(values.begin(), values.end(), target.begin());\n{% if expression_values %}\n    expression_values_dirty_ = true;\n{% endif %}\n{% for block in parameter.dirty_blocks %}\n''')
+          replace_once(path,
+          '''    if constexpr (Index == {{ parameter.index }}) {\n{% for block in parameter.dirty_blocks %}\n''',
+          '''    if constexpr (Index == {{ parameter.index }}) {\n{% if expression_values %}\n      expression_values_dirty_ = true;\n{% endif %}\n{% for block in parameter.dirty_blocks %}\n''')
+          replace_once(path,
+          '''  template <std::size_t Index>\n  [[nodiscard]] double info() const noexcept {\n''',
+          '''  template <std::size_t Index>\n  [[nodiscard]] std::span<const double> expression_value() noexcept {\n    static_assert(Index < {{ expression_values|length }}, "invalid expression value index");\n    return std::span<const double>(expression_values_.data() + Index, 1);\n  }\n\n  template <std::size_t Index>\n  [[nodiscard]] double info() const noexcept {\n''')
+
+          path = "src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/clarabel_program.hpp"
+          replace_once(path,
+          '''    ConstraintValue,\n    Info,\n''',
+          '''    ConstraintValue,\n    ExpressionValue,\n    Info,\n''')
+          replace_once(path,
+          '''                } else {\n                    static_assert(\n                        Projection::kind == ClarabelResultKind::ConstraintValue\n                    );\n                    return program_.template constraint_value<\n                        Projection::source_index\n                    >();\n                }\n''',
+          '''                } else if constexpr (\n                    Projection::kind == ClarabelResultKind::ConstraintValue\n                ) {\n                    return program_.template constraint_value<\n                        Projection::source_index\n                    >();\n                } else {\n                    static_assert(\n                        Projection::kind == ClarabelResultKind::ExpressionValue\n                    );\n                    return program_.template expression_value<\n                        Projection::source_index\n                    >();\n                }\n''')
+
+          path = "src/trading_dsl_engine/cpp_stream/python/codegen.py"
+          replace_once(path,
+          '''                            "constraint_value": "stackdsl::ClarabelResultKind::ConstraintValue",\n                            "info": "stackdsl::ClarabelResultKind::Info",\n''',
+          '''                            "constraint_value": "stackdsl::ClarabelResultKind::ConstraintValue",\n                            "expression_value": "stackdsl::ClarabelResultKind::ExpressionValue",\n                            "info": "stackdsl::ClarabelResultKind::Info",\n''')
+
+          for path in [
+              "src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py",
+              "src/trading_dsl_engine/cpp_stream/optimizer/factory.py",
+              "src/trading_dsl_engine/cpp_stream/optimizer/direct_clarabel.py",
+              "src/trading_dsl_engine/cpp_stream/python/codegen.py",
+          ]:
+              compile(Path(path).read_text(), path, "exec")
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/trading_dsl_engine/cpp_stream
+          git commit -m 'Support generic post-solve CVXPY expressions'
+          git push origin HEAD:agent/mpo-objective-horizon-cleanup
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
       - name: Run generic named-expression regression
