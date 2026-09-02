@@ -10,10 +10,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from flows.alpha_search import ic, ic1
 from flows.load import InputData
 from flows.pov import RollRets
 from flows.riskmodel import risk_covariance
-from flows.utils import ewm_std, streak, ts_zscore
+from flows.utils import streak, ts_zscore
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
@@ -42,11 +43,10 @@ from trading_dsl_engine.cpp_stream.optimizer import (
 HORIZONS = (1, 2, 4, 8, 16, 32, 64, 128)
 TRADE_STARTS = (0,) + HORIZONS[:-1]
 FEATURE_HLS = (4, 16, 64, 256)
+IC_VOL_SPAN = 1440 * 21
 RIDGE_HL = 1440 * 21
 RISK_SPAN = 1440 * 21
 RISK_MIN_PERIODS = 64
-YHAT_VOL_SPAN = 1440 * 21
-YHAT_VOL_MIN_PERIODS = 64
 RISK_RADIUS = 0.08
 TRADE_BIG_M = 1e3
 MINUTE_US = 60_000_000.0
@@ -64,6 +64,29 @@ def _clarabel() -> ClarabelNativePaths:
 
 def _feature_span(hl: float) -> float:
     return 2 / (1 - 0.5 ** (1 / hl)) - 1
+
+
+def _diagnostic_pnls(
+    signal,
+    *,
+    roll_rets,
+    is_tradable,
+    w,
+    lag: int,
+    hz: int,
+):
+    kwargs = dict(
+        roll_rets=roll_rets,
+        is_tradable=is_tradable,
+        hl=IC_VOL_SPAN,
+        lag=lag,
+        hz=hz,
+        w=w,
+    )
+    return {
+        "ic": ic(signal, **kwargs).mean(axis=[1]),
+        "ic1": ic1(signal, **kwargs).mean(axis=[1]),
+    }
 
 
 def _planned_trade_allowed(tradable):
@@ -133,12 +156,14 @@ def MPO(
 
     weights = cp.Variable((n_horizons, n_assets), name="weights")
     previous_weights = cp.Variable((n_assets,), name="previous_weights")
+    spread_cost = cp.Variable(name="spread_cost")
     delta = weights - cp.vstack([previous_weights, weights[:-1]])
     abs_delta = cp.abs(delta)
     constraints = [
         previous_weights == current_weights,
         cp.sum(delta, axis=1) == 0,
         abs_delta <= TRADE_BIG_M * trade_allowed,
+        cp.sum(cp.multiply(half_spread, abs_delta)) <= spread_cost,
     ]
     for h, risk_factor in enumerate(risk_factors):
         risk = cp.SOC(risk_radius, risk_factor @ weights[h])
@@ -147,7 +172,7 @@ def MPO(
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
-            + cp.sum(cp.multiply(half_spread, abs_delta))
+            + spread_cost
         ),
         constraints,
     )
@@ -172,7 +197,8 @@ def _formula(returns=None):
     # the first tradable row after reopening.
     clean_returns = where(tradable != 0, fillna(returns, 0.0), 0.0)
 
-    forecasts, yhat_signals, factors = [], [], []
+    forecasts, factors = [], []
+    alpha_pnl, yhat_pnl = {}, {}
     for start, end in zip(TRADE_STARTS, HORIZONS):
         width = end - start
         block_return = rolling_sum(clean_returns, width, min_periods=width)
@@ -202,15 +228,36 @@ def _formula(returns=None):
         )
         yhat = einsum(features, beta, "if,f->i")
         forecasts.append(fillna(yhat, 0.0))
-        yhat_signals.append(
-            purify(
-                yhat
-                / ewm_std(
-                    yhat,
-                    YHAT_VOL_SPAN,
-                    min_periods=YHAT_VOL_MIN_PERIODS,
-                )
+
+        horizon_key = f"{start}_{end}"
+        alpha_diagnostics = [
+            _diagnostic_pnls(
+                feature,
+                roll_rets=returns,
+                is_tradable=tradable,
+                w=fit_weights,
+                lag=start,
+                hz=width,
             )
+            for feature in feature_list
+        ]
+        alpha_pnl[horizon_key] = {
+            "ic": {
+                f"hl_{hl}": diagnostic["ic"]
+                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)
+            },
+            "ic1": {
+                f"hl_{hl}": diagnostic["ic1"]
+                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)
+            },
+        }
+        yhat_pnl[horizon_key] = _diagnostic_pnls(
+            yhat,
+            roll_rets=returns,
+            is_tradable=tradable,
+            w=fit_weights,
+            lag=start,
+            hz=width,
         )
 
         # Risk uses the total return of the same disjoint block, with no
@@ -229,8 +276,9 @@ def _formula(returns=None):
             psd_factor(fillna(covariance, 0.0), eigenvalue_floor=1e-8)
         )
 
+    forecast_matrix = cat(*forecasts)
     mpo = MPO(
-        expected_returns=cat(*forecasts),
+        expected_returns=forecast_matrix,
         half_spread=fillna(purify(hs), 0.0),
         current_weights=previous_solution("weights[0]", initial=0.0),
         risk_factor_0=factors[0],
@@ -255,116 +303,59 @@ def _formula(returns=None):
         get_field(mpo, "status"),
         float("nan"),
     )
-    risks = tuple(
-        where(
+    risk_values = {
+        f"{start}_{end}": where(
             session_open,
             get_field(mpo, f"risk_{h}.value"),
             float("nan"),
         )
-        for h in range(len(HORIZONS))
+        for h, (start, end) in enumerate(zip(TRADE_STARTS, HORIZONS))
+    }
+
+    mpo_spread_cost = where(
+        session_open,
+        get_field(mpo, "spread_cost"),
+        float("nan"),
     )
-    return (returns, features, cat(*yhat_signals), weights, status, *risks)
+    mpo_gross_pnl = (
+        fillna(shift(ffill(weights), 1), 0.0) * clean_returns
+    ).sum(axis=[1])
 
-
-def _purified_inverse_square(hs):
-    with np.errstate(divide="ignore", invalid="ignore"):
-        w = 1.0 / np.asarray(hs, dtype=float) ** 2
-    return np.where(np.isfinite(w), w, np.nan)
-
-
-def _normalize_rows(w, valid=None):
-    w = np.asarray(w, dtype=float)
-    if valid is not None:
-        w = np.where(valid, w, 0.0)
-    w = np.where(np.isfinite(w), w, 0.0)
-    total = w.sum(axis=1, keepdims=True)
-    return np.divide(w, total, out=np.zeros_like(w), where=total != 0.0)
-
-
-def _ic1_pnl(returns, signal, w, tradable, hs, *, lag, hz):
-    """Exact ic1 gross PnL plus aligned half-spread turnover cost."""
-    r = np.asarray(returns, dtype=float)
-    s = np.asarray(signal, dtype=float)
-    w = np.asarray(w, dtype=float)
-    if w.ndim == 0:
-        w = np.broadcast_to(w, r.shape).copy()
-    mask = pd.DataFrame(np.asarray(tradable, dtype=float)).fillna(0.0).ne(0.0)
-    position = pd.DataFrame(s).shift(lag).where(mask).ffill().fillna(0.0)
-
-    valid = np.isfinite(r)
-    weighted_return = np.where(valid, r, 0.0) * _normalize_rows(w, valid)
-    gross = (
-        pd.DataFrame(weighted_return)
-        .rolling(hz, min_periods=hz)
-        .mean()
-        .mul(position.shift(hz))
-        .sum(axis=1, min_count=1)
-        .to_numpy()
-    )
-
-    held_w = pd.DataFrame(w).where(mask).ffill().fillna(0.0).to_numpy()
-    holdings = position.to_numpy() * _normalize_rows(held_w)
-    previous = np.vstack([np.zeros((1, holdings.shape[1])), holdings[:-1]])
-    cost = np.sum(
-        np.abs(holdings - previous) * np.nan_to_num(hs, nan=0.0), axis=1
-    )
-    net = gross - pd.Series(cost).shift(hz).to_numpy() / hz
-    return gross, net
-
-
-def _portfolio_pnl(returns, weights, hs):
-    """Realized PnL of the actually implemented first-stage MPO portfolio."""
-    r = np.nan_to_num(np.asarray(returns, dtype=float), nan=0.0)
-    w = np.nan_to_num(np.asarray(weights, dtype=float), nan=0.0)
-    hs = np.nan_to_num(np.asarray(hs, dtype=float), nan=0.0)
-    carried = np.vstack([np.zeros((1, w.shape[1])), w[:-1]])
-    gross = np.sum(carried * r, axis=1)
-    cost = np.sum(np.abs(w - carried) * hs, axis=1)
-    return gross, gross - cost
+    return {
+        "returns": returns,
+        "features": features,
+        "weights": weights,
+        "status": status,
+        "mpo_spread_cost": mpo_spread_cost,
+        "mpo_gross_pnl": mpo_gross_pnl,
+        "risk": risk_values,
+        "alpha_pnl": alpha_pnl,
+        "yhat_pnl": yhat_pnl,
+    }
 
 
 def _cum(x):
     return np.cumsum(np.where(np.isfinite(x), x, 0.0))
 
 
-def _plot_diagnostics(
-    data,
-    returns,
-    features,
-    yhat_signals,
-    weights,
-    risk_values,
-    *,
-    plot_dir,
-):
+def _plot_diagnostics(data, values, *, plot_dir):
     plot_dir = Path(plot_dir)
     plot_dir.mkdir(parents=True, exist_ok=True)
     ts = np.asarray(data["_ev_ts"])
     ts = ts[:, 0] if ts.ndim > 1 else ts
     index = pd.to_datetime(pd.Series(ts).interpolate(), unit="us")
-    hs = np.asarray(data["vw_halfspread_out0"], dtype=float)
-    tradable = np.asarray(data["is_tradable_out0"], dtype=float)
-    alpha_w = _purified_inverse_square(hs)
     paths = []
 
-    for h, (start, end) in enumerate(zip(TRADE_STARTS, HORIZONS)):
-        hz = end - start
-
+    for start, end in zip(TRADE_STARTS, HORIZONS):
+        horizon_key = f"{start}_{end}"
+        diagnostics = values["alpha_pnl"][horizon_key]
         fig, ax = plt.subplots(figsize=(10, 5))
-        for j, hl in enumerate(FEATURE_HLS):
-            gross, net = _ic1_pnl(
-                returns,
-                features[:, :, j],
-                alpha_w,
-                tradable,
-                hs,
-                lag=start,
-                hz=hz,
-            )
-            ax.plot(index, _cum(gross), label=f"HL {hl} gross")
-            ax.plot(index, _cum(net), "--", label=f"HL {hl} net")
-        ax.set_title(f"Alpha PnL: horizon ({start}, {end}]")
-        ax.set_ylabel("Cumulative ic1 PnL")
+        for label, pnl in diagnostics["ic"].items():
+            ax.plot(index, _cum(pnl), label=f"{label} ic")
+        for label, pnl in diagnostics["ic1"].items():
+            ax.plot(index, _cum(pnl), "--", label=f"{label} ic1")
+        ax.set_title(f"Alpha PnL: horizon ({start}, {end}] — ic vs ic1")
+        ax.set_ylabel("Cumulative PnL")
         ax.legend(ncol=2, fontsize=8)
         ax.grid(alpha=0.2)
         fig.tight_layout()
@@ -373,19 +364,12 @@ def _plot_diagnostics(
         plt.close(fig)
         paths.append(path)
 
+        yhat = values["yhat_pnl"][horizon_key]
         fig, ax = plt.subplots(figsize=(10, 5))
-        gross, _ = _ic1_pnl(
-            returns,
-            yhat_signals[:, :, h],
-            alpha_w,
-            tradable,
-            hs,
-            lag=start,
-            hz=hz,
-        )
-        ax.plot(index, _cum(gross), label="gross")
+        ax.plot(index, _cum(yhat["ic"]), label="ic")
+        ax.plot(index, _cum(yhat["ic1"]), "--", label="ic1")
         ax.set_title(f"Aggregated Ridge yhat PnL: horizon ({start}, {end}]")
-        ax.set_ylabel("Cumulative ic1 PnL")
+        ax.set_ylabel("Cumulative PnL")
         ax.legend()
         ax.grid(alpha=0.2)
         fig.tight_layout()
@@ -394,11 +378,9 @@ def _plot_diagnostics(
         plt.close(fig)
         paths.append(path)
 
-    gross, net = _portfolio_pnl(returns, weights, hs)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(index, _cum(gross), label="gross")
-    ax.plot(index, _cum(net), "--", label="net")
-    ax.set_title("Implemented MPO portfolio PnL")
+    ax.plot(index, _cum(values["mpo_gross_pnl"]), label="gross")
+    ax.set_title("Implemented MPO portfolio gross PnL")
     ax.set_ylabel("Cumulative realized PnL")
     ax.legend()
     ax.grid(alpha=0.2)
@@ -409,8 +391,20 @@ def _plot_diagnostics(
     paths.append(path)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    for (start, end), value in zip(zip(TRADE_STARTS, HORIZONS), risk_values):
-        value = np.asarray(value, dtype=float)
+    ax.plot(index, _cum(values["mpo_spread_cost"]), label="planned spread cost")
+    ax.set_title("MPO objective spread cost")
+    ax.set_ylabel("Cumulative planned cost")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    path = plot_dir / "mpo_spread_cost.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for start, end in zip(TRADE_STARTS, HORIZONS):
+        value = np.asarray(values["risk"][f"{start}_{end}"], dtype=float)
         ax.plot(index, np.linalg.norm(value[:, 1:], axis=1), label=f"({start}, {end}]")
     ax.axhline(RISK_RADIUS, linestyle="--", label="constraint")
     ax.set_title("MPO risk constraint")
@@ -430,7 +424,7 @@ def _run(data, *, returns=None, output_dir=CACHE):
     output_dir.mkdir(parents=True, exist_ok=True)
     n_assets = data["is_tradable_out0"].shape[1]
     runtime = compile_formula(
-        list(_formula(returns)),
+        _formula(returns),
         data,
         n_instruments=n_assets,
     )
@@ -442,18 +436,7 @@ def _run(data, *, returns=None, output_dir=CACHE):
 
     result = runtime.run(out_path=output_dir / "result.npy")
     values = result.load()
-    realized_returns, features, yhat_signals, weights, status = values[:5]
-    risk_values = values[5:]
-    _ = status  # Returned for audit; plotting uses weights and constraint values.
-    paths = _plot_diagnostics(
-        data,
-        realized_returns,
-        features,
-        yhat_signals,
-        weights,
-        risk_values,
-        plot_dir=output_dir / "plots",
-    )
+    paths = _plot_diagnostics(data, values, plot_dir=output_dir / "plots")
     return result, paths
 
 
