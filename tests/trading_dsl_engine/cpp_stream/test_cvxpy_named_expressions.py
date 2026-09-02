@@ -8,6 +8,7 @@ import numpy as np
 from trading_dsl_engine.base.dsl import var
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import cvxpy_program, get_field
+from trading_dsl_engine.ir.types import VECTOR
 
 
 def test_factory_can_return_named_scalar_expression_without_adding_problem_rows(tmp_path: Path):
@@ -29,6 +30,14 @@ def test_factory_can_return_named_scalar_expression_without_adding_problem_rows(
     assert set(named) == {"abs_loss"}
     assert [variable.name() for variable in problem.variables()] == ["x"]
     assert len(problem.constraints) == 1
+
+    prototype = program.resolve_for_types(
+        {"target": VECTOR},
+        requested_fields=frozenset({"x", "abs_loss"}),
+        n_instruments=None,
+    )
+    assert prototype.resolve_field("abs_loss").kind == "expression_value"
+    assert prototype.resolve_field("abs_loss").logical_shape == ()
 
 
 def test_named_scalar_expression_projects_native_postsolve_value(tmp_path: Path):
