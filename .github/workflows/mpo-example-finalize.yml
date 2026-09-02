@@ -1,0 +1,180 @@
+name: MPO example finalize
+
+on:
+  push:
+    branches: [agent/mpo-objective-horizon-verify]
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/mpo-objective-horizon-cleanup
+          fetch-depth: 0
+      - name: Apply MPO horizon and plotting changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('examples/cpp_stream_mpo_one_pass.py')
+          text = path.read_text()
+
+          def one(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one anchor, found {count}: {old!r}')
+              text = text.replace(old, new, 1)
+
+          one(
+              'HORIZONS = (1, 2, 4, 8, 16, 32, 64, 128)\nTRADE_STARTS = (0,) + HORIZONS[:-1]\n',
+              'HORIZONS = (2, 4, 8, 16, 32, 64, 128)\nTRADE_STARTS = (1,) + HORIZONS[:-1]\n',
+          )
+
+          # The first remaining block is (1,2], so its rebalance is at t+1,
+          # not at the current row. All planned trades use scheduled sessions.
+          one(
+              '''    allowed = [tradable]\n    for start in TRADE_STARTS[1:]:\n        trade_ts = ts + start * MINUTE_US\n''',
+              '''    allowed = []\n    for start in TRADE_STARTS:\n        trade_ts = ts + start * MINUTE_US\n''',
+          )
+
+          one('    risk_factor_7,\n', '')
+          one('                risk_factor_7,\n', '')
+          one('        risk_factor_7=factors[7],\n', '')
+
+          one(
+              '''        ts_zscore(\n            returns,\n''',
+              '''        -ts_zscore(\n            returns,\n''',
+          )
+
+          one('    spread_cost = cp.Variable(name="spread_cost")\n', '')
+          one(
+              '''        abs_delta <= TRADE_BIG_M * trade_allowed,\n        cp.sum(cp.multiply(half_spread, abs_delta)) <= spread_cost,\n''',
+              '''        abs_delta <= TRADE_BIG_M * trade_allowed,\n''',
+          )
+          one(
+              '''    return cp.Problem(\n        cp.Minimize(\n            -cp.sum(cp.multiply(expected_returns, weights))\n            + spread_cost\n        ),\n        constraints,\n    )\n''',
+              '''    spread_cost = cp.sum(cp.multiply(half_spread, abs_delta))\n    problem = cp.Problem(\n        cp.Minimize(\n            -cp.sum(cp.multiply(expected_returns, weights))\n            + spread_cost\n        ),\n        constraints,\n    )\n    return problem, {"spread_cost": spread_cost}\n''',
+          )
+
+          one(
+              '''    status = where(\n        session_open,\n        get_field(mpo, "status"),\n        float("nan"),\n    )\n''',
+              '''    status = where(\n        session_open,\n        get_field(mpo, "status"),\n        float("nan"),\n    )\n    mpo_objective = where(\n        session_open,\n        get_field(mpo, "objective"),\n        float("nan"),\n    )\n''',
+          )
+          one(
+              '''        "mpo_spread_cost": mpo_spread_cost,\n        "mpo_gross_pnl": mpo_gross_pnl,\n''',
+              '''        "mpo_spread_cost": mpo_spread_cost,\n        "mpo_objective": mpo_objective,\n        "mpo_gross_pnl": mpo_gross_pnl,\n''',
+          )
+
+          # Add the objective plot immediately after the spread-cost plot.
+          anchor = '''    path = plot_dir / "mpo_spread_cost.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    for start, end in zip(TRADE_STARTS, HORIZONS):\n'''
+          replacement = '''    path = plot_dir / "mpo_spread_cost.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    ax.plot(index, _cum(values["mpo_objective"]), label="objective")\n    ax.set_title("MPO objective")\n    ax.set_ylabel("Cumulative objective")\n    ax.legend()\n    ax.grid(alpha=0.2)\n    fig.tight_layout()\n    path = plot_dir / "mpo_objective.png"\n    fig.savefig(path, dpi=150)\n    plt.close(fig)\n    paths.append(path)\n\n    fig, ax = plt.subplots(figsize=(10, 5))\n    for start, end in zip(TRADE_STARTS, HORIZONS):\n'''
+          one(anchor, replacement)
+
+          # User explicitly requested show immediately after every tight_layout.
+          text, count = re.subn(
+              r'(?m)^(\s*)fig\.tight_layout\(\)\n(?!\1plt\.show\(\)\n)',
+              r'\1fig.tight_layout()\n\1plt.show()\n',
+              text,
+          )
+          if count != 6:
+              raise SystemExit(f'expected to add six plt.show calls, added {count}')
+
+          path.write_text(text)
+          compile(text, str(path), 'exec')
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add examples/cpp_stream_mpo_one_pass.py
+          git commit -m 'Refine MPO horizons and objective diagnostics'
+          git push origin HEAD:agent/mpo-objective-horizon-cleanup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[optimizer]' graphviz
+      - name: Run focused regressions
+        env:
+          PYTHONPATH: src:.
+          MPLBACKEND: Agg
+        run: >-
+          python -m pytest -q -o addopts=''
+          tests/examples/test_cpp_stream_mpo_diagnostics.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_named_expressions.py
+          tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+      - name: Run native one-pass smoke
+        env:
+          PYTHONPATH: src:.
+          MPLBACKEND: Agg
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import tempfile
+          import numpy as np
+          import examples.cpp_stream_mpo_one_pass as example
+
+          rows, assets = 320, 3
+          rng = np.random.default_rng(73)
+          returns = rng.normal(scale=2e-4, size=(rows, assets))
+          tradable = np.ones((rows, assets), dtype=float)
+          tradable[140:150] = 0.0
+          returns[140:150] = 0.0
+          hs = np.full((rows, assets), 8e-5)
+          ts = np.arange(rows, dtype=float) * example.MINUTE_US + 1_800_000_000_000_000.0
+          broad_start = np.full((rows, assets), ts[0] - 10 * example.MINUTE_US)
+          broad_end = np.full((rows, assets), ts[-1] + 500 * example.MINUTE_US)
+          data = {
+              'returns': returns,
+              'is_tradable_out0': tradable,
+              'vw_halfspread_out0': hs,
+              '_ev_ts': ts,
+              'session_start0': broad_start,
+              'session_end0': broad_end,
+              'next_session_start0': broad_start,
+              'next_session_end0': broad_end,
+          }
+          example.FEATURE_HLS = (2, 4, 8, 16)
+          example.IC_VOL_SPAN = 32
+          example.RIDGE_HL = 64
+          example.RISK_SPAN = 32
+          example.RISK_MIN_PERIODS = 8
+
+          with tempfile.TemporaryDirectory() as directory:
+              result, paths = example._run(
+                  data,
+                  returns=example.var('returns'),
+                  output_dir=Path(directory),
+              )
+              values = result.load(mmap_mode=None)
+              assert result.rows == rows
+              assert len(paths) == 18, len(paths)
+              assert values['mpo_spread_cost'].shape == (rows,)
+              assert values['mpo_objective'].shape == (rows,)
+              assert np.isnan(values['weights'][140:150]).all()
+              assert np.isnan(values['status'][140:150]).all()
+              assert np.isnan(values['mpo_spread_cost'][140:150]).all()
+              assert np.isnan(values['mpo_objective'][140:150]).all()
+              assert len(values['risk']) == 7
+              assert len(values['alpha_pnl']) == 7
+              assert len(values['yhat_pnl']) == 7
+              assert (Path(directory) / 'plots' / 'mpo_objective.png').is_file()
+              print('rows', result.rows, 'seconds', result.seconds, 'plots', len(paths))
+          PY
+      - name: Verify diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin agent/strongly-typed-gp
+          git diff --check origin/agent/strongly-typed-gp...HEAD
+          git diff --name-only origin/agent/strongly-typed-gp...HEAD
