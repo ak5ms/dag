@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import cvxpy as cp
 import numpy as np
 
@@ -65,26 +67,35 @@ def test_diagnostic_pnls_scalarize_xs_broadcast(monkeypatch):
     assert "axis" in repr(actual["ic1"])
 
 
-def test_formula_returns_alpha_search_diagnostics_and_named_spread_cost():
+def test_formula_uses_only_future_tradeable_horizons_and_negative_zscores():
     formula = example._formula(var("returns"))
 
-    assert isinstance(formula, dict)
+    assert example.HORIZONS == (2, 4, 8, 16, 32, 64, 128)
+    assert example.TRADE_STARTS == (1, 2, 4, 8, 16, 32, 64)
+    assert "0_1" not in formula["alpha_pnl"]
     assert set(formula) >= {
         "returns",
         "features",
         "weights",
         "status",
-        "mpo_spread_cost",
+        "mpo_objective",
         "mpo_gross_pnl",
         "risk",
         "alpha_pnl",
         "yhat_pnl",
     }
-    spread_cost = repr(formula["mpo_spread_cost"])
-    assert "spread_cost" in spread_cost
-    assert "objective" not in spread_cost
+    assert "mpo_spread_cost" not in formula
+    assert "objective" in repr(formula["mpo_objective"])
     assert len(formula["alpha_pnl"]) == len(example.HORIZONS)
     assert len(formula["yhat_pnl"]) == len(example.HORIZONS)
+
+    features = formula["features"]
+    assert features.fn == "cat"
+    assert len(features.args) == len(example.FEATURE_HLS)
+    for feature in features.args:
+        assert feature.fn == "sub"
+        assert feature.args[0].value == 0.0
+
     for horizon in formula["alpha_pnl"].values():
         assert set(horizon) == {"ic", "ic1"}
         assert len(horizon["ic"]) == len(example.FEATURE_HLS)
@@ -93,7 +104,7 @@ def test_formula_returns_alpha_search_diagnostics_and_named_spread_cost():
         assert set(horizon) == {"ic", "ic1"}
 
 
-def test_mpo_exposes_spread_cost_as_generic_named_primal():
+def test_mpo_prices_spread_directly_in_objective_without_spread_constraint():
     n_horizons = len(example.HORIZONS)
     n_assets = 3
     zeros = np.zeros((n_horizons, n_assets))
@@ -107,6 +118,7 @@ def test_mpo_exposes_spread_cost_as_generic_named_primal():
         example.RISK_RADIUS,
     )
     assert problem.is_dpp()
+    assert len(problem.constraints) == 3 + n_horizons
 
     rng = np.random.default_rng(51)
     parameter_values = {
@@ -130,14 +142,31 @@ def test_mpo_exposes_spread_cost_as_generic_named_primal():
     assert problem.status in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 
     variables = {variable.name(): variable for variable in problem.variables()}
-    assert set(variables) == {"weights", "previous_weights", "spread_cost"}
+    assert set(variables) == {"weights", "previous_weights"}
     weights = np.asarray(variables["weights"].value)
     current = parameter_values["current_weights"]
     delta = weights - np.vstack([current, weights[:-1]])
     direct_cost = np.sum(parameter_values["half_spread"] * np.abs(delta))
+    expected_objective = (
+        -np.sum(parameter_values["expected_returns"] * weights) + direct_cost
+    )
     np.testing.assert_allclose(
-        float(variables["spread_cost"].value),
-        direct_cost,
+        float(problem.value),
+        expected_objective,
         rtol=2e-7,
         atol=2e-10,
     )
+
+
+def test_plot_diagnostics_shows_every_figure_and_cumsums_objective():
+    source = inspect.getsource(example._plot_diagnostics)
+    lines = source.splitlines()
+    tight_layout_lines = [
+        index for index, line in enumerate(lines) if "fig.tight_layout()" in line
+    ]
+    assert tight_layout_lines
+    for index in tight_layout_lines:
+        assert lines[index + 1].strip() == "plt.show()"
+
+    assert '_cum(values["mpo_objective"])' in source
+    assert '"mpo_objective.png"' in source
