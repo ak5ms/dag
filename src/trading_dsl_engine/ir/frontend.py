@@ -162,7 +162,14 @@ def _number_key(value: int | float) -> tuple:
     return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
-def _expr_key(node: Expr) -> tuple:
+_EXPR_KEY_ID_MEMO: dict[int, tuple] = {}
+
+
+def clear_expr_key_id_memo() -> None:
+    _EXPR_KEY_ID_MEMO.clear()
+
+
+def _expr_key_uncached(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
@@ -213,7 +220,9 @@ def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Call):
         args = tuple(_expr_key(arg) for arg in node.args)
         if node.fn in _COMMUTATIVE_NARY and len(args) == 2:
-            args = tuple(sorted(args, key=repr))
+            # Tuple keys are structurally orderable; repr() on deep nested keys
+            # grows exponentially for boolean/session logic chains.
+            args = tuple(sorted(args))
         return (
             "call",
             node.fn,
@@ -221,6 +230,15 @@ def _expr_key(node: Expr) -> tuple:
             tuple((name, _expr_key(value)) for name, value in node.kwargs),
         )
     raise FormulaIRCompileError(f"unhandled expression {node!r}")
+
+
+def _expr_key(node: Expr) -> tuple:
+    cached = _EXPR_KEY_ID_MEMO.get(id(node))
+    if cached is not None:
+        return cached
+    result = _expr_key_uncached(node)
+    _EXPR_KEY_ID_MEMO[id(node)] = result
+    return result
 
 
 def _contains_self(node: Expr) -> bool:
@@ -1632,4 +1650,4 @@ def compile_ir(
     return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
 
 
-__all__ = ["FormulaIRCompileError", "compile_ir"]
+__all__ = ["FormulaIRCompileError", "clear_expr_key_id_memo", "compile_ir"]

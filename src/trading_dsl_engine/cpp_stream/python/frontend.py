@@ -107,6 +107,7 @@ def compile_ir(
     # cpp_stream currently extends the neutral frontend's tensor broadcasting and
     # shape-preserving temporal semantics. Keep that compatibility shim confined to
     # IR construction; lowering/codegen are imported explicitly by compile.py.
+    neutral_frontend.clear_expr_key_id_memo()
     with _COMPILE_LOCK:
         original_nary = neutral_frontend._nary_result_type
         original_lane_state = neutral_frontend._lane_state_result_type
