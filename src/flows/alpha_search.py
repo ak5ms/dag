@@ -175,6 +175,24 @@ def ic(
     )
 
 
+def _ic1_terms(s, *, roll_rets, is_tradable, lag: int = 0, hz: int = 1, w=1):
+    """Matured (predictor, mean return, origin weight) used by ``ic1``.
+
+    ``s`` is already in the caller's desired units. In particular, Ridge can
+    pass alpha * sigma while ``ic1`` passes alpha / sigma. Both then use the
+    identical lag -> session hold -> horizon maturation, including the weight
+    frozen at the position observation. No future shift is needed.
+    """
+    position, clean_rets, weight = _ic_terms(
+        s, roll_rets=roll_rets, is_tradable=is_tradable, w=w, lag=lag,
+    )
+    return (
+        shift(position, hz),
+        rolling_mean(clean_rets, hz, min_periods=hz),
+        shift(weight, hz),
+    )
+
+
 def ic1(
     s,
     *,
@@ -185,23 +203,12 @@ def ic1(
     hz: int = 1,
     w=1,
 ):
-    position, clean_rets, weight = _ic_terms(
-        s=s / ewm_std(roll_rets, span=hl),
-        roll_rets=roll_rets,
-        is_tradable=is_tradable,
-        w=w,
-        lag=lag,
+    position, mean_return, weight = _ic1_terms(
+        s / ewm_std(roll_rets, span=hl),
+        roll_rets=roll_rets, is_tradable=is_tradable, w=w, lag=lag, hz=hz,
     )
+    return xs_sum(position * mean_return * weight)
 
-    return xs_sum(
-        rolling_mean(
-            clean_rets,
-            hz,
-            min_periods=hz,
-        )
-        * shift(position, hz)
-        * shift(weight, hz)
-    )
 
 def default_alpha_pnl(alpha: Expr, *, roll_rets: Expr, is_tradable: Expr, hl: Expr | float, lag: int = 0, hz: Expr | int = 1) -> Expr:
     alpha_scaled = alpha / ewm_std(roll_rets, span=hl)

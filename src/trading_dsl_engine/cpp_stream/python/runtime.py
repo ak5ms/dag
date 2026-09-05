@@ -267,6 +267,7 @@ class CppStreamRuntime:
             4: "group capacity exceeded or dense key fell outside its declared domain",
             5: "lane-parallel public outputs are not partitionable by instrument",
             6: "output payload offset is not aligned for float64",
+            7: "optimizer non-solution cannot be used for feedback (infeasible, unbounded, or failed solve)",
         }
         base = meanings.get(code, f"native runtime returned error code {code}")
         raise RuntimeError(

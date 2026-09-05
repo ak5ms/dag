@@ -209,3 +209,19 @@ This backend must remain independent of `jax_flat`.
   row loop. Do not reintroduce a post-batch optimizer pass or historical input
   materialization. Render generated adapter C++ through the optimizer Jinja
   templates rather than handwritten source-string assembly.
+
+## Alignment and failed-solve checks
+
+- Sequential Clarabel stages use `on_data_checked` and propagate native error
+  code 7 for a non-solution before any feedback cache is updated. Only solved
+  and almost-solved results can become portfolio feedback. Non-feedback
+  programs retain their status/certificate inspection behavior.
+- Ridge XX, XY, and metric statistics freeze independently on missing
+  observations and resume with the usual alpha, not alpha**gap.
+- Keep CVXPY's existing column-major binding: DSL `(asset, horizon)` buffers
+  become `(horizon, asset)` parameters. A PSD factor L with S=L L' reaches
+  CVXPY as L', so the SOC computes sqrt(w' S w). Do not transpose twice.
+- The MPO example's native ablations are in
+  `tests/examples/test_cpp_stream_mpo_diagnostics.py`; exercise the beta=1
+  identity, independent normal equations, causal prefixes, raw gaps, valid
+  zero returns, actual execution, and transaction costs.

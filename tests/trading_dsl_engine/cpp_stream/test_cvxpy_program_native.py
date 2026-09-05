@@ -258,7 +258,7 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
         "risk_factor",
     ]
     assert manifest["parameters"][-1]["dirty_blocks"] == ["A"]
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert len(manifest["duals"]) == len(_mpo_problem().constraints)
 
 
@@ -614,7 +614,7 @@ def test_warm_generated_solver_hot_path_has_zero_allocations(tmp_path: Path):
                 node.setup();
                 auto solve = [&](int iteration) {
                     context.lower[0] = 1e-6 * iteration;
-                    node.on_data(context);
+                    if (!node.on_data_checked(context)) std::abort();
                     return context.output[0];
                 };
                 volatile double checksum = 0.0;

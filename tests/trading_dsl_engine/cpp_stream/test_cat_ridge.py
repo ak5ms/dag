@@ -86,7 +86,7 @@ def _stateful_pairwise_reference(
         for j in range(k):
             if xy_valid[j]:
                 if has_xy[j]:
-                    decay = alpha ** (t - last_xy[j])
+                    decay = alpha
                     xy[j] = xy[j] + decay * (xy_new[j] - xy[j])
                 else:
                     xy[j] = xy_new[j]
@@ -95,7 +95,7 @@ def _stateful_pairwise_reference(
             for ell in range(k):
                 if xx_valid[j, ell]:
                     if has_xx[j, ell]:
-                        decay = alpha ** (t - last_xx[j, ell])
+                        decay = alpha
                         xx[j, ell] = xx[j, ell] + decay * (xx_new[j, ell] - xx[j, ell])
                     else:
                         xx[j, ell] = xx_new[j, ell]
@@ -310,3 +310,24 @@ def test_nonnegative_ridge_active_set_matches_bruteforce_kkt_reference(tmp_path:
         rhs = features[row].T @ y[row]
         expected[row] = _nnqp_reference(system, rhs)
     np.testing.assert_allclose(actual, expected, rtol=2e-8, atol=2e-8)
+
+
+def test_ridge_reopening_update_uses_observation_clock_not_alpha_power_gap(tmp_path):
+    import pandas as pd
+    from trading_dsl_engine.base.dsl import Ridge, get_beta, var
+    rows, n = 60, 2
+    x = np.ones((rows, n))
+    y = np.ones_like(x)
+    x[4:54] = np.nan
+    y[4:54] = np.nan
+    y[54:] = -2.0
+    half_life = 4.0
+    formula = get_beta(Ridge(var('x'), y=var('y'), hl=half_life, lambda_=0.0))
+    runtime = compile_formula(formula, {'x': x, 'y': y}, n_instruments=n)
+    result = runtime.run(out_path=tmp_path / 'gap.npy').load()
+    xy = pd.Series(np.where(np.isfinite(y).all(axis=1), np.nansum(x*y, axis=1), np.nan))
+    xx = pd.Series(np.where(np.isfinite(x).all(axis=1), np.nansum(x*x, axis=1), np.nan))
+    expected = (xy.ewm(halflife=half_life, adjust=False, ignore_na=True).mean()
+                / xx.ewm(halflife=half_life, adjust=False, ignore_na=True).mean())
+    np.testing.assert_allclose(np.asarray(result).reshape(rows), expected, atol=2e-13, rtol=2e-13)
+    assert result[54] < .6  # a long closure must not discard the opening observation

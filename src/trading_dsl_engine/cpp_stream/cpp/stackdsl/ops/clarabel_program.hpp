@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "stackdsl/ops/einsum.hpp"
 #include "stackdsl/utils.hpp"
@@ -271,11 +272,11 @@ public:
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
-    STACKDSL_HOT void on_data(Context& ctx) {
+    STACKDSL_HOT bool on_data_checked(Context& ctx) noexcept {
         if constexpr (!std::is_same_v<Guard, ClarabelAlwaysEnabled>) {
             if (ctx.template read<Guard>(0) == 0.0) {
                 (project_nan<Projections>(ctx), ...);
-                return;
+                return true;
             }
         }
         bool changed = false;
@@ -284,10 +285,21 @@ public:
         // parameters imply an identical problem and the cached result is valid.
         if (changed || !has_solution_) {
             program_.solve();
+            if constexpr ((Bindings::feedback || ...)) {
+                const auto status = program_.result().status;
+                using Status = std::remove_cv_t<decltype(status)>;
+                if (status != Status::ClarabelSolved
+                    && status != Status::ClarabelAlmostSolved) {
+                    // Infeasible/unbounded solves return certificates, NOT
+                    // portfolios. Never let one become the next carried state.
+                    return false;
+                }
+            }
             has_solution_ = true;
         }
         (cache_feedback_result<Bindings>(), ...);
         (project<Projections>(ctx), ...);
+        return true;
     }
 };
 

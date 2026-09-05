@@ -139,7 +139,7 @@ struct CppStreamPlanRunner {
 {% for stage in stages %}
 {% if not stage.final_on_data %}
 {% if stage.checked %}
-            if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
+            if (!s{{ stage.index }}.on_data_checked(ctx)) return {{ stage.error_code }};
 {% else %}
             s{{ stage.index }}.on_data(ctx);
 {% endif %}
@@ -157,7 +157,7 @@ struct CppStreamPlanRunner {
 {% for stage in stages %}
 {% if stage.final_on_data %}
 {% if stage.checked %}
-        if (!s{{ stage.index }}.on_data_checked(ctx)) return 4;
+        if (!s{{ stage.index }}.on_data_checked(ctx)) return {{ stage.error_code }};
 {% else %}
         s{{ stage.index }}.on_data(ctx);
 {% endif %}

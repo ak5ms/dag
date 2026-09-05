@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 import struct
+import weakref
 
 from trading_dsl_engine.base.custom import StatelessCall
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -162,7 +163,7 @@ def _number_key(value: int | float) -> tuple:
     return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
-_EXPR_KEY_ID_MEMO: dict[int, tuple] = {}
+_EXPR_KEY_ID_MEMO: dict[int, tuple[weakref.ReferenceType[Expr], tuple]] = {}
 
 
 def clear_expr_key_id_memo() -> None:
@@ -233,11 +234,21 @@ def _expr_key_uncached(node: Expr) -> tuple:
 
 
 def _expr_key(node: Expr) -> tuple:
-    cached = _EXPR_KEY_ID_MEMO.get(id(node))
-    if cached is not None:
-        return cached
+    # Macro expansion creates short-lived ASTs. CPython can recycle their ids
+    # DURING the same compile, so a bare id -> key cache corrupts CSE. A weak
+    # identity guard prevents aliasing without retaining entire expanded DAGs.
+    identity = id(node)
+    cached = _EXPR_KEY_ID_MEMO.get(identity)
+    if cached is not None and cached[0]() is node:
+        return cached[1]
     result = _expr_key_uncached(node)
-    _EXPR_KEY_ID_MEMO[id(node)] = result
+
+    def forget(reference):
+        current = _EXPR_KEY_ID_MEMO.get(identity)
+        if current is not None and current[0] is reference:
+            del _EXPR_KEY_ID_MEMO[identity]
+
+    _EXPR_KEY_ID_MEMO[identity] = (weakref.ref(node, forget), result)
     return result
 
 

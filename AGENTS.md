@@ -158,3 +158,24 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ## Future roadmap hints
 
 Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+
+## IC-aligned native MPO invariants
+
+- The MPO example's dimensionless alphas follow `scratch_10.py` cleaning,
+  EWM **span**, cross-sectional rank, and Gaussianization semantics. Ridge
+  consumes `alpha * return_vol`, not raw alpha or inverse-vol positions.
+- Keep `ic1` and Ridge sample construction on `_ic1_terms` / `_ic_terms`.
+  Normalize/hold liquidity at its observation anchor, not target maturity.
+  Convert mean-return forecasts to block totals once; do not add a beta lag.
+- Keep signal-cleaned returns separate from raw finite portfolio/risk returns.
+  A full reopening gap is never divided by elapsed closed minutes. A valid
+  open-session zero return is a risk observation, unlike a closed placeholder.
+- Native Ridge missing-statistic updates follow observation-clock EWM: the
+  next update is alpha, never alpha raised to a missing-row count.
+- Do not confuse queued optimizer targets with executed holdings. A signal
+  observed at a bar's VWAP cannot earn that same VWAP-to-next-bar return.
+- Failed sequential optimizer solves must stop before updating feedback;
+  infeasibility certificates are not holdings. Propagate a checked error from
+  the noexcept runner rather than throwing inside its hot loop.
+- Expression identity caches must validate or retain the referenced object;
+  bare id-to-key caches alias temporary macro ASTs when Python reuses IDs.

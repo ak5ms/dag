@@ -73,3 +73,13 @@ def test_header_digest_cache_invalidates_after_header_edit(tmp_path):
     header.write_text("#define VALUE 22\n")
     second = compile_module._header_digest(str(cpp_root), str(eigen_root))
     assert second != first
+
+
+def test_expression_key_cache_does_not_alias_recycled_python_objects():
+    from trading_dsl_engine.base.parser import Number
+    from trading_dsl_engine.ir.frontend import _expr_key, clear_expr_key_id_memo
+    clear_expr_key_id_memo()
+    # Expansion creates temporary ASTs. Their Python ids can be reused while
+    # one compilation is still running, so id alone is not an identity guard.
+    for value in range(2000):
+        assert _expr_key(Number(value)) == ('num', ('int', value))

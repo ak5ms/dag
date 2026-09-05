@@ -1388,6 +1388,7 @@ class StageView:
     index: int
     cpp_type: str
     checked: bool = False
+    error_code: int = 4
     final_on_data: bool = False
     finalizer: bool = False
 
@@ -1588,6 +1589,8 @@ def render_translation_unit(
                     _stage_type(
                         stage, n, direct, input_types=input_types
                     ).render(),
+                    checked=stage.kind in {"clarabel", "clarabel_bundle"},
+                    error_code=7 if stage.kind in {"clarabel", "clarabel_bundle"} else 4,
                     final_on_data=stage.final_only,
                     finalizer=stage.kind in {
                         "reduce", "reduction_bundle", "emit_last"

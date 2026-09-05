@@ -1,0 +1,29 @@
+{
+  "base_commit": "834eebe165c2c6832c8328c76c00fa596ce815ae",
+  "rows": 360,
+  "vol_span": 24,
+  "ridge_halflife": 30,
+  "ridge_lambda": 0.1,
+  "feature_spans": [
+    4,
+    16
+  ],
+  "cases": {
+    "3": {
+      "beta_vs_normal_equations_max_abs_error": 8.881784197001252e-16,
+      "yhat_vs_normal_equations_max_abs_error": 1.734723475976807e-18,
+      "beta_one_ic_and_ic1_max_abs_error": 1.3322676295501878e-15,
+      "double_return_units_beta_max_abs_error": 0.0,
+      "double_return_units_yhat_vs_twice_original_max_abs_error": 1.0842021724855044e-19,
+      "horizons_checked": 7
+    },
+    "9": {
+      "beta_vs_normal_equations_max_abs_error": 6.106226635438361e-16,
+      "yhat_vs_normal_equations_max_abs_error": 2.6020852139652106e-18,
+      "beta_one_ic_and_ic1_max_abs_error": 1.4210854715202004e-14,
+      "double_return_units_beta_max_abs_error": 0.0,
+      "double_return_units_yhat_vs_twice_original_max_abs_error": 0.0,
+      "horizons_checked": 7
+    }
+  }
+}

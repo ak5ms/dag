@@ -127,7 +127,7 @@ suffix, only once during finalization.
 - Ridge feature args can be vectors and/or matrices; matrix features are expanded by columns internally, so `Ridge(bspline(...), y, w, hl, lambda)` works without manual `col(...)` calls.
 - Explicit `weights` can be a scalar, a vector `(n, 1)`/`(n,)` of sample weights, or a dense matrix `(n, n)` for `X'WX`/`X'Wy` weighting; scalar weights are broadcast per instrument.
 - State uses pairwise-NaN-aware exponentially weighted sufficient statistics (`X'WX`, `X'Wy`) with per-statistic clocks, then solves `beta = (G + lambda * diag(G))^-1 h` fresh each tick.
-- Pairwise clocks only advance when the corresponding `xx[j, k]` or `xy[j]` statistic receives at least one finite observation; missing rows or full outages leave only the affected statistics unchanged.
+- Pairwise clocks only advance when the corresponding `xx[j, k]` or `xy[j]` statistic receives at least one finite observation; missing rows or full outages leave only the affected statistics unchanged. In `cpp_stream`, the next observed statistic uses the ordinary update weight `alpha = 1 - 2**(-1/hl)` (pandas `adjust=False, ignore_na=True`), never `alpha**gap`.
 - A visual checklist for NaN behavior is available in `docs/ewm_regression_nan_handling.svg`.
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
@@ -257,11 +257,30 @@ returns, the native risk covariance flow, PSD factorization, a persistent
 direct Clarabel MPO solve, and downstream PnL in one generated temporal loop.
 The optimizer inputs are not materialized and replayed in a second pass.
 
+The example uses `xs_gauss(xs_rank(-ts_zscore(clean_returns, span)))` and
+regresses on **alpha times return volatility**. `_ic1_terms` shares the public
+`ic1` session-held predictor, return-window, and observation-weight alignment;
+Ridge predicts a window mean and the MPO receives its total exactly once.
+`_formula(beta_override=1.0, fit_weights=1)` enables the identity ablation, and
+`fit_weights` also accepts a caller-supplied liquidity expression. Diagnostics
+convert return-unit `yhat` back to alpha units before calling `ic`/`ic1` and
+match `scratch_10.py`'s instrument **sum**.
+
+Orders generated at row `t` execute at row `t+1`'s VWAP and first earn return
+`t+2`. Planned and executed portfolios are separate outputs. Closed or
+missing-quote lanes hold their actually executed position; full reopening
+returns enter realized PnL and risk, even if excluded by feature cleaning.
+Feedback solvers fail with a checked runtime error instead of carrying an
+infeasibility certificate as portfolio weights. Hard risk constraints are not
+silently relaxed. See [`docs/mpo_ic_alignment.md`](docs/mpo_ic_alignment.md)
+for the ablations, timing equations, calendar assumptions, and limitations.
+
 Define a DPP-compliant problem once with `@cvxpy_program`, explicitly declaring
 its shaped `cp.Parameter` objects and attributes inside the function, then call
 that same function with DSL expressions. `previous_solution("weights[0]",
-initial=0.0)` feeds the prior solve's actual first-horizon portfolio into the
-next row; it automatically makes the stage sequential. Independent programs
+initial=0.0)` feeds the prior solve's first-horizon **plan** into the
+next row; it automatically makes the stage sequential. Execution timing is a
+modeling decision, not a property of this feedback edge. Independent programs
 remain eligible for row-parallel worker-owned solvers, and `sequential=True` or
 `False` can assert the intended solver dependency. Concrete shapes and the MPO
 sub-compilation are cached independently of the fused outer runner. The

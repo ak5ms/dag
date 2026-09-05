@@ -804,8 +804,9 @@ struct RidgeNode<
                 const std::size_t state_matrix = group * K * K, state_vector = group * K;
                 for (std::size_t j = 0; j < K; ++j) fallback[j] = state.beta[state_vector + j];
                 if (all_finite && state.full_synced[group]) {
-                    const auto gap = state.t - state.last_full[group];
-                    const double decay = gap == 1 ? alpha : std::pow(alpha, static_cast<double>(gap));
+                    // Observation-clock EWM (ignore_na=True): a missing
+                    // interval freezes a statistic, not its next update weight.
+                    const double decay = alpha;
                     for (std::size_t j = 0; j < K; ++j) {
                         const std::size_t sj = state_vector + j;
                         state.xy[sj] = std::fma(decay, xy_new[local_vector + j] - state.xy[sj], state.xy[sj]);
@@ -822,7 +823,7 @@ struct RidgeNode<
                     for (std::size_t j = 0; j < K; ++j) {
                         const std::size_t lj = local_vector + j, sj = state_vector + j;
                         if (all_finite || xy_valid[lj]) {
-                            if (state.has_xy[sj]) { const auto gap = state.t - state.last_xy[sj]; const double decay = gap == 1 ? alpha : std::pow(alpha, static_cast<double>(gap)); state.xy[sj] = std::fma(decay, xy_new[lj] - state.xy[sj], state.xy[sj]); }
+                            if (state.has_xy[sj]) { const double decay = alpha; state.xy[sj] = std::fma(decay, xy_new[lj] - state.xy[sj], state.xy[sj]); }
                             else state.xy[sj] = xy_new[lj];
                             state.has_xy[sj] = 1; state.last_xy[sj] = state.t;
                         }
@@ -830,7 +831,7 @@ struct RidgeNode<
                         for (std::size_t k = 0; k < K; ++k) {
                             const std::size_t ljk = local_matrix + j * K + k, sjk = state_matrix + j * K + k;
                             if (all_finite || xx_valid[ljk]) {
-                                if (state.has_xx[sjk]) { const auto gap = state.t - state.last_xx[sjk]; const double decay = gap == 1 ? alpha : std::pow(alpha, static_cast<double>(gap)); state.xx[sjk] = std::fma(decay, xx_new[ljk] - state.xx[sjk], state.xx[sjk]); }
+                                if (state.has_xx[sjk]) { const double decay = alpha; state.xx[sjk] = std::fma(decay, xx_new[ljk] - state.xx[sjk], state.xx[sjk]); }
                                 else state.xx[sjk] = xx_new[ljk];
                                 state.has_xx[sjk] = 1; state.last_xx[sjk] = state.t;
                             }
@@ -859,10 +860,7 @@ struct RidgeNode<
                     const std::size_t state_vector = group * K;
                     if (metric_valid[active]) {
                         if (metrics.initialized[group]) {
-                            const std::uint64_t gap = state.t - metrics.last_update[group];
-                            const double update = gap == 1
-                                ? alpha
-                                : std::pow(alpha, static_cast<double>(gap));
+                            const double update = alpha;
                             const double old_factor = 1.0 - update;
                             for (std::size_t j = 0; j < K; ++j) {
                                 metrics.xy[state_vector + j] = std::fma(

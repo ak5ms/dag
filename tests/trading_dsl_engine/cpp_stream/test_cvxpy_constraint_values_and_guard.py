@@ -217,3 +217,27 @@ def test_fixed_solver_settings_are_emitted_and_cached(
         manifests[0].parent / "include" / f"{manifest['prefix']}instance.hpp"
     ).read_text()
     assert "settings_.iterative_refinement_enable = false;" in header
+
+
+def test_failed_solve_is_not_fed_back_as_a_portfolio(tmp_path):
+    import os
+    import pytest
+    from trading_dsl_engine.cpp_stream.optimizer import ClarabelNativePaths
+    include, library = os.environ.get('CLARABEL_INCLUDE_DIR'), os.environ.get('CLARABEL_STATIC_LIBRARY')
+    native = (ClarabelNativePaths(Path(include), Path(library)) if include and library
+              else build_current_clarabel(cache_dir=tmp_path / 'clarabel-native'))
+
+    @cvxpy_program(cache_dir=tmp_path / 'program', clarabel=native)
+    def FrozenHolding(carried, bound):
+        carried = cp.Parameter((2,), name='carried')
+        bound = cp.Parameter((2,), name='bound')
+        holding = cp.Variable(2, name='holding')
+        return cp.Problem(cp.Minimize(cp.sum_squares(holding)),
+                          [holding == carried, holding <= bound])
+
+    program = FrozenHolding(carried=previous_solution('holding', initial=2.0), bound=var('bound'))
+    runtime = compile_formula({'holding': get_field(program, 'holding'),
+                               'status': get_field(program, 'status')},
+                              {'bound': np.array([[3., 3.], [1., 1.], [3., 3.]])}, n_instruments=2)
+    with pytest.raises(RuntimeError, match='non-solution.*feedback'):
+        runtime.run(out_path=tmp_path / 'out.npy')
