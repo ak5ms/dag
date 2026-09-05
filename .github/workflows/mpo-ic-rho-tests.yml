@@ -1,0 +1,79 @@
+name: MPO IC rho regression tests
+
+on:
+  push:
+    branches: [agent/mpo-ic-rho-alignment]
+    paths:
+      - 'src/**'
+      - 'examples/cpp_stream_mpo_one_pass.py'
+      - 'tests/**'
+      - '.github/workflows/mpo-ic-rho-tests.yml'
+  pull_request:
+    paths:
+      - 'src/trading_dsl_engine/cpp_stream/**'
+      - 'src/trading_dsl_engine/ir/frontend.py'
+      - 'src/trading_dsl_engine/jax_flat/ops*'
+      - 'examples/cpp_stream_mpo_one_pass.py'
+      - 'tests/examples/test_cpp_stream_mpo_diagnostics.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CXX: g++
+      PYTHONPATH: src:.
+      MPLBACKEND: Agg
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      TRADING_DSL_ENGINE_CPP_LTO: '0'
+      TRADING_DSL_ENGINE_CPP_EXTRA_FLAGS: '-O1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install and build active runtimes
+        run: python -m pip install -e '.[optimizer]' polars
+      - name: Build native solver
+        run: |
+          python - <<'PY'
+          import os
+          from trading_dsl_engine.cpp_stream.optimizer import build_current_clarabel
+          native = build_current_clarabel()
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'CLARABEL_INCLUDE_DIR={native.include_dir}\n')
+              output.write(f'CLARABEL_STATIC_LIBRARY={native.static_library}\n')
+          PY
+      - name: Native example, fit, compiler and solver regressions
+        run: |
+          python -m pytest -n 0 -q --junitxml=mpo-native.xml \
+            tests/examples/test_cpp_stream_mpo_diagnostics.py \
+            tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py \
+            tests/trading_dsl_engine/cpp_stream/test_ridge_projections.py \
+            tests/trading_dsl_engine/cpp_stream/test_ridge_recompute.py \
+            tests/trading_dsl_engine/cpp_stream/test_operator_fusion.py \
+            tests/trading_dsl_engine/ir/test_common_subexpressions.py \
+            tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py \
+            tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
+      - name: Active JAX and explicit native outage parity
+        env:
+          TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: '1'
+        run: |
+          python -m pytest -n 0 -q --junitxml=mpo-jax.xml \
+            tests/trading_dsl_engine/jax_flat/test_ridge_bspline.py -m 'not perf'
+      - name: Native one-feature Ridge parity
+        run: |
+          python -m pytest -n 0 -q --junitxml=mpo-jax-native.xml \
+            tests/trading_dsl_engine/jax_flat/test_ridge_bspline.py \
+            -k 'ridge_one_feature or ridge_outage_clock'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mpo-ic-rho-test-results
+          path: mpo-*.xml
