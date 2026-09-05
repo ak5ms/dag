@@ -1,0 +1,53 @@
+name: MPO IC alignment ablations
+on:
+  push:
+    branches: [agent/mpo-ic-alignment]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Prepare runtime
+        run: |
+          python -m pip install --target /tmp/mpo-runtime 'cvxpy>=1.9.1,<2' deap includeigen equinox pybind11 pytest-xdist astropy
+      - name: Export runtime for local native ablations
+        run: |
+          rm -rf /tmp/mpo-runtime/numpy /tmp/mpo-runtime/numpy.libs /tmp/mpo-runtime/numpy-*.dist-info
+          rm -rf /tmp/mpo-runtime/scipy /tmp/mpo-runtime/scipy.libs /tmp/mpo-runtime/scipy-*.dist-info
+          rm -rf /tmp/mpo-runtime/jax /tmp/mpo-runtime/jaxlib /tmp/mpo-runtime/jax-*.dist-info /tmp/mpo-runtime/jaxlib-*.dist-info
+          tar -C /tmp -czf /tmp/mpo-runtime.tar.gz mpo-runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-runtime
+          path: /tmp/mpo-runtime.tar.gz
+          retention-days: 1
+      - name: Build portable allocation-free Clarabel
+        env:
+          PYTHONPATH: /tmp/mpo-runtime:src
+        run: |
+          python -m pip install numpy scipy jax numba pandas matplotlib
+          python - <<'PY'
+          import trading_dsl_engine.cpp_stream.optimizer.clarabel_native as native
+          native._CLARABEL_NATIVE_RUSTFLAG = '-C target-cpu=x86-64'
+          native.build_current_clarabel(cache_dir='/tmp/mpo-clarabel')
+          PY
+          tar -C /tmp/mpo-clarabel -czf /tmp/mpo-clarabel.tar.gz native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-clarabel
+          path: /tmp/mpo-clarabel.tar.gz
+          retention-days: 1
+      - name: Run focused ablations
+        env:
+          PYTHONPATH: /tmp/mpo-runtime:src:.
+          CXX: g++
+          CLARABEL_INCLUDE_DIR: /tmp/mpo-clarabel/native/include
+          CLARABEL_STATIC_LIBRARY: /tmp/mpo-clarabel/native/lib/libclarabel_c.a
+        run: python -m pytest -n 0 tests/examples/test_cpp_stream_mpo_diagnostics.py -q
