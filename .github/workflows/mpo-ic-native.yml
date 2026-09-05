@@ -1,0 +1,45 @@
+name: Native MPO IC ablations
+
+on:
+  push:
+    branches: [agent/mpo-ic-rho-alignment]
+    paths: [.github/workflows/mpo-ic-native.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build portable patched native solver
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install jinja2
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+          path = Path('src/trading_dsl_engine/cpp_stream/optimizer/clarabel_native.py')
+          spec = importlib.util.spec_from_file_location('clarabel_build', path)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          # This downloadable test artifact must run on CPUs other than the runner.
+          module._CLARABEL_NATIVE_RUSTFLAG = ''
+          module.build_current_clarabel(cache_dir='/tmp/mpo-clarabel')
+          PY
+          tar -C /tmp/mpo-clarabel/native -czf /tmp/mpo-clarabel-native.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-clarabel-native
+          path: /tmp/mpo-clarabel-native.tar.gz
+          if-no-files-found: error
+          retention-days: 2
