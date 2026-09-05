@@ -158,3 +158,30 @@ RUN_PERF_TESTS=1 pytest -n 0 tests/jax_flat/test_performance.py -q
 ## Future roadmap hints
 
 Planned direction includes graph-level typed IR, CSE/fusion, and non-eager model/portfolio optimizer nodes compiled through the same pipeline. Avoid changes that block this evolution.
+
+## MPO calibration and execution invariants
+
+- `examples/cpp_stream_mpo_one_pass.py` must derive fit alignment from canonical
+  `_ic_terms`/`ic1`, not independent ad hoc feature shifts. Fit `alpha * sigma`;
+  distinguish raw-return `yhat` from `alpha_hat = yhat / sigma` in IC diagnostics.
+- Preserve scratch feature cleaning, literal span arguments, rank/Gaussian
+  transforms, and its sum-of-broadcast-IC display convention. Reconcile IC and
+  IC1 totals only after a complete tail, not pointwise for multi-bar horizons.
+- Mask X/Y/W consistently for complete-case fits. Closed rows, missing labels,
+  ordinary zero returns and reopening gap events are not interchangeable.
+- Every valid Ridge statistic uses one ordinary EW observation update after an
+  outage. Keep cpp_stream and both active jax_flat implementations consistent.
+- A t decision cannot earn r(t+1) when its first possible fill is VWAP(t+1).
+  Feed back actual masked fills separately from planned positions; charge spread
+  only on actual turnover. No future realized masks may enter planning.
+- Never remove a finite raw reopening return from realized portfolio PnL.
+  Gap risk is event-time total-return risk, separated from ordinary block risk,
+  and must cover a known closure extending beyond the finite horizon.
+- Failed native feedback solves quarantine subsequent primal outputs as NaN and
+  preserve the failure status. Never feed a solver certificate into portfolio
+  state. Do not claim risk headroom makes all unforeseen halts feasible.
+- Compiler identity memo entries must retain their source objects, be scoped to
+  a compilation, and be cleared on exceptions. Shared lazy expression work is
+  bounded generically before C++ emission; keep small arithmetic/stateful fusion.
+- Run the realistic native weekend/mask fixture, beta-one and Pandas pair
+  ablations, and native/JAX observation-clock tests when changing this workflow.

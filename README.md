@@ -130,6 +130,7 @@ suffix, only once during finalization.
 - Pairwise clocks only advance when the corresponding `xx[j, k]` or `xy[j]` statistic receives at least one finite observation; missing rows or full outages leave only the affected statistics unchanged.
 - A visual checklist for NaN behavior is available in `docs/ewm_regression_nan_handling.svg`.
 - `get_preds(Ridge(...))` returns one-step-lagged predictions per instrument (`beta(t-1)·x(t)`).
+- Stateful Ridge uses observation-time EW updates: after missing rows the next valid statistic receives `alpha = 1 - 0.5**(1/hl)`, not `alpha**elapsed_rows`. XX and XY remain pairwise; workflows requiring complete cases must mask X, Y and weights together.
 - `get_beta(Ridge(...))` returns the current coefficient vector with shape `(k, 1)`.
 
 ## JAX backend
@@ -257,11 +258,37 @@ returns, the native risk covariance flow, PSD factorization, a persistent
 direct Clarabel MPO solve, and downstream PnL in one generated temporal loop.
 The optimizer inputs are not materialized and replayed in a second pass.
 
+The example uses `xs_gauss(xs_rank(-ts_zscore(clean_returns, span)))` and fits
+`alpha * return_volatility` to canonical `ic1` observation pairs from
+`flows.alpha_search._ic_terms`. The exposed `fit` tree contains training X/Y/W,
+eligibility, counts and betas; `scaled_features` and `yhat` are return-unit
+quantities. `beta_override=1` isolates feature/IC timing, and explicit `features`,
+`volatility`, and `fit_weights` arguments support ablations without copying the
+workflow. IC diagnostics use `yhat / sigma` and preserve `scratch_10`'s
+cross-sectional **sum** display convention (not an extra average).
+
+Planned weights and actual fills are distinct: a plan formed at t can fill at
+VWAP(t+1), and starts earning VWAP returns at t+2. Actual fills require the
+current session, realized tradability, and a finite positive quote; future plans
+use only the published calendar and last known valid quote. Positions remain
+held during closures. Ordinary-bar forecasts are multiplied by the number of
+ordinary open-bar returns, not elapsed calendar minutes. Realized reopening
+returns remain unclipped in portfolio PnL and enter separate short/long-gap
+second-moment risk models, including closures beyond the finite horizon.
+A configurable 10% planning risk reserve leaves room for revisions during forced
+carry; it is not a guarantee against arbitrary future risk shocks. Failed
+feedback solves produce NaNs plus a persistent failing status, never an
+infeasibility certificate masquerading as holdings; the example rejects such
+trajectories before plotting. See [`docs/mpo_ic_alignment.md`](docs/mpo_ic_alignment.md)
+for the exact equations, assumptions, ablations, and reproduction commands.
+Default warmup is now 90,000 rows, rather than 20,000 rows below the default
+30,240-observation volatility requirement.
+
 Define a DPP-compliant problem once with `@cvxpy_program`, explicitly declaring
 its shaped `cp.Parameter` objects and attributes inside the function, then call
 that same function with DSL expressions. `previous_solution("weights[0]",
-initial=0.0)` feeds the prior solve's actual first-horizon portfolio into the
-next row; it automatically makes the stage sequential. Independent programs
+initial=0.0)` feeds the prior solve's first-horizon **plan** into the
+next row; the example separately reconstructs actual masked fills, and it automatically makes the stage sequential. Independent programs
 remain eligible for row-parallel worker-owned solvers, and `sequential=True` or
 `False` can assert the intended solver dependency. Concrete shapes and the MPO
 sub-compilation are cached independently of the fused outer runner. The

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import os
 
 import cvxpy as cp
 import numpy as np
@@ -10,11 +11,20 @@ from trading_dsl_engine.base.dsl import var, where
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import (
     build_current_clarabel,
+    ClarabelNativePaths,
     cvxpy_program,
     get_field,
     previous_solution,
 )
 from trading_dsl_engine.ir.types import SCALAR, VECTOR
+
+
+def _native(tmp_path: Path) -> ClarabelNativePaths:
+    include = os.environ.get("CLARABEL_INCLUDE_DIR")
+    library = os.environ.get("CLARABEL_STATIC_LIBRARY")
+    if include and library:
+        return ClarabelNativePaths(Path(include), Path(library))
+    return build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
 
 
 def test_constraint_value_request_does_not_add_a_solver_primal() -> None:
@@ -43,7 +53,7 @@ def test_native_constraint_value_is_evaluated_after_the_original_solve(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
+    native = _native(tmp_path)
 
     @cvxpy_program(
         cache_dir=tmp_path / "program-cache",
@@ -108,7 +118,7 @@ def test_scalar_where_skips_closed_solve_and_preserves_feedback_state(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
+    native = _native(tmp_path)
 
     @cvxpy_program(
         cache_dir=tmp_path / "program-cache",
@@ -183,7 +193,7 @@ def test_fixed_solver_settings_are_emitted_and_cached(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    native = build_current_clarabel(cache_dir=tmp_path / "clarabel-native")
+    native = _native(tmp_path)
 
     @cvxpy_program(
         cache_dir=tmp_path / "program-cache",

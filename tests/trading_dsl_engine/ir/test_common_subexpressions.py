@@ -43,3 +43,16 @@ def test_order_sensitive_minimum_is_not_commutatively_deduplicated() -> None:
         if isinstance(node.op, NaryOp) and node.op.name == "minimum"
     ]
     assert len(minima) == 2
+
+
+def test_expression_key_cache_does_not_alias_recycled_temporary_objects():
+    from trading_dsl_engine.ir import frontend
+    from trading_dsl_engine.base.parser import Number
+
+    frontend.clear_expr_key_id_memo()
+    try:
+        for i in range(1000):
+            actual = frontend._expr_key(Number(float(i)))
+            assert actual == ('num', frontend._number_key(float(i)))
+    finally:
+        frontend.clear_expr_key_id_memo()

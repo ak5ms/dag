@@ -258,7 +258,7 @@ def test_generated_class_is_persistent_and_instance_owned(tmp_path: Path):
         "risk_factor",
     ]
     assert manifest["parameters"][-1]["dirty_blocks"] == ["A"]
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 5
     assert len(manifest["duals"]) == len(_mpo_problem().constraints)
 
 
@@ -1166,3 +1166,23 @@ def test_cpp_stream_risk_covariance_and_psd_factor_handle_missing_rows(tmp_path:
         atol=1e-10,
     )
     assert np.linalg.eigvalsh(reconstructed).min() > 0.0
+
+
+def test_failed_feedback_solve_cannot_publish_or_carry_infeasibility_certificate(tmp_path):
+    from trading_dsl_engine.base.dsl import var
+    from trading_dsl_engine.cpp_stream import compile_formula
+
+    @cvxpy_program(cache_dir=tmp_path / 'failed-feedback', clarabel=_clarabel_native())
+    def Bound(lower, previous):
+        lower = cp.Parameter(lower.shape, name='lower')
+        previous = cp.Parameter(lower.shape, name='previous')
+        x = cp.Variable(lower.shape, name='x')
+        return cp.Problem(cp.Minimize(cp.sum_squares(x - previous)), [x >= lower, x <= 1])
+
+    model = Bound(var('lower'), previous_solution('x', initial=0.))
+    runtime = compile_formula({'x': get_field(model, 'x'), 'status': get_field(model, 'status')},
+                              {'lower': np.array([[.5], [1.5], [.2]])}, n_instruments=1)
+    got = runtime.run(out_path=tmp_path / 'must-not-publish.npy').load()
+    np.testing.assert_allclose(got['x'][0], .5, atol=1e-7)
+    assert np.isnan(got['x'][1:]).all()
+    np.testing.assert_array_equal(got['status'], [1., 2., 2.])

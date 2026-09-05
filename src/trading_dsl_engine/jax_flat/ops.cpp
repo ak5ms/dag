@@ -1794,7 +1794,7 @@ private:
     static void update_ew_stat(double& current, uint8_t& has, int64_t& last, double fresh, int64_t t, double hl) {
         const double rho = (!finite(hl) || hl <= 0.0) ? 0.0 : std::exp(std::log(0.5) / hl);
         const double alpha = std::min(std::max(1.0 - rho, 0.0), 1.0);
-        const double a = std::pow(alpha, static_cast<double>(t - last));
+        const double a = alpha;  // Missing samples freeze observation time.
         current = has ? current * (1.0 - a) + fresh * a : fresh;
         has = 1;
         last = t;

@@ -855,8 +855,8 @@ class RidgeOp(Op):
         rho = jnp.where(instant, 0.0, jnp.exp(jnp.log(0.5) / hl_value))
         alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
 
-        a_xx = alpha ** (state.t - state.last_xx)
-        a_xy = alpha ** (state.t - state.last_xy)
+        a_xx = alpha  # observation time: missing samples do not age the statistic
+        a_xy = alpha
         updated_xx = jnp.where(state.has_xx, state.xx * (1.0 - a_xx) + xx_new * a_xx, xx_new)
         updated_xy = jnp.where(state.has_xy, state.xy * (1.0 - a_xy) + xy_new * a_xy, xy_new)
         xx = jnp.where(xx_valid, updated_xx, state.xx)
@@ -932,8 +932,8 @@ class RidgeOp(Op):
             rho = jnp.where(instant, 0.0, jnp.exp(jnp.log(0.5) / hl_value))
             alpha = jnp.clip(1.0 - rho, 0.0, 1.0)
 
-            a_xx = alpha ** (t_c - last_xx_c)
-            a_xy = alpha ** (t_c - last_xy_c)
+            a_xx = alpha  # same observation-time clock as tick()
+            a_xy = alpha
             updated_xx = jnp.where(has_xx_c, xx_c * (1.0 - a_xx) + xx_new * a_xx, xx_new)
             updated_xy = jnp.where(has_xy_c, xy_c * (1.0 - a_xy) + xy_new * a_xy, xy_new)
             xx = jnp.where(xx_valid, updated_xx, xx_c)

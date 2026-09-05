@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from collections import Counter
 from typing import Mapping
 
 from trading_dsl_engine.cpp_stream.python import lowering as base
@@ -93,6 +94,24 @@ def _build_plan(
     max_matrix_width = 1
     materialized_sources: dict[Source, Source] = {}
     clarabel_stage_by_object: dict[tuple[Source, Source | None], int] = {}
+    inline_costs: dict[int, tuple[Source, int]] = {}
+    fanout = Counter(child for node in program.nodes for child in node.child_ids)
+
+    def inline_work(source: Source) -> int:
+        """Expanded work, not DAG-node count: C++ reads duplicate lazy children.
+
+        Bound generic expression trees before they reach the optimizing compiler.
+        Small algebra still fuses into its consumers without scratch traffic.
+        """
+        if source.kind not in {"expression", "stateless_expression"}:
+            return 0
+        key = id(source)
+        entry = inline_costs.get(key)
+        if entry is None or entry[0] is not source:
+            entry = (source, 1 + sum(inline_work(part) for part in source.parts))
+            inline_costs[key] = entry  # Retain identity until lowering completes.
+        return entry[1]
+
 
     def source_slot_dependencies(source: Source) -> frozenset[tuple[str, int]]:
         dependencies: set[tuple[str, int]] = set()
@@ -816,7 +835,10 @@ def _build_plan(
                 final_only=final_only,
             )
             if not is_root:
-                sources[node_id] = expression
+                sources[node_id] = (
+                    materialize_source(expression, node_shape, dtype=dtype)
+                    if fanout[node_id] > 1 and inline_work(expression) > 64 else expression
+                )
                 continue
             out = value_dest(True, node_shape)
             stage = Stage(

@@ -92,7 +92,9 @@ def test_comoment_expansion_uses_one_generic_ewm_traversal() -> None:
     bundles = [stage for stage in runtime.plan.stages if stage.kind == "ewm_bundle"]
     assert len(bundles) == 1
     assert len(bundles[0].members) == 8
-    assert runtime.plan.scratch_slots == 8
+    # Final algebra is emitted directly from the shared moment-state bundle.
+    assert runtime.plan.scratch_slots == 0
+    assert len(bundles[0].epilogues) == 1
     assert not {
         "unary",
         "binary",
@@ -241,3 +243,31 @@ def test_previous_different_adaptive_run_state_handles_expiry_and_nan(
         if different.size:
             expected[row, 0] = different[-1]
     np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+
+def test_large_shared_control_expression_has_bounded_inline_work(tmp_path):
+    """Do not expand a shared decision DAG into exponentially large C++ trees."""
+    from trading_dsl_engine.base.dsl import var, where
+    from trading_dsl_engine.cpp_stream.python.frontend import compile_ir
+    from trading_dsl_engine.cpp_stream.python.lowering_full import lower_program
+    # Reused predicates magnify lazy control-flow work, even with IR CSE.
+    x = var('x')
+    expression = x
+    for i in range(10):
+        expression = where(expression > (i / 100.), expression + .01, expression - .01)
+    ir = compile_ir(expression, n_instruments=3)
+    # Lowering is enough for the red test; do not invoke an unbounded C++ compile.
+    plan = lower_program(ir, n_instruments=3, default_group_capacity=128,
+                      key_cardinalities=None)
+    def work(source):
+        return (1 + sum(work(p) for p in source.parts)
+                if source.kind in {'expression', 'stateless_expression'} else 0)
+    largest = max(work(source) for stage in plan.stages for source in stage.inputs)
+    assert largest <= 256, largest
+    data = np.linspace(-.3, .3, 90).reshape(30, 3)
+    expected = data.copy()
+    for i in range(10):
+        expected = np.where(expected > i / 100., expected + .01, expected - .01)
+    runtime = compile_formula(expression, {'x': data})
+    actual = runtime.run(out_path=tmp_path / 'bounded-control.npy').load()
+    np.testing.assert_allclose(actual, expected, atol=1e-15)

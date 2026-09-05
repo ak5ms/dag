@@ -37,7 +37,7 @@ def _reference_ridge_one_feature(x, y, w, hl, ridge):
         if valid_xx.any():
             snap_xx = np.sum(x[t, valid_xx] * x[t, valid_xx] * w[t, valid_xx])
             if has_xx:
-                a = alpha ** (t - last_xx)
+                a = alpha
                 xx = xx * (1.0 - a) + snap_xx * a
             else:
                 xx = snap_xx
@@ -46,7 +46,7 @@ def _reference_ridge_one_feature(x, y, w, hl, ridge):
         if valid_xy.any():
             snap_xy = np.sum(x[t, valid_xy] * y[t, valid_xy] * w[t, valid_xy])
             if has_xy:
-                a = alpha ** (t - last_xy)
+                a = alpha
                 xy = xy * (1.0 - a) + snap_xy * a
             else:
                 xy = snap_xy
@@ -226,3 +226,15 @@ def test_perf_groupby_univ_only_ridge_beta_jax_flat_t_rows():
 
     print(f"groupby_univ_ridge_beta::jax_flat T_ROWS={T_ROWS} elapsed={elapsed:.3f}s")
     assert out.shape == (T_ROWS, N_INSTRUMENTS, 3)
+
+
+@pytest.mark.parametrize('disable_cpp', ['0', '1'])
+def test_ridge_outage_clock_matches_cpp_stream_for_native_and_jax(disable_cpp, monkeypatch):
+    monkeypatch.setenv('TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL', disable_cpp)
+    x = np.ones((102, 3))
+    y = np.ones_like(x)
+    x[1:101] = y[1:101] = np.nan
+    y[-1] = 3.
+    beta = np.asarray(_run('get_beta(Ridge(x, y, 1, 2, 0.0))', x, y))
+    expected = 1. + (1. - .5**.5) * 2.
+    np.testing.assert_allclose(beta[-1], expected, atol=1e-12)

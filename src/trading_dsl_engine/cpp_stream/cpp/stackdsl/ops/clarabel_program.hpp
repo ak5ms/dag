@@ -112,6 +112,7 @@ class ClarabelNode<
 > {
     alignas(64) Program program_{};
     bool has_solution_{false};
+    bool feedback_failed_{false};
 
     STACKDSL_HOT static bool same_value(double left, double right) noexcept {
         return std::bit_cast<std::uint64_t>(left)
@@ -267,11 +268,25 @@ class ClarabelNode<
         }
     }
 
+    template <class Projection, class Context>
+    STACKDSL_HOT void project_failure(Context& ctx) noexcept {
+        if constexpr (Projection::kind == ClarabelResultKind::Info
+                      && Projection::source_index == 2) {
+            project<Projection>(ctx);  // Preserve the first failing status.
+        } else {
+            project_nan<Projection>(ctx);
+        }
+    }
+
 public:
     STACKDSL_HOT void setup() noexcept {}
 
     template <class Context>
     STACKDSL_HOT void on_data(Context& ctx) {
+        if (feedback_failed_) {
+            (project_failure<Projections>(ctx), ...);
+            return;
+        }
         if constexpr (!std::is_same_v<Guard, ClarabelAlwaysEnabled>) {
             if (ctx.template read<Guard>(0) == 0.0) {
                 (project_nan<Projections>(ctx), ...);
@@ -284,6 +299,19 @@ public:
         // parameters imply an identical problem and the cached result is valid.
         if (changed || !has_solution_) {
             program_.solve();
+            if constexpr ((Bindings::feedback || ...)) {
+                // A certificate/failed iterate is not a portfolio. Reject it
+                // before projecting or caching any state for the next row.
+                const int status = static_cast<int>(program_.template info<2>());
+                if (status != 1 && status != 4) {
+                    // The row runner is noexcept. Quarantine this trajectory:
+                    // publish NaNs plus the failure status, never certificates,
+                    // and never advance feedback on subsequent rows.
+                    feedback_failed_ = true;
+                    (project_failure<Projections>(ctx), ...);
+                    return;
+                }
+            }
             has_solution_ = true;
         }
         (cache_feedback_result<Bindings>(), ...);

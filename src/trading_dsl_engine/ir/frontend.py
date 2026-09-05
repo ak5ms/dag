@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 import struct
+from threading import local
 
 from trading_dsl_engine.base.custom import StatelessCall
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry
@@ -162,11 +163,13 @@ def _number_key(value: int | float) -> tuple:
     return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
-_EXPR_KEY_ID_MEMO: dict[int, tuple] = {}
+_EXPR_KEY_LOCAL = local()
 
 
 def clear_expr_key_id_memo() -> None:
-    _EXPR_KEY_ID_MEMO.clear()
+    # Keep AST owners alive for precisely one compilation. An id-only cache
+    # aliases temporary macro expansions after Python recycles their addresses.
+    _EXPR_KEY_LOCAL.memo = {}
 
 
 def _expr_key_uncached(node: Expr) -> tuple:
@@ -233,11 +236,15 @@ def _expr_key_uncached(node: Expr) -> tuple:
 
 
 def _expr_key(node: Expr) -> tuple:
-    cached = _EXPR_KEY_ID_MEMO.get(id(node))
-    if cached is not None:
-        return cached
+    memo = getattr(_EXPR_KEY_LOCAL, "memo", None)
+    if memo is None:
+        clear_expr_key_id_memo()
+        memo = _EXPR_KEY_LOCAL.memo
+    cached = memo.get(id(node))
+    if cached is not None and cached[0] is node:
+        return cached[1]
     result = _expr_key_uncached(node)
-    _EXPR_KEY_ID_MEMO[id(node)] = result
+    memo[id(node)] = (node, result)
     return result
 
 
@@ -1632,22 +1639,26 @@ def compile_ir(
     column_names: list[str] | tuple[str, ...] | None = None,
     input_value_types: Mapping[str, ValueType] | None = None,
 ) -> Program:
-    expression = parse_formula(formula) if isinstance(formula, str) else formula
-    builder = _OuterBuilder(
-        dsl_registry or DEFAULT_DSL_REGISTRY,
-        {name: index for index, name in enumerate(column_names or ())},
-        input_value_types or {},
-    )
-    root = builder.build(expression)
-    for node_id, node in enumerate(builder.nodes):
-        terminal = isinstance(node.op, EmitOp) or (
-            isinstance(node.op, ReductionOp) and node.op.temporal
+    clear_expr_key_id_memo()
+    try:
+        expression = parse_formula(formula) if isinstance(formula, str) else formula
+        builder = _OuterBuilder(
+            dsl_registry or DEFAULT_DSL_REGISTRY,
+            {name: index for index, name in enumerate(column_names or ())},
+            input_value_types or {},
         )
-        if terminal and node_id != root:
-            raise FormulaIRCompileError(
-                "temporal reductions and emit('last') must be the terminal output"
+        root = builder.build(expression)
+        for node_id, node in enumerate(builder.nodes):
+            terminal = isinstance(node.op, EmitOp) or (
+                isinstance(node.op, ReductionOp) and node.op.temporal
             )
-    return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
+            if terminal and node_id != root:
+                raise FormulaIRCompileError(
+                    "temporal reductions and emit('last') must be the terminal output"
+                )
+        return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
+    finally:
+        clear_expr_key_id_memo()
 
 
 __all__ = ["FormulaIRCompileError", "clear_expr_key_id_memo", "compile_ir"]

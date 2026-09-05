@@ -86,7 +86,7 @@ def _stateful_pairwise_reference(
         for j in range(k):
             if xy_valid[j]:
                 if has_xy[j]:
-                    decay = alpha ** (t - last_xy[j])
+                    decay = alpha
                     xy[j] = xy[j] + decay * (xy_new[j] - xy[j])
                 else:
                     xy[j] = xy_new[j]
@@ -95,7 +95,7 @@ def _stateful_pairwise_reference(
             for ell in range(k):
                 if xx_valid[j, ell]:
                     if has_xx[j, ell]:
-                        decay = alpha ** (t - last_xx[j, ell])
+                        decay = alpha
                         xx[j, ell] = xx[j, ell] + decay * (xx_new[j, ell] - xx[j, ell])
                     else:
                         xx[j, ell] = xx_new[j, ell]
