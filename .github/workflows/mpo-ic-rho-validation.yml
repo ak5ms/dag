@@ -1,0 +1,39 @@
+name: MPO IC rho alignment validation
+
+on:
+  push:
+    branches: [agent/mpo-ic-rho-alignment]
+    paths:
+      - .github/workflows/mpo-ic-rho-validation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Export exact source and offline test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git bundle create /tmp/mpo-source.bundle --all
+          python -m pip install --target /tmp/mpo-runtime \
+            'cvxpy>=1.9.1,<2' deap includeigen pybind11 polars equinox unxt pytest-xdist
+          tar -C /tmp -czf /tmp/mpo-runtime.tar.gz mpo-runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-source-runtime
+          path: |
+            /tmp/mpo-source.bundle
+            /tmp/mpo-runtime.tar.gz
+          if-no-files-found: error
+          retention-days: 2
