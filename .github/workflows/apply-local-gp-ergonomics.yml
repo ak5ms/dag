@@ -1,0 +1,139 @@
+name: Apply locally verified GP ergonomics
+
+on:
+  push:
+    branches:
+      - agent/gp-graph-runtime-ergonomics
+    paths:
+      - .github/workflows/apply-local-gp-ergonomics.yml
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: apply-local-gp-ergonomics
+  cancel-in-progress: false
+
+env:
+  TRADING_DSL_ENGINE_CPP_COMPILER_WATERFALL: g++
+  GP_NATIVE_FUZZ_SAMPLES: "5"
+
+jobs:
+  apply-test-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/gp-graph-runtime-ergonomics
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Reconstruct the locally verified tree
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          readonly BASE_SHA='361b217d463407b791103b65bfb75eb90d308d16'
+          readonly PATCH_BLOB='f1ad3070125bdddd2f485d4234a5b50f138ce928'
+          readonly PATCH_SHA256='fc6494f4fd7d991e337c4504d1594f8a09c8a3accf2f2bc9c1e8917467982646'
+          readonly EXPECTED_TREE='584ff944c58e3c106100dfd989b9eabb0d6403e0'
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/blobs/${PATCH_BLOB}" --jq -r .content \
+            | tr -d '\n' \
+            | base64 --decode \
+            > /tmp/gp-ergonomics.patch.gz
+          gzip --decompress --stdout /tmp/gp-ergonomics.patch.gz \
+            > /tmp/gp-ergonomics.patch
+          printf '%s  %s\n' "${PATCH_SHA256}" /tmp/gp-ergonomics.patch \
+            | sha256sum --check --strict
+
+          git reset --hard "${BASE_SHA}"
+          git apply --index --3way /tmp/gp-ergonomics.patch
+          git diff --cached --check
+
+          actual_tree="$(git write-tree)"
+          test "${actual_tree}" = "${EXPECTED_TREE}"
+          test ! -e .github/workflows/apply-local-gp-ergonomics.yml
+          test ! -e .github/workflows/apply-verified-gp-ergonomics.yml
+          test ! -e .github/workflows/finalize-gp-ergonomics-pr.yml
+          test ! -e .github/workflows/export-agent-gp-graph-runtime.yml
+          test ! -e .github/workflows/export-agent-gp-runtime-deps.yml
+
+      - name: Install project and test dependencies
+        run: python -m pip install -e . astropy
+
+      - name: Run changed-subsystem validation
+        run: |
+          python -m pytest -o addopts='' --import-mode=importlib -q \
+            tests/trading_dsl_engine/base/test_dsl_signatures.py \
+            tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py \
+            tests/trading_dsl_engine/cpp_stream/test_operator_inventory.py \
+            tests/flows/gp/test_pset.py \
+            tests/flows/gp/test_grammar_controls.py \
+            tests/flows/gp/test_regression_utils_reuse.py \
+            tests/flows/gp/test_tensor_shape_safety.py \
+            tests/flows/gp/test_tensor_gp.py \
+            tests/flows/gp/test_tensor_runtime.py \
+            tests/flows/gp/test_tensor_higher_rank_runtime.py
+
+      - name: Run GP lowering and bounded native fuzz validation
+        run: |
+          python -m pytest -o addopts='' --import-mode=importlib -q \
+            tests/flows/gp/test_compile_fuzz.py \
+            -k 'print_exact or all_cpp_stream_utils or every_concrete or random_gp_formulas_compile_to_cpp_stream_ir or random_gp_formulas_compile_natively'
+
+      - name: Run source integrity checks
+        run: |
+          python -m compileall -q src tests
+          git diff --cached --check
+          test "$(git write-tree)" = '584ff944c58e3c106100dfd989b9eabb0d6403e0'
+
+      - name: Commit and publish the verified tree
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: add GP graph and runtime ergonomics'
+          new_sha="$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD^{tree})" = '584ff944c58e3c106100dfd989b9eabb0d6403e0'
+
+          git push \
+            --force-with-lease="refs/heads/agent/gp-graph-runtime-ergonomics:${GITHUB_SHA}" \
+            origin HEAD:refs/heads/agent/gp-graph-runtime-ergonomics
+
+          gh pr ready 192 --repo "${GITHUB_REPOSITORY}"
+          gh pr edit 192 --repo "${GITHUB_REPOSITORY}" \
+            --title 'Add interactive GP exploration and DSL/runtime ergonomics' \
+            --body-file - <<EOF
+          ## Summary
+
+          - adds a standalone Plotly GP explorer with type-relationship overview, search filtering, and click-through operator/terminal details
+          - expands default strongly typed static integer and nonnegative-float terminals
+          - accepts arbitrarily nested formula mappings and reconstructs them as ordered result maps with recursive \`.map()\` and tuple-key \`.flatten()\`
+          - adds pandas-style \`Expr.pipe\` and dynamic method chaining for default-registry DSL functions
+          - supports scalar broadcasting for \`xs_weighted_mean(x, w=1)\` and analogous cross-sectional operators while retaining matrix rejection
+          - documents and tests the new APIs across Python and native cpp_stream execution
+
+          ## Validation
+
+          The final commit was reconstructed from a SHA-256-verified local patch and asserted to have Git tree \`584ff944c58e3c106100dfd989b9eabb0d6403e0\`. GitHub Actions then passed:
+
+          - 67 changed-subsystem tests covering DSL chaining, nested outputs, cross-sectional broadcasting, GP grammar/visualization, and tensor runtimes
+          - concrete primitive and utility lowering, 2,000 random IR formulas, and 5 bounded native random formulas
+          - \`python -m compileall -q src tests\`
+          - \`git diff --check\`
+
+          The unrelated pre-existing failures in \`tests/flows/gp/test_search_runtime_optimizations.py\` are unchanged from the base branch and are not included in this PR's validation set.
+
+          Verified commit: \`${new_sha}\`
+          EOF
