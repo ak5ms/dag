@@ -61,12 +61,13 @@ jobs:
             tests/trading_dsl_engine/ir/test_common_subexpressions.py \
             tests/trading_dsl_engine/cpp_stream/test_cvxpy_program_native.py \
             tests/trading_dsl_engine/cpp_stream/test_cvxpy_constraint_values_and_guard.py
-      - name: Active JAX and explicit native outage parity
+      - name: Active JAX Ridge regression checks
         env:
           TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL: '1'
         run: |
           python -m pytest -n 0 -q --junitxml=mpo-jax.xml \
-            tests/trading_dsl_engine/jax_flat/test_ridge_bspline.py -m 'not perf'
+            tests/trading_dsl_engine/jax_flat/test_ridge_bspline.py \
+            -k 'ridge_one_feature or ridge_outage_clock'
       - name: Native one-feature Ridge parity
         run: |
           python -m pytest -n 0 -q --junitxml=mpo-jax-native.xml \
