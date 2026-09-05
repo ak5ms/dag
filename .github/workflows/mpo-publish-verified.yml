@@ -1,0 +1,73 @@
+name: Publish locally verified MPO alignment fixes
+
+on:
+  push:
+    branches: [agent/mpo-ic-rho-alignment]
+    paths: [.github/workflows/mpo-publish-verified.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'ak5ms/dag' && github.ref == 'refs/heads/agent/mpo-ic-rho-alignment'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify transport and apply exact tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, gzip, hashlib
+          from pathlib import Path
+          parts = [Path(f'.mpo-publish/part-{i}.b64').read_text().strip() for i in range(6)]
+          # Correct a known duplicated two-character transport token; then
+          # require the exact original Git blob hash and full patch SHA-256.
+          parts[0] = parts[0].replace('dxsT2T2YTs', 'dxsT2YTs')
+          expected = ['74dd3c5f2feb36b96b858627b22549c21cbf281c',
+                      'ae1538a351be1da08fc6e4c8b7c28527309ce95a',
+                      'a54bc89b4ea260dc5a2aa104d9f9536168e96e70',
+                      'd36a9bb6834c67500cb0e3c7c28ffcd0248169e3',
+                      '77b87569205aae4cfeaaa1555ef4f601e8021822',
+                      'bfaf645292d1abfbb509f6a6c64ef22e41201d44']
+          for text, sha in zip(parts, expected):
+              data = text.encode()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+          patch = gzip.decompress(base64.b64decode(''.join(parts), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '8d1d88428eba1f7000259d91f532ff59d5ff6ee9a5b13176fc299f0b86306275'
+          Path('/tmp/mpo.patch').write_bytes(patch)
+          PY
+          # Workflow publication uses the connected Git API separately; the
+          # Actions token only publishes the already-tested source/docs/tests.
+          git apply --check --exclude=.github/workflows/mpo-ic-rho-tests.yml /tmp/mpo.patch
+          git apply --exclude=.github/workflows/mpo-ic-rho-tests.yml /tmp/mpo.patch
+          git diff --check
+          python - <<'PY'
+          import ast, subprocess
+          from pathlib import Path
+          for name in subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines():
+              if name.endswith('.py'):
+                  ast.parse(Path(name).read_text(), filename=name)
+          PY
+      - name: Commit and fast-forward only this feature branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin agent/mpo-ic-rho-alignment
+          test "$(git rev-parse origin/agent/mpo-ic-rho-alignment)" = "$GITHUB_SHA"
+          git rm -r .mpo-publish
+          git add AGENTS.md README.md examples/cpp_stream_mpo_one_pass.py src tests docs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: align vol-scaled MPO Ridge with canonical IC and causal gap-aware execution'
+          git push origin HEAD:refs/heads/agent/mpo-ic-rho-alignment
+          git rev-parse HEAD | tee /tmp/mpo-published-commit.txt
+          git show --stat --oneline HEAD >> /tmp/mpo-published-commit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-published-source
+          path: /tmp/mpo-published-commit.txt
