@@ -1,0 +1,20 @@
+name: Export MPO source for local validation
+on:
+  push:
+    branches: [agent/mpo-ic-alignment]
+    paths: ['.github/workflows/export-mpo-local-source.yml']
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - run: tar --exclude=.git -czf /tmp/mpo-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpo-source
+          path: /tmp/mpo-source.tar.gz
+          retention-days: 1
