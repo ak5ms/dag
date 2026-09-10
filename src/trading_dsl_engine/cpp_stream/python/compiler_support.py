@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from time import perf_counter
 from typing import Mapping
 import urllib.request
 import warnings
@@ -47,6 +49,9 @@ _MINIFORGE_URL = (
 )
 _INTEL_CONDA_CHANNEL = "https://software.repos.intel.com/python/conda/"
 _warned_missing_icpx = False
+_HEADER_DIGEST_CACHE: dict[
+    tuple[str, str], tuple[tuple[tuple[str, int, int], ...], bytes]
+] = {}
 
 
 def _cpp_root() -> Path:
@@ -195,7 +200,9 @@ def _run_install_command(command: list[str], *, what: str) -> None:
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"{what} failed with exit code {result.returncode}: {detail}")
+        raise RuntimeError(
+            f"{what} failed with exit code {result.returncode}: {detail}"
+        )
 
 
 def install_icx(install_dir: str | os.PathLike[str] | None = None) -> str:
@@ -230,9 +237,7 @@ def install_icx(install_dir: str | os.PathLike[str] | None = None) -> str:
                 what="Miniforge bootstrap",
             )
         if not _executable(conda):
-            raise RuntimeError(
-                f"Miniforge completed but {conda} was not created"
-            )
+            raise RuntimeError(f"Miniforge completed but {conda} was not created")
 
     target.parent.mkdir(parents=True, exist_ok=True)
     _run_install_command(
@@ -278,6 +283,40 @@ def _compiler_runtime_link_flags(compiler: str) -> list[str]:
     return [f"-Wl,-rpath,{runtime.parent}"]
 
 
+@lru_cache(maxsize=None)
+def _compiler_identity(compiler: str) -> bytes:
+    """Return the stable compiler identity without spawning on every formula."""
+
+    version = subprocess.run(
+        [compiler, "--version"], capture_output=True, text=True, check=False
+    )
+    return (version.stdout or version.stderr).encode()
+
+
+def _header_digest(cpp_root: str, eigen_root: str) -> bytes:
+    """Fingerprint native headers, re-reading contents only after a metadata change."""
+
+    roots = (Path(cpp_root), Path(eigen_root))
+    headers = tuple(sorted(roots[0].rglob("*.hpp")))
+    eigen_macros = roots[1] / "Eigen" / "src" / "Core" / "util" / "Macros.h"
+    if eigen_macros.is_file():
+        headers += (eigen_macros,)
+    signature = tuple(
+        (str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in headers
+    )
+    key = (str(roots[0]), str(roots[1]))
+    cached = _HEADER_DIGEST_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    digest = hashlib.sha256()
+    for path in headers:
+        digest.update(str(path).encode())
+        digest.update(path.read_bytes())
+    value = digest.digest()
+    _HEADER_DIGEST_CACHE[key] = (signature, value)
+    return value
+
+
 def _flags() -> tuple[list[str], list[str]]:
     if os.name == "nt":
         raise RuntimeError("cpp_stream currently targets POSIX/Linux")
@@ -316,9 +355,7 @@ def _flags() -> tuple[list[str], list[str]]:
     link_flags = [
         "-Wl,-O3",
         "-pthread",
-        *shlex.split(
-            os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", "")
-        ),
+        *shlex.split(os.environ.get("TRADING_DSL_ENGINE_CPP_EXTRA_LINK_FLAGS", "")),
     ]
     return compile_flags, link_flags
 
@@ -329,6 +366,7 @@ def build_shared(
     extra_include_dirs: tuple[Path, ...] = (),
     extra_link_files: tuple[Path, ...] = (),
     extra_fingerprint_files: tuple[Path, ...] = (),
+    metrics: dict[str, float | bool] | None = None,
 ) -> tuple[Path, Path]:
     """Compile one generated translation unit and cache all native dependencies.
 
@@ -338,14 +376,13 @@ def build_shared(
     behavior.
     """
 
+    fingerprint_started = perf_counter()
     compiler = _compiler()
     compile_flags, link_flags = _flags()
     link_flags += _compiler_runtime_link_flags(compiler)
     digest = hashlib.sha256(source.encode())
-    for header in sorted(_cpp_root().rglob("*.hpp")):
-        digest.update(header.relative_to(_cpp_root()).as_posix().encode())
-        digest.update(header.read_bytes())
     eigen_include = _eigen_include()
+    digest.update(_header_digest(str(_cpp_root()), str(eigen_include)))
     digest.update(str(eigen_include).encode())
     normalized_include_dirs = tuple(Path(path).resolve() for path in extra_include_dirs)
     normalized_link_files = tuple(Path(path).resolve() for path in extra_link_files)
@@ -361,13 +398,7 @@ def build_shared(
         if not directory.is_dir():
             raise FileNotFoundError(f"native include directory not found: {directory}")
         digest.update(str(directory).encode())
-    eigen_macros = eigen_include / "Eigen" / "src" / "Core" / "util" / "Macros.h"
-    if eigen_macros.is_file():
-        digest.update(eigen_macros.read_bytes())
-    version = subprocess.run(
-        [compiler, "--version"], capture_output=True, text=True, check=False
-    )
-    digest.update((version.stdout or version.stderr).encode())
+    digest.update(_compiler_identity(compiler))
     digest.update("\0".join((*compile_flags, *link_flags)).encode())
     digest.update(
         f"{platform.platform()}|{platform.machine()}|{sys.implementation.cache_tag}".encode()
@@ -375,7 +406,12 @@ def build_shared(
     build_dir = _cache_root() / digest.hexdigest()
     cpp_path = build_dir / "formula.cpp"
     so_path = build_dir / "formula.so"
+    if metrics is not None:
+        metrics["dependency_fingerprint_seconds"] = perf_counter() - fingerprint_started
+        metrics["native_cache_hit"] = so_path.is_file()
     if so_path.is_file():
+        if metrics is not None:
+            metrics["native_compile_seconds"] = 0.0
         return so_path, cpp_path
     build_dir.mkdir(parents=True, exist_ok=True)
     temporary_cpp = build_dir / f"formula.{os.getpid()}.cpp"
@@ -393,7 +429,10 @@ def build_shared(
         "-o",
         str(temporary_so),
     ]
+    compile_started = perf_counter()
     result = subprocess.run(command, capture_output=True, text=True)
+    if metrics is not None:
+        metrics["native_compile_seconds"] = perf_counter() - compile_started
     if result.returncode:
         raise RuntimeError(
             "cpp_stream native compilation failed\n"
@@ -411,9 +450,7 @@ def input_value_type(spec: InputTypeSpec, n_instruments: int) -> ValueType:
     shape = tuple(spec.row_shape or ())
     if not shape:
         return SCALAR
-    logical_shape = (
-        (None,) + shape[1:] if shape[0] == n_instruments else shape
-    )
+    logical_shape = (None,) + shape[1:] if shape[0] == n_instruments else shape
     return tensor(logical_shape, dtype=spec.dtype)
 
 
@@ -462,7 +499,7 @@ class ReferencedSourceTypes(Mapping[str, ValueType]):
 
 
 def _broadcast_shapes(
-    shapes: tuple[tuple[int | None, ...], ...]
+    shapes: tuple[tuple[int | None, ...], ...],
 ) -> tuple[int | None, ...]:
     rank = max((len(shape) for shape in shapes), default=0)
     result: list[int | None] = []
@@ -527,9 +564,7 @@ def repair_value_types(program: Program) -> Program:
                 )
             child_type = child_nodes[0].value_type
             if child_type.kind == "object":
-                raise TypeError(
-                    f"{type(op).__name__} cannot consume object values"
-                )
+                raise TypeError(f"{type(op).__name__} cannot consume object values")
             node = replace(node, value_type=child_type)
         nodes.append(node)
     return replace(program, nodes=tuple(nodes))
@@ -574,9 +609,7 @@ def apply_input_key_hints(
             child_id = node.child_ids[index]
             child_op = program.nodes[child_id].op
             row_scalar = (
-                is_row_scalar(child_id)
-                if spec.row_scalar is None
-                else spec.row_scalar
+                is_row_scalar(child_id) if spec.row_scalar is None else spec.row_scalar
             )
             dtype = spec.dtype
             if isinstance(child_op, InputOp):

@@ -14,7 +14,10 @@ from trading_dsl_engine.cpp_stream.python.lowering import Plan
 from trading_dsl_engine.cpp_stream.python.npy import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.outputs import FormulaOutput, OutputLayout
 from trading_dsl_engine.cpp_stream.python.parallel import ParallelPlan
-from trading_dsl_engine.cpp_stream.python.sources import SourceValue, open_source_mapping
+from trading_dsl_engine.cpp_stream.python.sources import (
+    SourceValue,
+    open_source_mapping,
+)
 from trading_dsl_engine.ir.program import Program
 
 
@@ -151,6 +154,15 @@ class RunResult:
         return tuple(values)
 
 
+@dataclass(frozen=True, slots=True)
+class CompileMetrics:
+    """Wall-clock timings collected while constructing a native runtime."""
+
+    stage_seconds: Mapping[str, float]
+    total_seconds: float
+    native_cache_hit: bool
+
+
 class CppStreamRuntime:
     """One runtime for one or many public roots backed by one native runner."""
 
@@ -168,6 +180,7 @@ class CppStreamRuntime:
         return_multiple: bool,
         result_structure=None,
         bound_sources: Mapping[str, SourceValue] | None = None,
+        compile_metrics: CompileMetrics | None = None,
     ) -> None:
         self.program = program
         self.plan = plan
@@ -179,9 +192,8 @@ class CppStreamRuntime:
         self.output_layout = output_layout
         self.return_multiple = bool(return_multiple)
         self.result_structure = result_structure
-        self.bound_sources = (
-            None if bound_sources is None else dict(bound_sources)
-        )
+        self.bound_sources = None if bound_sources is None else dict(bound_sources)
+        self.compile_metrics = compile_metrics
         self._library: ctypes.CDLL | None = None
 
     @property
@@ -244,9 +256,7 @@ class CppStreamRuntime:
     def _validate_threads(threads: int) -> int:
         value = int(threads)
         if value < 0:
-            raise ValueError(
-                "threads must be >= 0; zero opts into automatic execution"
-            )
+            raise ValueError("threads must be >= 0; zero opts into automatic execution")
         return value
 
     def _resolved_request(self, threads: int) -> int:
@@ -269,9 +279,7 @@ class CppStreamRuntime:
             6: "output payload offset is not aligned for float64",
         }
         base = meanings.get(code, f"native runtime returned error code {code}")
-        raise RuntimeError(
-            f"cpp_stream: {base}" + (f": {message}" if message else "")
-        )
+        raise RuntimeError(f"cpp_stream: {base}" + (f": {message}" if message else ""))
 
     @staticmethod
     def _default_output_path() -> Path:
@@ -356,14 +364,10 @@ class CppStreamRuntime:
                     else (processed_input_rows,) + public.shape
                 )
             else:
-                logical_shape = (
-                    self.output_layout.storage_size(processed_input_rows),
-                )
+                logical_shape = (self.output_layout.storage_size(processed_input_rows),)
 
             output_path = (
-                self._default_output_path()
-                if out_path is None
-                else Path(out_path)
+                self._default_output_path() if out_path is None else Path(out_path)
             )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_offset = self._prepare_output(output_path, logical_shape)

@@ -41,6 +41,9 @@ Priorities, in order:
   run as a generated epilogue over bundle state rather than materializing every
   intermediate. Preserve specialized cross-sectional nodes such as `xs_rank`;
   do not replace them with a generic variadic physical loop.
+- Keep `cpp_stream` compile diagnostics attached to the returned runtime and
+  stage-granular. Dependency fingerprinting must preserve cache correctness while
+  avoiding repeated header reads and compiler identity subprocesses.
 - Stateless IR CSE may canonicalize only operations whose native semantics are
   genuinely order-independent. Preserve the IEEE distinction between `-0.0` and
   `+0.0`, including for order-sensitive minimum/maximum behavior.
