@@ -401,6 +401,50 @@ def test_cpp_flat_stateful_cse_shares_identical_alpha_denominator_transitions():
     _assert_cpp_matches_pure_jax(formula, data)
 
 
+def test_cpp_flat_ewm_fanout_matches_pure_jax_with_nonfinite_rows():
+    from trading_dsl_engine.base.dsl import cat, ewm, var
+
+    close = var("close")
+    formula = cat(
+        ewm(close, 2, min_periods=2),
+        ewm(close, 4, min_periods=1),
+        ewm(close, 8, min_periods=3),
+        ewm(close, 16),
+    )
+    data = np.array(
+        [
+            [1.0, np.nan, np.inf],
+            [2.0, 4.0, 3.0],
+            [np.nan, 5.0, 6.0],
+            [8.0, -np.inf, 9.0],
+        ]
+    )
+    native = compile_formula_native(formula)
+    assert native.program.input_names == ("close",)
+    assert sum(node.opcode == "input" for node in native.native_plan.nodes) == 1
+    _assert_cpp_matches_pure_jax(formula, {"close": data})
+
+
+def test_cpp_flat_diverse_cat_fuses_shared_inputs_across_nested_branches():
+    from trading_dsl_engine.base.dsl import abs, cat, cumsum, ewm, exp, var
+
+    close = var("close")
+    other = var("other")
+    formula = cat(
+        abs(close),
+        exp(other + close),
+        ewm(close, 8),
+        cumsum(other * close),
+    )
+    data = {
+        "close": np.array([[1.0, np.nan], [-2.0, 3.0], [4.0, 5.0]]),
+        "other": np.array([[0.5, 2.0], [1.5, np.nan], [-1.0, 2.0]]),
+    }
+    native = compile_formula_native(formula)
+    assert sum(node.opcode == "input" for node in native.native_plan.nodes) == 2
+    _assert_cpp_matches_pure_jax(formula, data)
+
+
 def test_cpp_flat_micro_runtime_comparison_smoke(capsys):
     rows = 256
     cols = 9
