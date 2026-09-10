@@ -55,6 +55,12 @@ jobs:
           python -m pip install --upgrade
           pip numpy numba pytest jinja2 jax equinox astropy
           includeigen pybind11 matplotlib graphviz
+      - name: Run xs_gauss behavior tests
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -m pytest -q -o addopts=""
+          tests/trading_dsl_engine/cpp_stream/test_xs_gauss.py
       - name: Run parser, IR, source, native operator, and roll_rets tests
         env:
           PYTHONPATH: src
