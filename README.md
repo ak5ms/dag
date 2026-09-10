@@ -317,3 +317,5 @@ fingerprinting, native compilation, and runtime setup; `total_seconds` reports
 the complete public call and `native_cache_hit` distinguishes cached builds.
 Repeated compiles cache unchanged native-header fingerprints and compiler
 identity checks, avoiding redundant file reads and compiler subprocesses.
+Optimizer expression nodes are defined in the neutral IR layer, so importing IR
+utilities does not initialize the `cpp_stream` backend or create import cycles.

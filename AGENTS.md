@@ -48,6 +48,8 @@ Priorities, in order:
   genuinely order-independent. Preserve the IEEE distinction between `-0.0` and
   `+0.0`, including for order-sensitive minimum/maximum behavior.
 - Formula metadata must stay static and off the compiled hot path: unit/type/range propagation should run at compile time, expose runtime inspection methods such as `get_units()`/`get_range()`, and avoid changing streaming tick or batch semantics.
+- Neutral IR modules must not import backend packages; optimizer expression nodes
+  live in the shared IR and backend DSL modules may re-export them.
 - Formula alpha generation/search belongs at Python compile/search time; keep DEAP evolution, objective orchestration, and candidate filtering outside JAX-flat live/batch hot paths.
 - DSL/operator naming convention: functions that emit scalar/vector/matrix arrays use lower_snake_case; helpers that emit object/model state use UpperCamelCase (for example `Ridge` and `InstrumentBasisMean`).
 - When adding new active `jax_flat` operators, implement both the pure JAX-flat operator and corresponding native C++ lowering/runtime support unless the task explicitly scopes C++ out; document and test any intentional C++ fallback.

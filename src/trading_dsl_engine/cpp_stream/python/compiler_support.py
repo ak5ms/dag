@@ -50,7 +50,7 @@ _MINIFORGE_URL = (
 _INTEL_CONDA_CHANNEL = "https://software.repos.intel.com/python/conda/"
 _warned_missing_icpx = False
 _HEADER_DIGEST_CACHE: dict[
-    tuple[str, str], tuple[tuple[tuple[str, int, int], ...], bytes]
+    tuple[str, str], tuple[tuple[tuple[str, int, int, int], ...], bytes]
 ] = {}
 
 
@@ -284,13 +284,22 @@ def _compiler_runtime_link_flags(compiler: str) -> list[str]:
 
 
 @lru_cache(maxsize=None)
-def _compiler_identity(compiler: str) -> bytes:
+def _compiler_identity_cached(
+    compiler: str, size: int, mtime_ns: int, ctime_ns: int
+) -> bytes:
     """Return the stable compiler identity without spawning on every formula."""
 
     version = subprocess.run(
         [compiler, "--version"], capture_output=True, text=True, check=False
     )
     return (version.stdout or version.stderr).encode()
+
+
+def _compiler_identity(compiler: str) -> bytes:
+    stat = Path(compiler).stat()
+    return _compiler_identity_cached(
+        compiler, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    )
 
 
 def _header_digest(cpp_root: str, eigen_root: str) -> bytes:
@@ -302,7 +311,13 @@ def _header_digest(cpp_root: str, eigen_root: str) -> bytes:
     if eigen_macros.is_file():
         headers += (eigen_macros,)
     signature = tuple(
-        (str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in headers
+        (
+            str(path),
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+        )
+        for path in headers
     )
     key = (str(roots[0]), str(roots[1]))
     cached = _HEADER_DIGEST_CACHE.get(key)

@@ -41,12 +41,14 @@ def _capture_compile_passes(monkeypatch, *, n_instruments):
     return calls, captured
 
 
-def test_known_instrument_count_uses_one_ir_build(monkeypatch):
+def test_known_instrument_count_rebuilds_after_source_resolution(monkeypatch):
     calls, captured = _capture_compile_passes(
         monkeypatch,
         n_instruments=9,
     )
-    assert len(calls) == 1
+    # Some composed Expr graphs finalize their source aliases during the first
+    # pass, so the exact-type pass is required even when N is supplied.
+    assert len(calls) == 2
     assert captured["kwargs"]["n_instruments"] == 9
 
 

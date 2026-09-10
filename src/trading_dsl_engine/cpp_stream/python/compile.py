@@ -238,18 +238,17 @@ def compile_formula(
         n = infer_n(infos, n_instruments)
         # Rebuild with exact N so all tensor and public-output extents become
         # compile-time constants before lowering and Jinja rendering.
-        if n_instruments is None:
-            with _measure(compile_stage_seconds, "frontend"):
-                program = compile_ir(
-                    formula,
-                    dsl_registry=dsl_registry,
-                    column_names=column_names,
-                    input_value_types={
-                        name: input_value_type(info.input_type, n)
-                        for name, info in infos.items()
-                    },
-                    n_instruments=n,
-                )
+        with _measure(compile_stage_seconds, "frontend"):
+            program = compile_ir(
+                formula,
+                dsl_registry=dsl_registry,
+                column_names=column_names,
+                input_value_types={
+                    name: input_value_type(info.input_type, n)
+                    for name, info in infos.items()
+                },
+                n_instruments=n,
+            )
         validate_names(program, data, what="source")
         ordered = tuple(infos[name].input_type for name in program.input_names)
         bound_sources: Mapping[str, SourceValue] | None = {

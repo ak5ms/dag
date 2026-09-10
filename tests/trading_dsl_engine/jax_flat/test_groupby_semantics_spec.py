@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import pytest
 
 from trading_dsl_engine.base.dsl import *
+from trading_dsl_engine.base.keys import key
 from trading_dsl_engine.jax_flat.engine import compile_formula
 from trading_dsl_engine.jax_flat.ops import GroupByOp, Op
 
@@ -21,6 +22,22 @@ def test_groupby_contract_scalar_key_nan_bucket_and_incremental_state():
     state, out2 = runtime.tick(state, jnp.array([1.0, jnp.nan]), jnp.array([4.0, 5.0]))
     assert jnp.allclose(out1, jnp.array([2.0, 3.0]), equal_nan=True)
     assert jnp.allclose(out2, jnp.array([6.0, 8.0]), equal_nan=True)
+
+
+def test_groupby_contract_accepts_key_metadata_wrapper():
+    formula = groupby(
+        (key(var("session"), row_scalar=True, monotonic=True),),
+        var("x"),
+        cumsum(self_),
+    )
+    runtime = compile_formula(formula)
+    _, out = runtime.run_batch((
+        jnp.array([[1.0, 1.0], [1.0, 1.0], [2.0, 2.0]]),
+        jnp.array([[2.0, 3.0], [4.0, 5.0], [7.0, 11.0]]),
+    ))
+    assert jnp.allclose(
+        out, jnp.array([[2.0, 3.0], [6.0, 8.0], [7.0, 11.0]])
+    )
 
 
 def test_groupby_contract_accepts_arbitrary_tuple_key_length():
