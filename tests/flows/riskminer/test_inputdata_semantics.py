@@ -145,3 +145,32 @@ def test_special_field_ranges():
     assert metadata["wdte_out0"].lower == 0.0
     assert metadata["volume_b9_out0"].lower == 0.0
     assert metadata["ap9_out0"].lower > 0.0
+
+
+def test_gp_alpha_search_terminal_metadata_adds_roll_rets():
+    from flows.gp import GPConfig, GrammarPolicy, make_pset
+    from flows.gp.types import DimensionlessRow
+    from flows.riskminer.semantics import (
+        gp_alpha_search_terminal_metadata,
+        gp_derived_alpha_terminal_metadata,
+        inputdata_alpha_terminal_metadata,
+    )
+
+    derived = gp_derived_alpha_terminal_metadata()
+    assert tuple(derived) == ("roll_rets",)
+    assert "dimensionless" in DEFAULT_TYPE_GRAPH.closure(
+        derived["roll_rets"].types
+    )
+
+    metadata = gp_alpha_search_terminal_metadata()
+    assert len(metadata) == len(inputdata_alpha_terminal_metadata()) + 1
+    assert "roll_rets" in metadata
+
+    pset = make_pset(
+        GPConfig(
+            fields=metadata,
+            grammar=GrammarPolicy(exclude_sections=("utils.group",)),
+        )
+    )
+    terminal_names = {terminal.name for terminal in pset.terminals[DimensionlessRow]}
+    assert "field_roll_rets" in terminal_names

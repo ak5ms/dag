@@ -634,7 +634,7 @@ struct XsGaussNode {
         std::array<std::uint8_t, Groups> valid{};
         for (std::size_t group = 0; group < Groups; ++group) {
             const std::uint32_t observations = count[group];
-            if (observations < 2 || !(maximum[group] > minimum[group])) continue;
+            if (observations == 0) continue;
 
             const double n = static_cast<double>(observations);
             mean[group] /= n;
@@ -656,6 +656,7 @@ struct XsGaussNode {
                 );
             }
             if (!finite(mean[group])) continue;
+            if (observations < 2 || !(maximum[group] > minimum[group])) continue;
 
             // Add one average inter-observation gap outside each endpoint.
             // This maps equally spaced values exactly to rank/(n+1), while
@@ -682,13 +683,14 @@ struct XsGaussNode {
             const double value = values[lane];
             if (!finite(value)) continue;
             const std::size_t group = Execution::cross_group(ctx, lane);
+
+            const double centered = value - mean[group];
+            input_m2[group] = std::fma(centered, centered, input_m2[group]);
+
             if (!valid[group]) {
                 values[lane] = 0.0;
                 continue;
             }
-
-            const double centered = value - mean[group];
-            input_m2[group] = std::fma(centered, centered, input_m2[group]);
 
             const double probability = std::fma(
                 value - minimum[group], maximum[group], q_base[group]
@@ -700,34 +702,51 @@ struct XsGaussNode {
         }
 
         // Centering only this spacing-derived component prevents its incidental
-        // mean from double-counting location. The input mean/std is then added
-        // exactly once; adding a constant leaves the final population std at 1.
+        // mean from double-counting location. Add the bounded common component
+        // mean/RMS exactly once; unlike mean/std it cannot explode when the
+        // cross-sectional dispersion approaches zero.
         for (std::size_t group = 0; group < Groups; ++group) {
-            if (!valid[group]) continue;
+            if (count[group] == 0 || !finite(mean[group])) continue;
             const double n = static_cast<double>(count[group]);
-            const double input_std = std::sqrt(
-                std::max(0.0, input_m2[group]) / n
+            const double input_variance = std::max(0.0, input_m2[group]) / n;
+            double input_rms = std::sqrt(
+                std::fma(mean[group], mean[group], input_variance)
             );
+            if (
+                !finite(input_rms)
+                || (
+                    !(input_rms > 0.0)
+                    && (mean[group] != 0.0 || input_variance > 0.0)
+                )
+            ) {
+                input_rms = std::hypot(
+                    mean[group], std::sqrt(input_variance)
+                );
+            }
+            double bounded_location = 0.0;
+            if (input_rms > 0.0 && finite(input_rms)) {
+                bounded_location = std::max(
+                    -1.0,
+                    std::min(1.0, mean[group] / input_rms)
+                );
+            }
+            // minimum is dead after probability construction; reuse it for the
+            // final common-location term, including constant cross sections.
+            minimum[group] = bounded_location;
+            if (!valid[group]) continue;
+
             const double raw_mean = raw_sum[group] / n;
             const double raw_variance = std::max(
                 0.0,
                 std::fma(-raw_mean, raw_mean, raw_sumsq[group] / n)
             );
             const double raw_std = std::sqrt(raw_variance);
-            const double standardized_location = mean[group] / input_std;
-            if (
-                !(input_std > 0.0)
-                || !(raw_std > 0.0)
-                || !finite(input_std)
-                || !finite(raw_std)
-                || !finite(standardized_location)
-            ) {
+            if (!(raw_std > 0.0) || !finite(raw_std)) {
                 valid[group] = 0;
                 continue;
             }
             mean[group] = raw_mean;
             maximum[group] = 1.0 / raw_std;
-            minimum[group] = standardized_location;
         }
 
         for (std::size_t lane = write_begin; lane < write_end; ++lane) {
@@ -743,7 +762,7 @@ struct XsGaussNode {
                     maximum[group],
                     minimum[group]
                 )
-                : 0.0;
+                : minimum[group];
         }
     }
 };

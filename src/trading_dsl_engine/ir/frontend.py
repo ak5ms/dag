@@ -162,7 +162,13 @@ def _number_key(value: int | float) -> tuple:
     return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
-def _expr_key(node: Expr) -> tuple:
+_EXPR_KEY_ID_MEMO: dict[int, tuple[Expr, tuple]] = {}
+
+def clear_expr_key_id_memo() -> None:
+    _EXPR_KEY_ID_MEMO.clear()
+
+
+def _expr_key_uncached(node: Expr) -> tuple:
     if isinstance(node, Identifier):
         return ("id", node.name)
     if isinstance(node, Number):
@@ -213,7 +219,9 @@ def _expr_key(node: Expr) -> tuple:
     if isinstance(node, Call):
         args = tuple(_expr_key(arg) for arg in node.args)
         if node.fn in _COMMUTATIVE_NARY and len(args) == 2:
-            args = tuple(sorted(args, key=repr))
+            # Tuple keys are structurally orderable; repr() on deep nested keys
+            # grows exponentially for boolean/session logic chains.
+            args = tuple(sorted(args))
         return (
             "call",
             node.fn,
@@ -221,6 +229,17 @@ def _expr_key(node: Expr) -> tuple:
             tuple((name, _expr_key(value)) for name, value in node.kwargs),
         )
     raise FormulaIRCompileError(f"unhandled expression {node!r}")
+
+
+def _expr_key(node: Expr) -> tuple:
+    cached = _EXPR_KEY_ID_MEMO.get(id(node))
+    if cached is not None and cached[0] is node:
+        return cached[1]
+    result = _expr_key_uncached(node)
+    # Retain the object beside its id for the lifetime of this compile so a later
+    # temporary macro expansion cannot reuse that id with a different structure.
+    _EXPR_KEY_ID_MEMO[id(node)] = (node, result)
+    return result
 
 
 def _contains_self(node: Expr) -> bool:
@@ -895,6 +914,42 @@ class _BaseBuilder:
         return self._build_terminal_or_capture(node)
 
     def _build_call(self, node: Call) -> int:
+        # A scalar `where(open, optimizer_field, NaN)` is a control-flow
+        # guard for the generated optimizer, not an eager elementwise mask.
+        # Encode the guard as a second projection child so cpp_stream can
+        # skip parameter loading, solving, and feedback-state advancement.
+        if (
+            node.fn == "where"
+            and not node.kwargs
+            and len(node.args) == 3
+            and isinstance(node.args[1], CvxpyFieldExpr)
+            and isinstance(node.args[2], Number)
+            and isinstance(node.args[2].value, float)
+            and math.isnan(node.args[2].value)
+        ):
+            condition = self.build(node.args[0])
+            condition_type = self.nodes[condition].value_type
+            try:
+                condition_shape = condition_type.logical_shape
+            except ValueError:
+                condition_shape = None
+            if condition_shape == ():
+                projection = node.args[1]
+                child = self.build(projection.program_expr)
+                child_op = self.nodes[child].op
+                if not isinstance(child_op, CvxpyProgramOp):
+                    raise FormulaIRCompileError(
+                        "optimizer field projection lost its generated "
+                        "program object"
+                    )
+                field = child_op.program.resolve_field(projection.field)
+                return self._append(
+                    CvxpyProjectionOp(field),
+                    (child, condition),
+                    _generated_field_value_type(
+                        child_op.program, field.logical_shape
+                    ),
+                )
         if node.fn in _NARY_ARITY:
             arity = _NARY_ARITY[node.fn]
             if node.kwargs or len(node.args) != arity:
@@ -1187,15 +1242,21 @@ class _BaseBuilder:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError("xs_weighted_mean expects x, weight")
             children = tuple(self.build(arg) for arg in node.args)
-            if any(self.nodes[child].value_type.kind != "vector" for child in children):
-                raise FormulaIRCompileError("xs_weighted_mean requires vectors")
+            kinds = tuple(self.nodes[child].value_type.kind for child in children)
+            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
+                raise FormulaIRCompileError(
+                    "xs_weighted_mean requires vector x and scalar or vector weight"
+                )
             return self._append(XsWeightedMeanOp(), children, VECTOR)
         if node.fn in {"xs_vector_projection", "xs_regression_projection"}:
             if node.kwargs or len(node.args) != 2:
                 raise FormulaIRCompileError(f"{node.fn} expects target, regressor")
             children = tuple(self.build(arg) for arg in node.args)
-            if any(self.nodes[child].value_type.kind != "vector" for child in children):
-                raise FormulaIRCompileError(f"{node.fn} requires vectors")
+            kinds = tuple(self.nodes[child].value_type.kind for child in children)
+            if kinds[0] != "vector" or kinds[1] not in {"scalar", "vector"}:
+                raise FormulaIRCompileError(
+                    f"{node.fn} requires vector target and scalar or vector regressor"
+                )
             return self._append(
                 XsProjectionOp(node.fn == "xs_regression_projection"),
                 children,
@@ -1338,6 +1399,21 @@ class _BaseBuilder:
                 _feature_width(self.nodes[index].value_type)
                 for index in feature_ids
             )
+            offsets = []
+            offset = 0
+            for width in widths:
+                offsets.append(offset)
+                offset += width
+            feature_keys = tuple(_expr_key(feature) for feature in features)
+            feature_order = sorted(
+                range(len(features)),
+                key=feature_keys.__getitem__,
+            )
+            solve_order = tuple(
+                coefficient
+                for index in feature_order
+                for coefficient in range(offsets[index], offsets[index] + widths[index])
+            )
             children = list(feature_ids) + [self.build(y)]
             if weights is not None:
                 children.append(self.build(weights))
@@ -1348,6 +1424,8 @@ class _BaseBuilder:
                 nonneg,
                 stateful,
                 recompute_every,
+                solve_order,
+                len(set(feature_keys)) == len(feature_keys),
             )
             return self._append(
                 op, tuple(children), object_value(op.coefficient_width)
@@ -1572,6 +1650,7 @@ def compile_ir(
     column_names: list[str] | tuple[str, ...] | None = None,
     input_value_types: Mapping[str, ValueType] | None = None,
 ) -> Program:
+    clear_expr_key_id_memo()
     expression = parse_formula(formula) if isinstance(formula, str) else formula
     builder = _OuterBuilder(
         dsl_registry or DEFAULT_DSL_REGISTRY,
@@ -1590,4 +1669,4 @@ def compile_ir(
     return Program(tuple(builder.nodes), (root,), tuple(builder.inputs))
 
 
-__all__ = ["FormulaIRCompileError", "compile_ir"]
+__all__ = ["FormulaIRCompileError", "clear_expr_key_id_memo", "compile_ir"]

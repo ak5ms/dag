@@ -92,7 +92,7 @@ def _build_plan(
     next_matrix_slot = 0
     max_matrix_width = 1
     materialized_sources: dict[Source, Source] = {}
-    clarabel_stage_by_object: dict[Source, int] = {}
+    clarabel_stage_by_object: dict[tuple[Source, Source | None], int] = {}
 
     def source_slot_dependencies(source: Source) -> frozenset[tuple[str, int]]:
         dependencies: set[tuple[str, int]] = set()
@@ -554,18 +554,31 @@ def _build_plan(
             continue
 
         if isinstance(op, CvxpyProjectionOp):
+            if len(children) not in {1, 2}:
+                raise CppStreamLoweringError(
+                    "optimizer projection expects its object and optional "
+                    "scalar guard"
+                )
             object_source = children[0]
+            guard_source = children[1] if len(children) == 2 else None
             if object_source.kind != "clarabel" or not isinstance(
                 object_source.op, CvxpyProgramOp
             ):
                 raise CppStreamLoweringError(
                     "optimizer projection lost its generated program object"
                 )
+            if guard_source is not None and guard_source.shape != ():
+                raise CppStreamLoweringError(
+                    "optimizer where guard must be scalar for the whole row"
+                )
             field = op.field
             out = value_dest(is_root, node_shape)
+            stage_inputs = object_source.parts + (
+                () if guard_source is None else (guard_source,)
+            )
             member = Stage(
                 "clarabel",
-                object_source.parts,
+                stage_inputs,
                 out,
                 1,
                 output_kind=node.value_type.kind,
@@ -574,9 +587,10 @@ def _build_plan(
                 projection=field.name,
                 final_only=final_only,
             )
-            previous_index = clarabel_stage_by_object.get(object_source)
+            bundle_key = (object_source, guard_source)
+            previous_index = clarabel_stage_by_object.get(bundle_key)
             if previous_index is None:
-                clarabel_stage_by_object[object_source] = len(stages)
+                clarabel_stage_by_object[bundle_key] = len(stages)
                 stages.append(member)
             else:
                 previous = stages[previous_index]

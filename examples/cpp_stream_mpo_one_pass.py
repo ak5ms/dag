@@ -1,10 +1,4 @@
-"""One-pass Ridge -> risk model -> direct Clarabel MPO -> downstream PnL example.
-
-The generated runner has one temporal loop. Ridge forecasts, the matrix EWM risk
-model, PSD factorization, bounded CVXPY canonicalization, persistent Clarabel solve,
-and downstream ``shift(weights[0]) * returns`` all run in that loop. No optimizer
-input is materialized as a historical array and there is no second pass over time.
-"""
+"""InputData -> gap-aware Ridge forecasts -> sequential Clarabel MPO, in one loop."""
 
 from __future__ import annotations
 
@@ -12,17 +6,32 @@ import os
 from pathlib import Path
 
 import cvxpy as cp
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
-from flows.riskmodel import risk_covariance
+from flows.alpha_search import _ic_terms, ic, ic1
+from flows.load import InputData
+from flows.pov import RollRets
+from flows.riskmodel import risk_covariance, vol as riskmodel_vol
+from flows.utils import streak, ts_zscore
+from trading_dsl_engine import diff
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
-    ewm,
-    get_preds,
+    einsum,
+    ffill,
+    fillna,
+    get_beta,
+    isfinite,
+    isnan,
     psd_factor,
+    purify,
+    reduce_max,
+    rolling_sum,
     shift,
     var,
+    where,
 )
 from trading_dsl_engine.cpp_stream import compile_formula
 from trading_dsl_engine.cpp_stream.optimizer import (
@@ -33,9 +42,17 @@ from trading_dsl_engine.cpp_stream.optimizer import (
     previous_solution,
 )
 
-N_ASSETS = 6
-N_HORIZONS = 3
-ROWS = 500
+HORIZONS = (2, 4, 8, 16, 32, 64, 128)
+TRADE_STARTS = (1,) + HORIZONS[:-1]
+FEATURE_HLS = (4, 16, 64, 256)
+IC_VOL_SPAN = 1440 * 21
+RIDGE_HL = 1440 * 21
+RISK_SPAN = 1440 * 21
+RISK_MIN_PERIODS = 64
+RISK_RADIUS = 0.08
+TRADE_BIG_M = 1e3
+MINUTE_US = 60_000_000.0
+ROWS = int(os.environ.get("MPO_EXAMPLE_ROWS", "100000"))
 CACHE = Path(".generated/cpp_stream_mpo_one_pass")
 
 
@@ -47,169 +64,427 @@ def _clarabel() -> ClarabelNativePaths:
     return build_current_clarabel()
 
 
+def _feature_span(hl: float) -> float:
+    return 2 / (1 - 0.5 ** (1 / hl)) - 1
+
+
+def _diagnostic_pnls(
+    signal,
+    *,
+    roll_rets,
+    is_tradable,
+    w,
+    lag: int,
+    hz: int,
+):
+    kwargs = dict(
+        roll_rets=roll_rets,
+        is_tradable=is_tradable,
+        hl=IC_VOL_SPAN,
+        lag=lag,
+        hz=hz,
+        w=w,
+    )
+    return {
+        "ic": ic(signal, **kwargs).sum(axis=[1]),
+        "ic1": ic1(signal, **kwargs).sum(axis=[1]),
+    }
+
+
+def _planned_trade_allowed(tradable):
+    """Scheduled availability for each future trade start."""
+    raw_ts = var("_ev_ts")
+    ts = ffill(raw_ts) + streak(isnan(raw_ts)) * MINUTE_US
+    session_start = ffill(var("session_start0"))
+    session_end = ffill(var("session_end0"))
+    next_session_start = ffill(var("next_session_start0"))
+    next_session_end = ffill(var("next_session_end0"))
+
+    allowed = []
+    for start in TRADE_STARTS:
+        trade_ts = ts + start * MINUTE_US
+        in_session = (trade_ts >= session_start) & (trade_ts < session_end)
+        in_next_session = (trade_ts >= next_session_start) & (trade_ts < next_session_end)
+        allowed.append(
+            fillna(where(in_session | in_next_session, 1.0, 0.0), 0.0)
+        )
+    return cat(*allowed)
+
+
 @cvxpy_program(
     cache_dir=CACHE / "clarabel",
     clarabel=_clarabel,
     sequential=None,
+    solver_settings={"iterative_refinement_enable": False},
 )
 def MPO(
     expected_returns,
-    half_spread_bps,
+    half_spread,
     current_weights,
-    risk_factor,
-    risk_radius=0.08,
-) -> cp.Problem:
-    """Define the optimizer once, including its CVXPY Parameter attributes."""
-
+    risk_factor_0,
+    risk_factor_1,
+    risk_factor_2,
+    risk_factor_3,
+    risk_factor_4,
+    risk_factor_5,
+    risk_factor_6,
+    trade_allowed,
+    risk_radius=RISK_RADIUS,
+):
     n_horizons, n_assets = expected_returns.shape
-    expected_returns = cp.Parameter(
-        expected_returns.shape, name="expected_returns"
+    expected_returns = cp.Parameter(expected_returns.shape, name="expected_returns")
+    half_spread = cp.Parameter(half_spread.shape, name="half_spread", nonneg=True)
+    current_weights = cp.Parameter((n_assets,), name="current_weights")
+    risk_factors = tuple(
+        cp.Parameter(arg.shape, name=f"risk_factor_{h}")
+        for h, arg in enumerate(
+            (
+                risk_factor_0,
+                risk_factor_1,
+                risk_factor_2,
+                risk_factor_3,
+                risk_factor_4,
+                risk_factor_5,
+                risk_factor_6,
+            )
+        )
     )
-    half_spread_bps = cp.Parameter(
-        half_spread_bps.shape,
-        name="half_spread_bps",
-        nonneg=True,
+    trade_allowed = cp.Parameter(
+        trade_allowed.shape, name="trade_allowed", nonneg=True
     )
-    current_weights = cp.Parameter(
-        (n_assets,), name="current_weights"
-    )
-    risk_factor = cp.Parameter(risk_factor.shape, name="risk_factor")
     risk_radius = cp.Parameter(name="risk_radius", nonneg=True)
+
     weights = cp.Variable((n_horizons, n_assets), name="weights")
-    turnover = cp.Variable((n_horizons, n_assets), name="turnover")
-    previous = cp.vstack([current_weights, weights[:-1]])
-    delta = weights - previous
-    turnover_up = turnover >= delta
-    turnover_up.set_label("turnover_up")
-    turnover_down = turnover >= -delta
-    turnover_down.set_label("turnover_down")
-    constraints = [turnover_up, turnover_down]
-    for horizon in range(n_horizons):
-        risk = cp.SOC(risk_radius, risk_factor @ weights[horizon])
-        risk.set_label(f"risk_{horizon}")
+    previous_weights = cp.Variable((n_assets,), name="previous_weights")
+    delta = weights - cp.vstack([previous_weights, weights[:-1]])
+    abs_delta = cp.abs(delta)
+    spread_cost = cp.sum(cp.multiply(half_spread, abs_delta))
+    constraints = [
+        previous_weights == current_weights,
+        cp.sum(delta, axis=1) == 0,
+        abs_delta <= TRADE_BIG_M * trade_allowed,
+    ]
+    for h, risk_factor in enumerate(risk_factors):
+        risk = cp.SOC(risk_radius, risk_factor @ weights[h])
+        risk.set_label(f"risk_{h}")
         constraints.append(risk)
     return cp.Problem(
         cp.Minimize(
             -cp.sum(cp.multiply(expected_returns, weights))
-            + cp.sum(cp.multiply(half_spread_bps * 1e-4, turnover))
+            + spread_cost
         ),
         constraints,
     )
 
 
-def _formula():
-    returns = var("returns")
-    lagged = shift(returns, 1, 1)
-    fast_level = ewm(returns, 8, min_periods=2)
+def _formula(returns=None):
+    returns = RollRets().roll_rets() if returns is None else returns
+    tradable = fillna(var("is_tradable_out0"), 0.0)
+    hs = var("vw_halfspread_out0")
+    fit_weights = purify(1 / hs**2)
+    feature_list = tuple(
+        -ts_zscore(
+            returns,
+            _feature_span(hl),
+            min_periods=max(2, round(_feature_span(hl))),
+        )
+        for hl in FEATURE_HLS
+    )
+    features = cat(*feature_list)
+    ridge_feature_list = tuple(
+        feature * riskmodel_vol for feature in feature_list
+    )
+    ridge_features = cat(*ridge_feature_list)
 
-    # Three streaming Ridge models produce one forecast vector per horizon.
-    horizon_forecasts = tuple(
-        get_preds(
+    # Closed rows contribute zero; RollRets puts the close-to-open gap move on
+    # the first tradable row after reopening.
+    clean_returns = where(tradable != 0, fillna(returns, 0.0), 0.0)
+
+    forecasts, forecast_started, factors = [], [], []
+    alpha_pnl, yhat_pnl = {}, {}
+    for start, end in zip(TRADE_STARTS, HORIZONS):
+        width = end - start
+        block_return = rolling_sum(clean_returns, width, min_periods=width)
+        block_observed = rolling_sum(tradable, width, min_periods=width)
+
+        # Mirror alpha_search.ic/ic1 state semantics. _ic_terms applies the
+        # lag, tradability-aware ffill, and cross-sectional weight
+        # normalization. Shifting its lagged position by width aligns feature
+        # time t-end with the block target ending at t.
+        fit_features = []
+        ridge_weights = None
+        for ridge_feature in ridge_feature_list:
+            position, _, ridge_weights = _ic_terms(
+                s=ridge_feature,
+                roll_rets=returns,
+                is_tradable=tradable,
+                w=fit_weights,
+                lag=start,
+            )
+            fit_features.append(shift(position, width))
+        fit_x = cat(*fit_features)
+        ridge_target = where(
+            block_observed > 0,
+            block_return,
+            float("nan"),
+        )
+        beta = get_beta(
             Ridge(
-                lagged,
-                fast_level,
-                y=returns,
-                hl=half_life,
+                fit_x,
+                y=ridge_target,
+                weights=shift(ridge_weights, width),
+                hl=RIDGE_HL,
                 lambda_=0.1,
             )
         )
-        for half_life in (8, 32, 128)
-    )
-    expected_returns = cat(*horizon_forecasts)  # logical shape (assets, horizons)
+        # x * sigma * beta makes beta dimensionless and correlation-like.
+        # The same current x * sigma features produce the forward forecast.
+        yhat = einsum(ridge_features, beta, "if,f->i")
+        forecasts.append(fillna(yhat, 0.0))
+        forecast_started.append(
+            fillna(
+                ffill(
+                    where(
+                        isfinite(yhat) & (yhat != 0.0),
+                        1.0,
+                        float("nan"),
+                    )
+                ),
+                0.0,
+            )
+        )
 
-    covariance = risk_covariance(
-        returns,
-        span=64,
-        min_periods=8,
-        ignore_na=True,
-        adjust=False,
-    )
-    # psd_factor emits row-major L. CVXPY's column-major parameter ABI sees L.T,
-    # so C.T @ C equals L @ L.T, the repaired covariance matrix.
-    risk_factor = psd_factor(covariance, eigenvalue_floor=1e-8)
+        horizon_key = f"{start}_{end}"
+        alpha_diagnostics = [
+            _diagnostic_pnls(
+                ridge_feature,
+                roll_rets=returns,
+                is_tradable=tradable,
+                w=fit_weights,
+                lag=start,
+                hz=width,
+            )
+            for ridge_feature in ridge_feature_list
+        ]
+        alpha_pnl[horizon_key] = {
+            "ic": {
+                f"hl_{hl}": diagnostic["ic"]
+                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)
+            },
+            "ic1": {
+                f"hl_{hl}": diagnostic["ic1"]
+                for hl, diagnostic in zip(FEATURE_HLS, alpha_diagnostics)
+            },
+        }
+        yhat_pnl[horizon_key] = _diagnostic_pnls(
+            yhat,
+            roll_rets=returns,
+            is_tradable=tradable,
+            w=fit_weights,
+            lag=start,
+            hz=width,
+        )
 
+        # Risk uses the total return of the same disjoint block, with no
+        # elapsed-time normalization.
+        risk_block = shift(block_return, start)
+        risk_observed = shift(block_observed, start)
+        risk_sample = where(risk_observed > 0, risk_block, float("nan"))
+        covariance = risk_covariance(
+            risk_sample,
+            span=RISK_SPAN,
+            min_periods=RISK_MIN_PERIODS,
+            ignore_na=True,
+            adjust=False,
+        )
+        factors.append(
+            psd_factor(fillna(covariance, 0.0), eigenvalue_floor=1e-8)
+        )
+
+    forecast_matrix = cat(*forecasts)
     mpo = MPO(
-        expected_returns=expected_returns,
-        half_spread_bps=var("half_spread_bps"),
-        # The first solve starts flat. Every later solve consumes the prior
-        # first-horizon solution as the portfolio actually carried into the row.
+        expected_returns=forecast_matrix,
+        half_spread=fillna(purify(hs), 0.0),
         current_weights=previous_solution("weights[0]", initial=0.0),
-        risk_factor=risk_factor,
-        risk_radius=0.08,
+        risk_factor_0=factors[0],
+        risk_factor_1=factors[1],
+        risk_factor_2=factors[2],
+        risk_factor_3=factors[3],
+        risk_factor_4=factors[4],
+        risk_factor_5=factors[5],
+        risk_factor_6=factors[6],
+        trade_allowed=(
+            _planned_trade_allowed(tradable) * cat(*forecast_started)
+        ),
+        risk_radius=RISK_RADIUS,
     )
-    next_weights = get_field(mpo, "weights[0]")
-    first_horizon_turnover = get_field(mpo, "turnover[0]")
-    turnover_lagrangian = get_field(mpo, "turnover_up.lagrangian[0]")
-    first_risk_dual = get_field(mpo, "risk_0.dual")
-    first_risk_value = get_field(mpo, "risk_0.value")
-    objective = get_field(mpo, "objective")
-    iterations = get_field(mpo, "iterations")
-
-    # This remains downstream of the native optimizer in the same row transition.
-    pnl = shift(next_weights, 1, 1) * returns
-    return (
-        pnl,
-        next_weights,
-        first_horizon_turnover,
-        turnover_lagrangian,
-        first_risk_dual,
-        first_risk_value,
-        objective,
-        iterations,
+    session_open = reduce_max(tradable, axis=[1]) != 0.0
+    weights = where(
+        session_open,
+        get_field(mpo, "weights[0]"),
+        float("nan"),
     )
-
-
-def _simulation() -> dict[str, np.ndarray]:
-    rng = np.random.default_rng(42)
-    loadings = rng.normal(size=(N_ASSETS, 2))
-    covariance = loadings @ loadings.T
-    covariance /= np.sqrt(np.outer(np.diag(covariance), np.diag(covariance)))
-    covariance = 2e-5 * covariance + 8e-5 * np.eye(N_ASSETS)
-    returns = rng.multivariate_normal(
-        np.zeros(N_ASSETS), covariance, size=ROWS
+    status = where(
+        session_open,
+        get_field(mpo, "status"),
+        float("nan"),
     )
-    returns[rng.random(returns.shape) < 0.01] = np.nan
-    half_spread = np.broadcast_to(
-        np.linspace(0.5, 1.5, N_ASSETS), (ROWS, N_ASSETS)
-    ).copy()
+    mpo_objective = where(
+        session_open,
+        get_field(mpo, "objective"),
+        float("nan"),
+    )
+    risk_values = {
+        f"{start}_{end}": where(
+            session_open,
+            get_field(mpo, f"risk_{h}.value"),
+            float("nan"),
+        )
+        for h, (start, end) in enumerate(zip(TRADE_STARTS, HORIZONS))
+    }
+
+    mpo_gross_pnl = (
+        fillna(shift(ffill(weights), 1), 0.0) * clean_returns
+    ).sum(axis=[1])
+    mpo_spread_cost = (
+        diff(ffill(weights)).abs() * fillna(purify(hs), 0.0)
+    ).sum(axis=[1])
+
+
     return {
         "returns": returns,
-        "half_spread_bps": half_spread,
+        "expected_returns": forecast_matrix,
+        "features": features,
+        "weights": weights,
+        "status": status,
+        "mpo_objective": mpo_objective,
+        "mpo_gross_pnl": mpo_gross_pnl,
+        "mpo_spread_cost": mpo_spread_cost,
+        "risk": risk_values,
+        "alpha_pnl": alpha_pnl,
+        "yhat_pnl": yhat_pnl,
     }
 
 
-def main() -> None:
-    data = _simulation()
-    runtime = compile_formula(list(_formula()), data)
+def _cum(x):
+    return np.cumsum(np.where(np.isfinite(x), x, 0.0))
+
+
+def _plot_diagnostics(data, values, *, plot_dir):
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    ts = np.asarray(data["_ev_ts"])
+    ts = ts[:, 0] if ts.ndim > 1 else ts
+    index = pd.to_datetime(pd.Series(ts).interpolate(), unit="us")
+    paths = []
+
+    for start, end in zip(TRADE_STARTS, HORIZONS):
+        horizon_key = f"{start}_{end}"
+        diagnostics = values["alpha_pnl"][horizon_key]
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for label, pnl in diagnostics["ic"].items():
+            ax.plot(index, _cum(pnl), label=f"{label} ic")
+        for label, pnl in diagnostics["ic1"].items():
+            ax.plot(index, _cum(pnl), "--", label=f"{label} ic1")
+        ax.set_title(f"Alpha PnL: horizon ({start}, {end}] — ic vs ic1")
+        ax.set_ylabel("Cumulative PnL")
+        ax.legend(ncol=2, fontsize=8)
+        ax.grid(alpha=0.2)
+        fig.tight_layout()
+        plt.show()
+        path = plot_dir / f"alphas_horizon_{start}_{end}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths.append(path)
+
+        yhat = values["yhat_pnl"][horizon_key]
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(index, _cum(yhat["ic"]), label="ic")
+        ax.plot(index, _cum(yhat["ic1"]), "--", label="ic1")
+        ax.set_title(f"Aggregated Ridge yhat PnL: horizon ({start}, {end}]")
+        ax.set_ylabel("Cumulative PnL")
+        ax.legend()
+        ax.grid(alpha=0.2)
+        fig.tight_layout()
+        plt.show()
+        path = plot_dir / f"yhat_horizon_{start}_{end}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(index, _cum(values["mpo_gross_pnl"]), label="gross")
+    ax.plot(index, _cum(values["mpo_spread_cost"]), label="spread cost")
+    ax.set_title("Implemented MPO portfolio gross PnL")
+    ax.set_ylabel("Cumulative realized PnL")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    plt.show()
+    path = plot_dir / "portfolio_pnl.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(index, _cum(values["mpo_objective"]), label="objective")
+    ax.set_title("MPO objective")
+    ax.set_ylabel("Cumulative minimized objective")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    plt.show()
+    path = plot_dir / "mpo_objective.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    paths.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for start, end in zip(TRADE_STARTS, HORIZONS):
+        value = np.asarray(values["risk"][f"{start}_{end}"], dtype=float)
+        ax.plot(index, np.linalg.norm(value[:, 1:], axis=1), label=f"({start}, {end}]")
+    ax.axhline(RISK_RADIUS, linestyle="--", label="constraint")
+    ax.set_title("MPO risk constraint")
+    ax.set_ylabel("sqrt(w' S w)")
+    ax.legend(ncol=2, fontsize=8)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    plt.show()
+    path = plot_dir / "risk_constraint.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    paths.append(path)
+    return paths
+
+
+def _run(data, *, returns=None, output_dir=CACHE):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_assets = data["is_tradable_out0"].shape[1]
+    runtime = compile_formula(
+        _formula(returns),
+        data,
+        n_instruments=n_assets,
+    )
 
     generated = runtime.generated_cpp.read_text()
     row_loop = "for (std::size_t t = row_begin; t < row_end; ++t)"
     assert generated.count(row_loop) == 1
     assert generated.count("stackdsl::ClarabelNode<") == 1
-    assert "stackdsl::PsdFactorNode<" in generated
-    assert "stackdsl::RidgeNode<" in generated or "stackdsl::RidgeBundleNode<" in generated
 
-    result = runtime.run(out_path=CACHE / "result.npy")
-    (
-        pnl,
-        weights,
-        turnover,
-        turnover_lagrangian,
-        risk_dual,
-        risk_value,
-        objective,
-        iterations,
-    ) = result.load()
-    print(runtime.explain())
-    print(f"single temporal loop: {generated.count(row_loop)}")
-    print(f"rows={result.rows}, seconds={result.seconds:.6f}")
-    print(f"pnl shape={pnl.shape}")
-    print(f"weights shape={weights.shape}")
-    print(f"turnover shape={turnover.shape}")
-    print(f"turnover Lagrangian shape={turnover_lagrangian.shape}")
-    print(f"risk dual/value shapes={risk_dual.shape}/{risk_value.shape}")
-    print(f"objective/iterations shapes={objective.shape}/{iterations.shape}")
-    print(f"last weights={np.asarray(weights[-1])}")
+    result = runtime.run(out_path=output_dir / "result.npy")
+    values = result.load()
+    paths = _plot_diagnostics(data, values, plot_dir=output_dir / "plots")
+    return result, paths
+    pd.DataFrame(values['expected_returns'][:,0])
+
+
+def main() -> None:
+    data = InputData(nrows=ROWS, idx=None).get_data()
+    result, paths = _run(data)
+    print(f"rows={result.rows:,} seconds={result.seconds:.3f}")
+    for path in paths:
+        print(path)
 
 
 if __name__ == "__main__":

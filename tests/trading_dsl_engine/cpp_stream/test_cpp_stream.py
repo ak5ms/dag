@@ -253,6 +253,27 @@ def test_one_element_formula_list_returns_one_element_tuple(tmp_path: Path):
     assert result.logical_output_shapes == ((4,),)
 
 
+def test_cross_sectional_vector_ops_broadcast_scalar_secondary_inputs(tmp_path: Path):
+    _require_native_compiler()
+    x = np.arange(1, 25, dtype=np.float64).reshape(6, 4)
+    runtime = compile_formula(
+        [
+            "xs_weighted_mean(x, 1)",
+            "xs_vector_projection(x, 1)",
+            "xs_regression_projection(x, 1)",
+        ],
+        {"x": x},
+        n_instruments=4,
+    )
+    weighted, projection, regression = runtime.run(
+        out_path=tmp_path / "scalar-xs.npy"
+    ).load(mmap_mode=None)
+    expected_mean = np.mean(x, axis=1, keepdims=True)
+    np.testing.assert_allclose(weighted, np.broadcast_to(expected_mean, x.shape))
+    np.testing.assert_allclose(projection, np.broadcast_to(expected_mean, x.shape))
+    assert np.isnan(regression).all()  # a constant regressor has zero variance
+
+
 def test_formula_list_can_mix_row_and_final_outputs(tmp_path: Path):
     _require_native_compiler()
     x = np.arange(40, dtype=np.float64).reshape(10, 4)

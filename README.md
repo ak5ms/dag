@@ -282,3 +282,30 @@ and 4.46 GiB peak RSS to a 1.001-second median and 395.6 MiB absolute peak RSS
 in the full project environment. Generation itself added only 39.2 MiB above
 the already-loaded CVXPY/JAX baseline, and the header shrank from 26.28 MiB to
 5.20 MiB.
+
+`examples/cpp_stream_mpo_consistency.py` is the focused verification example for
+aligned feature, fitted, and MPO gross/net PnL on the primary `(1, 2]` realized
+stage. Synthetic mode is deterministic and asserts positive consistency checks;
+real-data mode reports diagnostics only.
+
+```bash
+PYTHONPATH=src python examples/cpp_stream_mpo_consistency.py --data synthetic
+PYTHONPATH=src python examples/cpp_stream_mpo_consistency.py --data real --rows 5000
+```
+
+The exploratory `examples/cpp_stream_mpo_one_pass.py` script remains available
+for broader integration experiments but does not enforce the same accounting
+checks.
+## Formula ergonomics and structured outputs
+
+Python expressions support pandas-style composition with `expr.pipe(function,
+*args, **kwargs)`. Every function installed through `register_dsl_function` in
+the default registry is also chainable, so `returns.ts_zscore(span=5)` and
+`ts_zscore(returns, span=5)` construct the same formula.
+
+The native `cpp_stream.compile_formula` runner accepts arbitrarily nested formula
+dictionaries. `result.load()` reconstructs them as ordered `FormulaResults`;
+`.map(function)` transforms every leaf while retaining the tree and `.flatten()`
+returns an ordered mapping whose keys are tuples containing the full nested path.
+Cross-sectional binary statistics broadcast scalar secondary values, including
+unit weights in `xs_weighted_mean(x, 1)` and scalar regressors in projection ops.

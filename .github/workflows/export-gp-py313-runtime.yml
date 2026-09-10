@@ -1,0 +1,33 @@
+name: Export minimal GP Python 3.13 runtime
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/export-gp-py313-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build minimal runtime directory
+        shell: bash
+        run: |
+          python -m pip install --target /tmp/gp-py313-runtime \
+            deap==1.4.2 includeigen
+          tar -C /tmp -czf /tmp/gp-py313-runtime.tar.gz \
+            gp-py313-runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gp-py313-runtime-${{ github.sha }}
+          path: /tmp/gp-py313-runtime.tar.gz
+          if-no-files-found: error
+          retention-days: 1

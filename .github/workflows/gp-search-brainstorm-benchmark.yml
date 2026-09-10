@@ -1,0 +1,89 @@
+name: GP search brainstorm benchmark
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/gp-search-brainstorm-benchmark.yml"
+      - "scripts/benchmark_gp_search_brainstorms_v2.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: src
+      TRADING_DSL_ENGINE_CPP_LTO: "0"
+      TRADING_DSL_ENGINE_CPP_NATIVE: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      GP_BRAINSTORM_ROWS: "25000"
+      GP_BRAINSTORM_INSTRUMENTS: "9"
+      GP_BRAINSTORM_CANDIDATES: "1"
+      GP_BRAINSTORM_POOL: "100"
+      GP_BRAINSTORM_RUNS: "3"
+      GP_BRAINSTORM_WARMUPS: "1"
+      GP_BRAINSTORM_THREADS: "1"
+      GP_BRAINSTORM_ROOT: /tmp/gp-brainstorm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m py_compile scripts/benchmark_gp_search_brainstorms_v2.py
+
+      - name: Record machine
+        run: |
+          mkdir -p /tmp/gp-brainstorm-report
+          {
+            echo "sha=$GITHUB_SHA"
+            echo "nproc=$(nproc)"
+            lscpu
+            g++ --version
+            python --version
+          } | tee /tmp/gp-brainstorm-report/machine.txt
+
+      - name: Run benchmark
+        id: bench
+        shell: bash
+        run: |
+          set +e
+          /usr/bin/time -v -o /tmp/gp-brainstorm-report/time.txt \
+            python scripts/benchmark_gp_search_brainstorms_v2.py \
+            2>&1 | tee /tmp/gp-brainstorm-report/benchmark.log
+          status=${PIPESTATUS[0]}
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cp /tmp/gp-brainstorm/benchmark.json /tmp/gp-brainstorm-report/ 2>/dev/null || true
+          exit 0
+
+      - name: Upload benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gp-search-brainstorm-${{ github.sha }}
+          path: /tmp/gp-brainstorm-report
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail if benchmark failed
+        if: always()
+        run: |
+          [[ "${{ steps.bench.outputs.status }}" == "0" ]] || exit 1

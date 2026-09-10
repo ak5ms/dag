@@ -21,11 +21,12 @@ from trading_dsl_engine.base.dsl import (
     get_beta,
     mul,
     ne,
-    pow as dsl_pow,
+    purify,
     reduction,
     shift,
     var,
     where,
+    xs_sum,
 )
 from trading_dsl_engine.base.parser import Expr
 
@@ -40,12 +41,42 @@ def halflife_to_span(halflife: float) -> float:
     return 2.0 / alpha - 1.0
 
 
+def ridge_pool_capacity_raw(
+    *,
+    hs_name: str = "vw_halfspread_out0",
+    volume_name: str = "volume_out0",
+    vwap_name: str = "vwap_mp_out0",
+) -> Expr:
+    """Bar dollar capacity scaled by inverse spread variance."""
+
+    hs = var(hs_name)
+    return purify(mul(var(volume_name), var(vwap_name)) / (hs ** 2))
+
+
+def ridge_pool_capacity_share(
+    *,
+    hs_name: str = "vw_halfspread_out0",
+    volume_name: str = "volume_out0",
+    vwap_name: str = "vwap_mp_out0",
+) -> Expr:
+    """Cross-sectional share of ``ridge_pool_capacity_raw``."""
+
+    raw = ridge_pool_capacity_raw(
+        hs_name=hs_name,
+        volume_name=volume_name,
+        vwap_name=vwap_name,
+    )
+    return purify(div(raw, xs_sum(raw)))
+
+
 def build_ridge_pool_score_formula(
     alphas: Sequence[Expr],
     *,
     roll_rets_name: str = "roll_rets",
     hs_name: str = "hs",
     vol_name: str = "vol",
+    volume_name: str = "volume_out0",
+    vwap_name: str = "vwap_mp_out0",
     is_tradable_name: str = "is_tradable",
     ridge_halflife: float = 1440.0 * 5.0,
     ridge_lambda: float = 0.0,
@@ -59,13 +90,17 @@ def build_ridge_pool_score_formula(
     if int(ridge_recompute_every) < 1:
         raise ValueError("ridge_recompute_every must be >= 1")
     roll_rets = var(roll_rets_name)
-    hs = var(hs_name)
     vol = var(vol_name)
     is_tradable = var(is_tradable_name)
     nan = float("nan")
 
     clean_rets = where(ne(roll_rets, 0.0), roll_rets, nan)
-    ridge_weights = dsl_pow(hs, -2.0)
+    capacity_share = ridge_pool_capacity_share(
+        hs_name=hs_name,
+        volume_name=volume_name,
+        vwap_name=vwap_name,
+    )
+    ridge_weights = capacity_share
     scaled_alphas = tuple(mul(alpha, vol) for alpha in alphas)
     scaled_matrix = cat(*scaled_alphas)
 
@@ -106,7 +141,7 @@ def build_ridge_pool_score_formula(
     )
     pool_pnl = reduction(
         "sum",
-        pool_contributions,
+        fillna(mul(pool_contributions, capacity_share), 0.0),
         axis=1,
     )
     score = div(
@@ -204,4 +239,6 @@ __all__ = [
     "PoolEvaluation",
     "build_ridge_pool_score_formula",
     "halflife_to_span",
+    "ridge_pool_capacity_raw",
+    "ridge_pool_capacity_share",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
@@ -29,7 +30,27 @@ from trading_dsl_engine.cpp_stream.python.sources import SourceValue
 
 
 Formula = str | Expr
-FormulaInput = Formula | list[Formula] | tuple[Formula, ...]
+FormulaInput = Formula | list[Formula] | tuple[Formula, ...] | Mapping[object, object]
+
+
+def _flatten_formula_mapping(formula: Mapping[object, object]):
+    flat: list[Formula] = []
+
+    def visit(value, path):
+        if isinstance(value, Mapping):
+            if not value:
+                raise ValueError(f"formula mapping at {path or '<root>'} must not be empty")
+            return OrderedDict(
+                (key, visit(child, path + (key,))) for key, child in value.items()
+            )
+        if not isinstance(value, (str, Expr)):
+            raise TypeError(f"formula mapping leaf at {path} must be a string or Expr")
+        index = len(flat)
+        flat.append(value)
+        return index
+
+    structure = visit(formula, ())
+    return tuple(flat), structure
 
 
 def _compile_program(
@@ -42,6 +63,7 @@ def _compile_program(
     prefetch_rows: int,
     bound_sources: Mapping[str, SourceValue] | None,
     return_multiple: bool,
+    result_structure=None,
 ) -> CppStreamRuntime:
     program = repair_value_types(program)
     for root_id in program.outputs:
@@ -130,6 +152,7 @@ def _compile_program(
         parallel_plan=parallel_plan,
         output_layout=layout,
         return_multiple=return_multiple,
+        result_structure=result_structure,
     )
 
 
@@ -149,7 +172,12 @@ def compile_formula(
 
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
-    return_multiple = isinstance(formula, (list, tuple))
+    result_structure = None
+    if isinstance(formula, Mapping):
+        formula, result_structure = _flatten_formula_mapping(formula)
+        return_multiple = True
+    else:
+        return_multiple = isinstance(formula, (list, tuple))
     if return_multiple:
         formula = tuple(formula)
         if not formula:
@@ -232,6 +260,7 @@ def compile_formula(
         prefetch_rows=prefetch_rows,
         bound_sources=bound_sources,
         return_multiple=return_multiple,
+        result_structure=result_structure,
     )
 
 

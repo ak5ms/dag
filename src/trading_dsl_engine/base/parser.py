@@ -146,6 +146,11 @@ class Expr:
 
         return emit(self, mode=mode)
 
+    def pipe(self, func, *args, **kwargs):
+        """Apply ``func`` to this expression, as in :meth:`pandas.DataFrame.pipe`."""
+
+        return func(self, *args, **kwargs)
+
     def groupby(self, key, rhs=None, *args):
         from trading_dsl_engine.base.dsl import grouped
 
@@ -174,12 +179,15 @@ class Expr:
         )
 
     def __getattr__(self, name: str):
-        from trading_dsl_engine.base.dsl import call, get_dsl_op_signature
+        from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, call, get_dsl_op_signature
 
-        if get_dsl_op_signature(name) is None:
+        registered = DEFAULT_DSL_REGISTRY.get(name)
+        if registered is None and get_dsl_op_signature(name) is None:
             raise AttributeError(f"{type(self).__name__!s} object has no attribute {name!r}")
 
         def _method_chained_op(*args, **kwargs):
+            if registered is not None:
+                return registered(self, *args, **kwargs)
             return call(name, self, *args, **kwargs)
 
         return _method_chained_op

@@ -354,10 +354,17 @@ class RidgeOp:
     nonneg: bool = False
     is_stateful: bool = True
     recompute_every: int = 1
+    solve_order: tuple[int, ...] = ()
+    solve_order_unique: bool = True
 
     def __post_init__(self) -> None:
         if self.recompute_every < 1:
             raise ValueError("Ridge recompute_every must be >= 1")
+        width = self.coefficient_width
+        if not self.solve_order:
+            object.__setattr__(self, "solve_order", tuple(range(width)))
+        elif sorted(self.solve_order) != list(range(width)):
+            raise ValueError("Ridge solve_order must permute all coefficients")
 
     @property
     def coefficient_width(self) -> int:

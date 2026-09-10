@@ -1,0 +1,33 @@
+name: Export strongly typed GP source
+# export revision: local-debug-all-refs
+
+on:
+  push:
+    branches:
+      - agent/strongly-typed-gp
+    paths:
+      - ".github/workflows/export-strongly-typed-gp-source.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/strongly-typed-gp
+          fetch-depth: 0
+      - name: Fetch all branches and package history
+        shell: bash
+        run: |
+          git fetch --force origin '+refs/heads/*:refs/remotes/origin/*'
+          git bundle create /tmp/dag-all-refs.bundle --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dag-all-refs-${{ github.sha }}
+          path: /tmp/dag-all-refs.bundle
+          if-no-files-found: error
+          retention-days: 1

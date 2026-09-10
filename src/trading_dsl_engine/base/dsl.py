@@ -547,9 +547,7 @@ def register_dsl_function(name: str | None = None, registry: DSLFunctionRegistry
 
         target.register(fn_name, fn)
         dispatch = target.get(fn_name) or fn
-        op_signature = _DSL_OP_SIGNATURES.get(fn_name)
-        if op_signature is not None:
-            dispatch.__signature__ = op_signature
+        dispatch.__signature__ = _DSL_OP_SIGNATURES.get(fn_name, signature(fn))
         return dispatch
 
     return _decorator

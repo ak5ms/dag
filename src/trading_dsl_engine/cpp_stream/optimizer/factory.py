@@ -17,6 +17,7 @@ from typing import Any
 from trading_dsl_engine.base.dsl import ensure_expr
 from trading_dsl_engine.cpp_stream.optimizer.clarabel_native import (
     ClarabelNativePaths,
+    ConstraintValueLayout,
     DualLayout,
     FieldAlias,
     GeneratedClarabelProgram,
@@ -36,7 +37,7 @@ from trading_dsl_engine.ir.types import ValueType
 
 
 _SYMBOLIC_INSTRUMENT_COUNT = 113
-_FACTORY_CACHE_SCHEMA = 4
+_FACTORY_CACHE_SCHEMA = 5
 _PROGRAM_CACHE_LOCK = RLock()
 _DEFAULT_ENABLE_SETTINGS = (
     "verbose",
@@ -59,6 +60,7 @@ class CvxpyProgramPrototype:
     duals: tuple[DualLayout, ...]
     aliases: tuple[FieldAlias, ...]
     instrument_count: int
+    constraint_values: tuple[ConstraintValueLayout, ...] = ()
 
     def parameter_index(self, name: str) -> int:
         for index, parameter in enumerate(self.parameters):
@@ -76,6 +78,7 @@ class CvxpyProgramPrototype:
             primals=self.primals,
             duals=self.duals,
             aliases=self.aliases,
+            constraint_values=self.constraint_values,
         )
 
 
@@ -201,30 +204,27 @@ def _requested_constraint_values(
     return tuple(sorted(result))
 
 
-def _augment_constraint_values(cp, problem, requested_fields):
+def _constraint_value_layouts(cp, problem, requested_fields):
     requested = _requested_constraint_values(problem, requested_fields)
-    if not requested:
-        return problem, {}
-    constraints = list(problem.constraints)
-    aliases: dict[str, str] = {}
-    variable_names = {variable.name() for variable in problem.variables()}
+    layouts = []
     for index in requested:
         constraint = problem.constraints[index]
         expression = _constraint_value_expression(cp, constraint)
-        base_name = f"cpp_stream_constraint_value_{index}"
-        name = base_name
-        suffix = 1
-        while name in variable_names:
-            suffix += 1
-            name = f"{base_name}_{suffix}"
-        variable_names.add(name)
-        value = cp.Variable(expression.shape, name=name)
-        constraints.append(value == expression)
-        aliases[f"constraint[{index}].value"] = name
-        label = _constraint_label(constraint)
-        if label is not None:
-            aliases[f"{label}.value"] = name
-    return cp.Problem(problem.objective, constraints), aliases
+        if not expression.is_affine():
+            raise ValueError(
+                f"constraint value {index} must be affine for native "
+                "post-solve evaluation"
+            )
+        layouts.append(
+            ConstraintValueLayout(
+                f"v{index}",
+                index,
+                _constraint_label(constraint),
+                tuple(int(extent) for extent in expression.shape),
+                int(expression.size),
+            )
+        )
+    return tuple(layouts)
 
 
 def _call_with_named_values(factory, signature, values):
@@ -277,6 +277,7 @@ class CvxpyProgramDefinition:
         prefix: str | None = None,
         sequential: bool | None = None,
         enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+        solver_settings: Mapping[str, Any] | None = None,
         parameter_shard_size: int = 512,
     ) -> None:
         self.factory = factory
@@ -297,6 +298,7 @@ class CvxpyProgramDefinition:
             raise TypeError("sequential must be True, False, or None")
         self.sequential = sequential
         self.enable_settings = tuple(enable_settings)
+        self.solver_settings = dict(solver_settings or {})
         if int(parameter_shard_size) <= 0:
             raise ValueError("parameter_shard_size must be positive")
         self.parameter_shard_size = int(parameter_shard_size)
@@ -312,6 +314,7 @@ class CvxpyProgramDefinition:
             self.factory.__qualname__,
             self._factory_hash,
             self.sequential,
+            tuple(sorted(self.solver_settings.items())),
         )
 
     def validate_field_request(self, field: str) -> None:
@@ -397,7 +400,7 @@ class CvxpyProgramDefinition:
                 f"{self.factory.__qualname__} must return cvxpy.Problem, "
                 f"got {type(problem).__name__}"
             )
-        problem, aliases = _augment_constraint_values(
+        constraint_values = _constraint_value_layouts(
             cp, problem, requested_fields
         )
         parameters = {}
@@ -427,9 +430,9 @@ class CvxpyProgramDefinition:
                     f"cp.Parameter {name!r} has shape {parameter_shape}, but "
                     f"its bound DSL argument has CVXPY shape {argument.shape}"
                 )
-        return problem, aliases
+        return problem, constraint_values
 
-    def _prototype(self, problem, aliases, n_instruments):
+    def _prototype(self, problem, constraint_values, n_instruments):
         offset = 0
         parameters = []
         for parameter in problem.parameters():
@@ -466,14 +469,17 @@ class CvxpyProgramDefinition:
             tuple(parameters),
             primals,
             duals,
-            tuple(
-                FieldAlias(name, primal_name)
-                for name, primal_name in sorted(aliases.items())
-            ),
+            (),
             n_instruments,
+            constraint_values,
         )
 
-    def _cache_key(self, problem, n_instruments: int) -> str:
+    def _cache_key(
+        self,
+        problem,
+        n_instruments: int,
+        constraint_values: tuple[ConstraintValueLayout, ...],
+    ) -> str:
         payload = {
             "cache_schema": _FACTORY_CACHE_SCHEMA,
             "factory": self._factory_hash,
@@ -499,6 +505,10 @@ class CvxpyProgramDefinition:
                 (variable.name(), tuple(variable.shape))
                 for variable in problem.variables()
             ],
+            "constraint_values": [
+                (value.constraint_index, value.label, value.shape)
+                for value in constraint_values
+            ],
             "constraints": [
                 (
                     type(constraint).__name__,
@@ -508,6 +518,7 @@ class CvxpyProgramDefinition:
                 for constraint in problem.constraints
             ],
             "enable_settings": self.enable_settings,
+            "solver_settings": self.solver_settings,
             "parameter_shard_size": self.parameter_shard_size,
         }
         return hashlib.sha256(
@@ -550,7 +561,7 @@ class CvxpyProgramDefinition:
             raise KeyError(
                 f"feedback contains unknown CVXPY arguments {unknown_feedback}"
             )
-        problem, aliases = self._instantiate_problem(
+        problem, constraint_values = self._instantiate_problem(
             parameter_types,
             requested_fields=requested_fields
             | frozenset(feedback_fields.values()),
@@ -558,9 +569,11 @@ class CvxpyProgramDefinition:
             feedback_names=frozenset(feedback_fields),
         )
         if n_instruments is None:
-            return self._prototype(problem, aliases, resolved_n)
+            return self._prototype(problem, constraint_values, resolved_n)
 
-        cache_key = self._cache_key(problem, int(n_instruments))
+        cache_key = self._cache_key(
+            problem, int(n_instruments), constraint_values
+        )
         with self._lock, _PROGRAM_CACHE_LOCK:
             cached = self._resolved.get(cache_key)
             if cached is not None:
@@ -594,8 +607,12 @@ class CvxpyProgramDefinition:
                     prefix=prefix,
                     instrument_count=int(n_instruments),
                     enable_settings=self.enable_settings,
+                    clarabel_settings=self.solver_settings,
                     parameter_shard_size=self.parameter_shard_size,
-                    field_aliases=aliases,
+                    constraint_value_indices=tuple(
+                        value.constraint_index for value in constraint_values
+                    ),
+                    field_aliases={},
                     force=force,
                 )
                 self._resolved[cache_key] = artifact
@@ -611,6 +628,7 @@ def cvxpy_program(
     prefix: str | None = None,
     sequential: bool | None = None,
     enable_settings: tuple[str, ...] = _DEFAULT_ENABLE_SETTINGS,
+    solver_settings: Mapping[str, Any] | None = None,
     parameter_shard_size: int = 512,
 ):
     """Decorate a CVXPY problem factory for direct use in the formula DSL."""
@@ -624,6 +642,7 @@ def cvxpy_program(
             prefix=prefix,
             sequential=sequential,
             enable_settings=enable_settings,
+            solver_settings=solver_settings,
             parameter_shard_size=parameter_shard_size,
         )
 

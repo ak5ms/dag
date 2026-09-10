@@ -9,7 +9,7 @@ from trading_dsl_engine.cpp_stream.python.compile import (
     compile_formula as _compile_formula,
 )
 from trading_dsl_engine.cpp_stream.python.compiler_support import install_icx
-from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime, RunResult
+from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime, FormulaResults, RunResult
 from trading_dsl_engine.cpp_stream.python.source_types import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.sources import (
     InputSource,
@@ -87,6 +87,7 @@ __all__ = [
     "infer_n_instruments",
     "install_icx",
     "CppStreamRuntime",
+    "FormulaResults",
     "RunResult",
     "InputTypeSpec",
     "InputSource",
