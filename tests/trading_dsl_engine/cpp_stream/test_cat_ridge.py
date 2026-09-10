@@ -285,6 +285,73 @@ def _nnqp_reference(system: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return best
 
 
+def test_stateful_nonnegative_ridge_beta_is_invariant_to_feature_order(tmp_path: Path) -> None:
+    rng = np.random.default_rng(20260909)
+    rows, n = 120, 7
+    x0 = rng.normal(size=(rows, n))
+    x1 = 0.95 * x0 + rng.normal(scale=0.05, size=(rows, n))
+    y = 0.3 * x0 + 0.1 * x1 + rng.normal(scale=0.01, size=(rows, n))
+    paths = {
+        "x0": _save(tmp_path / "x0.npy", x0),
+        "x1": _save(tmp_path / "x1.npy", x1),
+        "y": _save(tmp_path / "y.npy", y),
+    }
+    runtime_01 = compile_formula(
+        "get_beta(Ridge(cat(x0, x1), y=y, hl=16, lambda_=0.0, nonneg=True))",
+        paths,
+        n_instruments=n,
+    )
+    runtime_10 = compile_formula(
+        "get_beta(Ridge(cat(x1, x0), y=y, hl=16, lambda_=0.0, nonneg=True))",
+        paths,
+        n_instruments=n,
+    )
+    out_01 = tmp_path / "beta_01.bin"
+    out_10 = tmp_path / "beta_10.bin"
+    runtime_01.run(out_path=out_01)
+    runtime_10.run(out_path=out_10)
+    beta_01 = np.asarray(np.memmap(out_01, mode="r", dtype=np.float64, shape=(rows, 2)))
+    beta_10 = np.asarray(np.memmap(out_10, mode="r", dtype=np.float64, shape=(rows, 2)))
+    np.testing.assert_allclose(beta_01[:, [1, 0]], beta_10, rtol=1e-8, atol=1e-8)
+
+
+def test_nonnegative_ridge_rank_deficient_solution_is_permutation_invariant(
+    tmp_path: Path,
+) -> None:
+    features = [np.full((1, 9), np.nan) for _ in range(3)]
+    y = np.full((1, 9), np.nan)
+    lane_values = np.array([
+        -4.0273105168213793e-7,
+        -3.5210007260251709e-4,
+        -7.3190576235058631e-5,
+    ])
+    for feature, value in zip(features, lane_values, strict=True):
+        feature[0, 4] = value
+    y[0, 4] = -1.7992042727787982e-5
+    paths = {
+        f"x{index}": _save(tmp_path / f"singular_x{index}.npy", feature)
+        for index, feature in enumerate(features)
+    }
+    paths["y"] = _save(tmp_path / "singular_y.npy", y)
+
+    def run(feature_names: str, name: str) -> np.ndarray:
+        formula = (
+            f"get_beta(Ridge(cat({feature_names}), y=y, weights=1, "
+            "hl=181440, lambda_=0, nonneg=True))"
+        )
+        output = tmp_path / name
+        compile_formula(formula, paths, n_instruments=9).run(out_path=output)
+        return np.asarray(np.memmap(output, mode="r", dtype=np.float64, shape=(1, 3)))
+
+    forward = run("x0, x1, x2", "singular-forward.bin")
+    reverse = run("x2, x1, x0", "singular-reverse.bin")
+    design = lane_values[np.newaxis, :]
+    expected = np.linalg.pinv(design) @ np.array([y[0, 4]])
+
+    np.testing.assert_allclose(forward, reverse[:, ::-1], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(forward[0], expected, rtol=1e-10, atol=1e-12)
+
+
 def test_nonnegative_ridge_active_set_matches_bruteforce_kkt_reference(tmp_path: Path) -> None:
     rng = np.random.default_rng(20260802)
     rows, n, k = 20, 8, 3

@@ -76,7 +76,7 @@ This backend must remain independent of `jax_flat`.
 - Positive-half-life predictions use the prior beta; `hl<=0` or nonfinite is current-row/stateless.
 - Regularization is `XX + lambda * diag(diag(XX))`, with nonnegative lambda.
 - Unconstrained Ridge keeps the allocation-free fixed-array Cholesky, pivoted Gaussian, and Jacobi pseudoinverse chain because same-host benchmarks show a full Eigen replacement is materially slower at K=3. Fixed-size Eigen is used by the stateless NNQP path and may be used for cold numeric helpers only when benchmarks show no hot-path regression.
-- Stateless nonnegative Ridge uses the fixed-size active-set NNQP implementation adapted from the repository's `jax_ffi/nnqp` solver. Stateful nonnegative Ridge keeps its exact warm-started fixed-array coordinate solver; stateless nonnegative Ridge uses fixed-size NNQP.
+- Nonnegative Ridge (stateful and stateless) uses the fixed-size active-set NNQP implementation adapted from the repository's `jax_ffi/nnqp` solver. Stateful solves warm-start from the prior beta via the NNQP fallback argument so feature order does not change the optimum.
 - Ridge results remain projections of the neutral object. In addition to beta and
   prior-beta predictions, native projections may expose residuals, scalar fit
   metrics, individual coefficients, standard errors, t-statistics, effective model

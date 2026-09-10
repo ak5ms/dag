@@ -109,6 +109,7 @@ def compile_ir(
     # IR construction; lowering/codegen are imported explicitly by compile.py.
     neutral_frontend.clear_expr_key_id_memo()
     with _COMPILE_LOCK:
+        neutral_frontend.clear_expr_key_id_memo()
         original_nary = neutral_frontend._nary_result_type
         original_lane_state = neutral_frontend._lane_state_result_type
         neutral_frontend._nary_result_type = _nary_result_type

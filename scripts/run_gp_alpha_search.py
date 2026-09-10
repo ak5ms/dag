@@ -20,23 +20,6 @@ import time
 
 import matplotlib
 
-if not os.environ.get("DISPLAY"):
-    matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from deap import base, creator, gp, tools
-
-from flows.alpha_search import default_alpha_pnl
-from flows.gp import GPConfig, GrammarPolicy, individual_to_expr, make_pset, make_toolbox
-from flows.load import InputData
-from flows.riskminer.semantics import (
-    gp_alpha_search_terminal_metadata,
-    inputdata_alpha_terminal_metadata,
-)
-from flows.riskmodel import roll_rets
-from flows.utils import ewm_std, replace
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
@@ -45,6 +28,7 @@ from trading_dsl_engine.base.dsl import (
     fillna,
     ffill,
     get_beta,
+    isfinite,
     mul,
     purify,
     reduction,
@@ -52,7 +36,27 @@ from trading_dsl_engine.base.dsl import (
     var,
     where,
 )
+
+if not os.environ.get("DISPLAY"):
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from deap import base, creator, gp, tools
+
+from flows.alpha_search import ic
+from flows.gp import GPConfig, GrammarPolicy, individual_to_expr, make_pset, make_toolbox
+from flows.load import InputData
+from flows.riskminer.semantics import (
+    gp_alpha_search_terminal_metadata,
+    inputdata_alpha_terminal_metadata,
+)
+from flows.riskminer.pool import ridge_pool_capacity_share
+from flows.riskmodel import roll_rets
+from flows.utils import ewm_std, replace
 from trading_dsl_engine.cpp_stream import compile_formula
+from trading_dsl_engine.cpp_stream.python import xs_gauss
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -75,15 +79,19 @@ GENERATIONS = int(os.environ.get("GP_GENERATIONS", "50"))
 DEPTH_GROW_EVERY = int(os.environ.get("GP_DEPTH_GROW_EVERY", "5"))
 ELITE_COUNT = int(os.environ.get("GP_ELITE_COUNT", "8"))
 TOURNAMENT_SIZE = int(os.environ.get("GP_TOURNAMENT_SIZE", "3"))
-CROSSOVER_PROB = float(os.environ.get("GP_CROSSOVER_PROB", "0.20"))
-MUTATION_PROB = float(os.environ.get("GP_MUTATION_PROB", "0.80"))
+CROSSOVER_PROB = float(os.environ.get("GP_CROSSOVER_PROB", "0.05"))
+MUTATION_PROB = float(os.environ.get("GP_MUTATION_PROB", "0.90"))
 IMMIGRANTS = int(os.environ.get("GP_IMMIGRANTS", "8"))
 SEED = int(os.environ.get("GP_SEED", "40"))
-
+FITNESS_MIN = 0.0
+FITNESS_MIN_FINITE_ROWS = int(
+    os.environ.get("GP_FITNESS_MIN_FINITE_ROWS", "1000")
+)
 # Fitness / execution controls. Terminal temporal reductions are single-owner
 # cpp_stream plans, so independent candidate batches are the useful unit of
 # concurrency for fitness evaluation.
 LAG = 1
+HZ = 1
 ALPHA_PNL_HL = int(os.environ.get("GP_ALPHA_PNL_HL", str(1440 * 21)))
 PREFETCH_ROWS = int(os.environ.get("GP_PREFETCH_ROWS", "16"))
 THREADS = int(os.environ.get("GP_THREADS", "1"))
@@ -124,10 +132,10 @@ POOL_SIZE = int(os.environ.get("GP_POOL_SIZE", "16"))
 POOL_CANDIDATES_PER_GENERATION = int(
     os.environ.get("GP_POOL_CANDIDATES_PER_GENERATION", "8")
 )
-POOL_RIDGE_HL = int(os.environ.get("GP_POOL_RIDGE_HL", str(1440 * 5)))
-POOL_RIDGE_LAMBDA = float(os.environ.get("GP_POOL_RIDGE_LAMBDA", "1e-3"))
+POOL_RIDGE_HL = int(os.environ.get("GP_POOL_RIDGE_HL", str(1440 * 84)))
+POOL_RIDGE_LAMBDA = float(os.environ.get("GP_POOL_RIDGE_LAMBDA", "1e-5"))
 POOL_RIDGE_RECOMPUTE_EVERY = 1
-POOL_ROW_THRESHOLD = int(os.environ.get("GP_POOL_ROW_THRESHOLD", "5000000"))
+POOL_ROW_THRESHOLD = int(os.environ.get("GP_POOL_ROW_THRESHOLD", "1000000"))
 _explicit_pool = os.environ.get("GP_ENABLE_POOL", str(True))
 ENABLE_POOL = (
     _explicit_pool.strip().lower() in {"1", "true", "yes", "on"}
@@ -142,12 +150,38 @@ PLOT_PNL_BY_POOL = _env_bool("GP_PLOT_PNL_BY_POOL", True)
 # terminals, so no generic default_group_capacity override is required.
 GRAMMAR = GrammarPolicy(exclude_sections=("utils.group",),)
 
-default_alpha_pnl = partial(default_alpha_pnl, lag=LAG)
+perf_by_asset = partial(ic, lag=LAG, hz=HZ, w=ridge_pool_capacity_share())
 
-def l1_norm(x):
-    """Cross-sectionally normalize a signal with finite-value purification."""
 
-    return purify(x / abs(x).sum(axis=-1))
+def _fitness_ic_series(alpha, clean_rets):
+    """Collapse broadcast cross-sectional IC to one scalar per row."""
+
+    return reduction(
+        "mean",
+        perf_by_asset(
+            alpha,
+            roll_rets=clean_rets,
+            is_tradable=var("is_tradable_out0"),
+            hl=ALPHA_PNL_HL,
+        ),
+        axis=1,
+    )
+
+
+def _fitness_score_expr(alpha, clean_rets):
+    """Sharpe-like IC score with a minimum finite-row guard."""
+
+    series = _fitness_ic_series(alpha, clean_rets)
+    n_finite = reduction(
+        "sum",
+        fillna(where(isfinite(series), 1.0, 0.0), 0.0),
+        axis=0,
+    )
+    return where(
+        n_finite >= float(FITNESS_MIN_FINITE_ROWS),
+        purify(series.mean(axis=0) / series.std(axis=0)),
+        float("nan"),
+    )
 
 
 def clean_returns_expr():
@@ -225,7 +259,7 @@ def _run_expr_array(expr, sources, label: str) -> np.ndarray:
 
 def _alpha_pnl_matrix_expr(individuals, pset, clean_rets):
     pnls = [
-        default_alpha_pnl(
+        perf_by_asset(
             alpha_expr(individual, pset),
             roll_rets=clean_rets,
             is_tradable=var("is_tradable_out0"),
@@ -247,8 +281,7 @@ def _pool_scaled_alphas(individuals, pset):
 
 
 def _pool_ridge_expr(scaled_alphas, clean_rets, lag = 0):
-    hs = var("vw_halfspread_out0")
-    ridge_weights = purify(var("volume_out0")*var("vwap_mp_out0") / (hs * hs))
+    ridge_weights = ridge_pool_capacity_share()
     return Ridge(
         *(shift(scaled_alpha, 1 + lag) for scaled_alpha in scaled_alphas),
         y=clean_rets,
@@ -290,36 +323,24 @@ def _candidate_has_positive_fitness(individual) -> bool:
     if not individual.fitness.valid:
         return False
     fitness = float(individual.fitness.values[0])
-    return np.isfinite(fitness) and fitness > 0.0
+    return np.isfinite(fitness) and fitness > FITNESS_MIN
 
 
 def _pool_pnl_expr(individuals, pset, clean_rets):
-    """Portfolio PnL for the Ridge pool, matching riskminer pool semantics."""
+    """Portfolio PnL for the Ridge pool with capacity-weighted aggregation."""
 
     yhat = _pool_yhat_expr(individuals, pset, clean_rets)
-    # denominator = mul(
-    #     ewm_std(yhat, span=ALPHA_PNL_HL),
-    #     ewm_std(clean_rets, span=ALPHA_PNL_HL),
-    # )
-    # session_position = ffill(
-    #     where(
-    #         var("is_tradable_out0"),
-    #         div(yhat, denominator),
-    #         float("nan"),
-    #     )
-    # )
-    # pool_contributions = fillna(
-    #     mul(shift(session_position, 1, 1), clean_rets),
-    #     0.0,
-    # )
-    # return reduction("sum", pool_contributions, axis=1)
-    pnl = default_alpha_pnl(
+    per_inst = perf_by_asset(
         purify(yhat / ewm_std(yhat, ALPHA_PNL_HL)),
         roll_rets=clean_rets,
         is_tradable=var("is_tradable_out0"),
         hl=ALPHA_PNL_HL,
-    ).sum(axis=1)
-    return pnl
+    )
+    return reduction(
+        "sum",
+        fillna(mul(per_inst, ridge_pool_capacity_share()), 0.0),
+        axis=1,
+    )
 
 def _plot_alpha_pnls(
     individuals,
@@ -528,7 +549,7 @@ def load_sources(rows = None):
     else:
         print("derived=roll_rets reused precomputed input")
 
-    # This is the exact ewm_std denominator used by default_alpha_pnl. It is
+    # This is the exact ewm_std denominator used by perf_by_asset. It is
     # materialized once so the Ridge feature scaling does not rebuild it in
     # every generation.
     if "volatility" not in sources:
@@ -606,7 +627,7 @@ def raw_alpha_expr(individual, pset):
 
 
 def alpha_expr(individual, pset):
-    return l1_norm(raw_alpha_expr(individual, pset))
+    return xs_gauss(raw_alpha_expr(individual, pset))
 
 
 def _split_batches(items, requested_shards: int):
@@ -646,10 +667,17 @@ def _run_fitness_score(
     run_started = time.perf_counter()
     result = runtime.run(out_path=out_path, threads=THREADS)
     wall_seconds = time.perf_counter() - run_started
-    values = np.asarray(
-        result.load(mmap_mode=None),
-        dtype=np.float64,
-    ).reshape(-1)
+    loaded = result.load(mmap_mode=None)
+    if isinstance(score, (list, tuple)):
+        values = np.asarray(
+            [
+                float(np.asarray(item, dtype=np.float64).reshape(-1)[0])
+                for item in loaded
+            ],
+            dtype=np.float64,
+        )
+    else:
+        values = np.asarray(loaded, dtype=np.float64).reshape(-1)
     out_path.unlink(missing_ok=True)
 
     if values.size != candidate_count:
@@ -680,13 +708,7 @@ def _fitness_batch_fallback(
     stages = []
     for key, alpha in batch:
         try:
-            pnl = default_alpha_pnl(
-                alpha,
-                roll_rets=clean_rets,
-                is_tradable=var("is_tradable_out0"),
-                hl=ALPHA_PNL_HL,
-            ).sum(axis=1)
-            score = pnl.mean(axis=0) / pnl.std(axis=0)
+            score = _fitness_score_expr(alpha, clean_rets)
             values, metrics = _run_fitness_score(
                 score,
                 1,
@@ -760,21 +782,11 @@ def _fitness_batch(
     shard: int,
     label: str,
 ):
-    pnls = [
-        default_alpha_pnl(
-            alpha,
-            roll_rets=clean_rets,
-            is_tradable=var("is_tradable_out0"),
-            hl=ALPHA_PNL_HL,
-        )
+    scores = [
+        _fitness_score_expr(alpha, clean_rets)
         for _, alpha in batch
     ]
-    pnl = (
-        pnls[0].sum(axis=1)
-        if len(pnls) == 1
-        else cat(*pnls).sum(axis=1)
-    )
-    score = pnl.mean(axis=0) / pnl.std(axis=0)
+    score = scores[0] if len(scores) == 1 else scores
 
     try:
         values, metrics = _run_fitness_score(
@@ -1116,14 +1128,12 @@ def ridge_contributions(
     individuals,
     pset,
     sources,
+    sources_all,
     clean_rets,
     generation: int,
 ):
     """Return mean(abs(beta)) using the requested scaled nonnegative Ridge."""
 
-    # alpha_expr is explicitly l1_norm(raw_alpha). Ridge therefore receives
-    # shift(l1_norm(alpha), 1, 1) multiplied by the exact volatility used in the
-    # default_alpha_pnl denominator.
     scaled_alphas = _pool_scaled_alphas(individuals, pset)
     regression = _pool_ridge_expr(scaled_alphas, clean_rets)
     mean_abs_beta = abs(get_beta(regression)).mean(axis=0)
@@ -1155,12 +1165,24 @@ def ridge_contributions(
     ## plotting
     runtime = compile_formula(
         get_beta(regression),
-        sources,
+        sources_all,
         n_instruments=N_INSTRUMENTS,
         prefetch_rows=PREFETCH_ROWS,
     )
     result_beta = runtime.run(out_path=out_path, threads=THREADS)
-    pd.DataFrame(result_beta.load()).plot(); plt.show()
+    pd.DataFrame(result_beta.load()).pipe(lambda x: x.groupby(x.index // PNL_PLOT_DOWNSAMPLE).last()).plot()
+    plt.xlabel(f"Time (every {PNL_PLOT_DOWNSAMPLE:,} rows)")
+    plt.ylabel(f"")
+    plt.title(
+        f"Betas — generation {generation}"
+    )
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    # plt.savefig(plot_path, dpi=160)
+    if SHOW_PLOT:
+        plt.show()
+    # plt.close()
 
     if values.size != len(individuals):
         raise RuntimeError(
@@ -1208,19 +1230,23 @@ def update_pool(
     population,
     pset,
     sources,
+    sources_all,
     clean_rets,
     toolbox,
     generation: int,
 ):
     """Merge strong population members into the pool and rerank by Ridge beta."""
 
+    # Pool maintenance is optional; skip all Ridge work when disabled.
     if not ENABLE_POOL:
         return pool, {}, _empty_ridge_metrics(reason="pool disabled")
 
+    # Candidate set = carry-over pool members + this generation's best GP individuals.
     candidates = list(pool.values()) + tools.selBest(
         population,
         min(POOL_CANDIDATES_PER_GENERATION, len(population)),
     )
+    # Collapse duplicate expressions (same str(individual) key).
     unique = {}
     for individual in candidates:
         unique.setdefault(str(individual), individual)
@@ -1229,22 +1255,27 @@ def update_pool(
     if not candidates:
         return {}, {}, _empty_ridge_metrics()
 
+    # Score each candidate by mean(|Ridge beta|) against the scaled pool alphas.
     contribution, ridge_metrics = ridge_contributions(
         candidates,
         pset,
         sources,
+        sources_all,
         clean_rets,
         generation,
     )
+    # Prefer higher marginal Ridge contribution when filling the next pool.
     order = np.argsort(contribution)[::-1]
     previous_keys = set(pool.keys())
     next_pool = {}
     next_contribution = {}
     for index in order:
+        # Drop alphas Ridge assigns zero (or negative) weight.
         if contribution[index] <= 0.0:
             continue
         individual = candidates[index]
         key = str(individual)
+        # New entrants must pass GP fitness; incumbents may stay without re-check.
         if key not in previous_keys and not _candidate_has_positive_fitness(
             individual
         ):
@@ -1254,6 +1285,7 @@ def update_pool(
         if len(next_pool) >= POOL_SIZE:
             break
 
+    # Shrink until the capacity-weighted combined pool PnL has nonzero signal.
     while next_pool:
         ordered = [
             next_pool[key]
@@ -1268,8 +1300,17 @@ def update_pool(
             sources,
             f"pool_check_g{generation:03d}",
         )
+
+        # _plot_alpha_pnls(
+        #     list(next_pool.values()),
+        #     pset=pset,
+        #     sources=sources_all,
+        #     clean_rets=clean_rets,
+        #     generation=generation
+        # )
         if _pool_pnl_has_signal(combined_pnl):
             break
+        # No tradable PnL: evict the weakest remaining contributor and retry.
         worst_key = min(
             next_pool,
             key=lambda item: next_contribution[item],
@@ -1376,9 +1417,12 @@ def _settings():
         "plot_pnl_by_alpha": PLOT_PNL_BY_ALPHA,
         "plot_pnl_by_pool": PLOT_PNL_BY_POOL,
         "pnl_plot_downsample": PNL_PLOT_DOWNSAMPLE,
-        "ridge_weights": "purify(1 / (vw_halfspread_out0 ** 2))",
+        "ridge_weights": (
+            "purify((volume_out0 * vwap_mp_out0 / vw_halfspread_out0**2)"
+            " / xs_sum(...))"
+        ),
         "ridge_feature": (
-            "shift(l1_norm(alpha), 1, 1) "
+            "shift(xs_gauss(alpha), 1, 1) "
             "* ewm_std(clean_roll_rets, span=alpha_pnl_span)"
         ),
         "stop_if_projected_over_seconds": (
@@ -1505,6 +1549,7 @@ if __name__ == "__main__":
             population,
             pset,
             sources,
+            sources_all,
             clean_rets,
             toolbox,
             generation,

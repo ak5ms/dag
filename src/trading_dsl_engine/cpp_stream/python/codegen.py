@@ -1330,6 +1330,11 @@ def _stage_type(
             BoolArg(physical.op.nonneg),
             BoolArg(stateful),
             projection,
+            tmpl(
+                "stackdsl::RidgeSolveOrder",
+                *(IntArg(index) for index in physical.op.solve_order),
+            ),
+            BoolArg(physical.op.solve_order_unique),
             execution,
             IntArg(physical.op.recompute_every),
         )

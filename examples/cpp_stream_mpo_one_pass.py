@@ -10,11 +10,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from flows.alpha_search import ic, ic1
+from flows.alpha_search import _ic_terms, ic, ic1
 from flows.load import InputData
 from flows.pov import RollRets
-from flows.riskmodel import risk_covariance
+from flows.riskmodel import risk_covariance, vol as riskmodel_vol
 from flows.utils import streak, ts_zscore
+from trading_dsl_engine import diff
 from trading_dsl_engine.base.dsl import (
     Ridge,
     cat,
@@ -22,6 +23,7 @@ from trading_dsl_engine.base.dsl import (
     ffill,
     fillna,
     get_beta,
+    isfinite,
     isnan,
     psd_factor,
     purify,
@@ -50,7 +52,7 @@ RISK_MIN_PERIODS = 64
 RISK_RADIUS = 0.08
 TRADE_BIG_M = 1e3
 MINUTE_US = 60_000_000.0
-ROWS = int(os.environ.get("MPO_EXAMPLE_ROWS", "20000"))
+ROWS = int(os.environ.get("MPO_EXAMPLE_ROWS", "100000"))
 CACHE = Path(".generated/cpp_stream_mpo_one_pass")
 
 
@@ -84,8 +86,8 @@ def _diagnostic_pnls(
         w=w,
     )
     return {
-        "ic": ic(signal, **kwargs).mean(axis=[1]),
-        "ic1": ic1(signal, **kwargs).mean(axis=[1]),
+        "ic": ic(signal, **kwargs).sum(axis=[1]),
+        "ic1": ic1(signal, **kwargs).sum(axis=[1]),
     }
 
 
@@ -189,54 +191,80 @@ def _formula(returns=None):
         for hl in FEATURE_HLS
     )
     features = cat(*feature_list)
+    ridge_feature_list = tuple(
+        feature * riskmodel_vol for feature in feature_list
+    )
+    ridge_features = cat(*ridge_feature_list)
 
     # Closed rows contribute zero; RollRets puts the close-to-open gap move on
     # the first tradable row after reopening.
     clean_returns = where(tradable != 0, fillna(returns, 0.0), 0.0)
 
-    forecasts, factors = [], []
+    forecasts, forecast_started, factors = [], [], []
     alpha_pnl, yhat_pnl = {}, {}
     for start, end in zip(TRADE_STARTS, HORIZONS):
         width = end - start
         block_return = rolling_sum(clean_returns, width, min_periods=width)
         block_observed = rolling_sum(tradable, width, min_periods=width)
 
-        # Ridge predicts the total return of block (start, end] directly.
-        # ic1 alignment implies feature time t-end for a target ending at t.
-        target = where(block_observed > 0, block_return, float("nan"))
-        fit_x = cat(
-            *(
-                where(
-                    shift(tradable, end) != 0,
-                    shift(feature, end),
-                    float("nan"),
-                )
-                for feature in feature_list
+        # Mirror alpha_search.ic/ic1 state semantics. _ic_terms applies the
+        # lag, tradability-aware ffill, and cross-sectional weight
+        # normalization. Shifting its lagged position by width aligns feature
+        # time t-end with the block target ending at t.
+        fit_features = []
+        ridge_weights = None
+        for ridge_feature in ridge_feature_list:
+            position, _, ridge_weights = _ic_terms(
+                s=ridge_feature,
+                roll_rets=returns,
+                is_tradable=tradable,
+                w=fit_weights,
+                lag=start,
             )
+            fit_features.append(shift(position, width))
+        fit_x = cat(*fit_features)
+        ridge_target = where(
+            block_observed > 0,
+            block_return,
+            float("nan"),
         )
         beta = get_beta(
             Ridge(
                 fit_x,
-                y=target,
-                weights=fit_weights,
+                y=ridge_target,
+                weights=shift(ridge_weights, width),
                 hl=RIDGE_HL,
                 lambda_=0.1,
             )
         )
-        yhat = einsum(features, beta, "if,f->i")
+        # x * sigma * beta makes beta dimensionless and correlation-like.
+        # The same current x * sigma features produce the forward forecast.
+        yhat = einsum(ridge_features, beta, "if,f->i")
         forecasts.append(fillna(yhat, 0.0))
+        forecast_started.append(
+            fillna(
+                ffill(
+                    where(
+                        isfinite(yhat) & (yhat != 0.0),
+                        1.0,
+                        float("nan"),
+                    )
+                ),
+                0.0,
+            )
+        )
 
         horizon_key = f"{start}_{end}"
         alpha_diagnostics = [
             _diagnostic_pnls(
-                feature,
+                ridge_feature,
                 roll_rets=returns,
                 is_tradable=tradable,
                 w=fit_weights,
                 lag=start,
                 hz=width,
             )
-            for feature in feature_list
+            for ridge_feature in ridge_feature_list
         ]
         alpha_pnl[horizon_key] = {
             "ic": {
@@ -285,7 +313,9 @@ def _formula(returns=None):
         risk_factor_4=factors[4],
         risk_factor_5=factors[5],
         risk_factor_6=factors[6],
-        trade_allowed=_planned_trade_allowed(tradable),
+        trade_allowed=(
+            _planned_trade_allowed(tradable) * cat(*forecast_started)
+        ),
         risk_radius=RISK_RADIUS,
     )
     session_open = reduce_max(tradable, axis=[1]) != 0.0
@@ -316,14 +346,20 @@ def _formula(returns=None):
     mpo_gross_pnl = (
         fillna(shift(ffill(weights), 1), 0.0) * clean_returns
     ).sum(axis=[1])
+    mpo_spread_cost = (
+        diff(ffill(weights)).abs() * fillna(purify(hs), 0.0)
+    ).sum(axis=[1])
+
 
     return {
         "returns": returns,
+        "expected_returns": forecast_matrix,
         "features": features,
         "weights": weights,
         "status": status,
         "mpo_objective": mpo_objective,
         "mpo_gross_pnl": mpo_gross_pnl,
+        "mpo_spread_cost": mpo_spread_cost,
         "risk": risk_values,
         "alpha_pnl": alpha_pnl,
         "yhat_pnl": yhat_pnl,
@@ -378,6 +414,7 @@ def _plot_diagnostics(data, values, *, plot_dir):
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(index, _cum(values["mpo_gross_pnl"]), label="gross")
+    ax.plot(index, _cum(values["mpo_spread_cost"]), label="spread cost")
     ax.set_title("Implemented MPO portfolio gross PnL")
     ax.set_ylabel("Cumulative realized PnL")
     ax.legend()
@@ -439,6 +476,7 @@ def _run(data, *, returns=None, output_dir=CACHE):
     values = result.load()
     paths = _plot_diagnostics(data, values, plot_dir=output_dir / "plots")
     return result, paths
+    pd.DataFrame(values['expected_returns'][:,0])
 
 
 def main() -> None:

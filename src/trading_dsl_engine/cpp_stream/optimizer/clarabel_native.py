@@ -398,6 +398,57 @@ def _host_native_rustflags() -> str:
     return " ".join(flag for flag in (existing, _CLARABEL_NATIVE_RUSTFLAG) if flag)
 
 
+def _git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "advice.detachedHead"
+    env["GIT_CONFIG_VALUE_0"] = "false"
+    return env
+
+
+def _run_git(command: list[str], *, cwd: Path | None = None) -> None:
+    subprocess.run(
+        ["git", *command],
+        check=True,
+        cwd=cwd,
+        env=_git_env(),
+    )
+
+
+def _find_cargo() -> str:
+    configured = os.environ.get("CARGO")
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file():
+            return str(path)
+    for candidate in (
+        shutil.which("cargo"),
+        str(Path.home() / ".cargo" / "bin" / "cargo"),
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Rust toolchain (cargo) is required to build the Clarabel native library. "
+        "Install Rust from https://rustup.rs/, add cargo to PATH, or set "
+        "CLARABEL_INCLUDE_DIR and CLARABEL_STATIC_LIBRARY to pre-built artifacts."
+    )
+
+
+def _clarabel_cache_complete(
+    *,
+    include: Path,
+    library: Path,
+    marker: Path,
+    build_id: str,
+) -> bool:
+    return (
+        include.is_dir()
+        and library.is_file()
+        and marker.is_file()
+        and marker.read_text() == build_id
+    )
+
+
 def build_current_clarabel(
     *,
     cache_dir: str | os.PathLike[str] | None = None,
@@ -424,20 +475,14 @@ def build_current_clarabel(
     include = root / "native" / "include"
     library = root / "native" / "lib" / "libclarabel_c.a"
     marker = root / "native" / "BUILD_ID"
-    if (
-        include.is_dir()
-        and library.is_file()
-        and marker.is_file()
-        and marker.read_text() == build_id
-        and not force
-    ):
+    if _clarabel_cache_complete(
+        include=include,
+        library=library,
+        marker=marker,
+        build_id=build_id,
+    ) and not force:
         return ClarabelNativePaths(include, library, rs_tag.removeprefix("v"))
-    if root.exists():
-        if not force:
-            raise RuntimeError(
-                f"Clarabel cache {root} exists but is incomplete; pass force=True "
-                "to replace that dedicated cache directory"
-            )
+    if root.exists() and force:
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
     cpp = root / "Clarabel.cpp"
@@ -445,24 +490,25 @@ def build_current_clarabel(
     cpp_source = os.environ.get("CLARABEL_CPP_SOURCE_DIR")
     rs_source = os.environ.get("CLARABEL_RS_SOURCE_DIR")
     if cpp_source:
-        shutil.copytree(Path(cpp_source), cpp, dirs_exist_ok=True)
-    else:
-        subprocess.run(
+        if not cpp.is_dir():
+            shutil.copytree(Path(cpp_source), cpp, dirs_exist_ok=True)
+    elif not (cpp / ".git").is_dir():
+        _run_git(
             [
-                "git",
                 "clone",
                 "https://github.com/oxfordcontrol/Clarabel.cpp.git",
                 str(cpp),
-            ],
-            check=True,
+            ]
         )
-        subprocess.run(["git", "checkout", cpp_commit], cwd=cpp, check=True)
-    if rs_source:
-        shutil.copytree(Path(rs_source), rs, dirs_exist_ok=True)
+        _run_git(["checkout", cpp_commit], cwd=cpp)
     else:
-        subprocess.run(
+        _run_git(["checkout", cpp_commit], cwd=cpp)
+    if rs_source:
+        if not rs.is_dir():
+            shutil.copytree(Path(rs_source), rs, dirs_exist_ok=True)
+    elif not (rs / ".git").is_dir():
+        _run_git(
             [
-                "git",
                 "clone",
                 "--depth",
                 "1",
@@ -470,19 +516,19 @@ def build_current_clarabel(
                 rs_tag,
                 "https://github.com/oxfordcontrol/Clarabel.rs.git",
                 str(rs),
-            ],
-            check=True,
+            ]
         )
     target_rs = cpp / "Clarabel.rs"
     if target_rs.exists():
         shutil.rmtree(target_rs)
     shutil.copytree(rs, target_rs, ignore=shutil.ignore_patterns(".git"))
     _patch_clarabel_allocation_free_timers(target_rs)
+    cargo = _find_cargo()
     cargo_env = os.environ.copy()
     cargo_env["RUSTFLAGS"] = rustflags
     subprocess.run(
         [
-            "cargo",
+            cargo,
             "build",
             "--release",
             "--manifest-path",

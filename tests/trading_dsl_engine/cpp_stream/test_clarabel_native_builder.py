@@ -53,7 +53,7 @@ impl Timers {
     def fake_run(command, **kwargs):
         command = tuple(str(part) for part in command)
         calls.append((command, kwargs))
-        if command[0] == "cargo":
+        if Path(command[0]).name == "cargo":
             manifest = Path(command[command.index("--manifest-path") + 1])
             output = manifest.parent / "target" / "release" / "libclarabel_c.a"
             output.parent.mkdir(parents=True)
@@ -66,9 +66,9 @@ impl Timers {
     paths = clarabel_native.build_current_clarabel(cache_dir=cache)
 
     cargo_command, cargo_kwargs = next(
-        call for call in calls if call[0][0] == "cargo"
+        call for call in calls if Path(call[0][0]).name == "cargo"
     )
-    assert cargo_command[:3] == ("cargo", "build", "--release")
+    assert cargo_command[1:3] == ("build", "--release")
     assert cargo_kwargs["env"]["RUSTFLAGS"] == (
         "-C debuginfo=1 -C target-cpu=native"
     )

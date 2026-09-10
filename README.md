@@ -282,6 +282,20 @@ and 4.46 GiB peak RSS to a 1.001-second median and 395.6 MiB absolute peak RSS
 in the full project environment. Generation itself added only 39.2 MiB above
 the already-loaded CVXPY/JAX baseline, and the header shrank from 26.28 MiB to
 5.20 MiB.
+
+`examples/cpp_stream_mpo_consistency.py` is the focused verification example for
+aligned feature, fitted, and MPO gross/net PnL on the primary `(1, 2]` realized
+stage. Synthetic mode is deterministic and asserts positive consistency checks;
+real-data mode reports diagnostics only.
+
+```bash
+PYTHONPATH=src python examples/cpp_stream_mpo_consistency.py --data synthetic
+PYTHONPATH=src python examples/cpp_stream_mpo_consistency.py --data real --rows 5000
+```
+
+The exploratory `examples/cpp_stream_mpo_one_pass.py` script remains available
+for broader integration experiments but does not enforce the same accounting
+checks.
 ## Formula ergonomics and structured outputs
 
 Python expressions support pandas-style composition with `expr.pipe(function,

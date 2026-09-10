@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import builtins
 import re
 
 import numpy as np
@@ -36,7 +37,52 @@ def test_nested_formula_mapping_load_map_and_flatten(tmp_path: Path):
         ("summary",),
     ]
 
+from trading_dsl_engine.base.dsl import (
+    Ridge,
+    cat,
+    cumsum,
+    get_beta,
+    groupby,
+    self_,
+    var,
+)
+def test_ridge_beta_is_invariant_to_feature_formula_order(tmp_path: Path):
+    rows, cols = 96, 5
+    rng = np.random.default_rng(20260909)
+    x = rng.normal(size=(rows, cols)).astype(np.float64)
+    y = rng.normal(size=(rows, cols)).astype(np.float64)
+    target = (1.75 * x - 0.4 * y + rng.normal(scale=0.03, size=x.shape)).astype(
+        np.float64
+    )
+    first = (var("x") + var("y")).ewm(span=7)
+    second = (var("x") - var("y")).rolling_mean(5)
 
+    def beta(features):
+        model = Ridge(
+            cat(*features),
+            y=var("target"),
+            weights=1,
+            hl=12,
+            lambda_=0.05,
+            nonneg=True,
+        )
+        # Include shared expressions as earlier public roots, like a real formula
+        # mapping, so root traversal order cannot alter the Ridge transition.
+        return {"first": first, "second": second, "beta": get_beta(model)}
+
+    data = {"x": x, "y": y, "target": target}
+    forward = compile_formula(beta((first, second)), data, n_instruments=cols).run(
+        out_path=tmp_path / "forward.npy"
+    ).load(mmap_mode=None)
+    reverse = compile_formula(beta((second, first)), data, n_instruments=cols).run(
+        out_path=tmp_path / "reverse.npy"
+    ).load(mmap_mode=None)
+
+    np.testing.assert_allclose(forward["first"], reverse["first"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(forward["second"], reverse["second"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        forward["beta"], reverse["beta"][..., ::-1], rtol=1e-12, atol=1e-12
+    )
 def test_promoted_row_output_remains_readable_by_final_projection(tmp_path: Path):
     rows, cols = 48, 4
     rng = np.random.default_rng(20260819)
@@ -234,3 +280,51 @@ def test_grouped_ewm_epilogue_uses_no_inner_scalar_scratch(tmp_path: Path):
     generated = runtime.generated_cpp.read_text()
     assert "stackdsl::EwmDiscardDst" in generated
     assert "stackdsl::EwmEpilogueBinding" in generated
+
+
+def test_ridge_beta_is_invariant_to_output_mapping_key_order(tmp_path: Path) -> None:
+    rows, cols = 96, 4
+    rng = np.random.default_rng(20260908)
+    x1 = rng.normal(size=(rows, cols))
+    x2 = rng.normal(size=(rows, cols))
+    y = 0.6 * x1 - 0.25 * x2 + rng.normal(scale=0.05, size=(rows, cols))
+    paths = {
+        "x1": tmp_path / "x1.npy",
+        "x2": tmp_path / "x2.npy",
+        "y": tmp_path / "y.npy",
+    }
+    np.save(paths["x1"], x1)
+    np.save(paths["x2"], x2)
+    np.save(paths["y"], y)
+
+    beta_first = compile_formula(
+        {
+            "beta": "get_beta(Ridge(cat(x1, x2), y=y, hl=8, lambda_=0.05))",
+            "ic_like": "cat(ewm(x1, 3), ewm(x2, 5))",
+        },
+        paths,
+        n_instruments=cols,
+    )
+    beta_last = compile_formula(
+        {
+            "ic_like": "cat(ewm(x1, 3), ewm(x2, 5))",
+            "beta": "get_beta(Ridge(cat(x1, x2), y=y, hl=8, lambda_=0.05))",
+        },
+        paths,
+        n_instruments=cols,
+    )
+    first = beta_first.run(out_path=tmp_path / "beta-first.npy").load(mmap_mode=None)
+    last = beta_last.run(out_path=tmp_path / "beta-last.npy").load(mmap_mode=None)
+    np.testing.assert_allclose(first["beta"], last["beta"], rtol=1e-12, atol=1e-12)
+
+    ridge_first = builtins.next(
+        index
+        for index, stage in enumerate(beta_first.plan.stages)
+        if stage.kind == "ridge"
+    )
+    ridge_last = builtins.next(
+        index
+        for index, stage in enumerate(beta_last.plan.stages)
+        if stage.kind == "ridge"
+    )
+    assert ridge_first != ridge_last

@@ -21,6 +21,8 @@ from .pool import (
     PoolEvaluation,
     build_ridge_pool_score_formula,
     halflife_to_span,
+    ridge_pool_capacity_raw,
+    ridge_pool_capacity_share,
 )
 from .rpn import (
     RPNState,
@@ -80,6 +82,8 @@ __all__ = [
     "halflife_to_span",
     "inputdata_alpha_keys",
     "inputdata_alpha_terminal_metadata",
+    "ridge_pool_capacity_raw",
+    "ridge_pool_capacity_share",
     "search_cpp_stream_alphas",
     "subtraction_output",
 ]

@@ -61,8 +61,8 @@ def test_diagnostic_pnls_scalarize_xs_broadcast(monkeypatch):
         hz=2,
     )
 
-    assert actual["ic"].fn == "mean"
-    assert actual["ic1"].fn == "mean"
+    assert actual["ic"].fn == "sum"
+    assert actual["ic1"].fn == "sum"
     assert "axis" in repr(actual["ic"])
     assert "axis" in repr(actual["ic1"])
 
@@ -79,13 +79,17 @@ def test_formula_uses_only_future_tradeable_horizons_and_negative_zscores():
         "weights",
         "status",
         "mpo_objective",
+        "mpo_objective_by_horizon",
         "mpo_gross_pnl",
+        "mpo_spread_cost",
         "risk",
         "alpha_pnl",
         "yhat_pnl",
+        "ridge_fit",
     }
-    assert "mpo_spread_cost" not in formula
     assert "objective" in repr(formula["mpo_objective"])
+    assert len(formula["mpo_objective_by_horizon"]) == len(example.HORIZONS)
+    assert "weights[0]" in repr(formula["mpo_spread_cost"])
     assert len(formula["alpha_pnl"]) == len(example.HORIZONS)
     assert len(formula["yhat_pnl"]) == len(example.HORIZONS)
 
@@ -93,8 +97,10 @@ def test_formula_uses_only_future_tradeable_horizons_and_negative_zscores():
     assert features.fn == "cat"
     assert len(features.args) == len(example.FEATURE_HLS)
     for feature in features.args:
-        assert feature.fn == "sub"
-        assert feature.args[0].value == 0.0
+        assert feature.fn == "mul"
+        assert feature.args[0].fn == "xs_rank"
+        assert feature.args[0].args[0].fn == "sub"
+        assert feature.args[0].args[0].args[0].value == 0.0
 
     for horizon in formula["alpha_pnl"].values():
         assert set(horizon) == {"ic", "ic1"}
@@ -102,6 +108,19 @@ def test_formula_uses_only_future_tradeable_horizons_and_negative_zscores():
         assert len(horizon["ic1"]) == len(example.FEATURE_HLS)
     for horizon in formula["yhat_pnl"].values():
         assert set(horizon) == {"ic", "ic1"}
+    for horizon in formula["ridge_fit"].values():
+        assert set(horizon) == {
+            "beta",
+            "r2",
+            "effective_n",
+            "prediction",
+            "target",
+            "ic1",
+            "yhat_ic1",
+            "feature_target_product",
+        }
+        assert len(horizon["ic1"]) == len(example.FEATURE_HLS)
+        assert len(horizon["feature_target_product"]) == len(example.FEATURE_HLS)
 
 
 def test_mpo_prices_spread_directly_in_objective_without_spread_constraint():
@@ -118,7 +137,7 @@ def test_mpo_prices_spread_directly_in_objective_without_spread_constraint():
         example.RISK_RADIUS,
     )
     assert problem.is_dpp()
-    assert len(problem.constraints) == 3 + n_horizons
+    assert len(problem.constraints) == 2 + n_horizons
 
     rng = np.random.default_rng(51)
     parameter_values = {
@@ -148,7 +167,7 @@ def test_mpo_prices_spread_directly_in_objective_without_spread_constraint():
     delta = weights - np.vstack([current, weights[:-1]])
     direct_cost = np.sum(parameter_values["half_spread"] * np.abs(delta))
     expected_objective = (
-        -np.sum(parameter_values["expected_returns"] * weights) + direct_cost
+        np.sum(parameter_values["expected_returns"] * weights) - direct_cost
     )
     np.testing.assert_allclose(
         float(problem.value),
@@ -168,5 +187,16 @@ def test_plot_diagnostics_shows_every_figure_and_cumsums_objective():
     for index in tight_layout_lines:
         assert lines[index + 1].strip() == "plt.show()"
 
-    assert '_cum(values["mpo_objective"])' in source
+    assert '_cum(total_objective)' in source
+    assert 'values["mpo_objective_by_horizon"]' in source
+    assert '_cum(values["mpo_spread_cost"])' in source
     assert '"mpo_objective.png"' in source
+    assert '"spread_cost.png"' in source
+    assert 'fit["beta"]' in source
+    assert 'fit["r2"]' in source
+    assert 'fit["effective_n"]' in source
+    assert 'fit["prediction"]' in source
+    assert 'fit["target"]' in source
+    assert 'fit["ic1"]' in source
+    assert 'fit["feature_target_product"]' in source
+    assert '"ridge_fit_horizon_' in source

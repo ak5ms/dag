@@ -162,8 +162,7 @@ def _number_key(value: int | float) -> tuple:
     return ("bits", struct.unpack("!Q", struct.pack("!d", numeric))[0])
 
 
-_EXPR_KEY_ID_MEMO: dict[int, tuple] = {}
-
+_EXPR_KEY_ID_MEMO: dict[int, tuple[Expr, tuple]] = {}
 
 def clear_expr_key_id_memo() -> None:
     _EXPR_KEY_ID_MEMO.clear()
@@ -234,10 +233,12 @@ def _expr_key_uncached(node: Expr) -> tuple:
 
 def _expr_key(node: Expr) -> tuple:
     cached = _EXPR_KEY_ID_MEMO.get(id(node))
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is node:
+        return cached[1]
     result = _expr_key_uncached(node)
-    _EXPR_KEY_ID_MEMO[id(node)] = result
+    # Retain the object beside its id for the lifetime of this compile so a later
+    # temporary macro expansion cannot reuse that id with a different structure.
+    _EXPR_KEY_ID_MEMO[id(node)] = (node, result)
     return result
 
 
@@ -1398,6 +1399,21 @@ class _BaseBuilder:
                 _feature_width(self.nodes[index].value_type)
                 for index in feature_ids
             )
+            offsets = []
+            offset = 0
+            for width in widths:
+                offsets.append(offset)
+                offset += width
+            feature_keys = tuple(_expr_key(feature) for feature in features)
+            feature_order = sorted(
+                range(len(features)),
+                key=feature_keys.__getitem__,
+            )
+            solve_order = tuple(
+                coefficient
+                for index in feature_order
+                for coefficient in range(offsets[index], offsets[index] + widths[index])
+            )
             children = list(feature_ids) + [self.build(y)]
             if weights is not None:
                 children.append(self.build(weights))
@@ -1408,6 +1424,8 @@ class _BaseBuilder:
                 nonneg,
                 stateful,
                 recompute_every,
+                solve_order,
+                len(set(feature_keys)) == len(feature_keys),
             )
             return self._append(
                 op, tuple(children), object_value(op.coefficient_width)
@@ -1632,6 +1650,7 @@ def compile_ir(
     column_names: list[str] | tuple[str, ...] | None = None,
     input_value_types: Mapping[str, ValueType] | None = None,
 ) -> Program:
+    clear_expr_key_id_memo()
     expression = parse_formula(formula) if isinstance(formula, str) else formula
     builder = _OuterBuilder(
         dsl_registry or DEFAULT_DSL_REGISTRY,

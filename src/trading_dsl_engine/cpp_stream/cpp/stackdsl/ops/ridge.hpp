@@ -33,6 +33,13 @@ struct RidgeResidualVarianceProjection {};
 struct RidgeEffectiveDfProjection {};
 struct RidgeEffectiveNProjection {};
 
+template <std::size_t... Indices>
+struct RidgeSolveOrder {
+    inline static constexpr std::array<std::size_t, sizeof...(Indices)> values{
+        Indices...
+    };
+};
+
 template <class Out, class Projection>
 struct RidgeProjectionBinding {
     using output_type = Out;
@@ -289,19 +296,23 @@ STACKDSL_HOT bool unconstrained_solve(
     return pseudo_inverse_solve(system, rhs, solution);
 }
 
-template <std::size_t K>
+template <std::size_t K, class SolveOrder>
 STACKDSL_HOT bool coordinate_nonnegative_solve(
     const std::array<double, K * K>& system,
     const std::array<double, K>& rhs,
     const std::array<double, K>& fallback,
     std::array<double, K>& solution
 ) noexcept {
+    static_assert(SolveOrder::values.size() == K);
+    bool check_degeneracy = false;
     for (std::size_t j = 0; j < K; ++j) {
         solution[j] = std::max(0.0, fallback[j]);
+        check_degeneracy = check_degeneracy || solution[j] <= 1e-12;
     }
     for (std::size_t sweep = 0; sweep < 64; ++sweep) {
         double max_change = 0.0;
-        for (std::size_t j = 0; j < K; ++j) {
+        for (std::size_t position = 0; position < K; ++position) {
+            const std::size_t j = SolveOrder::values[position];
             const double diagonal = system[j * K + j];
             if (!(diagonal > 1e-18) || !std::isfinite(diagonal)) continue;
             double residual = rhs[j];
@@ -318,7 +329,14 @@ STACKDSL_HOT bool coordinate_nonnegative_solve(
             max_change = std::max(max_change, std::abs(next - solution[j]));
             solution[j] = next;
         }
-        if (max_change <= 1e-12) break;
+        if (max_change <= 1e-12) {
+            break;
+        }
+    }
+    if (check_degeneracy) {
+        for (double coefficient : solution) {
+            if (coefficient <= 1e-12) return false;
+        }
     }
     return finite_vector(solution);
 }
@@ -569,6 +587,8 @@ template <
     bool Nonnegative,
     bool Stateful,
     class Projection,
+    class SolveOrder,
+    bool SolveOrderUnique,
     class Execution = DirectExecution<N>,
     std::size_t RecomputeEvery = 1
 >
@@ -584,6 +604,8 @@ template <
     bool Nonnegative,
     bool Stateful,
     class Projection,
+    class SolveOrder,
+    bool SolveOrderUnique,
     class Execution,
     std::size_t RecomputeEvery,
     class... FeatureSources
@@ -599,6 +621,8 @@ struct RidgeNode<
     Nonnegative,
     Stateful,
     Projection,
+    SolveOrder,
+    SolveOrderUnique,
     Execution,
     RecomputeEvery
 > {
@@ -606,6 +630,7 @@ struct RidgeNode<
     static constexpr std::size_t Groups = Execution::cross_state_size;
     static constexpr std::size_t MaxActiveGroups = Groups < N ? Groups : N;
     static_assert(K > 0 && Groups > 0);
+    static_assert(SolveOrder::values.size() == K);
     using Projections = ridge_detail::projection_set<Projection, Out>;
     static constexpr bool PredProjection = Projections::predicts;
     static constexpr bool NeedsInference = Projections::needs_inference;
@@ -972,11 +997,12 @@ struct RidgeNode<
             auto& beta = solved_betas[active];
             bool solved = false;
             if constexpr (Nonnegative) {
-                if constexpr (Stateful) {
-                    solved = ridge_detail::coordinate_nonnegative_solve(
-                        system, xy, fallback, beta
-                    );
-                } else {
+                if constexpr (Stateful && SolveOrderUnique) {
+                    solved = ridge_detail::coordinate_nonnegative_solve<
+                        K, SolveOrder
+                    >(system, xy, fallback, beta);
+                }
+                if (!solved) {
                     solved = ridge_detail::nnqp_nonnegative_solve(
                         system, xy, fallback, beta
                     );
