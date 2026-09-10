@@ -115,6 +115,7 @@ class CppFlatRuntime:
     core: Any
     supported_ops: tuple[str, ...]
     native_plan: NativeExecutionPlan
+    workers: int
 
     def init_state(self, n_instruments: int):
         return self.core.init_state(n_instruments)
@@ -231,7 +232,18 @@ class NativeExecutionPlan:
         }
 
 
-def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None) -> CppFlatRuntime:
+def _resolve_workers(workers: int | None) -> int:
+    if workers is None:
+        # cpu_count may be unavailable in constrained containers.
+        return os.cpu_count() or 1
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0:
+        raise ValueError("workers must be a positive integer or None")
+    return workers
+
+
+def compile_formula(
+    formula: str | Expr, dsl_registry: DSLFunctionRegistry | None = None, *, workers: int | None = None
+) -> CppFlatRuntime:
     """Compile a supported jax_flat formula to the native C++ tick runtime.
 
     This backend intentionally covers the allocation-sensitive scalar/vector tick
@@ -242,12 +254,14 @@ def compile_formula(formula: str | Expr, dsl_registry: DSLFunctionRegistry | Non
 
     runtime = compile_formula_jax(formula, dsl_registry=dsl_registry, cpp=False)
     plan, supported = lower_native_plan(runtime.program)
-    core = _cpp_flat.make_runtime(plan.reference_specs(), plan.output_id, plan.state_count)
+    resolved_workers = _resolve_workers(workers)
+    core = _cpp_flat.make_runtime(plan.reference_specs(), plan.output_id, plan.state_count, resolved_workers)
     return CppFlatRuntime(
         program=runtime.program,
         core=core,
         supported_ops=tuple(sorted(set(supported))),
         native_plan=plan,
+        workers=resolved_workers,
     )
 
 
@@ -667,24 +681,25 @@ def _try_cpp_hybrid_batch(
     accelerator_cache: dict[tuple[Any, ...], Any],
     warn_callback: Callable[[Any, str], None],
     out_path=False,
+    workers: int | None = None,
 ):
     """Run full-native or staged native/JAX/native batch execution when possible."""
     if os.getenv("TRADING_DSL_ENGINE_DISABLE_CPP_ACCEL", "0") == "1":
         return None
     full = _try_cpp_full_batch(
-        runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path
+        runtime, inputs, accelerator_cache, warn_callback, emit_warning=False, out_path=out_path, workers=workers
     )
     if full is not None:
         return full
     if out_path:
-        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True, workers=workers)
         return None
 
     n_steps, n_instruments = inputs[0].shape
     candidates = _cpp_hybrid_candidates(runtime.program, n_steps, n_instruments)
     if not candidates:
         if any(isinstance(node.op, GroupByOp) for node in runtime.program.nodes):
-            _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+            _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True, workers=workers)
         return None
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
@@ -701,10 +716,11 @@ def _try_cpp_hybrid_batch(
         except NotImplementedError:
             continue
         node_specs = plan.reference_specs()
-        key = (node_specs, plan.output_id, plan.state_count, n_instruments)
+        resolved_workers = _resolve_workers(workers)
+        key = (node_specs, plan.output_id, plan.state_count, n_instruments, resolved_workers)
         core = accelerator_cache.get(key)
         if core is None:
-            core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
+            core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count, resolved_workers)
             accelerator_cache[key] = core
         state = core.init_state(n_instruments)
         source_inputs = tuple(np.asarray(inputs[i], dtype=np.float64) for i in source_input_indices)
@@ -712,10 +728,10 @@ def _try_cpp_hybrid_batch(
         extra_inputs.append(np.asarray(_reshape_cpp_batch_output(subprogram, raw, n_steps, n_instruments)))
         candidate_programs.append(node_id)
     if not extra_inputs:
-        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True)
+        _try_cpp_full_batch(runtime, inputs, accelerator_cache, warn_callback, emit_warning=True, workers=workers)
         return None
 
-    staged = _try_cpp_staged_output_batch(runtime, inputs, tuple(candidate_programs), tuple(extra_inputs), accelerator_cache)
+    staged = _try_cpp_staged_output_batch(runtime, inputs, tuple(candidate_programs), tuple(extra_inputs), accelerator_cache, workers=workers)
     if staged is not None:
         return staged
 
@@ -733,6 +749,7 @@ def _try_cpp_full_batch(
     *,
     emit_warning: bool,
     out_path=False,
+    workers: int | None = None,
 ):
     try:
         from trading_dsl_engine.jax_flat import _cpp_flat
@@ -745,10 +762,11 @@ def _try_cpp_full_batch(
     n_steps, n_instruments = inputs[0].shape
     out = _cpp_batch_output(runtime.program, out_path, n_steps, n_instruments) if out_path else None
     node_specs = plan.reference_specs()
-    key = (node_specs, plan.output_id, plan.state_count, n_instruments)
+    resolved_workers = _resolve_workers(workers)
+    key = (node_specs, plan.output_id, plan.state_count, n_instruments, resolved_workers)
     core = accelerator_cache.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
+        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count, resolved_workers)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
     cpp_inputs = tuple(np.asarray(arr, dtype=np.float64) for arr in inputs)
@@ -777,7 +795,7 @@ def _cpp_batch_output(program: StreamingProgram, out_path, n_steps: int, n_instr
     return np.memmap(os.fspath(out_path), mode="w+", dtype=np.float64, shape=shape)
 
 
-def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, ...], upstream_values: tuple[np.ndarray, ...], accelerator_cache: dict[tuple[Any, ...], Any]):
+def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, ...], upstream_values: tuple[np.ndarray, ...], accelerator_cache: dict[tuple[Any, ...], Any], *, workers: int | None = None):
     if len(runtime.program.outputs) != 1:
         return None
     root_id = runtime.program.outputs[0]
@@ -808,10 +826,11 @@ def _try_cpp_staged_output_batch(runtime, inputs, upstream_node_ids: tuple[int, 
 
     n_steps, n_instruments = inputs[0].shape
     node_specs = plan.reference_specs()
-    key = (node_specs, plan.output_id, plan.state_count, n_instruments)
+    resolved_workers = _resolve_workers(workers)
+    key = (node_specs, plan.output_id, plan.state_count, n_instruments, resolved_workers)
     core = accelerator_cache.get(key)
     if core is None:
-        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count)
+        core = _cpp_flat.make_runtime(node_specs, plan.output_id, plan.state_count, resolved_workers)
         accelerator_cache[key] = core
     state = core.init_state(n_instruments)
     frontier_by_id = dict(zip(frontier_ids, frontier_values, strict=True))

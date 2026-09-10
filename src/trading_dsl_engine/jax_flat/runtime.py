@@ -39,6 +39,7 @@ class JaxFlatRuntime(eqx.Module):
     runtimes: list[float] = eqx.field(default_factory=list, static=True)
     _jit_compile_tracker: JitCompileTracker = eqx.field(default_factory=JitCompileTracker, static=True)
     cpp: bool = eqx.field(default=True, static=True)
+    cpp_workers: int | None = eqx.field(default=None, static=True)
     cpp_fallback_warnings: list[str] = eqx.field(default_factory=list, static=True)
     cached_values: dict[int, np.ndarray] = eqx.field(default_factory=dict, static=True)
     cache_memmap_tracker: MemmapPathTracker = eqx.field(default_factory=MemmapPathTracker, static=True)
@@ -269,7 +270,8 @@ class JaxFlatRuntime(eqx.Module):
                 _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
             else:
                 hybrid = _try_cpp_hybrid_batch(
-                    self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback, out_path=out_path
+                    self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback,
+                    out_path=out_path, workers=self.cpp_workers
                 )
                 if hybrid is not None:
                     if isinstance(hybrid[1], np.memmap):

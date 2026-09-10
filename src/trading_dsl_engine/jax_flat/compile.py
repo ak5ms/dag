@@ -895,7 +895,10 @@ def compile_formula(
     metadata: MetadataConfig | dict | None = None,
     type_relations=(),
     runtimes: JaxFlatRuntime | Iterable[JaxFlatRuntime] | None = None,
+    workers: int | None = None,
 ) -> JaxFlatRuntime:
+    if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0):
+        raise ValueError("workers must be a positive integer or None")
     expr = parse_formula(formula) if isinstance(formula, str) else formula
     expr = _normalize_static_jax_flat_kwargs(expr)
     expr = _expand_dsl(expr, dsl_registry or DEFAULT_DSL_REGISTRY)
@@ -924,6 +927,7 @@ def compile_formula(
             external_cache_inputs=external_cache_values or None,
         ),
         cpp=cpp,
+        cpp_workers=workers,
     )
     if cpp:
         import warnings

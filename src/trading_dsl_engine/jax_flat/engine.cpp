@@ -8,5 +8,5 @@ PYBIND11_MODULE(_cpp_flat, m) {
         .def("tick_into", &Runtime::tick_into, py::arg("state"), py::arg("out"))
         .def("run_batch", &Runtime::run_batch, py::arg("state"))
         .def("run_batch_into", &Runtime::run_batch_into, py::arg("state"), py::arg("out"));
-    m.def("make_runtime", &make_runtime, py::arg("node_specs"), py::arg("output_id"), py::arg("n_states"));
+    m.def("make_runtime", &make_runtime, py::arg("node_specs"), py::arg("output_id"), py::arg("n_states"), py::arg("workers"));
 }

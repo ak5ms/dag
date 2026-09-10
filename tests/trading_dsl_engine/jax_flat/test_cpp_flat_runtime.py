@@ -1,4 +1,6 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 import jax
 import pytest
@@ -20,6 +22,59 @@ def _assert_cpp_matches_jax(formula, data, *, rtol=1e-10, atol=1e-10):
     _, cpp_out = cpp_runtime.run_batch(data)
     _, jax_out = jax_runtime.run_batch(data)
     np.testing.assert_allclose(cpp_out, np.asarray(jax_out), rtol=rtol, atol=atol, equal_nan=True)
+
+
+def test_cpp_flat_worker_configuration_validation_and_resolution():
+    default = compile_formula_native("add(close, open)", workers=None)
+    assert default.workers == (os.cpu_count() or 1)
+    assert compile_formula_native("add(close, open)", workers=1).workers == 1
+    assert compile_formula_native("add(close, open)", workers=2).workers == 2
+    assert compile_formula("add(close, open)", cpp=True, workers=3).cpp_workers == 3
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="workers"):
+            compile_formula_native("add(close, open)", workers=invalid)
+        with pytest.raises(ValueError, match="workers"):
+            compile_formula("add(close, open)", workers=invalid)
+
+
+def test_cpp_flat_parallel_frontier_repeated_streaming_and_runtime_isolation():
+    formula = "add(norm_inv(close), norm_inv(open))"
+    rng = np.random.default_rng(414)
+    n_instruments = 300_000
+    data = {name: rng.uniform(0.01, 0.99, size=(3, n_instruments)) for name in ("close", "open")}
+    data["open"][1, 7] = np.nan
+
+    serial = compile_formula_native(formula, workers=1)
+    parallel = compile_formula_native(formula, workers=4)
+    _, expected = serial.run_batch(data)
+    _, actual = parallel.run_batch(data)
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+    # A state remains a sequential transition even when each row's independent
+    # DAG frontier is parallel, and separate runtimes own separate executors.
+    def replay(runtime):
+        state = runtime.init_state(n_instruments)
+        out = np.empty(n_instruments)
+        observed = []
+        for t in range(3):
+            runtime.tick_into(state, out, *(data[name][t] for name in runtime.program.input_names))
+            observed.append(out.copy())
+        return np.stack(observed)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outputs = list(executor.map(replay, (compile_formula_native(formula, workers=2), compile_formula_native(formula, workers=3))))
+    for output in outputs:
+        np.testing.assert_allclose(output, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def test_cpp_flat_wide_cat_worker_fallback_matches_serial():
+    formula = "cat(" + ",".join(f"exp(add(close, {i}.0))" for i in range(32)) + ")"
+    close = np.random.default_rng(912).normal(size=(8, 150))
+    serial = compile_formula_native(formula, workers=1)
+    automatic = compile_formula_native(formula, workers=None)
+    _, expected = serial.run_batch({"close": close})
+    _, actual = automatic.run_batch({"close": close})
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_cpp_flat_source_fingerprint_tracks_transitive_local_dependencies(tmp_path):

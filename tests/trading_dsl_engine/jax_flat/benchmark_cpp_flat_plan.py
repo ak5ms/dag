@@ -58,6 +58,11 @@ CASES = {
     "groupby_churn": "groupby((key0, key1), close, add(cumsum(self_), 1.0))",
     "universe_groupby": "groupby((univ([0, 1], [2, 3]), key0), close, cumsum(self_))",
     "ridge": "get_preds(Ridge(cat(close, open), open, 1.0, 16.0, 0.01))",
+    "wide_frontier": "add(add(exp(close), ln(abs(open))), add(xs_rank(high), xs_rank(low)))",
+    "cat_frontier": "cat(" + ",".join(f"exp(add(close, {i}.0))" for i in range(32)) + ")",
+    "norm_inv_frontier": "cat(" + ",".join(
+        f"norm_inv(clip(add(close, {i / 1000}), 0.001, 0.999))" for i in range(4)
+    ) + ")",
     "alpha_sharpes": None,
 }
 
@@ -109,11 +114,13 @@ def benchmark_alpha_sharpes(rows: int, instruments: int, runs: int, *, cpp: bool
     }
 
 
-def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1) -> dict[str, object]:
+def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1, *, workers: int | None = None) -> dict[str, object]:
     rng = np.random.default_rng(7)
     data = {
         "close": rng.normal(size=(rows, instruments)),
         "open": rng.normal(size=(rows, instruments)),
+        "high": rng.normal(size=(rows, instruments)),
+        "low": rng.normal(size=(rows, instruments)),
         "lag": rng.integers(0, 16, size=(rows, instruments)).astype(np.float64),
         "key0": rng.integers(0, 16, size=(rows, instruments)).astype(np.float64),
         "key1": rng.integers(0, 4, size=(rows, instruments)).astype(np.float64),
@@ -130,13 +137,12 @@ def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1)
     if case == "universe_groupby" and instruments < 4:
         raise ValueError("universe_groupby requires at least four instruments")
     t0 = time.perf_counter()
-    runtime = compile_formula(formula)
+    runtime = compile_formula(formula, workers=workers)
     state = runtime.init_state(instruments)
     cold_seconds = time.perf_counter() - t0
 
     inputs = tuple(data[name][0] for name in runtime.program.input_names)
-    out = np.empty(instruments, dtype=np.float64)
-    runtime.tick_into(state, out, *inputs)  # warm construction/lazy paths
+    out = np.empty_like(runtime.tick(state, *inputs))  # warm construction/lazy paths
     tick_rates = []
     batch_rates = []
     for _ in range(runs):
@@ -166,6 +172,8 @@ def benchmark(case: str, rows: int, instruments: int, ticks: int, runs: int = 1)
         "nodes": len(runtime.native_plan.nodes),
         "rows": rows,
         "instruments": instruments,
+        "workers": runtime.workers,
+        "graph_shape": "wide" if "frontier" in case else "chain_or_specialized",
         "cold_seconds": cold_seconds,
         "runs": runs,
         "ticks_per_second": float(np.median(tick_rates)),
@@ -183,21 +191,35 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=tuple(CASES) + ("all",), default="all")
     parser.add_argument("--rows", type=int, default=4096)
-    parser.add_argument("--instruments", type=int, choices=(150, 1000, 4000), default=150)
+    parser.add_argument("--instruments", type=int, choices=(150, 1000, 4000, 300000), default=150)
     parser.add_argument("--ticks", type=int, default=2000)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--backend", choices=("cpp", "jax"), default="cpp")
+    parser.add_argument("--workers", default="1,2,4", help="comma-separated native worker counts")
+    parser.add_argument("--assert-scaling", action="store_true", help="enforce opt-in scaling/no-regression guardrails")
     args = parser.parse_args()
     cases = CASES if args.case == "all" else (args.case,)
     for case in cases:
-        result = (
+        worker_values = [None] if args.backend == "jax" or case == "alpha_sharpes" else [int(v) for v in args.workers.split(",")]
+        baseline = None
+        results = []
+        for workers in worker_values:
+            result = (
             benchmark_alpha_sharpes(
                 args.rows, args.instruments, args.runs, cpp=args.backend == "cpp"
             )
             if case == "alpha_sharpes"
-            else benchmark(case, args.rows, args.instruments, args.ticks, args.runs)
-        )
-        print(json.dumps(result, sort_keys=True))
+                else benchmark(case, args.rows, args.instruments, args.ticks, args.runs, workers=workers)
+            )
+            rate = result["batch_rows_per_second"]
+            baseline = rate if baseline is None else baseline
+            result["speedup"] = rate / baseline
+            results.append(result)
+            print(json.dumps(result, sort_keys=True))
+        if args.assert_scaling and len(results) > 1 and case == "norm_inv_frontier" and max(r["speedup"] for r in results[1:]) < 1.05:
+            raise AssertionError("norm_inv_frontier did not improve by at least 5% with additional workers")
+        if args.assert_scaling and len(results) > 1 and case == "cat_frontier" and min(r["speedup"] for r in results[1:]) < 0.90:
+            raise AssertionError("cat_frontier serial fallback regressed by more than 10%")
 
 
 if __name__ == "__main__":
