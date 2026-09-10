@@ -224,14 +224,14 @@ class JaxFlatRuntime(eqx.Module):
     def tick(self, state_leaves, *input_rows):
         return self._tick_impl(state_leaves, *input_rows)
 
-    def run_batch(self, inputs, states=None, out_path: str | bool = False):
+    def run_batch(self, inputs, states=None, out_path: str | bool = False, workers=None):
 
         runtime = self
 
         while True:
             start = time.perf_counter()
             try:
-                result = runtime._run_batch_once(inputs, states, out_path)
+                result = runtime._run_batch_once(inputs, states, out_path, workers)
                 if runtime.block:
                     jax.block_until_ready(result)
                 end = time.perf_counter()
@@ -251,7 +251,7 @@ class JaxFlatRuntime(eqx.Module):
                 )
                 runtime = next_runtime
 
-    def _run_batch_once(self, inputs, states=None, out_path: str | bool = False):
+    def _run_batch_once(self, inputs, states=None, out_path: str | bool = False, workers=None):
         inputs = _normalize_batch_inputs(self, inputs)
         if not inputs:
             raise ValueError("run_batch requires at least one input array")
@@ -269,7 +269,7 @@ class JaxFlatRuntime(eqx.Module):
                 _warn_cpp_fallback(self, f"C++ jax_flat accelerator unavailable ({type(exc).__name__}: {exc}); falling back to JAX-flat")
             else:
                 hybrid = _try_cpp_hybrid_batch(
-                    self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback, out_path=out_path
+                    self, inputs, _CPP_ACCELERATOR_CACHE, _warn_cpp_fallback, out_path=out_path, workers=workers
                 )
                 if hybrid is not None:
                     if isinstance(hybrid[1], np.memmap):
