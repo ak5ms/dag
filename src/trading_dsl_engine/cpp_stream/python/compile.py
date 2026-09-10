@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextlib import contextmanager
+from time import perf_counter
 
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.base.parser import Expr
@@ -24,7 +26,10 @@ from trading_dsl_engine.cpp_stream.python.output_projection import (
 )
 from trading_dsl_engine.cpp_stream.python.outputs import build_output_layout
 from trading_dsl_engine.cpp_stream.python.parallel import select_parallel_plan
-from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime
+from trading_dsl_engine.cpp_stream.python.runtime import (
+    CompileMetrics,
+    CppStreamRuntime,
+)
 from trading_dsl_engine.ir.ops import CvxpyProgramOp
 from trading_dsl_engine.cpp_stream.python.sources import SourceValue
 
@@ -33,13 +38,24 @@ Formula = str | Expr
 FormulaInput = Formula | list[Formula] | tuple[Formula, ...] | Mapping[object, object]
 
 
+@contextmanager
+def _measure(metrics: dict[str, float], stage: str):
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        metrics[stage] = metrics.get(stage, 0.0) + perf_counter() - started
+
+
 def _flatten_formula_mapping(formula: Mapping[object, object]):
     flat: list[Formula] = []
 
     def visit(value, path):
         if isinstance(value, Mapping):
             if not value:
-                raise ValueError(f"formula mapping at {path or '<root>'} must not be empty")
+                raise ValueError(
+                    f"formula mapping at {path or '<root>'} must not be empty"
+                )
             return OrderedDict(
                 (key, visit(child, path + (key,))) for key, child in value.items()
             )
@@ -64,38 +80,40 @@ def _compile_program(
     bound_sources: Mapping[str, SourceValue] | None,
     return_multiple: bool,
     result_structure=None,
+    compile_stage_seconds: dict[str, float] | None = None,
+    compile_started: float | None = None,
 ) -> CppStreamRuntime:
-    program = repair_value_types(program)
-    for root_id in program.outputs:
-        root_kind = program.nodes[root_id].value_type.kind
-        if root_kind == "object":
-            raise ValueError(
-                "project object-valued operators before returning them from cpp_stream"
-            )
-        if root_kind not in {"scalar", "vector", "matrix", "fixed", "tensor"}:
-            raise ValueError(f"unsupported cpp_stream root kind {root_kind!r}")
-
-    program = apply_input_key_hints(program, input_types)
-    scalar = row_scalar_analysis(program, input_types)
-    row_scalar_nodes = frozenset(
-        index for index in range(len(program.nodes)) if scalar(index)
-    )
-    layout = build_output_layout(program, n_instruments)
-    plan = optimize_public_projections(
-        lower_program(
-            program,
-            n_instruments=n_instruments,
-            default_group_capacity=default_group_capacity,
-            key_cardinalities=key_cardinalities,
-            row_scalar_nodes=row_scalar_nodes,
-            input_dtypes=tuple(spec.dtype for spec in input_types),
+    metrics = compile_stage_seconds if compile_stage_seconds is not None else {}
+    started = perf_counter() if compile_started is None else compile_started
+    with _measure(metrics, "type_analysis"):
+        program = repair_value_types(program)
+        for root_id in program.outputs:
+            root_kind = program.nodes[root_id].value_type.kind
+            if root_kind == "object":
+                raise ValueError(
+                    "project object-valued operators before returning them from cpp_stream"
+                )
+            if root_kind not in {"scalar", "vector", "matrix", "fixed", "tensor"}:
+                raise ValueError(f"unsupported cpp_stream root kind {root_kind!r}")
+        program = apply_input_key_hints(program, input_types)
+        scalar = row_scalar_analysis(program, input_types)
+        row_scalar_nodes = frozenset(
+            index for index in range(len(program.nodes)) if scalar(index)
         )
-    )
-    parallel_plan = select_parallel_plan(
-        plan,
-        n_instruments,
-        output_layout=layout,
-    )
+        layout = build_output_layout(program, n_instruments)
+    with _measure(metrics, "lowering"):
+        plan = optimize_public_projections(
+            lower_program(
+                program,
+                n_instruments=n_instruments,
+                default_group_capacity=default_group_capacity,
+                key_cardinalities=key_cardinalities,
+                row_scalar_nodes=row_scalar_nodes,
+                input_dtypes=tuple(spec.dtype for spec in input_types),
+            )
+        )
+    with _measure(metrics, "parallel_planning"):
+        parallel_plan = select_parallel_plan(plan, n_instruments, output_layout=layout)
     generated_programs = []
     seen_programs = set()
     for node in program.nodes:
@@ -114,14 +132,15 @@ def _compile_program(
     native_headers = tuple(
         artifact.instance_header.name for artifact in generated_programs
     )
-    generated = render_translation_unit(
-        plan,
-        n_instruments=n_instruments,
-        prefetch_rows=prefetch_rows,
-        input_types=input_types,
-        output_layout=layout,
-        native_headers=native_headers,
-    )
+    with _measure(metrics, "code_generation"):
+        generated = render_translation_unit(
+            plan,
+            n_instruments=n_instruments,
+            prefetch_rows=prefetch_rows,
+            input_types=input_types,
+            output_layout=layout,
+            native_headers=native_headers,
+        )
     include_dirs = tuple(
         directory
         for artifact in generated_programs
@@ -131,17 +150,21 @@ def _compile_program(
         path for artifact in generated_programs for path in artifact.link_files
     )
     fingerprint_files = tuple(
-        path
-        for artifact in generated_programs
-        for path in artifact.fingerprint_files
+        path for artifact in generated_programs for path in artifact.fingerprint_files
     )
-    library_path, cpp_path = build_shared(
-        generated.text,
-        extra_include_dirs=include_dirs,
-        extra_link_files=link_files,
-        extra_fingerprint_files=fingerprint_files,
-    )
-    return CppStreamRuntime(
+    native_metrics: dict[str, float | bool] = {}
+    with _measure(metrics, "native_build"):
+        library_path, cpp_path = build_shared(
+            generated.text,
+            extra_include_dirs=include_dirs,
+            extra_link_files=link_files,
+            extra_fingerprint_files=fingerprint_files,
+            metrics=native_metrics,
+        )
+    for name in ("dependency_fingerprint_seconds", "native_compile_seconds"):
+        metrics[name] = float(native_metrics.get(name, 0.0))
+    runtime_started = perf_counter()
+    runtime = CppStreamRuntime(
         program=program,
         plan=plan,
         library_path=library_path,
@@ -153,7 +176,15 @@ def _compile_program(
         output_layout=layout,
         return_multiple=return_multiple,
         result_structure=result_structure,
+        compile_metrics=None,
     )
+    metrics["runtime_setup"] = perf_counter() - runtime_started
+    runtime.compile_metrics = CompileMetrics(
+        stage_seconds=dict(metrics),
+        total_seconds=perf_counter() - started,
+        native_cache_hit=bool(native_metrics.get("native_cache_hit", False)),
+    )
+    return runtime
 
 
 def compile_formula(
@@ -170,6 +201,8 @@ def compile_formula(
 ) -> CppStreamRuntime:
     """Compile one or many formulas into one CSE'd native streaming program."""
 
+    compile_started = perf_counter()
+    compile_stage_seconds: dict[str, float] = {}
     if prefetch_rows < 0:
         raise ValueError("prefetch_rows must be >= 0")
     result_structure = None
@@ -189,13 +222,14 @@ def compile_formula(
             input_types,
             n_instruments,
         )
-        program = compile_ir(
-            formula,
-            dsl_registry=dsl_registry,
-            column_names=column_names,
-            input_value_types=referenced_types,
-            n_instruments=n_instruments,
-        )
+        with _measure(compile_stage_seconds, "frontend"):
+            program = compile_ir(
+                formula,
+                dsl_registry=dsl_registry,
+                column_names=column_names,
+                input_value_types=referenced_types,
+                n_instruments=n_instruments,
+            )
         validate_names(program, data, what="source")
         infos = referenced_types.infos_for(program.input_names)
         if infos and len({info.rows for info in infos.values()}) != 1:
@@ -204,16 +238,17 @@ def compile_formula(
         n = infer_n(infos, n_instruments)
         # Rebuild with exact N so all tensor and public-output extents become
         # compile-time constants before lowering and Jinja rendering.
-        program = compile_ir(
-            formula,
-            dsl_registry=dsl_registry,
-            column_names=column_names,
-            input_value_types={
-                name: input_value_type(info.input_type, n)
-                for name, info in infos.items()
-            },
-            n_instruments=n,
-        )
+        with _measure(compile_stage_seconds, "frontend"):
+            program = compile_ir(
+                formula,
+                dsl_registry=dsl_registry,
+                column_names=column_names,
+                input_value_types={
+                    name: input_value_type(info.input_type, n)
+                    for name, info in infos.items()
+                },
+                n_instruments=n,
+            )
         validate_names(program, data, what="source")
         ordered = tuple(infos[name].input_type for name in program.input_names)
         bound_sources: Mapping[str, SourceValue] | None = {
@@ -228,24 +263,20 @@ def compile_formula(
         if n <= 0:
             raise ValueError(f"invalid n_instruments={n}")
         input_value_types = (
-            {
-                name: input_value_type(spec, n)
-                for name, spec in input_types.items()
-            }
+            {name: input_value_type(spec, n) for name, spec in input_types.items()}
             if input_types is not None
             else None
         )
-        program = compile_ir(
-            formula,
-            dsl_registry=dsl_registry,
-            column_names=column_names,
-            input_value_types=input_value_types,
-            n_instruments=n,
-        )
-        if input_types is None:
-            ordered = tuple(
-                InputTypeSpec("float64", n) for _ in program.input_names
+        with _measure(compile_stage_seconds, "frontend"):
+            program = compile_ir(
+                formula,
+                dsl_registry=dsl_registry,
+                column_names=column_names,
+                input_value_types=input_value_types,
+                n_instruments=n,
             )
+        if input_types is None:
+            ordered = tuple(InputTypeSpec("float64", n) for _ in program.input_names)
         else:
             validate_names(program, input_types, what="input_types")
             ordered = tuple(input_types[name] for name in program.input_names)
@@ -261,6 +292,8 @@ def compile_formula(
         bound_sources=bound_sources,
         return_multiple=return_multiple,
         result_structure=result_structure,
+        compile_stage_seconds=compile_stage_seconds,
+        compile_started=compile_started,
     )
 
 

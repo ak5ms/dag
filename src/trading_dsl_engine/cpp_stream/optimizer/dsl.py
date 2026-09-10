@@ -1,34 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from trading_dsl_engine.base.dsl import ensure_expr
 from trading_dsl_engine.base.parser import Expr
-
-
-@dataclass(frozen=True, eq=False)
-class CvxpyProgramExpr(Expr):
-    """Object-valued call to one generated native CVXPY program."""
-
-    program: object
-    bindings: tuple[tuple[str, Expr], ...]
-    requested_fields: set[str] = field(default_factory=set)
-
-
-@dataclass(frozen=True, eq=False)
-class CvxpyFieldExpr(Expr):
-    """Named compile-time projection from a generated Clarabel program."""
-
-    program_expr: CvxpyProgramExpr
-    field: str
-
-
-@dataclass(frozen=True, eq=False)
-class CvxpyPreviousSolutionExpr(Expr):
-    """A delayed edge from the preceding solve into the next parameter set."""
-
-    field: str
-    initial: Expr
+from trading_dsl_engine.ir.optimizer import (
+    CvxpyFieldExpr,
+    CvxpyPreviousSolutionExpr,
+    CvxpyProgramExpr,
+)
 
 
 def previous_solution(

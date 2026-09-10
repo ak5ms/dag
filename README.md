@@ -309,3 +309,13 @@ dictionaries. `result.load()` reconstructs them as ordered `FormulaResults`;
 returns an ordered mapping whose keys are tuples containing the full nested path.
 Cross-sectional binary statistics broadcast scalar secondary values, including
 unit weights in `xs_weighted_mean(x, 1)` and scalar regressors in projection ops.
+
+Every returned `CppStreamRuntime` exposes `compile_metrics`. Its
+`stage_seconds` mapping separates source inference, frontend construction, type
+analysis, physical lowering, parallel planning, C++ generation, dependency
+fingerprinting, native compilation, and runtime setup; `total_seconds` reports
+the complete public call and `native_cache_hit` distinguishes cached builds.
+Repeated compiles cache unchanged native-header fingerprints and compiler
+identity checks, avoiding redundant file reads and compiler subprocesses.
+Optimizer expression nodes are defined in the neutral IR layer, so importing IR
+utilities does not initialize the `cpp_stream` backend or create import cycles.

@@ -18,7 +18,7 @@ from trading_dsl_engine.base.parser import (
     Universe,
     parse_formula,
 )
-from trading_dsl_engine.cpp_stream.optimizer.dsl import (
+from trading_dsl_engine.ir.optimizer import (
     CvxpyFieldExpr,
     CvxpyPreviousSolutionExpr,
     CvxpyProgramExpr,

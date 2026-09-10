@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from trading_dsl_engine.base.dsl import DEFAULT_DSL_REGISTRY, DSLFunctionRegistry, ensure_expr, get_dsl_op_signature
+from trading_dsl_engine.base.keys import Key
 from trading_dsl_engine.base.metadata import MetadataConfig
 from trading_dsl_engine.base.parser import Call, Expr, Identifier, KeyTuple, Number, String, Universe, parse_formula
 from trading_dsl_engine.jax_flat.custom import RollingJaxCall, StatelessJaxCall
@@ -166,6 +167,8 @@ def _normalize_static_jax_flat_kwargs(node: Expr) -> Expr:
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_normalize_static_jax_flat_kwargs(item) for item in node.items))
+    if isinstance(node, Key):
+        return replace(node, expr=_normalize_static_jax_flat_kwargs(node.expr))
     return node
 
 # --- Expression keys and groupby canonical-form helpers ---
@@ -208,6 +211,9 @@ def _expr_key(node: Expr):
         )
     if isinstance(node, KeyTuple):
         return ("tuple", tuple(_expr_key(item) for item in node.items))
+    if isinstance(node, Key):
+        return ("key", _expr_key(node.expr), node.num_keys, node.offset,
+                node.row_scalar, node.dtype, node.monotonic)
     if isinstance(node, Universe):
         return ("univ", node.groups)
     raise ValueError(f"Unsupported expression: {node}")
@@ -278,6 +284,8 @@ def _replace_self(node: Expr, lhs: Expr) -> Expr:
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_replace_self(a, lhs) for a in node.items))
+    if isinstance(node, Key):
+        return replace(node, expr=_replace_self(node.expr, lhs))
     return node
 
 
@@ -687,10 +695,11 @@ def _compile_groupby_node(
     universe_items = [item for item in key_items if isinstance(item, Universe)]
 
     dynamic_items = [item for item in key_items if not isinstance(item, Universe)]
+    dynamic_exprs = [item.expr if isinstance(item, Key) else item for item in dynamic_items]
     inner_op, feed_exprs = _compile_groupby_inner_op(expr.args[2], expr.args[1])
     universe_groups = _resolve_universe_groups(universe_items[0]) if universe_items else None
 
-    key_child_ids = tuple(_compile_node(k, memo, nodes, input_names, external_cache_names) for k in dynamic_items)
+    key_child_ids = tuple(_compile_node(k, memo, nodes, input_names, external_cache_names) for k in dynamic_exprs)
     feed_child_ids = tuple(_compile_node(feed, memo, nodes, input_names, external_cache_names) for feed in feed_exprs)
     child_ids = key_child_ids + feed_child_ids
     inner_op = _typed_groupby_inner_op(inner_op, tuple(nodes[cid].op for cid in feed_child_ids))
@@ -850,6 +859,8 @@ def _expand_dsl(node: Expr, dsl_registry: DSLFunctionRegistry, depth: int = 0) -
         )
     if isinstance(node, KeyTuple):
         return KeyTuple(tuple(_expand_dsl(item, dsl_registry, depth) for item in node.items))
+    if isinstance(node, Key):
+        return replace(node, expr=_expand_dsl(node.expr, dsl_registry, depth))
     return node
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
+from time import perf_counter
 
 from trading_dsl_engine.base.dsl import DSLFunctionRegistry
 from trading_dsl_engine.cpp_stream.python.compile import (
@@ -9,7 +10,12 @@ from trading_dsl_engine.cpp_stream.python.compile import (
     compile_formula as _compile_formula,
 )
 from trading_dsl_engine.cpp_stream.python.compiler_support import install_icx
-from trading_dsl_engine.cpp_stream.python.runtime import CppStreamRuntime, FormulaResults, RunResult
+from trading_dsl_engine.cpp_stream.python.runtime import (
+    CompileMetrics,
+    CppStreamRuntime,
+    FormulaResults,
+    RunResult,
+)
 from trading_dsl_engine.cpp_stream.python.source_types import InputTypeSpec
 from trading_dsl_engine.cpp_stream.python.sources import (
     InputSource,
@@ -33,8 +39,7 @@ def infer_n_instruments(infos: Mapping[str, SourceInfo]) -> int:
     counts = Counter(
         int(info.input_type.row_shape[0])
         for info in infos.values()
-        if info.input_type.row_shape
-        and int(info.input_type.row_shape[0]) > 1
+        if info.input_type.row_shape and int(info.input_type.row_shape[0]) > 1
     )
     if not counts:
         raise ValueError(
@@ -64,12 +69,15 @@ def compile_formula(
     input_types: Mapping[str, InputTypeSpec] | None = None,
 ) -> CppStreamRuntime:
     """Compile one or many formulas, inferring N from supplied sources."""
+    started = perf_counter()
+    inference_started = started
     resolved_n = n_instruments
     if data is not None and resolved_n is None:
         resolved_n = infer_n_instruments(
             inspect_source_mapping(data, expected_types=input_types)
         )
-    return _compile_formula(
+    inference_seconds = perf_counter() - inference_started
+    runtime = _compile_formula(
         formula,
         data,
         n_instruments=resolved_n,
@@ -80,6 +88,16 @@ def compile_formula(
         prefetch_rows=prefetch_rows,
         input_types=input_types,
     )
+    metrics = runtime.compile_metrics
+    if metrics is not None:
+        stages = dict(metrics.stage_seconds)
+        stages["source_inference"] = inference_seconds
+        runtime.compile_metrics = CompileMetrics(
+            stage_seconds=stages,
+            total_seconds=perf_counter() - started,
+            native_cache_hit=metrics.native_cache_hit,
+        )
+    return runtime
 
 
 __all__ = [
@@ -87,6 +105,7 @@ __all__ = [
     "infer_n_instruments",
     "install_icx",
     "CppStreamRuntime",
+    "CompileMetrics",
     "FormulaResults",
     "RunResult",
     "InputTypeSpec",
