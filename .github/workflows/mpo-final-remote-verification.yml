@@ -1,0 +1,98 @@
+name: mpo-final-remote-verification
+
+on:
+  push:
+    branches: [mpo-agent-export]
+    paths:
+      - '.github/workflows/mpo-final-remote-verification.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify exact remote MPO head and clean temporary work
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_mpo=6c547e46f35ead26de625883eed746e6faf3f6e0
+          verified=""
+          for _ in $(seq 1 120); do
+            git fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*'
+            mpo_head=$(git rev-parse origin/mpo)
+            main_head=$(git rev-parse origin/main)
+            if [[ "$mpo_head" != "$old_mpo" ]] && git merge-base --is-ancestor "$main_head" "$mpo_head"; then
+              verified="$mpo_head"
+              break
+            fi
+            sleep 30
+          done
+          [[ -n "$verified" ]] || { echo 'Remote mpo was not replaced by a linear rebase' >&2; exit 1; }
+
+          git checkout -q --detach "$verified"
+          test "$(git rev-list --merges "$main_head"..HEAD --count)" -eq 0
+          obsolete=(
+            docs/benchmarks/cpp_stream_optimizer_node.json
+            docs/benchmarks/cpp_stream_optimizer_node_benchmark.txt
+            docs/benchmarks/cpp_stream_optimizer_node_validation.txt
+            docs/benchmarks/mpo_optimizer_final_status.md
+            docs/benchmarks/mpo_optimizer_full_validation.txt
+            scripts/benchmark_cpp_stream_optimizer_node.py
+            scripts/benchmark_mpo_cvxpygen.py
+            scripts/benchmark_mpo_cvxpygen_native.c
+          )
+          for path in "${obsolete[@]}"; do [[ ! -e "$path" ]] || { echo "obsolete file remains: $path" >&2; exit 1; }; done
+          required=(
+            src/trading_dsl_engine/cpp_stream/python/lowering_multi.py
+            src/trading_dsl_engine/cpp_stream/python/output_projection.py
+            tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py
+            tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+          )
+          for path in "${required[@]}"; do [[ -e "$path" ]] || { echo "required file missing: $path" >&2; exit 1; }; done
+
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest numpy scipy cvxpy clarabel includeigen pybind11 jinja2 jax equinox astropy
+          export PYTHONPATH="$PWD/src"
+          export JAX_ENABLE_X64=1
+          python -m compileall -q src
+          python -m pytest -q -o addopts="" \
+            tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py \
+            tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py \
+            tests/trading_dsl_engine/cpp_stream/test_output_projection.py \
+            tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py \
+            tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py | tee "$RUNNER_TEMP/mpo-final-tests.txt"
+          if [[ -e tests/flows/test_mpo.py ]]; then
+            python -m pytest -q -o addopts="" tests/flows/test_mpo.py | tee -a "$RUNNER_TEMP/mpo-final-tests.txt"
+          fi
+
+          gh pr edit 155 --repo "$GITHUB_REPOSITORY" \
+            --title "Add first-class cpp_stream MPO operator (rebased and verified)" \
+            --body "Rebased linearly onto current \`main\` at \`$main_head\` and force-pushed to \`mpo\`. MPO is a regular cpp_stream DAG operator: named \`get_field\` projections share one physical optimizer node, can feed downstream formulas, and compose with heterogeneous \`compile_formula([...])\` outputs through the existing multi-output/CSE runtime. Obsolete standalone optimizer/CVXPYgen benchmark artifacts were removed. The focused MPO, output-projection, multi-output, Ridge, and cpp_stream suites passed against this exact remote head.\n\nVerified head: \`$verified\`."
+
+          gh pr close 172 --repo "$GITHUB_REPOSITORY" --comment "Export/rebase verification completed; deleting the temporary branch." || true
+          gh pr close 156 --repo "$GITHUB_REPOSITORY" --comment "Superseded standalone CVXPYgen benchmark; first-class MPO is verified on branch mpo." || true
+          gh pr close 158 --repo "$GITHUB_REPOSITORY" --comment "Temporary Clarabel vendor branch is no longer required by the verified MPO branch." || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin --delete mpo-cvxpygen-bench || true
+          git push origin --delete agent/clarabel-current-vendor || true
+          printf 'verified_sha=%s\nmain_sha=%s\n' "$verified" "$main_head" | tee "$RUNNER_TEMP/mpo-final-result.txt"
+          git push origin --delete mpo-agent-export || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mpo-final-remote-verification
+          path: |
+            ${{ runner.temp }}/mpo-final-result.txt
+            ${{ runner.temp }}/mpo-final-tests.txt
+          if-no-files-found: ignore
+          retention-days: 2

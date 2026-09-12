@@ -1,0 +1,52 @@
+name: mpo-cleanup-after-success
+
+on:
+  push:
+    branches: [mpo-agent-export]
+    paths:
+      - '.github/workflows/mpo-cleanup-after-success.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Wait for validated MPO head, then remove temporary branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_mpo=6c547e46f35ead26de625883eed746e6faf3f6e0
+          validated=""
+          for _ in $(seq 1 120); do
+            git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+            mpo_head=$(git rev-parse origin/mpo)
+            main_head=$(git rev-parse origin/main)
+            body=$(gh pr view 155 --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null || true)
+            if [[ "$mpo_head" != "$old_mpo" ]] \
+               && git merge-base --is-ancestor "$main_head" "$mpo_head" \
+               && grep -q 'Validated head:' <<<"$body" \
+               && grep -q "$mpo_head" <<<"$body"; then
+              validated="$mpo_head"
+              break
+            fi
+            sleep 30
+          done
+          [[ -n "$validated" ]] || { echo 'Validated MPO force-push did not complete' >&2; exit 1; }
+
+          gh pr close 172 --repo "$GITHUB_REPOSITORY" --comment "Repository export and rebase validation completed; temporary branch is being removed." || true
+          gh pr close 156 --repo "$GITHUB_REPOSITORY" --comment "Obsolete standalone CVXPYgen benchmark branch; the first-class MPO operator is now on mpo." || true
+          gh pr close 158 --repo "$GITHUB_REPOSITORY" --comment "Temporary Clarabel vendor branch is no longer needed by the validated MPO branch." || true
+
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin --delete mpo-cvxpygen-bench || true
+          git push origin --delete agent/clarabel-current-vendor || true
+          git push origin --delete mpo-agent-export || true

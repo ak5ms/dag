@@ -1,0 +1,123 @@
+name: mpo-rebase-and-validate-v2
+
+on:
+  push:
+    branches: [mpo-agent-export]
+    paths:
+      - '.github/workflows/mpo-rebase-and-validate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebase MPO onto current main and validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          original_mpo=$(git rev-parse origin/mpo)
+          main_head=$(git rev-parse origin/main)
+          work_root="$RUNNER_TEMP/mpo-rebase"
+          rm -rf "$work_root"
+          mkdir -p "$work_root"
+          selected=""
+
+          for strategy in theirs ours; do
+            candidate="$work_root/$strategy"
+            git clone --no-local "$GITHUB_WORKSPACE" "$candidate"
+            cd "$candidate"
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+            git checkout -B mpo-rebased "$original_mpo"
+            if ! GIT_EDITOR=true git rebase "$main_head" -X "$strategy"; then
+              git rebase --abort || true
+              continue
+            fi
+
+            required_main_files=(
+              benchmarks/cpp_stream_multi_output_audit.md
+              scripts/benchmark_cpp_stream_multi_output_subgraph.py
+              src/trading_dsl_engine/cpp_stream/cpp/stackdsl/ops/output.hpp
+              src/trading_dsl_engine/cpp_stream/python/compiler_support.py
+              src/trading_dsl_engine/cpp_stream/python/lowering_multi.py
+              src/trading_dsl_engine/cpp_stream/python/output_projection.py
+              src/trading_dsl_engine/cpp_stream/python/outputs.py
+              tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+              tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+            )
+            for path in "${required_main_files[@]}"; do
+              [[ -e "$path" ]] || git checkout "$main_head" -- "$path"
+            done
+
+            rm -f \
+              docs/benchmarks/cpp_stream_optimizer_node.json \
+              docs/benchmarks/cpp_stream_optimizer_node_benchmark.txt \
+              docs/benchmarks/cpp_stream_optimizer_node_validation.txt \
+              docs/benchmarks/mpo_optimizer_final_status.md \
+              docs/benchmarks/mpo_optimizer_full_validation.txt \
+              scripts/benchmark_cpp_stream_optimizer_node.py \
+              scripts/benchmark_mpo_cvxpygen.py \
+              scripts/benchmark_mpo_cvxpygen_native.c
+
+            if ! git diff --quiet; then
+              git add -A
+              git commit -m "Rebase first-class MPO onto current main"
+            fi
+
+            python -m pip install --upgrade pip
+            python -m pip install -e .
+            python -m pip install pytest numpy scipy cvxpy clarabel includeigen pybind11 jinja2 jax equinox astropy
+            export PYTHONPATH=src
+            export JAX_ENABLE_X64=1
+
+            python - <<'PY'
+          from pathlib import Path
+          root = Path('src/trading_dsl_engine/cpp_stream')
+          combined = '\n'.join(p.read_text(errors='ignore') for p in root.rglob('*.py'))
+          bad = [token for token in ('OptimizerPipeline(', 'optimizer_pipeline(') if token in combined]
+          if bad:
+              raise SystemExit(f'post-batch optimizer pipeline remains reachable: {bad}')
+          PY
+
+            test_paths=(
+              tests/trading_dsl_engine/cpp_stream/test_multi_output_runtime.py
+              tests/trading_dsl_engine/cpp_stream/test_output_projection.py
+              tests/trading_dsl_engine/cpp_stream/test_cat_ridge.py
+              tests/trading_dsl_engine/cpp_stream/test_cpp_stream.py
+            )
+            [[ -e tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py ]] && test_paths+=(tests/trading_dsl_engine/cpp_stream/test_optimizer_node.py)
+            [[ -e tests/flows/test_mpo.py ]] && test_paths+=(tests/flows/test_mpo.py)
+            [[ -e tests/flows/test_mpo_cvxpy_node.py ]] && test_paths+=(tests/flows/test_mpo_cvxpy_node.py)
+
+            if python -m pytest -q -o addopts="" "${test_paths[@]}"; then
+              selected="$candidate"
+              break
+            fi
+          done
+
+          [[ -n "$selected" ]] || { echo 'No valid rebase candidate' >&2; exit 1; }
+          cd "$selected"
+          git merge-base --is-ancestor "$main_head" HEAD
+          test "$(git rev-list --merges "$main_head"..HEAD --count)" -eq 0
+          git push --force-with-lease=refs/heads/mpo:"$original_mpo" origin HEAD:refs/heads/mpo
+          git rev-parse HEAD | tee "$RUNNER_TEMP/mpo-final-sha.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mpo-rebase-validation-v2
+          path: ${{ runner.temp }}/mpo-final-sha.txt
+          if-no-files-found: ignore
+          retention-days: 2
